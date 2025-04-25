@@ -86,6 +86,8 @@ class UR10eCuroboMoveIt(Node):
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             "ur10e.yml", world_config, interpolation_dt=0.004
         )
+        
+        
 
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
@@ -204,27 +206,32 @@ class UR10eCuroboMoveIt(Node):
                 print("Exiting...")
                 self.running = False
                 break
-
-
-
-                
+              
     def get_end_effector_pose(self):
-        """Retrieve the end-effector pose using TF lookup."""
-        self.get_logger().info("Retrieving end-effector pose...")
-
-        source_frame, target_frame = "base_link", "tool0"
+        """Compute current end-effector pose using CuRobo forward kinematics."""
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Joint states not yet received.")
+            return None
 
         try:
-            transform = self.tf_buffer.lookup_transform(
-                source_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            joint_state = JointState.from_position(
+                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order
             )
-            position = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
-            orientation = [transform.transform.rotation.w, transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z]
-            self.get_logger().info(f"Current End-Effector Pose: {position}, {orientation}")
+
+            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
+
+            position = ee_pose.ee_pos_seq[0].cpu().tolist()
+            orientation = ee_pose.ee_quat_seq[0].cpu().tolist()
+
+            self.get_logger().info(f"[FK] End-effector position: {position}, orientation: {orientation}")
             return position + orientation
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Failed to get end-effector pose: {e}")
+
+        except Exception as e:
+            self.get_logger().warn(f"FK computation failed: {e}")
             return None
+
 
     def ask_goal_position(self, current_position):
         """Prompt user for new goal position."""
@@ -265,7 +272,7 @@ class UR10eCuroboMoveIt(Node):
             goal_pose = Pose.from_list(goal)
 
             # Generate motion plan
-            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=5))
+            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=5, enable_finetune_trajopt=True))
 
             if result.success:
                 self.get_logger().info("Motion plan generated successfully! Executing...")
@@ -349,18 +356,21 @@ class UR10eCuroboMoveIt(Node):
 
         
     def forward_kinematics(self, joint_positions):
-        """Compute the end-effector position in Cartesian space using forward kinematics."""
+        """Use CuRobo's rollout_fn to compute end-effector pose."""
         try:
-            transform = self.tf_buffer.lookup_transform(
-                "base_link", "tool0", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            return Point(
-                x=transform.transform.translation.x,
-                y=transform.transform.translation.y,
-                z=transform.transform.translation.z,
-            )
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Failed to compute forward kinematics: {e}")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            joint_tensor = torch.tensor([joint_positions], dtype=torch.float32, device=device)
+            joint_state = JointState.from_position(joint_tensor, joint_names=self.joint_order)
+
+            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
+
+            pos = ee_pose.ee_pos_seq.squeeze().tolist()
+            # Optionally get orientation:
+            # quat = ee_pose.ee_quat_seq.squeeze().tolist()
+            return Point(x=pos[0], y=pos[1], z=pos[2])
+
+        except Exception as e:
+            self.get_logger().warn(f"CuRobo FK failed: {e}")
             return None
 
 
@@ -541,7 +551,7 @@ class UR10eCuroboMoveIt(Node):
         self.publish_goal_marker(goal_position[:3])
 
     def subscribe_to_goal_pose_topic(self):
-        """Subscribe once to a temporary goal pose topic and store the received pose."""
+        """Subscribe to a topic that continuously receives external goal poses."""
         
         # Capture the current orientation once
         current_pose = self.get_end_effector_pose()
@@ -562,12 +572,10 @@ class UR10eCuroboMoveIt(Node):
             print(f"Goal {len(self.goal_poses)} received from topic and saved: {goal_position}")
             self.publish_goal_marker(goal_position[:3])
 
-            try:
-                self.temp_goal_pose_sub.destroy()
-            except Exception as e:
-                self.get_logger().warn(f"Failed to destroy temporary subscriber: {e}")
+        # Keep a persistent subscription alive
+        if not hasattr(self, 'goal_pose_sub'):
+            self.goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
 
-        self.temp_goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
         
         
         
