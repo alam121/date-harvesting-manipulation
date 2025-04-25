@@ -1,0 +1,27 @@
+digraph G {
+"odom" -> "zed_camera_link"[label=" Broadcaster: default_authority\nAverage rate: 15.199\nBuffer length: 5.0\nMost recent transform: 1745480217.701923\nOldest transform: 1745480212.701627\n"];
+"map" -> "odom"[label=" Broadcaster: default_authority\nAverage rate: 15.199\nBuffer length: 5.0\nMost recent transform: 1745480217.701923\nOldest transform: 1745480212.701627\n"];
+"zed_camera_center" -> "zed_baro_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_link" -> "zed_camera_center"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_center" -> "zed_left_camera_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_left_camera_frame" -> "zed_left_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_center" -> "zed_mag_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_camera_center" -> "zed_right_camera_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_right_camera_frame" -> "zed_right_camera_optical_frame"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_left_camera_frame" -> "zed_temp_left_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"zed_right_camera_frame" -> "zed_temp_right_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "base"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "base_link_inertia"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"flange" -> "tool0"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"wrist_3_link" -> "flange"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"wrist_2_link" -> "wrist_3_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+"upper_arm_link" -> "forearm_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+"shoulder_link" -> "upper_arm_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+"base_link_inertia" -> "shoulder_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+"forearm_link" -> "wrist_1_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+"wrist_1_link" -> "wrist_2_link"[label=" Broadcaster: default_authority\nAverage rate: 18.058\nBuffer length: 4.984\nMost recent transform: 1745480217.776408\nOldest transform: 1745480212.792531\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1745480217.807773"[ shape=plaintext ] ;
+}->"base_link";
+}
