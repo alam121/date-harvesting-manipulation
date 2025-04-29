@@ -86,12 +86,24 @@ class UR10eCuroboMoveIt(Node):
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             "ur10e.yml", world_config, interpolation_dt=0.004
         )
+        
+        
 
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
 
+
         self.get_logger().info("Waiting for joint states...")
         self.timer = self.create_timer(0.5, self.check_joint_states)
+        #self.home_pose = [-0.0357, 0.3447, 0.5241, 0.0417, -0.7464, 0.6636, 0.0261]  # Cartesian home
+        self.home_pose = [
+            0.07427068054676056, 0.9948397278785706, 0.6564829349517822,
+            0.6820823550224304, -0.1366513967514038, 0.07068025320768356, 0.7149085998535156
+        ]
+        
+        
+        
+        self.move_to_home_position()
         self.keyboard_thread = threading.Thread(target=self.wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
 
@@ -138,7 +150,9 @@ class UR10eCuroboMoveIt(Node):
         print("Do you want to (O)pen or (C)lose the gripper?")
 
         while self.running:
+            #self.get_end_effector_pose()
             key = self.get_key()
+            
 
             if key == "y" and self.latest_marker_pose:
                 # Store goal from interactive marker
@@ -191,6 +205,12 @@ class UR10eCuroboMoveIt(Node):
 
             elif key == "n" and self.goal_poses:
                 print("Executing motion...")
+                
+                if hasattr(self, 'goal_pose_sub'):
+                    self.destroy_subscription(self.goal_pose_sub)
+                    del self.goal_pose_sub
+                    print("Unsubscribed from external goal poses.")
+                    
                 self.plan_and_execute()
                 self.get_logger().info("All goals executed. Waiting for gripper command...")
 
@@ -199,32 +219,40 @@ class UR10eCuroboMoveIt(Node):
 
             elif key == "c":
                 self.control_gripper("CLOSE")
+                
+            elif key == "h":
+                self.move_to_home_position()
 
             elif key == "q":
                 print("Exiting...")
                 self.running = False
                 break
-
-
-
-                
+              
     def get_end_effector_pose(self):
-        """Retrieve the end-effector pose using TF lookup."""
-        self.get_logger().info("Retrieving end-effector pose...")
-
-        source_frame, target_frame = "base_link", "tool0"
+        """Compute current end-effector pose using CuRobo forward kinematics."""
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Joint states not yet received.")
+            return None
 
         try:
-            transform = self.tf_buffer.lookup_transform(
-                source_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            joint_state = JointState.from_position(
+                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order
             )
-            position = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
-            orientation = [transform.transform.rotation.w, transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z]
-            self.get_logger().info(f"Current End-Effector Pose: {position}, {orientation}")
+
+            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
+
+            position = ee_pose.ee_pos_seq[0].cpu().tolist()
+            orientation = ee_pose.ee_quat_seq[0].cpu().tolist()
+
+            self.get_logger().info(f"[FK] End-effector position: {position}, orientation: {orientation}")
             return position + orientation
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Failed to get end-effector pose: {e}")
+
+        except Exception as e:
+            self.get_logger().warn(f"FK computation failed: {e}")
             return None
+
 
     def ask_goal_position(self, current_position):
         """Prompt user for new goal position."""
@@ -265,7 +293,7 @@ class UR10eCuroboMoveIt(Node):
             goal_pose = Pose.from_list(goal)
 
             # Generate motion plan
-            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=5))
+            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=10, enable_finetune_trajopt=False))
 
             if result.success:
                 self.get_logger().info("Motion plan generated successfully! Executing...")
@@ -311,7 +339,7 @@ class UR10eCuroboMoveIt(Node):
                     torch.tensor([trajectory_msg.points[-1].positions], dtype=torch.float32, device=device),
                     joint_names=self.joint_order,
                 )
-                self.get_logger().info(f"Updated start state for next goal: {start_state.position.tolist()}")
+                #self.get_logger().info(f"Updated start state for next goal: {start_state.position.tolist()}")
 
             else:
                 self.get_logger().warn("Failed to generate a motion plan for goal!")
@@ -349,18 +377,21 @@ class UR10eCuroboMoveIt(Node):
 
         
     def forward_kinematics(self, joint_positions):
-        """Compute the end-effector position in Cartesian space using forward kinematics."""
+        """Use CuRobo's rollout_fn to compute end-effector pose."""
         try:
-            transform = self.tf_buffer.lookup_transform(
-                "base_link", "tool0", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            return Point(
-                x=transform.transform.translation.x,
-                y=transform.transform.translation.y,
-                z=transform.transform.translation.z,
-            )
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Failed to compute forward kinematics: {e}")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            joint_tensor = torch.tensor([joint_positions], dtype=torch.float32, device=device)
+            joint_state = JointState.from_position(joint_tensor, joint_names=self.joint_order)
+
+            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
+
+            pos = ee_pose.ee_pos_seq.squeeze().tolist()
+            # Optionally get orientation:
+            # quat = ee_pose.ee_quat_seq.squeeze().tolist()
+            return Point(x=pos[0], y=pos[1], z=pos[2])
+
+        except Exception as e:
+            self.get_logger().warn(f"CuRobo FK failed: {e}")
             return None
 
 
@@ -539,36 +570,108 @@ class UR10eCuroboMoveIt(Node):
         self.goal_poses.append(goal_position)
         self.get_logger().info(f"Received goal pose from topic: {goal_position}")
         self.publish_goal_marker(goal_position[:3])
+        
+        
+     
 
     def subscribe_to_goal_pose_topic(self):
-        """Subscribe once to a temporary goal pose topic and store the received pose."""
-        
-        # Capture the current orientation once
-        current_pose = self.get_end_effector_pose()
-        if current_pose:
-            current_orientation = current_pose[3:]  # [w, x, y, z]
-        else:
-            current_orientation = [1.0, 0.0, 0.0, 0.0]  # fallback identity quaternion
+        """Subscribe to a topic that continuously receives external goal poses."""
 
         def callback(msg):
-            # Use new position + existing orientation
+            # Directly use both position and orientation from the received message
             goal_position = [
                 msg.position.x,
                 msg.position.y,
                 msg.position.z,
-            ] + current_orientation
+                msg.orientation.w,
+                msg.orientation.x,
+                msg.orientation.y,
+                msg.orientation.z
+            ]
 
-            self.goal_poses.append(goal_position)
-            print(f"Goal {len(self.goal_poses)} received from topic and saved: {goal_position}")
-            self.publish_goal_marker(goal_position[:3])
+            # Check if a similar goal already exists (within a small tolerance)
+            duplicate = False
+            for existing_goal in self.goal_poses:
+                distance = ((existing_goal[0] - goal_position[0]) ** 2 +
+                            (existing_goal[1] - goal_position[1]) ** 2 +
+                            (existing_goal[2] - goal_position[2]) ** 2) ** 0.5
+                if distance < 0.01:  # 1 cm tolerance
+                    duplicate = True
+                    duplicate = False
+                    break
 
-            try:
-                self.temp_goal_pose_sub.destroy()
-            except Exception as e:
-                self.get_logger().warn(f"Failed to destroy temporary subscriber: {e}")
+            if duplicate:
+                print(f"⚠️ Duplicate goal detected at {goal_position[:3]}. Skipping...")
+            else:
+                self.goal_poses.append(goal_position)
+                print(f"✅ Goal {len(self.goal_poses)} received and saved: {goal_position}")
+                self.publish_goal_marker(goal_position[:3])
 
-        self.temp_goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
+        # Keep a persistent subscription alive
+        if not hasattr(self, 'goal_pose_sub'):
+            self.goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
+
+
+                    
+
+    def move_to_home_position(self, timeout=5.0):
+        """Move the robot to a predefined Cartesian end-effector pose (home) after waiting for joint state."""
+        self.get_logger().info("Waiting for joint state before moving to home pose...")
+
+        # Wait until joint states are received or timeout
+        start_time = time.time()
+        while self.current_joint_positions is None and (time.time() - start_time < timeout):
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Joint state not received after waiting. Skipping home motion.")
+            return
+
+        self.get_logger().info("Joint state received. Moving to home pose...")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        start_state = JointState.from_position(
+            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+            joint_names=self.joint_order,
+        )
+
+        home_pose = Pose.from_list(self.home_pose)
+
+        result = self.motion_gen.plan_single(start_state, home_pose)
+
+        if result.success:
+            self.get_logger().info("Successfully planned to home pose.")
+
+            trajectory_msg = JointTrajectory()
+            trajectory_msg.joint_names = self.joint_order
+            interpolated_plan = result.get_interpolated_plan()
+            
+            if isinstance(interpolated_plan, JointState):
+                    interpolated_plan = interpolated_plan.position
+            if not isinstance(interpolated_plan, torch.Tensor):
+                    interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
+            interpolated_plan = interpolated_plan.to("cpu")
+
+            time_from_start = 0.0
+            for point in interpolated_plan:
+                traj_point = JointTrajectoryPoint()
+                traj_point.positions = point.tolist()
+                traj_point.velocities = [0.1] * len(self.joint_order)
+                traj_point.time_from_start.sec = int(time_from_start)
+                traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
+                time_from_start += 0.03
+                trajectory_msg.points.append(traj_point)
+
+            self.trajectory_pub.publish(trajectory_msg)
+            #self.wait_for_execution_completion(self.home_pose[:3])
+
+        else:
+            self.get_logger().warn("Failed to plan motion to home pose.")
+            
         
+
+
         
         
 def main():

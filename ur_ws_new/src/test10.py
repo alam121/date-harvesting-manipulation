@@ -21,6 +21,7 @@ import termios
 import tty
 import select
 import threading
+import math
 
 class UR10eCuroboMoveIt(Node):
     def __init__(self):
@@ -36,6 +37,7 @@ class UR10eCuroboMoveIt(Node):
             ROSJointState, "/joint_states", self.joint_state_callback, 10
         )
         
+        self.wrist_publisher_ = self.create_publisher(JointTrajectory, '/joint_trajectory_controller/joint_trajectory', 10)
         
         self.planned_path_pub = self.create_publisher(
             DisplayTrajectory, "/display_planned_path", 10
@@ -84,7 +86,7 @@ class UR10eCuroboMoveIt(Node):
         world_config = {"cuboid": {"table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0.0]}}}
 
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            "ur10e.yml", world_config, interpolation_dt=0.004
+            "ur10e.yml", interpolation_dt=0.004
         )
         
         
@@ -95,7 +97,11 @@ class UR10eCuroboMoveIt(Node):
 
         self.get_logger().info("Waiting for joint states...")
         self.timer = self.create_timer(0.5, self.check_joint_states)
-        self.home_pose = [-0.0357, 0.3447, 0.5241, 0.0417, -0.7464, 0.6636, 0.0261]  # Cartesian home
+        #self.home_pose = [-0.0357, 0.3447, 0.5241, 0.0417, -0.7464, 0.6636, 0.0261]  # Cartesian home
+        self.home_pose = [0.028592996299266815, 1.0296179056167603, 0.6764343976974487,0.8586909770965576, -0.10553082078695297, 0.009807142429053783, -0.5014148950576782]  # Cartesian home
+
+
+ 
         self.move_to_home_position()
         self.keyboard_thread = threading.Thread(target=self.wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
@@ -143,6 +149,8 @@ class UR10eCuroboMoveIt(Node):
         print("Do you want to (O)pen or (C)lose the gripper?")
 
         while self.running:
+
+            #self.get_end_effector_pose()
             key = self.get_key()
             
 
@@ -205,12 +213,30 @@ class UR10eCuroboMoveIt(Node):
                     
                 self.plan_and_execute()
                 self.get_logger().info("All goals executed. Waiting for gripper command...")
+                self.control_gripper("CLOSE")
+                self.control_gripper("CLOSE")
+                self.rotate_wrist(20)
+                self.rotate_wrist(-20)
+                time.sleep(2)
+                self.control_gripper("OPEN")
+                self.control_gripper("OPEN")
+                #self.move_backward(-0.05)
+                self.wait_until_motion_finishes()
+                self.move_to_home_position()
 
             elif key == "o":
                 self.control_gripper("OPEN")
+                self.control_gripper("OPEN")
+                #self.move_backward(-0.05)
+                self.wait_until_motion_finishes()
 
             elif key == "c":
                 self.control_gripper("CLOSE")
+                self.control_gripper("CLOSE")
+                self.rotate_wrist(20)
+                self.rotate_wrist(-20)
+                #self.move_backward(0.05)
+                #self.wait_until_motion_finishes()
                 
             elif key == "h":
                 self.move_to_home_position()
@@ -285,7 +311,7 @@ class UR10eCuroboMoveIt(Node):
             goal_pose = Pose.from_list(goal)
 
             # Generate motion plan
-            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=5, enable_finetune_trajopt=True))
+            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=10, enable_finetune_trajopt=False))
 
             if result.success:
                 self.get_logger().info("Motion plan generated successfully! Executing...")
@@ -663,7 +689,51 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().warn("Failed to plan motion to home pose.")
             
         
+    def rotate_wrist(self, degrees):
+        """ Rotates the UR10's wrist (wrist_3_joint) by the given degrees. """
+        if self.current_joint_positions is None:
+            self.get_logger().error("No joint state received yet. Cannot rotate wrist.")
+            return
 
+        radians = math.radians(degrees)  # Convert degrees to radians
+        trajectory_msg = JointTrajectory()
+        trajectory_msg.joint_names = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                                      "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]  # Full joint list
+
+        # Maintain current positions for other joints, modify only wrist_3_joint
+        new_positions = self.current_joint_positions.copy()
+        new_positions[5] += radians  # Modify wrist_3_joint (6th joint)
+
+        point = JointTrajectoryPoint()
+        point.positions = new_positions  # Set new positions
+        point.time_from_start.sec = 2  # Execute within 2 seconds
+
+        trajectory_msg.points.append(point)
+        self.wrist_publisher_.publish(trajectory_msg)
+        self.get_logger().info(f"UR10 wrist rotating by {degrees} degrees ({radians} radians)")
+        time.sleep(2)
+        
+    def move_backward(self, backward_distance):
+        """ Moves the UR10 slightly backward by adjusting shoulder_pan_joint. """
+        if self.current_joint_positions is None:
+            self.get_logger().error("No joint state received yet. Cannot move.")
+            return
+
+        trajectory_msg = JointTrajectory()
+        trajectory_msg.joint_names = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                                      "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]  # Full joint list
+
+        new_positions = self.current_joint_positions.copy()
+        new_positions[1] -= backward_distance  # Modify shoulder_pan_joint (1st joint)
+
+        point = JointTrajectoryPoint()
+        point.positions = new_positions  # Set new positions
+        point.time_from_start.sec = 1  # Execute within 2 seconds
+
+        trajectory_msg.points.append(point)
+        self.wrist_publisher_.publish(trajectory_msg)
+        self.get_logger().info(f"UR10 moved backward by {backward_distance} meters")
+        time.sleep(2)
 
         
         
