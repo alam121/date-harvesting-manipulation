@@ -1,0 +1,44 @@
+ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=yyy.yyy.yyy.yyy use_fake_hardware:=true launch_rviz:=false
+
+
+ros2 launch ur_bringup ur_moveit.launch.py ur_type:=ur10e robot_ip:="xxx.xxx" use_fake_hardware:=true launch_rviz:=true
+
+
+python3 test3.py 
+
+
+
+
+
+
+
+
+
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.1.101/24 dev eth0
+sudo ip addr add 169.254.186.100/24 dev eth0
+sudo ip link set eth0 up
+ip a | grep eth0
+3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 169.254.186.100/24 scope global eth0
+    inet 192.168.1.101/24 scope global eth0
+
+
+
+
+
+
+ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=false
+
+
+ros2 launch ur_bringup ur_moveit.launch.py ur_type:=ur10e robot_ip:="192.168.1.190" use_fake_hardware:=false launch_rviz:=true
+
+ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 
+
+ros2 topic pub /gripper/write_register std_msgs/msg/Int16MultiArray "{data: [68,30]}"
+
+ros2 topic pub /gripper/grasp std_msgs/Bool "{data: true}"  # Open the gripper
+
+ros2 topic pub /gripper/grasp std_msgs/Bool "{data: false}"  # Open the gripper
+
+

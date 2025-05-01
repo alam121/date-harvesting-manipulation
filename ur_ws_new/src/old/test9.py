@@ -204,9 +204,6 @@ class UR10eCuroboMoveIt(Node):
                 print("Exiting...")
                 self.running = False
                 break
-
-
-
                 
     def get_end_effector_pose(self):
         """Retrieve the end-effector pose using TF lookup."""
