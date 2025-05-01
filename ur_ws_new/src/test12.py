@@ -79,7 +79,7 @@ class UR10eCuroboMoveIt(Node):
             "elbow_joint",
             "wrist_1_joint",
             "wrist_2_joint",
-            "wrist_3_joint"
+            "wrist_3_joint",
         ]
 
         # Load cuRobo motion planning config for UR10e
@@ -98,10 +98,10 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info("Waiting for joint states...")
         self.timer = self.create_timer(0.5, self.check_joint_states)
         #self.home_pose = [-0.0357, 0.3447, 0.5241, 0.0417, -0.7464, 0.6636, 0.0261]  # Cartesian home
-        self.home_pose = [-0.058337293565273285, 1.099843144416809, 0.8954595923423767, 0.9791568517684937, -0.19517193734645844, 0.04805416613817215, -0.02916407212615013]# Cartesian home
-        
-        self.dropoff_pose = [0.27728310227394104, 0.9824779629707336, 0.2173084318637848, 0.5567391514778137, -0.770662248134613, 0.29106608033180237, 0.10677960515022278]
+        self.home_pose = [0.028592996299266815, 1.0296179056167603, 0.6764343976974487,0.8586909770965576, -0.10553082078695297, 0.009807142429053783, -0.5014148950576782]  # Cartesian home
 
+
+ 
         #self.move_to_home_position()
         self.keyboard_thread = threading.Thread(target=self.wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
@@ -151,7 +151,6 @@ class UR10eCuroboMoveIt(Node):
         while self.running:
 
             #self.get_end_effector_pose()
-
             key = self.get_key()
             
 
@@ -231,10 +230,6 @@ class UR10eCuroboMoveIt(Node):
                 
             elif key == "h":
                 self.move_to_home_position()
-                
-            elif key == "d":
-                print("Moving to drop-off zone...")
-                self.move_to_dropoff_position()
 
             elif key == "q":
                 print("Exiting...")
@@ -242,28 +237,21 @@ class UR10eCuroboMoveIt(Node):
                 break
               
     def get_end_effector_pose(self):
-        """Compute current end-effector pose using CuRobo forward kinematics."""
-        if self.current_joint_positions is None:
-            self.get_logger().warn("Joint states not yet received.")
-            return None
+        """Retrieve the end-effector pose using TF lookup."""
+        self.get_logger().info("Retrieving end-effector pose...")
+
+        source_frame, target_frame = "base_link", "gripper_tip"
 
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            joint_state = JointState.from_position(
-                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
-                joint_names=self.joint_order
+            transform = self.tf_buffer.lookup_transform(
+                source_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
             )
-
-            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
-
-            position = ee_pose.ee_pos_seq[0].cpu().tolist()
-            orientation = ee_pose.ee_quat_seq[0].cpu().tolist()
-
-            self.get_logger().info(f"[FK] End-effector position: {position}, orientation: {orientation}")
+            position = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
+            orientation = [transform.transform.rotation.w, transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z]
+            self.get_logger().info(f"Current End-Effector Pose: {position}, {orientation}")
             return position + orientation
-
-        except Exception as e:
-            self.get_logger().warn(f"FK computation failed: {e}")
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(f"Failed to get end-effector pose: {e}")
             return None
 
 
@@ -298,6 +286,8 @@ class UR10eCuroboMoveIt(Node):
             torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
             joint_names=self.joint_order,
         )
+        
+        print(start_state)
 
         while self.goal_poses and self.running:
             goal = self.goal_poses.pop(0)  # Get and remove the first goal
@@ -595,8 +585,7 @@ class UR10eCuroboMoveIt(Node):
         if current_pose:
             current_orientation = current_pose[3:]  # [w, x, y, z]
         else:
-            print(f"⚠️ Current pose not found.")
-            current_orientation = [0.8314505815505981, -0.46857336163520813, 0.19491221010684967, 0.2261378914117813]  # fallback quaternion
+            current_orientation = [0.0417, -0.7464, 0.6636, 0.0261]  # fallback quaternion
 
         def callback(msg):
             # Use new position + existing orientation
@@ -730,53 +719,9 @@ class UR10eCuroboMoveIt(Node):
         self.wrist_publisher_.publish(trajectory_msg)
         self.get_logger().info(f"UR10 moved backward by {backward_distance} meters")
         time.sleep(2)
+
         
-    def move_to_dropoff_position(self, timeout=5.0):
-        """Move the robot to the predefined drop-off position."""
-        if self.current_joint_positions is None:
-            self.get_logger().warn("Joint state not available. Cannot move to drop-off.")
-            return
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        start_state = JointState.from_position(
-            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
-            joint_names=self.joint_order,
-        )
-
-        dropoff_pose = Pose.from_list(self.dropoff_pose)
-
-        result = self.motion_gen.plan_single(start_state, dropoff_pose)
-
-        if result.success:
-            self.get_logger().info("Successfully planned to drop-off position.")
-            trajectory_msg = JointTrajectory()
-            trajectory_msg.joint_names = self.joint_order
-            interpolated_plan = result.get_interpolated_plan()
-
-            if isinstance(interpolated_plan, JointState):
-                interpolated_plan = interpolated_plan.position
-            if not isinstance(interpolated_plan, torch.Tensor):
-                interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
-
-            interpolated_plan = interpolated_plan.to("cpu")
-            time_from_start = 0.0
-
-            for point in interpolated_plan:
-                traj_point = JointTrajectoryPoint()
-                traj_point.positions = point.tolist()
-                traj_point.velocities = [0.1] * len(self.joint_order)
-                traj_point.time_from_start.sec = int(time_from_start)
-                traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
-                time_from_start += 0.03
-                trajectory_msg.points.append(traj_point)
-
-            self.trajectory_pub.publish(trajectory_msg)
-            self.wait_for_execution_completion(self.dropoff_pose[:3])
-
-        else:
-            self.get_logger().warn("Failed to plan to drop-off position.")
-            
-            
+        
 def main():
     print("Starting UR10e MoveIt Node...")
     rclpy.init()
