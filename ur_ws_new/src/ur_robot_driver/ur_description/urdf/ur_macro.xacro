@@ -361,7 +361,7 @@
     <joint name="${prefix}tool0_to_gripper" type="fixed">
   		<parent link="${prefix}tool0"/>
   		<child link="${prefix}gripper_link"/>
-  		<origin xyz="0 0 0" rpy="0 0 0"/>
+  		<origin xyz="0 0 0.01" rpy="0 0 0"/>
 		</joint>
 		
 		
@@ -369,7 +369,7 @@
     <joint name="${prefix}gripper_link_to_tip" type="fixed">
   		<parent link="${prefix}gripper_link"/>
   		<child link="${prefix}gripper_tip"/>
-  		<origin xyz="0 0 0.23" rpy="0 0 0"/> <!-- Match the box length -->
+  		<origin xyz="0 0 0.205" rpy="0 0 0"/> <!-- Match the box length -->
 		</joint>
 
 		
@@ -377,7 +377,7 @@
     <!-- Gripper geometry attached to tool0 -->
 <link name="${prefix}gripper_link">
   <visual>
-    <origin xyz="0 0 0.0" rpy="0 0 0"/> <!-- adjust offset as needed -->
+    <origin xyz="0 0 0.1" rpy="0 0 0"/> <!-- adjust offset as needed -->
     <geometry>
       <box size="0.07 0.07 0.19"/> <!-- dimensions of your gripper -->
     </geometry>
