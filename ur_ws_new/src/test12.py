@@ -13,6 +13,7 @@ from geometry_msgs.msg import Point
 from ros2_robotiqgripper.srv import RobotiqGripper 
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Point, Pose as ROSPose
+from delto_gripper_controller import DeltoGripperController
 
 import torch
 import time
@@ -79,14 +80,14 @@ class UR10eCuroboMoveIt(Node):
             "elbow_joint",
             "wrist_1_joint",
             "wrist_2_joint",
-            "wrist_3_joint",
+            "wrist_3_joint"
         ]
 
         # Load cuRobo motion planning config for UR10e
         world_config = {"cuboid": {"table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0.0]}}}
 
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            "ur10e.yml", interpolation_dt=0.004
+            "ur10e.yml", world_config, interpolation_dt=0.004
         )
         
         
@@ -98,11 +99,13 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info("Waiting for joint states...")
         self.timer = self.create_timer(0.5, self.check_joint_states)
         #self.home_pose = [-0.0357, 0.3447, 0.5241, 0.0417, -0.7464, 0.6636, 0.0261]  # Cartesian home
-        self.home_pose = [0.028592996299266815, 1.0296179056167603, 0.6764343976974487,0.8586909770965576, -0.10553082078695297, 0.009807142429053783, -0.5014148950576782]  # Cartesian home
+        self.home_pose = [0.07565116137266159, -0.4599267244338989, 0.9337347745895386, 0.062273602932691574, -0.019624363631010056, -0.20094674825668335, 0.977423906326294] #Cartesian home        
+        self.dropoff_pose = [-0.19983947277069092, -0.7162748575210571, 0.10007642209529877, 0.04266364127397537, -0.29519373178482056, -0.9115561842918396, 0.2830296754837036]
 
+        
+        self.gripper_controller = DeltoGripperController(self)
 
- 
-        #self.move_to_home_position()
+        self.move_to_home_position()
         self.keyboard_thread = threading.Thread(target=self.wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
 
@@ -151,6 +154,7 @@ class UR10eCuroboMoveIt(Node):
         while self.running:
 
             #self.get_end_effector_pose()
+
             key = self.get_key()
             
 
@@ -216,20 +220,22 @@ class UR10eCuroboMoveIt(Node):
 
             elif key == "o":
                 self.control_gripper("OPEN")
-                self.control_gripper("OPEN")
                 #self.move_backward(-0.05)
                 self.wait_until_motion_finishes()
 
             elif key == "c":
                 self.control_gripper("CLOSE")
-                self.control_gripper("CLOSE")
-                self.rotate_wrist(20)
-                self.rotate_wrist(-20)
-                #self.move_backward(0.05)
+                self.rotate_wrist(90)
+                self.rotate_wrist(-90)
+                self.move_backward(-0.005)
                 #self.wait_until_motion_finishes()
                 
             elif key == "h":
                 self.move_to_home_position()
+                
+            elif key == "d":
+                print("Moving to drop-off zone...")
+                self.move_to_dropoff_position()
 
             elif key == "q":
                 print("Exiting...")
@@ -237,21 +243,28 @@ class UR10eCuroboMoveIt(Node):
                 break
               
     def get_end_effector_pose(self):
-        """Retrieve the end-effector pose using TF lookup."""
-        self.get_logger().info("Retrieving end-effector pose...")
-
-        source_frame, target_frame = "base_link", "gripper_tip"
+        """Compute current end-effector pose using CuRobo forward kinematics."""
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Joint states not yet received.")
+            return None
 
         try:
-            transform = self.tf_buffer.lookup_transform(
-                source_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            joint_state = JointState.from_position(
+                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order
             )
-            position = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
-            orientation = [transform.transform.rotation.w, transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z]
-            self.get_logger().info(f"Current End-Effector Pose: {position}, {orientation}")
+
+            ee_pose = self.motion_gen.rollout_fn.compute_kinematics(joint_state)
+
+            position = ee_pose.ee_pos_seq[0].cpu().tolist()
+            orientation = ee_pose.ee_quat_seq[0].cpu().tolist()
+
+            self.get_logger().info(f"[FK] End-effector position: {position}, orientation: {orientation}")
             return position + orientation
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Failed to get end-effector pose: {e}")
+
+        except Exception as e:
+            self.get_logger().warn(f"FK computation failed: {e}")
             return None
 
 
@@ -286,67 +299,69 @@ class UR10eCuroboMoveIt(Node):
             torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
             joint_names=self.joint_order,
         )
-        
-        print(start_state)
 
         while self.goal_poses and self.running:
-            goal = self.goal_poses.pop(0)  # Get and remove the first goal
+            goal = self.goal_poses.pop(0)
             self.get_logger().info(f"Processing goal: {goal}")
 
-            goal_pose = Pose.from_list(goal)
+            x, y, z = goal[:3]
+            orientation = goal[3:]
+            
+            # 🔹 Step 1: Go to (x, y, z + offset) → approach pose
+            approach_pose = [x, y, z - 0.10] + orientation  # You can adjust the Z offset
 
-            # Generate motion plan
-            result = self.motion_gen.plan_single(start_state, goal_pose, MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=False))
+            # 🔹 Step 2: Then go to (x, y, z) → actual target
+            ordered_goals = [approach_pose, goal]
+            
+            for sub_goal in ordered_goals:
+                goal_pose = Pose.from_list(sub_goal)
 
-            if result.success:
-                self.get_logger().info("Motion plan generated successfully! Executing...")
-
-                trajectory_msg = JointTrajectory()
-                trajectory_msg.joint_names = self.joint_order
-                interpolated_plan = result.get_interpolated_plan()
-
-                if isinstance(interpolated_plan, JointState):
-                    interpolated_plan = interpolated_plan.position
-                if not isinstance(interpolated_plan, torch.Tensor):
-                    interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
-                interpolated_plan = interpolated_plan.to("cpu")
-
-                if len(interpolated_plan) < 2:
-                    self.get_logger().warn("Generated trajectory has too few points or no motion!")
-                    continue
-
-                time_from_start = 0.0
-                for i, point in enumerate(interpolated_plan):
-                    traj_point = JointTrajectoryPoint()
-                    traj_point.positions = point.numpy().tolist()
-                    traj_point.velocities = [0.1] * len(self.joint_order)
-                    traj_point.time_from_start.sec = int(time_from_start)
-                    traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
-                    time_from_start += 0.03
-                    trajectory_msg.points.append(traj_point)
-
-                    # Convert joint space to Cartesian space and update the path
-                    cartesian_point = self.forward_kinematics(traj_point.positions)
-                    if cartesian_point:
-                        self.path_points.append(cartesian_point)
-                        self.publish_path_marker()  # Update path dynamically
-
-                # Publish trajectory for execution
-                self.trajectory_pub.publish(trajectory_msg)
-
-                # Wait for execution to complete before proceeding to the next goal
-                self.wait_for_execution_completion(goal[:3])
-
-                # Update start state to the last position of the executed trajectory
-                start_state = JointState.from_position(
-                    torch.tensor([trajectory_msg.points[-1].positions], dtype=torch.float32, device=device),
-                    joint_names=self.joint_order,
+                result = self.motion_gen.plan_single(
+                    start_state,
+                    goal_pose,
+                    MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=False)
                 )
-                #self.get_logger().info(f"Updated start state for next goal: {start_state.position.tolist()}")
 
-            else:
-                self.get_logger().warn("Failed to generate a motion plan for goal!")
+                if result.success:
+                    self.get_logger().info("Motion plan generated successfully! Executing...")
 
+                    trajectory_msg = JointTrajectory()
+                    trajectory_msg.joint_names = self.joint_order
+                    interpolated_plan = result.get_interpolated_plan()
+
+                    if isinstance(interpolated_plan, JointState):
+                        interpolated_plan = interpolated_plan.position
+                    if not isinstance(interpolated_plan, torch.Tensor):
+                        interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
+                    interpolated_plan = interpolated_plan.to("cpu")
+
+                    time_from_start = 0.0
+                    for i, point in enumerate(interpolated_plan):
+                        traj_point = JointTrajectoryPoint()
+                        traj_point.positions = point.numpy().tolist()
+                        traj_point.velocities = [0.1] * len(self.joint_order)
+                        traj_point.time_from_start.sec = int(time_from_start)
+                        traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
+                        time_from_start += 0.03
+                        trajectory_msg.points.append(traj_point)
+
+                        cartesian_point = self.forward_kinematics(traj_point.positions)
+                        if cartesian_point:
+                            self.path_points.append(cartesian_point)
+                            self.publish_path_marker()
+
+                    self.trajectory_pub.publish(trajectory_msg)
+                    self.wait_for_execution_completion(sub_goal[:3])
+
+                    start_state = JointState.from_position(
+                        torch.tensor([trajectory_msg.points[-1].positions], dtype=torch.float32, device=device),
+                        joint_names=self.joint_order,
+                    )
+                else:
+                    self.get_logger().warn("Failed to generate a motion plan for sub-goal!")
+                    
+            
+            
         self.get_logger().info("All goals executed. Waiting for new goals...")
 
 
@@ -555,18 +570,6 @@ class UR10eCuroboMoveIt(Node):
         return False  # Default to False if nothing indicates movement
 
 
-
-    def control_gripper(self, action):
-        """Publish a command to open or close the Delto 3F gripper."""
-        self.get_logger().info(f"Sending Delto 3F gripper command: {action}")
-
-        self.gripper_pub = self.create_publisher(Bool, "/gripper/grasp", 10)
-        msg = Bool()
-        msg.data = True if action.upper() == "CLOSE" else False  # True = Close, False = Open
-        self.gripper_pub.publish(msg)
-
-        self.get_logger().info(f"Published gripper command '{msg.data}' to /gripper/grasp")
-
     def goal_pose_callback(self, msg):
         """Callback to store the latest goal pose received from the topic."""
         goal_position = [msg.position.x, msg.position.y, msg.position.z, msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z]
@@ -575,34 +578,38 @@ class UR10eCuroboMoveIt(Node):
         self.publish_goal_marker(goal_position[:3])
         
         
-     
 
     def subscribe_to_goal_pose_topic(self):
-        """Subscribe to a topic that continuously receives external goal poses."""
+        """Subscribe to the external goal pose topic and unsubscribe after one valid goal is received."""
+
+        if hasattr(self, 'goal_pose_sub'):
+            self.get_logger().info("Already subscribed. Unsubscribing first.")
+            self.destroy_subscription(self.goal_pose_sub)
+            del self.goal_pose_sub
 
         # Capture the current orientation once
         current_pose = self.get_end_effector_pose()
         if current_pose:
             current_orientation = current_pose[3:]  # [w, x, y, z]
         else:
-            current_orientation = [0.0417, -0.7464, 0.6636, 0.0261]  # fallback quaternion
+            print(f"⚠️ Current pose not found.")
+            current_orientation = [0.9949363470077515, -0.09815747290849686, 0.015445873141288757, 0.015106959268450737]  # fallback quaternion
 
         def callback(msg):
-            # Use new position + existing orientation
             goal_position = [
                 msg.position.x,
                 msg.position.y,
                 msg.position.z,
             ] + current_orientation
 
-            # Check if a similar goal already exists (within a small tolerance)
+            # Avoid duplicates
             duplicate = False
             for existing_goal in self.goal_poses:
                 distance = ((existing_goal[0] - goal_position[0]) ** 2 +
                             (existing_goal[1] - goal_position[1]) ** 2 +
                             (existing_goal[2] - goal_position[2]) ** 2) ** 0.5
-                if distance < 0.01:  # 1 cm tolerance
-                    duplicate = False
+                if distance < 0.01:
+                    duplicate = True
                     break
 
             if duplicate:
@@ -612,9 +619,16 @@ class UR10eCuroboMoveIt(Node):
                 print(f"✅ Goal {len(self.goal_poses)} received and saved: {goal_position}")
                 self.publish_goal_marker(goal_position[:3])
 
-        # Keep a persistent subscription alive
-        if not hasattr(self, 'goal_pose_sub'):
-            self.goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
+            # 🔴 UNSUBSCRIBE immediately after receiving the first goal
+            if hasattr(self, 'goal_pose_sub'):
+                self.destroy_subscription(self.goal_pose_sub)
+                del self.goal_pose_sub
+                print("📴 Automatically unsubscribed from /external_goal_pose.")
+
+        # 🔄 Store the subscription so it can be deleted
+        self.goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', callback, 10)
+        self.get_logger().info("🟢 Subscribed to /external_goal_pose")
+
 
                     
 
@@ -719,9 +733,60 @@ class UR10eCuroboMoveIt(Node):
         self.wrist_publisher_.publish(trajectory_msg)
         self.get_logger().info(f"UR10 moved backward by {backward_distance} meters")
         time.sleep(2)
+        
+    def move_to_dropoff_position(self, timeout=5.0):
+        """Move the robot to the predefined drop-off position."""
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Joint state not available. Cannot move to drop-off.")
+            return
 
-        
-        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        start_state = JointState.from_position(
+            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+            joint_names=self.joint_order,
+        )
+
+        dropoff_pose = Pose.from_list(self.dropoff_pose)
+
+        result = self.motion_gen.plan_single(start_state, dropoff_pose)
+
+        if result.success:
+            self.get_logger().info("Successfully planned to drop-off position.")
+            trajectory_msg = JointTrajectory()
+            trajectory_msg.joint_names = self.joint_order
+            interpolated_plan = result.get_interpolated_plan()
+
+            if isinstance(interpolated_plan, JointState):
+                interpolated_plan = interpolated_plan.position
+            if not isinstance(interpolated_plan, torch.Tensor):
+                interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
+
+            interpolated_plan = interpolated_plan.to("cpu")
+            time_from_start = 0.0
+
+            for point in interpolated_plan:
+                traj_point = JointTrajectoryPoint()
+                traj_point.positions = point.tolist()
+                traj_point.velocities = [0.1] * len(self.joint_order)
+                traj_point.time_from_start.sec = int(time_from_start)
+                traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
+                time_from_start += 0.03
+                trajectory_msg.points.append(traj_point)
+
+            self.trajectory_pub.publish(trajectory_msg)
+            self.wait_for_execution_completion(self.dropoff_pose[:3])
+
+        else:
+            self.get_logger().warn("Failed to plan to drop-off position.")
+            
+            
+    def control_gripper(self, action):
+        if action.upper() == "OPEN":
+            self.gripper_controller.open_gripper()
+        elif action.upper() == "CLOSE":
+            self.gripper_controller.run_closure_loop()
+            
+            
 def main():
     print("Starting UR10e MoveIt Node...")
     rclpy.init()

@@ -108,7 +108,7 @@ def launch_setup(context, *args, **kwargs):
 
     
     nodes_to_start = [
-        # gui_arg,
+        gui_arg,
         delto_3f_driver,
         robot_state_publisher_node,
         delay_rviz2_spawner,
