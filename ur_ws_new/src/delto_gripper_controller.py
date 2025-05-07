@@ -7,15 +7,15 @@ class DeltoGripperController:
     def __init__(self, node, force_topic='/gripper/force', target_topic='/gripper/target_joint'):
         self.node = node
         self.force_data = [0.0, 0.0, 0.0]
-        self.force_threshold = -0.1
+        self.force_threshold = -0.15
         self.steps = 10
         self.step_delay = 0.5  # seconds
         self.current_step = 0
 
         self.open_position = [
-            -0.0942, -0.1500, 1.8660, -0.5062,
+            -0.0942, -0.1500, 2.0660, -0.5062,
             -1.6318, 0.1309, 1.2753, -0.4887,
-            0.3333, 0.2234, 1.8673, -0.4311
+            0.3333, 0.2234, 2.0673, -0.4311
         ]
         self.closed_position = self.open_position.copy()
         self.closed_position[2] = 2.5660
