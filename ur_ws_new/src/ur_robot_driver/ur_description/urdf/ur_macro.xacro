@@ -356,7 +356,12 @@
       <child link="${prefix}tool0"/>
     </joint>
     
-    
+      <link name="zed2_left_camera_frame"/>
+  <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
+    <parent link="tool0"/>
+    <child link="zed2_left_camera_frame"/>
+    <origin xyz="-0.06 -0.14 0.06" rpy="0 0 0"/>
+  </joint>
     
     <joint name="${prefix}tool0_to_gripper" type="fixed">
   		<parent link="${prefix}tool0"/>
