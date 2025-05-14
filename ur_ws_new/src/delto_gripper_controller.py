@@ -14,7 +14,7 @@ class DeltoGripperController:
 
         self.open_position = [
             -0.0942, -0.1500, 2.0660, -0.5062,
-            -1.6318, 0.1309, 1.2753, -0.4887,
+            -1.6318, 0.1309, 1.6753, -0.4887,
             0.3333, 0.2234, 2.0673, -0.4311
         ]
         self.closed_position = self.open_position.copy()

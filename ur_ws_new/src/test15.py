@@ -84,7 +84,20 @@ class UR10eCuroboMoveIt(Node):
         ]
 
         # Load cuRobo motion planning config for UR10e
-        world_config = {"cuboid": {"table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0.0]}}}
+        world_config = {
+    "cuboid": {
+        "table": {
+            "dims": [5.0, 5.0, 0.2],          # 5×5×0.2 m table
+            "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0]  # center at z=-0.1 so top is at z=0
+        },
+        "pole": {
+            # full dims: 0.02 m thick in x, 0.02 m thick in y, 1.0 m tall in z
+            "dims": [0.02, 0.02, 1.0],
+            # center at x=0, y=0.65, z=0.5 (half of 1.0m)
+            "pose": [0.0, -0.65, 0.5, 1, 0, 0, 0]
+        }
+    }
+}
 
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             "ur10e.yml", world_config, interpolation_dt=0.004) #,trajopt_dt=0.05, num_trajopt_seeds=5)

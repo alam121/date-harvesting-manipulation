@@ -10,35 +10,61 @@ class VisibleBoxPublisher(Node):
         self.timer = self.create_timer(1.0, self.publish_marker)  # Every second
 
     def publish_marker(self):
-        marker = Marker()
-        marker.header.frame_id = 'base_link'  # Make sure this matches your RViz fixed frame
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = 'test_box'
-        marker.id = 0
-        marker.type = Marker.CUBE
-        marker.action = Marker.ADD
+        now = self.get_clock().now().to_msg()
 
-        # Small cube at 0.5m in front of base_link
-        marker.pose.position.x = 0.0
-        marker.pose.position.y = 0.0
-        marker.pose.position.z = -0.1  # Slightly above ground
+        # ─── TABLE ───
+        table = Marker()
+        table.header.frame_id = 'base_link'
+        table.header.stamp = now
+        table.ns = 'environment'
+        table.id = 0
+        table.type = Marker.CUBE
+        table.action = Marker.ADD
 
-        marker.pose.orientation.x = 0.0
-        marker.pose.orientation.y = 0.0
-        marker.pose.orientation.z = 0.0
-        marker.pose.orientation.w = 1.0
+        # center at [0,0,-0.1], dims [5×5×0.2]
+        table.pose.position.x = 0.0
+        table.pose.position.y = 0.0
+        table.pose.position.z = -0.1  
+        table.pose.orientation.w = 1.0
 
-        marker.scale.x = 2.0
-        marker.scale.y = 2.0
-        marker.scale.z = 0.2
+        table.scale.x = 5.0
+        table.scale.y = 5.0
+        table.scale.z = 0.2
 
-        marker.color.a = 1.0  # Fully opaque
-        marker.color.r = 1.0
-        marker.color.g = 0.0
-        marker.color.b = 0.0
+        table.color.a = 1.0
+        table.color.r = 1.0
+        table.color.g = 0.0
+        table.color.b = 0.0
 
-        self.marker_pub.publish(marker)
-        self.get_logger().info("Published visible cube marker at [0.5, 0.0, 0.1]")
+        # ─── POLE ───
+        pole = Marker()
+        pole.header.frame_id = 'base_link'
+        pole.header.stamp = now
+        pole.ns = 'environment'
+        pole.id = 1
+        pole.type = Marker.CUBE
+        pole.action = Marker.ADD
+
+        # center at [0,0.65,0.5], dims [0.02×0.02×1.0]
+        pole.pose.position.x = 0.0
+        pole.pose.position.y = -0.65
+        pole.pose.position.z = 0.5  
+        pole.pose.orientation.w = 1.0
+
+        pole.scale.x = 0.02
+        pole.scale.y = 0.02
+        pole.scale.z = 1.0
+
+        pole.color.a = 1.0
+        pole.color.r = 0.0
+        pole.color.g = 1.0
+        pole.color.b = 0.0
+
+        # publish both
+        self.marker_pub.publish(table)
+        self.marker_pub.publish(pole)
+
+        self.get_logger().info("Published table and pole markers.")
 
 def main():
     rclpy.init()

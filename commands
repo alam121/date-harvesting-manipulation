@@ -28,7 +28,7 @@ ip a | grep eth0
 
 
 
-ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=false
+ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true
 
 
 ros2 launch ur_bringup ur_moveit.launch.py ur_type:=ur10e robot_ip:="192.168.1.190" use_fake_hardware:=false launch_rviz:=true
@@ -40,5 +40,4 @@ ros2 topic pub /gripper/write_register std_msgs/msg/Int16MultiArray "{data: [68,
 ros2 topic pub /gripper/grasp std_msgs/Bool "{data: true}"  # Open the gripper
 
 ros2 topic pub /gripper/grasp std_msgs/Bool "{data: false}"  # Open the gripper
-
 
