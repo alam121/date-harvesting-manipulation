@@ -13,6 +13,9 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Point, Pose as ROSPose
 from delto_gripper_controller import DeltoGripperController
+from geometry_msgs.msg import PointStamped, PoseStamped
+from std_msgs.msg import Float32MultiArray
+
 
 import torch
 import time
@@ -39,6 +42,13 @@ class UR10eCuroboMoveIt(Node):
         
         self.wrist_publisher_ = self.create_publisher(JointTrajectory, '/joint_trajectory_controller/joint_trajectory', 10)
         
+
+        self.force_sub = self.create_subscription(
+            Float32MultiArray,
+            '/gripper/force',
+            self.force_callback,
+            10
+        )
         
         # New publisher for goal position markers
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
@@ -48,10 +58,13 @@ class UR10eCuroboMoveIt(Node):
 
         # Store the path points
         self.path_points = []
-
+        self.last_force = None
+        self.force_threshold = 0.04    # adjust to your slip‐sensitivity
+        self.gripper_closed = False
 
         self.stop_requested = False  # Flag to request stopping the current motion
-
+        self.slip_detection = False   # Flag to see slip
+        self.abort_flag = False
 
         # ROS2 subscriber for MoveIt interactive marker feedback
         self.marker_sub = self.create_subscription(
@@ -84,7 +97,20 @@ class UR10eCuroboMoveIt(Node):
         ]
 
         # Load cuRobo motion planning config for UR10e
-        world_config = {"cuboid": {"table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0.0]}}}
+        world_config = {
+    "cuboid": {
+        "table": {
+            "dims": [5.0, 5.0, 0.2],          # 5×5×0.2 m table
+            "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0]  # center at z=-0.1 so top is at z=0
+        },
+        "pole": {
+            # full dims: 0.02 m thick in x, 0.02 m thick in y, 1.0 m tall in z
+            "dims": [0.02, 0.02, 1.0],
+            # center at x=0, y=0.65, z=0.5 (half of 1.0m)
+            "pose": [0.0, -0.65, 0.5, 1, 0, 0, 0]
+        }
+    }
+}
 
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             "ur10e.yml", world_config, interpolation_dt=0.004) #,trajopt_dt=0.05, num_trajopt_seeds=5)
@@ -365,12 +391,45 @@ class UR10eCuroboMoveIt(Node):
             
         self.get_logger().info("All goals executed. Waiting for new goals...")
         self.control_gripper("CLOSE")
-        self.move_backward(-0.02)
-        self.rotate_wrist(90)
-        self.rotate_wrist(-90)
-        self.move_to_dropoff_position()
-        self.control_gripper("OPEN")
-        self.move_to_home_position()
+        time.sleep(1)
+
+        if self.abort_flag == True:
+            self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
+            self.control_gripper("OPEN")
+            self.nudge_wrist3(math.radians(2), duration=1.5)
+            self.move_to_home_position()
+            self.abort_flag = False
+            return
+        
+        if self.slip_detection == True:
+            self.get_logger().info("🛠 Slip detected → nudging end-effector up by 0.01 m")
+            self.control_gripper("OPEN")
+            # get current EE pose (x,y,z, qw,qx,qy,qz)
+            current = self.get_end_effector_pose()
+            if current:
+                # build a one-step up goal
+                up_goal = [current[0], current[1], current[2] + 0.018] + current[3:]
+                # execute that small upward move
+                self.execute_single_pose(up_goal)
+            # reset slip flag
+            self.slip_detection = False
+            self.control_gripper("CLOSE")
+
+        if self.abort_flag == False:
+
+            self.move_backward(-0.02)
+            self.rotate_wrist(90)
+            self.rotate_wrist(-90)
+            self.move_to_dropoff_position()
+            self.control_gripper("OPEN")
+            self.move_to_home_position()
+
+        else:
+            self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
+            self.control_gripper("OPEN")
+            self.nudge_wrist3(math.radians(2), duration=1.5)
+            self.move_to_home_position()
+            self.abort_flag = False
 
 
 
@@ -401,6 +460,43 @@ class UR10eCuroboMoveIt(Node):
         self.path_marker_pub.publish(marker)
         #self.get_logger().info("Published real-time path marker to RViz.")
 
+    def nudge_wrist3(self, delta_rad: float, duration: float = 1.0):
+        """
+        Move only the wrist_3_joint by delta_rad (radians), over duration seconds,
+        then automatically return to its original position.
+        """
+        if self.current_joint_positions is None:
+            self.get_logger().error("No joint state – cannot nudge wrist.")
+            return
+
+        # 1) remember original
+        orig = self.current_joint_positions[5]
+        target = orig + delta_rad
+
+        # 2) build and publish first trajectory to target
+        traj1 = JointTrajectory()
+        traj1.joint_names = ["wrist_3_joint"]
+        pt1 = JointTrajectoryPoint()
+        pt1.positions = [target]
+        pt1.time_from_start.sec     = int(duration)
+        pt1.time_from_start.nanosec = int((duration % 1.0)*1e9)
+        traj1.points = [pt1]
+        self.wrist_publisher_.publish(traj1)
+        self.get_logger().info(f"Wrist3 → {math.degrees(delta_rad):.1f}° over {duration:.1f}s")
+
+        # 3) wait for it to finish
+        time.sleep(duration + 0.1)
+
+        # 4) build and publish return trajectory back to original
+        traj2 = JointTrajectory()
+        traj2.joint_names = ["wrist_3_joint"]
+        pt2 = JointTrajectoryPoint()
+        pt2.positions = [orig]
+        pt2.time_from_start.sec     = int(duration)
+        pt2.time_from_start.nanosec = int((duration % 1.0)*1e9)
+        traj2.points = [pt2]
+        self.wrist_publisher_.publish(traj2)
+        self.get_logger().info(f"Wrist3 → back to original over {duration:.1f}s")
 
         
     def forward_kinematics(self, joint_positions):
@@ -606,9 +702,9 @@ class UR10eCuroboMoveIt(Node):
             time.sleep(1)  # Let robot stabilize
 
             goal_position = [
-                msg.position.x,
-                msg.position.y,
-                msg.position.z,
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z,
             ] + current_orientation
 
             # Check for duplicates
@@ -634,7 +730,7 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().info("📴 Unsubscribed from /external_goal_pose.")
 
         # Subscribe to goal pose
-        self.goal_pose_sub = self.create_subscription(ROSPose, '/external_goal_pose', goal_callback, 10)
+        self.goal_pose_sub = self.create_subscription(PoseStamped, '/external_goal_pose', goal_callback, 10)
         self.get_logger().info("🟢 Subscribed to /external_goal_pose")
 
         # Motion pattern: Up → Left → Right → Down → Left → Right
@@ -920,9 +1016,32 @@ class UR10eCuroboMoveIt(Node):
     def control_gripper(self, action):
         if action.upper() == "OPEN":
             self.gripper_controller.open_gripper()
+            self.gripper_closed = False
+            self.slip_detection = False
+            self.get_logger().info("Gripper opened → slip detection paused")
         elif action.upper() == "CLOSE":
-            self.gripper_controller.run_closure_loop()
-            
+            self.gripper_closed = True
+            self.gripper_controller.run_closure_loop()           
+            self.get_logger().info("Gripper closed → slip detection active")
+
+    def force_callback(self, msg):
+        forces = list(msg.data)
+        if self.gripper_closed:
+            print("forces:", forces)
+            # 1) Check for abort condition first (too much force, e.g. ≤ –0.50)
+            if any(f <= -0.40 for f in forces):
+                if not self.abort_flag:
+                    self.get_logger().error(
+                        f"🛑 ABORT: force exceeded safety limit: {forces}"
+                    )
+                self.abort_flag = True
+            # 2) Otherwise check for slip (weaker grip, between –0.20 and –0.50)
+            elif any(-0.40 < f < -0.20 for f in forces):
+                if not self.slip_detection:
+                    self.get_logger().warn(
+                        f"⚠️ Slip detected! force in slip range: {forces}"
+                    )
+                self.slip_detection = True
             
 def main():
     print("Starting UR10e MoveIt Node...")
