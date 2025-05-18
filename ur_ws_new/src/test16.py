@@ -74,6 +74,9 @@ class UR10eCuroboMoveIt(Node):
             10
         )
         self.speed_scale = 1.8    
+        self.alpha = 0.2                # smoothing factor (0 < α < 1)
+        self.filtered_forces = None     # will become a list of length N_channels
+        self.grap_miss = False 
 
         # TF buffer and listener for end-effector pose
         self.tf_buffer = Buffer()
@@ -396,23 +399,24 @@ class UR10eCuroboMoveIt(Node):
         if self.abort_flag == True:
             self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
             self.control_gripper("OPEN")
-            self.nudge_wrist3(math.radians(2), duration=1.5)
+            #self.nudge_wrist1(math.radians(5), duration=15)
             self.move_to_home_position()
             self.abort_flag = False
             return
         
-        if self.slip_detection == True:
+        if self.slip_detection or self.grap_miss == True:
             self.get_logger().info("🛠 Slip detected → nudging end-effector up by 0.01 m")
             self.control_gripper("OPEN")
             # get current EE pose (x,y,z, qw,qx,qy,qz)
             current = self.get_end_effector_pose()
             if current:
                 # build a one-step up goal
-                up_goal = [current[0], current[1], current[2] + 0.018] + current[3:]
+                up_goal = [current[0], current[1], current[2] + 0.015] + current[3:]
                 # execute that small upward move
                 self.execute_single_pose(up_goal)
             # reset slip flag
             self.slip_detection = False
+            self.grap_miss == False
             self.control_gripper("CLOSE")
 
         if self.abort_flag == False:
@@ -427,12 +431,9 @@ class UR10eCuroboMoveIt(Node):
         else:
             self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
             self.control_gripper("OPEN")
-            self.nudge_wrist3(math.radians(2), duration=1.5)
+            #self.nudge_wrist1(math.radians(5), duration=1.5)
             self.move_to_home_position()
             self.abort_flag = False
-
-
-
 
 
     def publish_path_marker(self):
@@ -460,43 +461,50 @@ class UR10eCuroboMoveIt(Node):
         self.path_marker_pub.publish(marker)
         #self.get_logger().info("Published real-time path marker to RViz.")
 
-    def nudge_wrist3(self, delta_rad: float, duration: float = 1.0):
+    def nudge_wrist2(self, delta_rad: float, duration: float = 1.0):
         """
-        Move only the wrist_3_joint by delta_rad (radians), over duration seconds,
-        then automatically return to its original position.
+        Move only the wrist_2_joint by delta_rad (radians) over `duration` seconds,
+        then return to its original position.
         """
         if self.current_joint_positions is None:
-            self.get_logger().error("No joint state – cannot nudge wrist.")
+            self.get_logger().error("No joint state – cannot nudge wrist_2.")
             return
 
-        # 1) remember original
-        orig = self.current_joint_positions[5]
-        target = orig + delta_rad
+        # 1) Save original full joint state
+        orig = list(self.current_joint_positions)
 
-        # 2) build and publish first trajectory to target
-        traj1 = JointTrajectory()
-        traj1.joint_names = ["wrist_3_joint"]
-        pt1 = JointTrajectoryPoint()
-        pt1.positions = [target]
-        pt1.time_from_start.sec     = int(duration)
-        pt1.time_from_start.nanosec = int((duration % 1.0)*1e9)
-        traj1.points = [pt1]
-        self.wrist_publisher_.publish(traj1)
-        self.get_logger().info(f"Wrist3 → {math.degrees(delta_rad):.1f}° over {duration:.1f}s")
+        # 2) Build target joint state, bump wrist_2 (index 4)
+        target = orig.copy()
+        target[4] += delta_rad  # wrist_2_joint is the 5th in joint_order
 
-        # 3) wait for it to finish
-        time.sleep(duration + 0.1)
+        # 3) Publish the 6-joint trajectory to move out
+        traj_out = JointTrajectory()
+        traj_out.joint_names = self.joint_order
+        pt_out = JointTrajectoryPoint()
+        pt_out.positions = target
+        pt_out.time_from_start.sec     = int(duration)
+        pt_out.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+        traj_out.points = [pt_out]
+        self.trajectory_pub.publish(traj_out)
+        self.get_logger().info(f"Nudging wrist_2 by {math.degrees(delta_rad):.1f}°")
 
-        # 4) build and publish return trajectory back to original
-        traj2 = JointTrajectory()
-        traj2.joint_names = ["wrist_3_joint"]
-        pt2 = JointTrajectoryPoint()
-        pt2.positions = [orig]
-        pt2.time_from_start.sec     = int(duration)
-        pt2.time_from_start.nanosec = int((duration % 1.0)*1e9)
+        # 4) Wait for motion to complete
+        time.sleep(duration + 0.05)
+
+        # 5) Publish the 6-joint trajectory to return to original
+        traj_back = JointTrajectory()
+        traj_back.joint_names = self.joint_order
+        pt_back = JointTrajectoryPoint()
+        pt_back.positions = orig
+        pt_back.time_from_start.sec     = int(duration)
+        pt_back.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+        traj_back.points = [pt_back]
+        self.trajectory_pub.publish(traj_back)
+        self.get_logger().info("Returning wrist_2 to original orientation")
+
         traj2.points = [pt2]
         self.wrist_publisher_.publish(traj2)
-        self.get_logger().info(f"Wrist3 → back to original over {duration:.1f}s")
+        self.get_logger().info(f"wrist_2_joint → back to original over {duration:.1f}s")
 
         
     def forward_kinematics(self, joint_positions):
@@ -1018,30 +1026,52 @@ class UR10eCuroboMoveIt(Node):
             self.gripper_controller.open_gripper()
             self.gripper_closed = False
             self.slip_detection = False
+            self.grap_miss = False
             self.get_logger().info("Gripper opened → slip detection paused")
         elif action.upper() == "CLOSE":
-            self.gripper_closed = True
             self.gripper_controller.run_closure_loop()           
+            self.gripper_closed = True
             self.get_logger().info("Gripper closed → slip detection active")
 
     def force_callback(self, msg):
-        forces = list(msg.data)
-        if self.gripper_closed:
-            print("forces:", forces)
-            # 1) Check for abort condition first (too much force, e.g. ≤ –0.50)
-            if any(f <= -0.40 for f in forces):
-                if not self.abort_flag:
-                    self.get_logger().error(
-                        f"🛑 ABORT: force exceeded safety limit: {forces}"
-                    )
-                self.abort_flag = True
-            # 2) Otherwise check for slip (weaker grip, between –0.20 and –0.50)
-            elif any(-0.40 < f < -0.20 for f in forces):
-                if not self.slip_detection:
-                    self.get_logger().warn(
-                        f"⚠️ Slip detected! force in slip range: {forces}"
-                    )
-                self.slip_detection = True
+        raw = list(msg.data)
+
+        # initialize filtered_forces on first pass
+        if self.filtered_forces is None:
+            self.filtered_forces = raw.copy()
+        else:
+            # EWMA: filtered = α·raw + (1–α)·prev_filtered
+            self.filtered_forces = [
+                self.alpha * r + (1 - self.alpha) * f
+                for r, f in zip(raw, self.filtered_forces)
+            ]
+
+        # only check when gripper truly closed
+        if not self.gripper_closed:
+            return
+
+        f = self.filtered_forces  # short name
+        print(f)
+
+        # abort if any channel ≤ –0.35
+        if any(ch <= -0.35 for ch in f):
+            if not self.abort_flag:
+                self.get_logger().error(f"🛑 ABORT (smoothed): {f}")
+            self.abort_flag = True
+        # slip if any channel in (–0.35, –0.24)
+        elif any(-0.35 < ch < -0.24 for ch in f):
+            if not self.slip_detection:
+                self.get_logger().warn(f"⚠️ Slip (smoothed): {f}")
+            self.slip_detection = True
+        elif any(-0.11 < f[i] < -0.05 for i in (0, 2)):
+            if not self.abort_flag:
+                vals = (f[0], f[2])
+                self.get_logger().error(f"🛑 ABORT: Did not grab, channels[0,2]={vals}")
+            self.grap_miss = True 
+
+        # finally, stash raw if you want
+        self.last_force = raw
+
             
 def main():
     print("Starting UR10e MoveIt Node...")
