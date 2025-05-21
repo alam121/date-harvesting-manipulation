@@ -374,7 +374,7 @@
     <joint name="${prefix}gripper_link_to_tip" type="fixed">
   		<parent link="${prefix}gripper_link"/>
   		<child link="${prefix}gripper_tip"/>
-  		<origin xyz="0 0 0.205" rpy="0 0 0"/> <!-- Match the box length -->
+  		<origin xyz="0 0 0.225" rpy="0 0 0"/> <!-- Match the box length -->
 		</joint>
 
 		
