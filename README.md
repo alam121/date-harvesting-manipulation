@@ -35,7 +35,7 @@ sudo ip addr add 169.254.186.100/24 dev eth0
 sudo ip link set eth0 up
 ip a | grep eth0
 ```
-Output should look like this" 
+Output should look like this:
 ```
 eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
     inet 169.254.186.100/24 scope global eth0
