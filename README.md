@@ -26,3 +26,24 @@ sudo apt install ros-foxy-ackermann-msgs
 
 1. Clone the repository ```git clone https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm.git```
 2. Move to ```cd manipulatordateplam/ur_ws_new/src``` and run ```colcon build --symlink-install```
+
+## Setup UR10 Connections 
+```
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.1.101/24 dev eth0
+sudo ip addr add 169.254.186.100/24 dev eth0
+sudo ip link set eth0 up
+ip a | grep eth0
+```
+Output should look like this" 
+```
+eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 169.254.186.100/24 scope global eth0
+    inet 192.168.1.101/24 scope global eth0
+```
+
+## Run UR10 launch file
+```ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true```
+
+## Run Delto gripper launch file
+```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
