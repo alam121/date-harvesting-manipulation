@@ -24,8 +24,8 @@ sudo apt install ros-foxy-ackermann-msgs
 ```
 ## Install workspace 
 
-1. Clone the repository ```https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm.git```
-2. Move to ```/src``` and run ```colcon build --symlink-install```
+1. Clone the repository ```git clone https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm.git```
+2. Move to ```cd manipulatordateplam/ur_ws_new/src``` and run ```colcon build --symlink-install```
 
 
 
