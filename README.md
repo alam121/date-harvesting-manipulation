@@ -2,7 +2,8 @@
 
 ## Dependencies 
 1. Install ```ros2 foxy``` via debian package
-2. Install the following dependencies:
+2. Install [Curobo](https://curobo.org/get_started/5_docker_development.html#docker-dev) in docker for native usage on jetson
+3. Install the following dependencies:
 ```
 sudo apt install ros-foxy-ur-msgs
 sudo apt install ros-foxy-ur-client-library
@@ -40,6 +41,17 @@ Output should look like this:
 eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
     inet 169.254.186.100/24 scope global eth0
     inet 192.168.1.101/24 scope global eth0
+```
+
+## Run Curobo 
+```
+sudo docker run -it --rm --network host \
+  --runtime=nvidia \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -v ~/curobo_ws:/root/curobo_ws \
+  curobo_docker:aarch64
 ```
 
 ## Run UR10 launch file
