@@ -59,3 +59,11 @@ sudo docker run -it --rm --network host \
 
 ## Run Delto gripper launch file
 ```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
+
+## Trained Model to ONNX 
+```python3 -m tf2onnx.convert --saved-model saved_model_datefruit --output model.onnx```
+
+## Saving ONNX model to TRT Engine
+```/usr/src/tensorrt/bin/trtexec --onnx=model.onnx --saveEngine=model.engine --fp16```
+
+
