@@ -306,8 +306,12 @@ class UR10eCuroboMoveIt(Node):
 
 
     def plan_and_execute(self):
-        """Execute motion plans sequentially while dynamically updating the path visualization and waiting for execution completion."""
-        self.get_logger().info("Starting path planning for all goals sequentially")
+        """Execute motion plans sequentially while dynamically updating the path visualization
+        and waiting for execution completion. This version measures the true flange→tip offset
+        via TF, then compensates for that offset when computing the flange pose so that the
+        actual TCP lands exactly at (x_goal, y_goal, z_goal) even under tilt.
+        """
+        self.get_logger().info("Starting UR10eCuroboMoveIt.plan_and_execute()")
 
         if self.current_joint_positions is None:
             self.get_logger().warn("Current joint state not received yet!")
@@ -319,7 +323,53 @@ class UR10eCuroboMoveIt(Node):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Initialize start state from the current joint positions
+        # -----------------------------------------------------------------------
+        # Helper functions for quaternion math (all quaternions as (x, y, z, w)):
+        # -----------------------------------------------------------------------
+        def quat_conjugate(q):
+            return (-q[0], -q[1], -q[2], q[3])
+
+        def quat_multiply(a, b):
+            ax, ay, az, aw = a
+            bx, by, bz, bw = b
+            return (
+                aw*bx + ax*bw + ay*bz - az*by,  # x
+                aw*by - ax*bz + ay*bw + az*bx,  # y
+                aw*bz + ax*by - ay*bx + az*bw,  # z
+                aw*bw - ax*bx - ay*by - az*bz   # w
+            )
+
+        def rotate_vector_by_quat(vec, q):
+            # Rotate 3D vector `vec = (vx, vy, vz)` by quaternion q=(qx, qy, qz, qw).
+            vqx, vqy, vqz = vec
+            v_quat = (vqx, vqy, vqz, 0.0)
+            q_conj = quat_conjugate(q)
+            tmp = quat_multiply(q, v_quat)
+            v_rot = quat_multiply(tmp, q_conj)
+            return (v_rot[0], v_rot[1], v_rot[2])
+
+        # ----------------------------------------------------------------------------
+        # Measure the true flange→tip offset once via TF (robot must be roughly in “home”):
+        # ----------------------------------------------------------------------------
+        try:
+            # Look up transform from "flange" to "gripper_tip"
+            tf_msg = self.tf_buffer.lookup_transform(
+                "flange", "gripper_tip", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+            v_tip_local = (
+                tf_msg.transform.translation.x,
+                tf_msg.transform.translation.y,
+                tf_msg.transform.translation.z
+            )
+            self.get_logger().info(f"Measured flange→tip offset: {v_tip_local}")
+        except Exception as e:
+            # If TF fails, fall back to a conservative default (user should correct URDF if this happens)
+            self.get_logger().warn(f"TF lookup for flange→tip failed ({e}); using fallback offset (0.0, -0.235, 0.0)")
+            v_tip_local = (0.0, -0.235, 0.0)
+
+        # ----------------------------------------------------------------------------
+        # Build the starting CuRobo JointState from the current joint positions:
+        # ----------------------------------------------------------------------------
         start_state = JointState.from_position(
             torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
             joint_names=self.joint_order,
@@ -329,18 +379,78 @@ class UR10eCuroboMoveIt(Node):
             goal = self.goal_poses.pop(0)
             self.get_logger().info(f"Processing goal: {goal}")
 
-            x, y, z = goal[:3]
-            orientation = goal[3:]
-            
-            # 🔹 Step 1: Go to (x, y, z + offset) → approach pose
-            approach_pose = [x, y, z - 0.10] + orientation  # You can adjust the Z offset
+            x_goal, y_goal, z_goal = goal[:3]
+            orig_orientation = goal[3:]  # (qx0, qy0, qz0, qw0)
 
-            # 🔹 Step 2: Then go to (x, y, z) → actual target
-            ordered_goals = [approach_pose, goal]
-            
+            # ↓ Step A: Get the current end-effector pose to decide tilt direction
+            current = self.get_end_effector_pose()
+            if current:
+                x_curr, y_curr, z_curr, qx0, qy0, qz0, qw0 = current
+            else:
+                # If FK failed, assume goal orientation as baseline
+                z_curr = z_goal
+                qx0, qy0, qz0, qw0 = orig_orientation
+
+            dz = z_goal - z_curr
+            max_tilt = math.radians(20.0)
+            tilt_angle = math.copysign(max_tilt, dz)
+
+            # ----------------------------------------------------------------------------
+            # Step B: Build a “tilt quaternion” of ±20° about the tool’s local X‐axis
+            # ----------------------------------------------------------------------------
+            q_orig = (qx0, qy0, qz0, qw0)
+
+            # To find tool’s local X in world frame, rotate world‐Z by q_orig
+            axis_world = rotate_vector_by_quat((0.0, 0.0, 1.0), q_orig)
+            ax, ay, az = axis_world
+            norm_axis = math.sqrt(ax*ax + ay*ay + az*az)
+            if norm_axis > 0.0:
+                ax /= norm_axis; ay /= norm_axis; az /= norm_axis
+            else:
+                ax, ay, az = 1.0, 0.0, 0.0  # fallback if unexpected
+
+            half = tilt_angle / 2.0
+            s, c = math.sin(half), math.cos(half)
+            qx_t = ax * s
+            qy_t = ay * s
+            qz_t = az * s
+            qw_t = c
+            q_tilt = (qx_t, qy_t, qz_t, qw_t)
+
+            # ----------------------------------------------------------------------------
+            # Step C: Compose final tilted quaternion: q_final = q_orig ⊗ q_tilt
+            # ----------------------------------------------------------------------------
+            qx_new, qy_new, qz_new, qw_new = quat_multiply(q_orig, q_tilt)
+            norm_q = math.sqrt(qx_new*qx_new + qy_new*qy_new + qz_new*qz_new + qw_new*qw_new)
+            if norm_q > 0.0:
+                qx_new /= norm_q
+                qy_new /= norm_q
+                qz_new /= norm_q
+                qw_new /= norm_q
+            else:
+                qx_new, qy_new, qz_new, qw_new = qx0, qy0, qz0, qw0
+
+            orientation = [qx_new, qy_new, qz_new, qw_new]
+
+            # ----------------------------------------------------------------------------
+            # Step D: Compensate for TCP offset so that the tip lands exactly at (x_goal, y_goal, z_goal)
+            # ----------------------------------------------------------------------------
+
+            # 1) Rotate the measured local offset into world frame under q_final
+            vx_tip_world, vy_tip_world, vz_tip_world = rotate_vector_by_quat(v_tip_local, orientation)
+
+            # 2) Subtract that from the desired TCP target to get the flange position
+            flange_x = x_goal - vx_tip_world
+            flange_y = y_goal - vy_tip_world
+            flange_z = z_goal - vz_tip_world
+
+            # 3) Build “approach” and “final” flange poses:
+            approach_flange = [flange_x, flange_y, flange_z - 0.10] + orientation
+            final_flange    = [flange_x, flange_y, flange_z     ] + orientation
+            ordered_goals   = [approach_flange, final_flange]
+
             for sub_goal in ordered_goals:
                 goal_pose = Pose.from_list(sub_goal)
-
                 result = self.motion_gen.plan_single(
                     start_state,
                     goal_pose,
@@ -348,7 +458,7 @@ class UR10eCuroboMoveIt(Node):
                 )
 
                 if result.success:
-                    self.get_logger().info("Motion plan generated successfully! Executing...")
+                    self.get_logger().info("Motion plan generated successfully! Executing…")
 
                     trajectory_msg = JointTrajectory()
                     trajectory_msg.joint_names = self.joint_order
@@ -358,14 +468,16 @@ class UR10eCuroboMoveIt(Node):
                         interpolated_plan = interpolated_plan.position
                     if not isinstance(interpolated_plan, torch.Tensor):
                         interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
-                    interpolated_plan = interpolated_plan.to("cpu")
 
+                    interpolated_plan = interpolated_plan.to("cpu")
                     time_from_start = 0.0
-                    for i, point in enumerate(interpolated_plan):
+
+                    for point in interpolated_plan:
                         if self.stop_requested:
                             self.get_logger().warn("🛑 Stop requested! Aborting current goal execution.")
-                            self.stop_requested = False  # Reset for future use
-                            return  # Exit execution early
+                            self.stop_requested = False
+                            return
+
                         traj_point = JointTrajectoryPoint()
                         traj_point.positions = point.numpy().tolist()
                         traj_point.velocities = [0.1] * len(self.joint_order)
@@ -382,56 +494,50 @@ class UR10eCuroboMoveIt(Node):
                     self.trajectory_pub.publish(trajectory_msg)
                     self.wait_for_execution_completion(sub_goal[:3])
 
+                    # Update start_state for the next sub-goal
+                    last_positions = trajectory_msg.points[-1].positions
                     start_state = JointState.from_position(
-                        torch.tensor([trajectory_msg.points[-1].positions], dtype=torch.float32, device=device),
+                        torch.tensor([last_positions], dtype=torch.float32, device=device),
                         joint_names=self.joint_order,
                     )
                 else:
                     self.get_logger().warn("Failed to generate a motion plan for sub-goal!")
-                    
-                    
-            
-            
-        self.get_logger().info("All goals executed. Waiting for new goals...")
+
+        # ----------------------------------------------------------------------------
+        # After all goals: close gripper, slip/abort handling, return home, etc.
+        # ----------------------------------------------------------------------------
+        self.get_logger().info("All goals executed. Waiting for new goals…")
         self.control_gripper("CLOSE")
         time.sleep(1)
 
-        if self.abort_flag == True:
+        if self.abort_flag:
             self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
             self.control_gripper("OPEN")
-            #self.nudge_wrist1(math.radians(5), duration=15)
             self.move_to_home_position()
             self.abort_flag = False
             return
-        
-        if self.slip_detection or self.grap_miss == True:
-            self.get_logger().info("🛠 Slip detected → nudging end-effector up by 0.01 m")
+
+        if self.slip_detection or self.grap_miss:
+            self.get_logger().info("🛠 Slip detected → nudging end-effector up by 0.01 m")
             self.control_gripper("OPEN")
-            # get current EE pose (x,y,z, qw,qx,qy,qz)
             current = self.get_end_effector_pose()
             if current:
-                # build a one-step up goal
                 up_goal = [current[0], current[1], current[2] + 0.015] + current[3:]
-                # execute that small upward move
                 self.execute_single_pose(up_goal)
-            # reset slip flag
             self.slip_detection = False
-            self.grap_miss == False
+            self.grap_miss = False
             self.control_gripper("CLOSE")
 
-        if self.abort_flag == False:
-
+        if not self.abort_flag:
             self.move_backward(-0.02)
             self.rotate_wrist(90)
             self.rotate_wrist(-90)
             self.move_to_dropoff_position()
             self.control_gripper("OPEN")
             self.move_to_home_position()
-
         else:
             self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
             self.control_gripper("OPEN")
-            #self.nudge_wrist1(math.radians(5), duration=1.5)
             self.move_to_home_position()
             self.abort_flag = False
 
@@ -728,7 +834,6 @@ class UR10eCuroboMoveIt(Node):
             else:
                 self.goal_poses.append(goal_position)
                 self.publish_goal_marker(goal_position[:3])
-                
                 self.get_logger().info(f"✅ Goal received and saved: {goal_position}")
                 self.goal_received = True
 
@@ -748,6 +853,7 @@ class UR10eCuroboMoveIt(Node):
             ('LEFT',  0.0,  0.1, 0.0),
             ('RIGHT', 0.0, -0.1, 0.0),
             ('DOWN',  0.0,  0.0, -0.1),
+
         ]
         self.idle_motion_index = 0
 
