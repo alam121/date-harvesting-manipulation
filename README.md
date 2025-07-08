@@ -22,6 +22,8 @@ sudo apt install ros-foxy-realtime-tools
 sudo apt install ros-foxy-rviz2
 sudo apt install ros-foxy-rviz-visual-tools
 sudo apt install ros-foxy-ackermann-msgs
+pip install warp-lang==1.0.0
+
 ```
 ## Install workspace 
 
