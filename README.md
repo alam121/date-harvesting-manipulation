@@ -56,9 +56,13 @@ sudo docker run -it --rm --network host \
   curobo_docker:aarch64
 ```
 
-## Install YOLOv8 
+## YOLOv8 
 Install YOLOv8 in vitual environment
 ```pip install ultralytics```
+Download the labelled data from roboflow 
+Train the nextwork
+```yolo task=segment mode=train model=yolov8n-seg.pt data=/home/datepalm-ws/Documents/date_detection_maskrcnn/dateopalm_tree.v4i.yolov8-obb/data.yaml epochs=50 imgsz=720 batch=8```
+
 
 ## Run UR10 launch file
 ```ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true```
