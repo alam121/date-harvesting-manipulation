@@ -56,6 +56,10 @@ sudo docker run -it --rm --network host \
   curobo_docker:aarch64
 ```
 
+## Install YOLOv8 
+Install YOLOv8 in vitual environment
+```pip install ultralytics```
+
 ## Run UR10 launch file
 ```ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true```
 
@@ -63,9 +67,9 @@ sudo docker run -it --rm --network host \
 ```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
 
 ## Trained Model to ONNX 
-```python3 -m tf2onnx.convert --saved-model saved_model_datefruit --output model.onnx```
+```yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False```
 
 ## Saving ONNX model to TRT Engine
-```/usr/src/tensorrt/bin/trtexec --onnx=model.onnx --saveEngine=model.engine --fp16```
+```/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16```
 
 
