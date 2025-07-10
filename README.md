@@ -57,11 +57,20 @@ sudo docker run -it --rm --network host \
 ```
 
 ## YOLOv8 
+NOTE: [Yolov8 Segmentation](https://github.com/marcoslucianops/DeepStream-Yolo-Seg/tree/master) (yet to try out)
 Install YOLOv8 in vitual environment
 ```pip install ultralytics```
 Download the labelled data from roboflow 
 Train the nextwork
 ```yolo task=segment mode=train model=yolov8n-seg.pt data=/home/datepalm-ws/Documents/date_detection_maskrcnn/dateopalm_tree.v4i.yolov8-obb/data.yaml epochs=50 imgsz=720 batch=8```
+
+### Trained Model to ONNX 
+```yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False```
+
+### Saving ONNX model to TRT Engine
+```/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16```
+Install [ZED-GSTREAMER](https://github.com/stereolabs/zed-gstreamer)
+Consult [this](https://github.com/valdivj/gstream_Deep?tab=readme-ov-file)
 
 
 ## Run UR10 launch file
@@ -69,11 +78,4 @@ Train the nextwork
 
 ## Run Delto gripper launch file
 ```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
-
-## Trained Model to ONNX 
-```yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False```
-
-## Saving ONNX model to TRT Engine
-```/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16```
-
 
