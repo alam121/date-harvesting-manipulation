@@ -64,13 +64,14 @@ sudo docker run -it --rm --network host \
 Train the nextwork
 ```yolo task=segment mode=train model=yolov8n-seg.pt data=/home/datepalm-ws/Documents/date_detection_maskrcnn/dateopalm_tree.v4i.yolov8-obb/data.yaml epochs=50 imgsz=720 batch=8```
 
-### Trained Model to ONNX 
+4. ### Trained Model to ONNX 
 ```yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False```
 
-### Saving ONNX model to TRT Engine
+5. ### Saving ONNX model to TRT Engine
 ```/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16```
-4. Install [ZED-GSTREAMER](https://github.com/stereolabs/zed-gstreamer)
-5. Consult [this](https://github.com/valdivj/gstream_Deep?tab=readme-ov-file)
+
+6. Install [ZED-GSTREAMER](https://github.com/stereolabs/zed-gstreamer)
+7. Consult [this](https://github.com/valdivj/gstream_Deep?tab=readme-ov-file)
 
 
 ## Run UR10 launch file
