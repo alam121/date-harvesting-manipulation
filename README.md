@@ -80,3 +80,12 @@ Train the nextwork
 ## Run Delto gripper launch file
 ```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
 
+## Setting Headless machine 
+1. ```ssh -X username@remote_ip```
+2. ```sudo nano /etc/ssh/sshd_config```
+3. make sure following lines exit and are uncommented 
+```X11Forwarding yes X11DisplayOffset 10 X11UseLocalhost yes```
+4. ```sudo systemctl restart ssh```
+5. ```sudo apt install xauth```
+
+
