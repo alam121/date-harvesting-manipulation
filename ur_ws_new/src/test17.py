@@ -707,7 +707,7 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().warn("⚠️ Goal received while robot is moving. Ignoring.")
                 return
 
-            time.sleep(1)  # Let robot stabilize
+            time.sleep(0.5)  # Let robot stabilize
 
             goal_position = [
                 msg.pose.position.x,

@@ -52,8 +52,7 @@
 
   <xacro:include filename="$(find ur_description)/urdf/inc/ur_transmissions.xacro" />
   <xacro:include filename="$(find ur_description)/urdf/inc/ur_common.xacro" />
-  <xacro:include filename="$(find delto_description)/urdf/delto_gripper_3f.xacro"/>
-
+  
 
   <xacro:macro name="ur_robot" params="
     prefix
@@ -358,79 +357,54 @@
       <child link="${prefix}tool0"/>
     </joint>
     
-          <!-- ─── Delto 3-Finger Gripper ─── -->
-  <xacro:delto_gripper_3f
-    prefix="${prefix}"
-    parent="${prefix}tool0"/>
+      <link name="zed2_left_camera_frame"/>
+  <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
+    <parent link="tool0"/>
+    <child link="zed2_left_camera_frame"/>
+    <origin xyz="-0.06 -0.14 0.06" rpy="0 0 0"/>
+  </joint>
     
-    <link name="tool0_to_camera_mount_link">
+    <joint name="${prefix}tool0_to_gripper" type="fixed">
+  		<parent link="${prefix}tool0"/>
+  		<child link="${prefix}gripper_link"/>
+  		<origin xyz="0 0 0.01" rpy="0 0 0"/>
+		</joint>
+		
+		
+		
+    <joint name="${prefix}gripper_link_to_tip" type="fixed">
+  		<parent link="${prefix}gripper_link"/>
+  		<child link="${prefix}gripper_tip"/>
+  		<origin xyz="0 0 0.225" rpy="0 0 0"/> <!-- Match the box length -->
+		</joint>
+
+		
+    
+    <!-- Gripper geometry attached to tool0 -->
+<link name="${prefix}gripper_link">
   <visual>
-    <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/> <!-- adjust offset as needed -->
     <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
-
-    </geometry>
-    <material name="silver">
-      <color rgba="0.7 0.7 0.7 1.0"/>
-    </material>
-  </visual>
-  <collision>
-    <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
-    <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
-    </geometry>
-  </collision>
-  <inertial>
-    <mass value="0.2"/>
-    <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
-    <inertia ixx="0.0005" ixy="0.0" ixz="0.0" iyy="0.0005" iyz="0.0" izz="0.0005"/>
-  </inertial>
-</link>
-
-    <joint name="tool0_to_mount" type="fixed">
-  <parent link="tool0"/>
-  <child link="tool0_to_camera_mount_link"/>
-  <origin xyz="0 0 0" rpy="0 0 0"/>
-</joint>
-
-<link name="zed2_left_camera_frame">
-  <visual>
-    <origin xyz="0.07 0.015 -0.07" rpy="-1.5708 0 0"/>
-    <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/zed2_camera.stl" scale="0.001 0.001 0.001"/>
+      <box size="0.07 0.07 0.19"/> <!-- dimensions of your gripper -->
     </geometry>
     <material name="gray">
       <color rgba="0.5 0.5 0.5 1.0"/>
     </material>
   </visual>
   <collision>
-    <origin xyz="0.07 0.015 -0.07" rpy="-1.5708 0 0"/>
+    <origin xyz="0 0 0.0" rpy="0 0 0"/>
     <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/zed2_camera.stl" scale="0.001 0.001 0.001"/>
+      <box size="0.05 0.05 0.19"/>
     </geometry>
   </collision>
   <inertial>
-    <mass value="0.4"/>
-    <origin xyz="0.07 0.015 -0.07" rpy="-1.5708 0 0"/>
+    <mass value="0.5"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
     <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
   </inertial>
 </link>
 
 
-  <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
-    <parent link="tool0"/>
-    <child link="zed2_left_camera_frame"/>
-    <origin xyz="-0.06 -0.14 0.06" rpy="0 0 0"/>   <!-- CHANGE -->
-  </joint>
-
-    
-			
-    <joint name="${prefix}gripper_link_to_tip" type="fixed">
-  		<parent link="${prefix}delto_base_link"/>
-  		<child link="${prefix}gripper_tip"/>
-  		<origin xyz="0 0 0.1" rpy="0 0 0"/> <!-- Match the box length -->
-		</joint>
-		
 
 <!-- Gripper tip frame -->
 <link name="${prefix}gripper_tip"/>
