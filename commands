@@ -41,3 +41,8 @@ ros2 topic pub /gripper/grasp std_msgs/Bool "{data: true}"  # Open the gripper
 
 ros2 topic pub /gripper/grasp std_msgs/Bool "{data: false}"  # Open the gripper
 
+
+[0.5215896368026733, -0.31019413471221924, 0.7789396047592163].
+[0.12985782325267792, -0.254108190536499, 0.7879452109336853].
+
+[-0.3400733172893524, -0.18684297800064087, 0.798823356628418]
