@@ -10,15 +10,9 @@ from ultralytics.engine.results import Results
 from threading import Lock, Thread
 from time import sleep
 from typing import List
-import tf2_geometry_msgs
 
 import ogl_viewer.viewer as gl
 import cv_viewer.tracking_viewer as cv_viewer
-
-import rclpy
-from geometry_msgs.msg import PointStamped, PoseStamped
-from tf2_ros import Buffer, TransformListener
-from rclpy.duration import Duration as rclpyDuration
 
 # Globals
 lock = Lock()
@@ -28,7 +22,6 @@ image_net: np.ndarray = None
 detections: List[sl.CustomMaskObjectData] = None
 sl_mats: List[sl.Mat] = None  # keep sl.Mat ownership alive
 
-# TF listener setup (must pass node)
 
 def xywh2abcd_(xywh: np.ndarray) -> np.ndarray:
     out = np.zeros((4, 2), dtype=np.float32)
@@ -147,18 +140,7 @@ def label_to_name(o, class_names=None) -> str:
 
 
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_signal, detections, tf_listener
-
-    # ROS2 setup
-    rclpy.init()
-    node = rclpy.create_node('zed_date_detector')
-    point_pub = node.create_publisher(PointStamped, '/datefruit_3d_point', 10)
-    goal_pub = node.create_publisher(PoseStamped, '/external_goal_pose', 10)
-    goal_sent = False
-
-    # TF listener must be initialized with node
-    tf_buffer = Buffer()
-    tf_listener = TransformListener(tf_buffer, node)
+    global image_net, exit_signal, run_signal, detections
 
     capture_thread = Thread(
         target=torch_thread_,
@@ -174,7 +156,7 @@ def main_(args: argparse.Namespace):
     init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
     init_params.coordinate_units = sl.UNIT.METER
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL
-    #init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
+    init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
     init_params.depth_maximum_distance = 50
 
     print("Initializing Camera...")
@@ -264,34 +246,6 @@ def main_(args: argparse.Namespace):
 
                     if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
                         print(f"  id={o.id}  class={name}  XYZ(m) = [{x:.3f}, {y:.3f}, {z:.3f}]")
-                        # Publish to ROS2 topic
-                        point_msg = PointStamped()
-                        point_msg.header.frame_id = 'zed2_left_camera_frame'
-                        point_msg.header.stamp = rclpy.time.Time().to_msg()
-                        point_msg.point.x = float(x)
-                        point_msg.point.y = float(y)
-                        point_msg.point.z = float(z)
-                        try:
-                            while not tf_buffer.can_transform('base_link', 'zed2_left_camera_frame',
-                                  rclpy.time.Time(), rclpyDuration(seconds=0.1)):
-                                rclpy.spin_once(node, timeout_sec=0.1)  # optional; keeps things responsive
-                                
-                            pt_base = tf_buffer.transform(point_msg, 'base_link', timeout=rclpyDuration(seconds=0.5))
-                            point_pub.publish(pt_base)
-                            goal = PoseStamped()
-                            goal.pose.position = pt_base.point
-                            goal.pose.orientation.x = 0.0
-                            goal.pose.orientation.y = 0.0
-                            goal.pose.orientation.z = 0.0
-                            goal.pose.orientation.w = 1.0
-                            if not goal_sent:
-                                goal_pub.publish(goal)
-                                goal_sent = False
-                                print(f"✅ Published FIRST fruit pose:\n    position = ({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f}, {goal.pose.position.z:.3f})\n    orientation = ({goal.pose.orientation.x:.3f}, {goal.pose.orientation.y:.3f}, {goal.pose.orientation.z:.3f}, {goal.pose.orientation.w:.3f})")
-                            else:
-                                print("Skipping further goal publications.")
-                        except Exception as e:
-                            print(f"TF or publish failed: [{type(e).__name__}] {e}\n  looking for transform '{point_msg.header.frame_id}' → 'base_link'")
 
             # ------- Display -------
             zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA, sl.MEM.CPU, point_cloud_res)
@@ -336,7 +290,6 @@ def main_(args: argparse.Namespace):
     viewer.exit()
     exit_signal = True
     zed.close()
-    rclpy.shutdown()
 
 
 if __name__ == '__main__':
