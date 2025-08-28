@@ -15,6 +15,9 @@ from geometry_msgs.msg import Point, Pose as ROSPose
 from delto_gripper_controller import DeltoGripperController
 from geometry_msgs.msg import PointStamped, PoseStamped
 from std_msgs.msg import Float32MultiArray
+import numpy as np
+from geometry_msgs.msg import Quaternion
+from scipy.spatial.transform import Rotation as R
 
 
 import torch
@@ -49,6 +52,14 @@ class UR10eCuroboMoveIt(Node):
             self.force_callback,
             10
         )
+
+                # --- Emergency stop topic ---
+        self.create_subscription(
+            Bool,
+            "/emergency_stop",
+            self._stop_callback,
+            10
+        )
         
         # New publisher for goal position markers
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
@@ -77,6 +88,13 @@ class UR10eCuroboMoveIt(Node):
         self.alpha = 0.2                # smoothing factor (0 < α < 1)
         self.filtered_forces = None     # will become a list of length N_channels
         self.grap_miss = False 
+        self.open_baseline = [-0.10, -0.09, -0.08]
+        self.open_baseline = []
+        self.goal_capture_active = False
+        self.goal_capture_timer = None
+        self.goal_capture_count = 0
+        self.goal_sort_ref = None        # [x, y, z] reference for distance sorting
+        self.goal_sort_ascending = True  # nearest-first; set False for farthest-first
 
         # TF buffer and listener for end-effector pose
         self.tf_buffer = Buffer()
@@ -126,12 +144,23 @@ class UR10eCuroboMoveIt(Node):
 
         self.get_logger().info("Waiting for joint states...")
         self.timer = self.create_timer(0.5, self.check_joint_states)
-        self.home_joints =  [-1.7429350058185022, -2.118960682545797, 2.262824058532715, -4.16720420518984, 4.74897575378418, 0.008626394905149937]
+        #self.home_joints =  [-1.7429350058185022, -2.118960682545797, 2.262824058532715, -4.16720420518984, 4.74897575378418, 0.008626394905149937]
 
-        
+        #self.home_joints = [-1.730377499257223, -2.06564170518984, 2.350080728530884, -4.355106298123495, 4.711179733276367, 0.027907514944672585]
+        #self.home_joints = [-1.7171486059771937, -2.121176067982809, 2.4437646865844727, -4.073089901600973, 4.712892055511475, 0.006838873028755188]
+        self.home_joints =  [-1.5914891401873987, -1.7436569372760218, 2.196291923522949, -4.470575277005331, 4.604394912719727, -0.05696469942201787]
         self.dropoff_joints = [-2.16858417192568, -1.3347657362567347, 2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704]
+        self.predropoff_joints = [-1.6832264105426233, -2.020153347645895, 2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341]
 
         self.gripper_controller = DeltoGripperController(self)
+
+        self.robot_running = False
+        self.create_subscription(
+            Bool,
+            "/io_and_status_controller/robot_program_running",
+            self._robot_running_callback,
+            10
+        )
 
         #self.move_to_home_position()
         self.keyboard_thread = threading.Thread(target=self.wait_for_key_press, daemon=True)
@@ -236,14 +265,19 @@ class UR10eCuroboMoveIt(Node):
                     self.subscribe_to_goal_pose_topic()
 
 
+            elif key == "p":
+                print("Capturing external goals for 30 seconds…")
+                self.start_goal_capture(duration=10.0)
+
             elif key == "n" and self.goal_poses:
-                print("Executing motion...")
-                
+                # stop timed capture if running
+                if self.goal_capture_active:
+                    self.stop_goal_capture()
                 if hasattr(self, 'goal_pose_sub'):
                     self.destroy_subscription(self.goal_pose_sub)
                     del self.goal_pose_sub
                     print("Unsubscribed from external goal poses.")
-                    
+                print("Executing motion...")
                 self.plan_and_execute()
                 self.get_logger().info("All goals executed. Waiting for gripper command...")
 
@@ -306,12 +340,12 @@ class UR10eCuroboMoveIt(Node):
 
 
     def plan_and_execute(self):
-        """Execute motion plans sequentially while dynamically updating the path visualization
-        and waiting for execution completion. This version measures the true flange→tip offset
-        via TF, then compensates for that offset when computing the flange pose so that the
-        actual TCP lands exactly at (x_goal, y_goal, z_goal) even under tilt.
+        """Execute goals one-by-one:
+        approach -> target -> grip checks -> dropoff -> home, then next goal.
         """
-        self.get_logger().info("Starting UR10eCuroboMoveIt.plan_and_execute()")
+        if not self.robot_running:
+            self.get_logger().error("❌ Cannot execute goals: robot program is OFF. Please turn it ON first.")
+            return
 
         if self.current_joint_positions is None:
             self.get_logger().warn("Current joint state not received yet!")
@@ -323,133 +357,51 @@ class UR10eCuroboMoveIt(Node):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # -----------------------------------------------------------------------
-        # Helper functions for quaternion math (all quaternions as (x, y, z, w)):
-        # -----------------------------------------------------------------------
-        def quat_conjugate(q):
-            return (-q[0], -q[1], -q[2], q[3])
-
-        def quat_multiply(a, b):
-            ax, ay, az, aw = a
-            bx, by, bz, bw = b
-            return (
-                aw*bx + ax*bw + ay*bz - az*by,  # x
-                aw*by - ax*bz + ay*bw + az*bx,  # y
-                aw*bz + ax*by - ay*bx + az*bw,  # z
-                aw*bw - ax*bx - ay*by - az*bz   # w
-            )
-
-        def rotate_vector_by_quat(vec, q):
-            # Rotate 3D vector `vec = (vx, vy, vz)` by quaternion q=(qx, qy, qz, qw).
-            vqx, vqy, vqz = vec
-            v_quat = (vqx, vqy, vqz, 0.0)
-            q_conj = quat_conjugate(q)
-            tmp = quat_multiply(q, v_quat)
-            v_rot = quat_multiply(tmp, q_conj)
-            return (v_rot[0], v_rot[1], v_rot[2])
-
-        # ----------------------------------------------------------------------------
-        # Measure the true flange→tip offset once via TF (robot must be roughly in “home”):
-        # ----------------------------------------------------------------------------
-        try:
-            # Look up transform from "flange" to "gripper_tip"
-            tf_msg = self.tf_buffer.lookup_transform(
-                "flange", "gripper_tip", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            v_tip_local = (
-                tf_msg.transform.translation.x,
-                tf_msg.transform.translation.y,
-                tf_msg.transform.translation.z
-            )
-            self.get_logger().info(f"Measured flange→tip offset: {v_tip_local}")
-        except Exception as e:
-            # If TF fails, fall back to a conservative default (user should correct URDF if this happens)
-            self.get_logger().warn(f"TF lookup for flange→tip failed ({e}); using fallback offset (0.0, -0.235, 0.0)")
-            v_tip_local = (0.0, -0.235, 0.0)
-
-        # ----------------------------------------------------------------------------
-        # Build the starting CuRobo JointState from the current joint positions:
-        # ----------------------------------------------------------------------------
-        start_state = JointState.from_position(
-            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
-            joint_names=self.joint_order,
-        )
-
+        # while there are goals, handle EACH goal end-to-end
         while self.goal_poses and self.running:
+            # snapshot start state at the moment we begin this goal
+            start_state = JointState.from_position(
+                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order,
+            )
+
             goal = self.goal_poses.pop(0)
             self.get_logger().info(f"Processing goal: {goal}")
-
-            x_goal, y_goal, z_goal = goal[:3]
-            orig_orientation = goal[3:]  # (qx0, qy0, qz0, qw0)
-
-            # ↓ Step A: Get the current end-effector pose to decide tilt direction
-            current = self.get_end_effector_pose()
-            if current:
-                x_curr, y_curr, z_curr, qx0, qy0, qz0, qw0 = current
+            x, y, z = goal[:3]
+            # orientation depends on whether date is high or low
+            if z > 1.15:
+                # high → approach from SIDE, gripper faces inward
+                orientation = goal[3:]#self.quaternion_from_approach(pitch_deg=-20.0)
+                self.get_logger().info("Using SIDE orientation (high date).")
             else:
-                # If FK failed, assume goal orientation as baseline
-                z_curr = z_goal
-                qx0, qy0, qz0, qw0 = orig_orientation
+                # low → approach from ABOVE, gripper faces downward
+                #orientation = self.quaternion_from_approach(pitch_deg=30.0)
+                orientation = goal[3:]
+                self.get_logger().info("Using TOP-DOWN orientation (low date).")
 
-            dz = z_goal - z_curr
-            max_tilt = math.radians(20.0)
-            tilt_angle = math.copysign(max_tilt, dz)
 
-            # ----------------------------------------------------------------------------
-            # Step B: Build a “tilt quaternion” of ±20° about the tool’s local X‐axis
-            # ----------------------------------------------------------------------------
-            q_orig = (qx0, qy0, qz0, qw0)
-
-            # To find tool’s local X in world frame, rotate world‐Z by q_orig
-            axis_world = rotate_vector_by_quat((0.0, 0.0, 1.0), q_orig)
-            ax, ay, az = axis_world
-            norm_axis = math.sqrt(ax*ax + ay*ay + az*az)
-            if norm_axis > 0.0:
-                ax /= norm_axis; ay /= norm_axis; az /= norm_axis
+            # Decide approach offset based on height:
+            # - If the point is high (z > 1.18), approach from the side (x - 0.10)
+            # - Otherwise, approach from above (z - 0.10)
+            if z > 1.15:
+                approach = [x, y+0.10, z] + list(orientation)
+                y = y-0.004
+                z= z +0.02
+                self.get_logger().info(f"High goal (z={z:.3f}) → side approach (x-0.10)")
             else:
-                ax, ay, az = 1.0, 0.0, 0.0  # fallback if unexpected
+                approach = [x, y +0.1, z - 0.10] + list(orientation)
+                self.get_logger().info(f"Normal goal (z={z:.3f}) → top approach (z-0.10)")
+                z= z + 0.02
+                #y = y+0.8
+                y = y-0.003
 
-            half = tilt_angle / 2.0
-            s, c = math.sin(half), math.cos(half)
-            qx_t = ax * s
-            qy_t = ay * s
-            qz_t = az * s
-            qw_t = c
-            q_tilt = (qx_t, qy_t, qz_t, qw_t)
+            sub_goals = [
+                approach,                # approach first
+                [x, y, z] + list(orientation)  # then the actual target
+]
 
-            # ----------------------------------------------------------------------------
-            # Step C: Compose final tilted quaternion: q_final = q_orig ⊗ q_tilt
-            # ----------------------------------------------------------------------------
-            qx_new, qy_new, qz_new, qw_new = quat_multiply(q_orig, q_tilt)
-            norm_q = math.sqrt(qx_new*qx_new + qy_new*qy_new + qz_new*qz_new + qw_new*qw_new)
-            if norm_q > 0.0:
-                qx_new /= norm_q
-                qy_new /= norm_q
-                qz_new /= norm_q
-                qw_new /= norm_q
-            else:
-                qx_new, qy_new, qz_new, qw_new = qx0, qy0, qz0, qw0
 
-            orientation = [qx_new, qy_new, qz_new, qw_new]
-
-            # ----------------------------------------------------------------------------
-            # Step D: Compensate for TCP offset so that the tip lands exactly at (x_goal, y_goal, z_goal)
-            # ----------------------------------------------------------------------------
-
-            # 1) Rotate the measured local offset into world frame under q_final
-            vx_tip_world, vy_tip_world, vz_tip_world = rotate_vector_by_quat(v_tip_local, orientation)
-
-            # 2) Subtract that from the desired TCP target to get the flange position
-            flange_x = x_goal - vx_tip_world
-            flange_y = y_goal - vy_tip_world
-            flange_z = z_goal - vz_tip_world
-
-            # 3) Build “approach” and “final” flange poses:
-            approach_flange = [flange_x, flange_y, flange_z - 0.10] + orientation
-            final_flange    = [flange_x, flange_y, flange_z     ] + orientation
-            ordered_goals   = [approach_flange, final_flange]
-
-            for sub_goal in ordered_goals:
+            for sub_goal in sub_goals:
                 goal_pose = Pose.from_list(sub_goal)
                 result = self.motion_gen.plan_single(
                     start_state,
@@ -457,89 +409,94 @@ class UR10eCuroboMoveIt(Node):
                     MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
                 )
 
-                if result.success:
-                    self.get_logger().info("Motion plan generated successfully! Executing…")
+                if not result.success:
+                    self.get_logger().warn("Failed to generate a motion plan for sub-goal! Skipping this goal.")
+                    # break out of sub-goals; continue with next saved goal
+                    break
 
-                    trajectory_msg = JointTrajectory()
-                    trajectory_msg.joint_names = self.joint_order
-                    interpolated_plan = result.get_interpolated_plan()
+                # build & publish trajectory
+                traj_msg = JointTrajectory()
+                traj_msg.joint_names = self.joint_order
 
-                    if isinstance(interpolated_plan, JointState):
-                        interpolated_plan = interpolated_plan.position
-                    if not isinstance(interpolated_plan, torch.Tensor):
-                        interpolated_plan = torch.tensor(interpolated_plan, dtype=torch.float32)
+                interpolated = result.get_interpolated_plan()
+                if isinstance(interpolated, JointState):
+                    interpolated = interpolated.position
+                if not isinstance(interpolated, torch.Tensor):
+                    interpolated = torch.tensor(interpolated, dtype=torch.float32)
+                interpolated = interpolated.to("cpu")
 
-                    interpolated_plan = interpolated_plan.to("cpu")
-                    time_from_start = 0.0
+                tfs = 0.0
+                for point in interpolated:
+                    if self.stop_requested:
+                        self.get_logger().warn("🛑 Stop requested! Aborting current goal execution.")
+                        self.stop_requested = False
+                        return  # hard exit from execution immediately
 
-                    for point in interpolated_plan:
-                        if self.stop_requested:
-                            self.get_logger().warn("🛑 Stop requested! Aborting current goal execution.")
-                            self.stop_requested = False
-                            return
+                    pt = JointTrajectoryPoint()
+                    pt.positions = point.numpy().tolist()
+                    pt.velocities = [0.1] * len(self.joint_order)
+                    pt.time_from_start.sec = int(tfs)
+                    pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                    tfs += 0.03
+                    traj_msg.points.append(pt)
 
-                        traj_point = JointTrajectoryPoint()
-                        traj_point.positions = point.numpy().tolist()
-                        traj_point.velocities = [0.1] * len(self.joint_order)
-                        traj_point.time_from_start.sec = int(time_from_start)
-                        traj_point.time_from_start.nanosec = int((time_from_start % 1) * 1e9)
-                        time_from_start += 0.03
-                        trajectory_msg.points.append(traj_point)
+                    # live FK trail (optional)
+                    cp = self.forward_kinematics(pt.positions)
+                    if cp:
+                        self.path_points.append(cp)
+                        self.publish_path_marker()
 
-                        cartesian_point = self.forward_kinematics(traj_point.positions)
-                        if cartesian_point:
-                            self.path_points.append(cartesian_point)
-                            self.publish_path_marker()
+                self.trajectory_pub.publish(traj_msg)
+                self.wait_for_execution_completion(sub_goal[:3])
 
-                    self.trajectory_pub.publish(trajectory_msg)
-                    self.wait_for_execution_completion(sub_goal[:3])
+                # update start_state for next leg
+                start_state = JointState.from_position(
+                    torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
+                    joint_names=self.joint_order,
+                )
 
-                    # Update start_state for the next sub-goal
-                    last_positions = trajectory_msg.points[-1].positions
-                    start_state = JointState.from_position(
-                        torch.tensor([last_positions], dtype=torch.float32, device=device),
-                        joint_names=self.joint_order,
-                    )
-                else:
-                    self.get_logger().warn("Failed to generate a motion plan for sub-goal!")
+            else:
+                # Only runs if we didn't break: we reached the target successfully
+                # 2) Grip or checks around the goal
+                self.control_gripper("CLOSE")
+                time.sleep(1)
 
-        # ----------------------------------------------------------------------------
-        # After all goals: close gripper, slip/abort handling, return home, etc.
-        # ----------------------------------------------------------------------------
-        self.get_logger().info("All goals executed. Waiting for new goals…")
-        self.control_gripper("CLOSE")
-        time.sleep(1)
+                if self.abort_flag:
+                    #self.get_logger().info("🚨 Abort triggered → opening gripper and returning home.")
+                    self.control_gripper("OPEN")
+                    self.move_to_home_position()
+                    self.abort_flag = False
+                    continue  # move on to the next saved goal
 
-        if self.abort_flag:
-            self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
-            self.control_gripper("OPEN")
-            self.move_to_home_position()
-            self.abort_flag = False
-            return
+                if self.slip_detection or self.grap_miss:
+                    self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
+                    self.control_gripper("OPEN")
+                    cur = self.get_end_effector_pose()
+                    if cur:
+                        up_goal = [cur[0], cur[1], cur[2] + 0.015] + cur[3:]
+                        self.execute_single_pose(up_goal)
+                    self.slip_detection = False
+                    self.grap_miss = False
+                    self.control_gripper("CLOSE")
 
-        if self.slip_detection or self.grap_miss:
-            self.get_logger().info("🛠 Slip detected → nudging end-effector up by 0.01 m")
-            self.control_gripper("OPEN")
-            current = self.get_end_effector_pose()
-            if current:
-                up_goal = [current[0], current[1], current[2] + 0.015] + current[3:]
-                self.execute_single_pose(up_goal)
-            self.slip_detection = False
-            self.grap_miss = False
-            self.control_gripper("CLOSE")
+                # 3) Optional micro-motions
+                self.move_backward(-0.02)
+                self.rotate_wrist(90)
+                self.rotate_wrist(-90)
 
-        if not self.abort_flag:
-            self.move_backward(-0.02)
-            self.rotate_wrist(90)
-            self.rotate_wrist(-90)
-            self.move_to_dropoff_position()
-            self.control_gripper("OPEN")
-            self.move_to_home_position()
-        else:
-            self.get_logger().info("🚨 Abort triggered → opening gripper and returning home")
-            self.control_gripper("OPEN")
-            self.move_to_home_position()
-            self.abort_flag = False
+
+                #retract
+                self.move_to_predropoff_position()
+
+                # 4) Drop-off and open gripper
+                self.move_to_dropoff_position()
+                self.control_gripper("OPEN")
+
+                # 5) Return home before next goal
+                self.move_to_home_position()
+
+        self.get_logger().info("✅ Finished all goals.")
+
 
 
     def publish_path_marker(self):
@@ -698,7 +655,7 @@ class UR10eCuroboMoveIt(Node):
             
                
         
-    def publish_goal_marker(self, position):
+    def publish_goal_marker(self, position, rank=None):
         """Publishes a marker in RViz for the goal position."""
         marker = Marker()
         marker.header.frame_id = "base_link"  # Adjust if needed
@@ -723,10 +680,29 @@ class UR10eCuroboMoveIt(Node):
         marker.color.r = 1.0
         marker.color.g = 0.0
         marker.color.b = 0.0
-
         # Publish the marker
         self.goal_marker_pub.publish(marker)
-        self.get_logger().info(f"Published goal marker at {position}.")
+
+                # 🔹 Add text marker to show rank number
+        if rank is not None:
+            text_marker = Marker()
+            text_marker.header.frame_id = "base_link"
+            text_marker.header.stamp = self.get_clock().now().to_msg()
+            text_marker.ns = "goal_labels"
+            text_marker.id = 1000 + marker.id
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = position[0]
+            text_marker.pose.position.y = position[1]
+            text_marker.pose.position.z = position[2] + 0.06  # a bit above sphere
+            text_marker.scale.z = 0.05  # text size
+            text_marker.color.a = 1.0
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.text = str(rank)
+            self.goal_marker_pub.publish(text_marker)
+            self.get_logger().info(f"Published goal marker at {position}.")
 
     def wait_until_motion_finishes(self):
         """Dynamically check if motion execution is complete before moving to the next goal."""
@@ -813,7 +789,7 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().warn("⚠️ Goal received while robot is moving. Ignoring.")
                 return
 
-            time.sleep(1)  # Let robot stabilize
+            time.sleep(0.5)  # Let robot stabilize
 
             goal_position = [
                 msg.pose.position.x,
@@ -834,6 +810,7 @@ class UR10eCuroboMoveIt(Node):
             else:
                 self.goal_poses.append(goal_position)
                 self.publish_goal_marker(goal_position[:3])
+                
                 self.get_logger().info(f"✅ Goal received and saved: {goal_position}")
                 self.goal_received = True
 
@@ -853,7 +830,6 @@ class UR10eCuroboMoveIt(Node):
             ('LEFT',  0.0,  0.1, 0.0),
             ('RIGHT', 0.0, -0.1, 0.0),
             ('DOWN',  0.0,  0.0, -0.1),
-
         ]
         self.idle_motion_index = 0
 
@@ -1112,6 +1088,72 @@ class UR10eCuroboMoveIt(Node):
             # wait_for_execution_completion expects a list [x, y, z]
             self.wait_for_execution_completion([fk.x, fk.y, fk.z])
             
+
+
+    def move_to_predropoff_position(self, cfg: MotionGenPlanConfig = None):
+        """Plan & execute a joint-space path to self.dropoff_joints."""
+        if self.current_joint_positions is None:
+            self.get_logger().warn("No joint state; skipping drop-off move.")
+            return
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        start_state = JointState.from_position(
+            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+            joint_names=self.joint_order,
+        )
+        goal_state = JointState.from_position(
+            torch.tensor([self.predropoff_joints], dtype=torch.float32, device=device),
+            joint_names=self.joint_order,
+        )
+
+        plan_cfg = cfg or MotionGenPlanConfig(
+            max_attempts=20,
+            enable_finetune_trajopt=True
+        )
+        result = self.motion_gen.plan_single_js(start_state, goal_state, plan_cfg)
+
+        if not result.success:
+            self.get_logger().warn("❌ Joint-space plan to DROP-OFF failed.")
+            return
+
+        # build the ROS JointTrajectory exactly like execute_single_pose
+        trajectory_msg = JointTrajectory()
+        trajectory_msg.joint_names = self.joint_order
+
+        interpolated_plan = result.get_interpolated_plan()
+        if isinstance(interpolated_plan, JointState):
+            traj_tensor = interpolated_plan.position
+        else:
+            traj_tensor = interpolated_plan
+
+        traj_tensor = traj_tensor.to("cpu")
+        time_from_start = 0.0
+
+        for point in traj_tensor:
+            if self.stop_requested:
+                self.get_logger().warn("🛑 Stop requested! Aborting drop-off motion.")
+                self.stop_requested = False
+                return
+
+            pt = JointTrajectoryPoint()
+            pt.positions = point.tolist()
+            pt.velocities = [0.1] * len(self.joint_order)        # same 0.1 rad/s feed-forward
+            pt.time_from_start.sec     = int(time_from_start)
+            pt.time_from_start.nanosec = int((time_from_start % 1.0) * 1e9)
+
+            trajectory_msg.points.append(pt)
+            time_from_start += 0.03/self.speed_scale                                    # same 30 ms increment
+
+        self.trajectory_pub.publish(trajectory_msg)
+        self.get_logger().info("📦 Moving to preDROP-OFF joints…")
+        
+        final_joints = traj_tensor[-1].tolist()
+        fk = self.forward_kinematics(final_joints)
+        if fk:
+            # wait_for_execution_completion expects a list [x, y, z]
+            self.wait_for_execution_completion([fk.x, fk.y, fk.z])
+
+
       
     def _publish_stop_trajectory(self):
         """Publish a zero-time trajectory at the current joint positions to halt immediately."""
@@ -1132,6 +1174,7 @@ class UR10eCuroboMoveIt(Node):
             self.gripper_closed = False
             self.slip_detection = False
             self.grap_miss = False
+            self.open_baseline = self.filtered_forces.copy()
             self.get_logger().info("Gripper opened → slip detection paused")
         elif action.upper() == "CLOSE":
             self.gripper_controller.run_closure_loop()           
@@ -1156,28 +1199,283 @@ class UR10eCuroboMoveIt(Node):
             return
 
         f = self.filtered_forces  # short name
-        print(f)
+        self.get_logger().info(f"Updated open Filtetrerd force: {self.filtered_forces}")
+        self.get_logger().info(f"Updated open baseline: {self.open_baseline}")
+        d = [fi - bi for fi, bi in zip(self.open_baseline, self.filtered_forces)]
+        print("delta", d)
 
-        # abort if any channel ≤ –0.35
-        if any(ch <= -0.35 for ch in f):
+        # --- thresholds ---
+        POS_TH = 0.02     # "pushing out" vs baseline
+        NEG_TH = -0.08    # "squeezing in" vs baseline
+        HARD_ABORT = -0.35
+
+        # 1) Safety abort: very strong squeeze on any channel
+        if any(di <= HARD_ABORT for di in d):
             if not self.abort_flag:
-                self.get_logger().error(f"🛑 ABORT (smoothed): {f}")
-            self.abort_flag = True
-        # slip if any channel in (–0.35, –0.24)
-        elif any(-0.35 < ch < -0.24 for ch in f):
-            if not self.slip_detection:
-                self.get_logger().warn(f"⚠️ Slip (smoothed): {f}")
-            self.slip_detection = True
-        elif any(-0.11 < f[i] < -0.05 for i in (0, 2)):
-            if not self.abort_flag:
-                vals = (f[0], f[2])
-                self.get_logger().error(f"🛑 ABORT: Did not grab, channels[0,2]={vals}")
-            self.grap_miss = True 
+                self.get_logger().error(f"🛑 ABORT (hard): Δ={d}")
+            self.abort_flag = False
+            self.slip_detection = False
+            self.grap_miss = False
+            return
+
+        # 2) Classify grip using deltas
+        positives = sum(di > POS_TH for di in d)
+        negatives = sum(di < NEG_TH for di in d)
+
+        if negatives == len(d):
+            # All channels squeezed inward: likely closed on air → MISS
+            if not self.grap_miss:
+                self.get_logger().warn(f"❗ Likely miss: Δ={d}")
+            self.grap_miss = False
+            self.slip_detection = False
+
+        elif positives >= 1 and negatives >= 1:
+            # Opposing forces: object pinched between fingers → GOOD
+            if self.grap_miss:
+                self.get_logger().info(f"✅ Good grip: Δ={d}")
+            self.grap_miss = False
+
+        else:
+            # Not clearly miss nor strong opposing contact → BAD/weak
+            if not self.grap_miss:
+                self.get_logger().warn(f"⚠️ Weak/unstable grip: Δ={d}")
+            self.grap_miss = False
+            self.slip_detection = False
+
+        # Optional: a friendly status when everything is calm & good
+        if not self.grap_miss and not self.slip_detection and self.abort_flag is not False:
+            self.get_logger().info("👍 Gripper stable.")
 
         # finally, stash raw if you want
         self.last_force = raw
 
-            
+    def start_goal_capture(self, duration: float = 30.0):
+        """Subscribe to /external_goal_pose and collect unique goals for `duration` seconds, sorted by distance."""
+        # restart if already active
+        if self.goal_capture_active:
+            self.stop_goal_capture()
+
+        self.goal_poses.clear()
+        self.goal_capture_count = 0
+
+        # set distance reference at capture start
+        ee = self.get_end_effector_pose()
+        if ee:
+            self.goal_sort_ref = ee[:3]
+            self.get_logger().info(f"Sorting goals by distance to EE at capture start: {self.goal_sort_ref}")
+        else:
+            self.goal_sort_ref = [0.0, 0.0, 0.0]
+            self.get_logger().warn("EE pose unavailable; sorting by distance to [0,0,0].")
+
+        # subscribe
+        self.goal_pose_sub = self.create_subscription(
+            PoseStamped, '/external_goal_pose', self._capture_goal_callback, 10
+        )
+        self.goal_capture_active = True
+        self.goal_capture_count = 0
+        self.get_logger().info(f"Started goal capture for {duration:.0f}s from /external_goal_pose")
+
+        def _stop_once():
+            if self.goal_capture_timer is not None:
+                self.goal_capture_timer.cancel()
+                self.goal_capture_timer = None
+            self.stop_goal_capture()
+
+        # one-shot timer (seconds)
+        self.goal_capture_timer = self.create_timer(duration, _stop_once)
+
+    def stop_goal_capture(self):
+        """Stop timed goal capture if active."""
+        if not self.goal_capture_active:
+            return
+        self.goal_capture_active = False
+
+        if hasattr(self, 'goal_pose_sub'):
+            self.destroy_subscription(self.goal_pose_sub)
+            del self.goal_pose_sub
+
+        if self.goal_capture_timer is not None:
+            self.goal_capture_timer.cancel()
+            self.goal_capture_timer = None
+
+        # final sort to be sure
+        self._sort_goals_by_distance()
+        self.get_logger().info(f"Goal capture stopped. Collected {self.goal_capture_count} goals.")
+
+    def _capture_goal_callback(self, msg: PoseStamped):
+        """Append each unique incoming goal (1 cm de-dup) using the CURRENT EE orientation,
+        then keep the list distance-sorted."""
+        if self.is_robot_moving():
+            return
+
+        # incoming position
+        gx, gy, gz = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
+
+        # grab current EE orientation now (fresh per goal)
+        ee = self.get_end_effector_pose()
+        if ee:
+            # get_end_effector_pose() returns [x, y, z, qw, qx, qy, qz]
+            qw, qx, qy, qz = ee[3], ee[4], ee[5], ee[6]
+        else:
+            qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
+            self.get_logger().warn("EE orientation unavailable; using default [1,0,0,0].")
+
+        # 1 cm positional de-dup
+        is_dup = any(
+            ((g[0] - gx)**2 + (g[1] - gy)**2 + (g[2] - gz)**2) ** 0.5 < 0.01
+            for g in (self.goal_poses or [])
+        )
+        if is_dup:
+            return
+
+        # save position + current EE orientation
+        goal_position = [gx, gy, gz, qw, qx, qy, qz]
+        self.goal_poses.append(goal_position)
+        self._sort_goals_by_distance()  # keep list ordered after every insert
+
+        self.goal_capture_count += 1
+        self.publish_goal_marker(goal_position[:3])  # pass rank here if you want labels
+        print(f"🎯 New goal #{self.goal_capture_count}: {goal_position}")
+        self.get_logger().info(
+            f"Captured goal #{self.goal_capture_count} (total={len(self.goal_poses)})"
+        )
+
+    def _goal_distance(self, goal_xyz, ref_xyz=None):
+        """Euclidean distance from goal_xyz to ref_xyz (or self.goal_sort_ref)."""
+        rx, ry, rz = (ref_xyz or self.goal_sort_ref or [0.0, 0.0, 0.0])
+        gx, gy, gz = goal_xyz
+        dx, dy, dz = gx - rx, gy - ry, gz - rz
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+    def _sort_goals_by_distance(self, ref_xyz=None):
+        """Sort self.goal_poses in-place by distance to ref_xyz (or self.goal_sort_ref)."""
+        ref = ref_xyz or self.goal_sort_ref or [0.0, 0.0, 0.0]
+        self.goal_poses.sort(
+            key=lambda g: self._goal_distance(g[:3], ref),
+            reverse=not self.goal_sort_ascending
+        )
+
+    def _robot_running_callback(self, msg: Bool):
+        self.robot_running = msg.data
+        if not self.robot_running:
+            self.get_logger().warn(
+                "⚠️ Robot program is NOT running! Please turn it on in the teach pendant."
+            )
+        else:
+            self.get_logger().info("✅ Robot program is running.")
+
+
+    def _stop_callback(self, msg: Bool):
+        """Asynchronous stop: publish a 'hold' at current joints as soon as we receive True."""
+        if not msg.data:
+            return
+        self.get_logger().warn("🛑 Emergency stop from /emergency_stop!")
+        self.stop_requested = True
+        # publish a hold point right now so the controller brakes immediately
+        self._publish_stop_trajectory()
+
+
+    def quaternion_from_approach(self, direction_xyz=None, pitch_deg=None, world=False):
+        """
+        If pitch_deg is provided: apply a pitch-only rotation (about Y axis)
+        to the CURRENT end-effector orientation.
+
+        - pitch_deg: degrees to tilt (+ forward / - backward)
+        - world=False -> rotate about the TOOL's local Y (minimal arm motion)
+        world=True  -> rotate about the WORLD Y
+
+        Returns: [qw, qx, qy, qz]
+        """
+        import math
+        import numpy as np
+
+        # ---- Pitch-only path (preferred for minimal motion) ----
+        if pitch_deg is not None:
+            cur = self.get_end_effector_pose()
+            if cur:
+                qw, qx, qy, qz = cur[3], cur[4], cur[5], cur[6]
+            else:
+                # fallback to identity
+                qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
+
+            half = math.radians(pitch_deg) / 2.0
+            # delta quaternion for rotation about Y: (w, x, y, z)
+            cw, cx, cy, cz = math.cos(half), math.sin(half),0.0, 0.0
+
+            if world:
+                # world-pitch: q_new = q_delta ⊗ q_cur
+                nw = cw*qw - cx*qx - cy*qy - cz*qz
+                nx = cw*qx + cx*qw + cy*qz - cz*qy
+                ny = cw*qy - cx*qz + cy*qw + cz*qx
+                nz = cw*qz + cx*qy - cy*qx + cz*qw
+            else:
+                # tool-pitch (local Y): q_new = q_cur ⊗ q_delta
+                nw = qw*cw - qx*cx - qy*cy - qz*cz
+                nx = qw*cx + qx*cw + qy*cz - qz*cy
+                ny = qw*cy - qx*cz + qy*cw + qz*cx
+                nz = qw*cz + qx*cy - qy*cx + qz*cw
+
+            return [nw, nx, ny, nz]
+
+        # ---- (Optional) fallback: align tool +Z to a direction vector ----
+        if direction_xyz is None:
+            direction_xyz = (0, 0, -1)
+
+        d = np.array(direction_xyz, dtype=float)
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            # invalid direction -> return identity
+            return [1.0, 0.0, 0.0, 0.0]
+        d /= n
+
+        # Build orthonormal frame with z-axis = d and up = world Z
+        up = np.array([0.0, 0.0, 1.0], dtype=float)
+        x_axis = np.cross(up, d)
+        if np.linalg.norm(x_axis) < 1e-6:
+            x_axis = np.array([1.0, 0.0, 0.0])
+        x_axis /= np.linalg.norm(x_axis)
+        y_axis = np.cross(d, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        z_axis = d
+
+        R = np.array([[x_axis[0], y_axis[0], z_axis[0]],
+                    [x_axis[1], y_axis[1], z_axis[1]],
+                    [x_axis[2], y_axis[2], z_axis[2]]], dtype=float)
+
+        # rotation matrix -> quaternion (qw,qx,qy,qz)
+        t = R[0,0] + R[1,1] + R[2,2]
+        if t > 0.0:
+            s = math.sqrt(t + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (R[2,1] - R[1,2]) / s
+            qy = (R[0,2] - R[2,0]) / s
+            qz = (R[1,0] - R[0,1]) / s
+        else:
+            # robust branches
+            if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+                s = math.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2.0
+                qw = (R[2,1] - R[1,2]) / s
+                qx = 0.25 * s
+                qy = (R[0,1] + R[1,0]) / s
+                qz = (R[0,2] + R[2,0]) / s
+            elif R[1,1] > R[2,2]:
+                s = math.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2.0
+                qw = (R[0,2] - R[2,0]) / s
+                qx = (R[0,1] + R[1,0]) / s
+                qy = 0.25 * s
+                qz = (R[1,2] + R[2,1]) / s
+            else:
+                s = math.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2.0
+                qw = (R[1,0] - R[0,1]) / s
+                qx = (R[0,2] + R[2,0]) / s
+                qy = (R[1,2] + R[2,1]) / s
+                qz = 0.25 * s
+
+        return [qw, qx, qy, qz]
+
+
+
+
 def main():
     print("Starting UR10e MoveIt Node...")
     rclpy.init()
