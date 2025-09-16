@@ -29,6 +29,7 @@ import tty
 import select
 import threading
 import math
+from copy import deepcopy
 
 class UR10eCuroboMoveIt(Node):
     def __init__(self):
@@ -107,7 +108,7 @@ class UR10eCuroboMoveIt(Node):
         self.current_joint_positions = None
         self.latest_marker_pose = None  # Store latest marker pose
         self.goal_poses = []
-        self.running = True  # Control flag for keyboard thread
+        self.running = True  # Control flag for keyboard threadfrom copy import deepcopy
 
         self.joint_order = [
             "shoulder_pan_joint",
@@ -134,14 +135,25 @@ class UR10eCuroboMoveIt(Node):
          }
         }
 
+        # --- NEW: preallocate fixed obstacle spheres parked far away ---
+        self.max_goal_obstacles = 24
+        self.goal_obs_names = [f"gobs_{i}" for i in range(self.max_goal_obstacles)]
+        self.goal_obs_radius = 0.06
+        world_config.setdefault("sphere", {})
+        for name in self.goal_obs_names:
+            world_config["sphere"][name] = {
+                "radius": float(self.goal_obs_radius),
+                "pose": [999.0, 999.0, 999.0, 1.0, 0.0, 0.0, 0.0],  # parked/disabled
+            }
+        self.world_config = deepcopy(world_config)
+        # keep building MotionGen with this world_config as you already do
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            "ur10e.yml", world_config, interpolation_dt=0.004) #,trajopt_dt=0.05, num_trajopt_seeds=5)
-        
-        
-
+            "ur10e.yml", world_config, interpolation_dt=0.004
+        )
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
-        self. qos = QoSProfile(
+
+        self.qos = QoSProfile(
                     reliability=ReliabilityPolicy.BEST_EFFORT,
                     history=HistoryPolicy.KEEP_LAST,
                     depth=1,
@@ -351,7 +363,7 @@ class UR10eCuroboMoveIt(Node):
         """
         if not self.robot_running:
             self.get_logger().error("❌ Cannot execute goals: robot program is OFF. Please turn it ON first.")
-            return
+            #return
 
         if self.current_joint_positions is None:
             self.get_logger().warn("Current joint state not received yet!")
@@ -360,8 +372,10 @@ class UR10eCuroboMoveIt(Node):
         if not self.goal_poses:
             self.get_logger().warn("No goal positions stored!")
             return
+        
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
         # while there are goals, handle EACH goal end-to-end
         while self.goal_poses and self.running:
@@ -372,6 +386,8 @@ class UR10eCuroboMoveIt(Node):
             )
 
             goal = self.goal_poses.pop(0)
+            all_goals_snapshot = list(self.goal_poses)  #  xyz+quat for every captured goal
+
             self.get_logger().info(f"Processing goal: {goal}")
             x, y, z = goal[:3]
             # orientation depends on whether date is high or low
@@ -401,108 +417,162 @@ class UR10eCuroboMoveIt(Node):
                 #y = y+0.8
                 y = y-0.003
 
-            sub_goals = [
-                approach,                # approach first
-                [x, y, z] + list(orientation)  # then the actual target
-]
+            # ---------- 1) PLAN & EXECUTE APPROACH (pre-grasp) ----------
+
+            # Build obstacle list from all goals except *this* goal
+            others_xyz = [g[:3] for g in all_goals_snapshot if g is not goal]  # treat other dates as obstacles
+
+            world_with_obs = self._mk_world_with_goal_obstacles(others_xyz, sphere_r=0.06)
+            self._set_world_for_planning(world_with_obs)
 
 
-            for sub_goal in sub_goals:
-                goal_pose = Pose.from_list(sub_goal)
-                result = self.motion_gen.plan_single(
-                    start_state,
-                    goal_pose,
-                    MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
-                )
 
-                if not result.success:
-                    self.get_logger().warn("Failed to generate a motion plan for sub-goal! Skipping this goal.")
-                    # break out of sub-goals; continue with next saved goal
-                    break
+            goal_pose = Pose.from_list(approach)
+            result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
+            )
 
-                # build & publish trajectory
-                traj_msg = JointTrajectory()
-                traj_msg.joint_names = self.joint_order
+            if not result.success:
+                self.get_logger().warn("Failed to generate a motion plan for APPROACH. Skipping this goal.")
+                continue
 
-                interpolated = result.get_interpolated_plan()
-                if isinstance(interpolated, JointState):
-                    interpolated = interpolated.position
-                if not isinstance(interpolated, torch.Tensor):
-                    interpolated = torch.tensor(interpolated, dtype=torch.float32)
-                interpolated = interpolated.to("cpu")
+            traj_msg = JointTrajectory()
+            traj_msg.joint_names = self.joint_order
+            interpolated = result.get_interpolated_plan()
+            if isinstance(interpolated, JointState):
+                interpolated = interpolated.position
+            if not isinstance(interpolated, torch.Tensor):
+                interpolated = torch.tensor(interpolated, dtype=torch.float32)
+            interpolated = interpolated.to("cpu")
 
-                tfs = 0.0
-                for point in interpolated:
-                    if self.stop_requested:
-                        self.get_logger().warn("🛑 Stop requested! Aborting current goal execution.")
-                        self.stop_requested = False
-                        return  # hard exit from execution immediately
+            tfs = 0.0
+            for point in interpolated:
+                if self.stop_requested:
+                    self.get_logger().warn("🛑 Stop requested during approach. Aborting.")
+                    self.stop_requested = False
+                    return
+                pt = JointTrajectoryPoint()
+                pt.positions = point.numpy().tolist()
+                pt.velocities = [0.1] * len(self.joint_order)
+                pt.time_from_start.sec = int(tfs)
+                pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                tfs += 0.01
+                traj_msg.points.append(pt)
 
-                    pt = JointTrajectoryPoint()
-                    pt.positions = point.numpy().tolist()
-                    pt.velocities = [0.1] * len(self.joint_order)
-                    pt.time_from_start.sec = int(tfs)
-                    pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
-                    tfs += 0.03
-                    traj_msg.points.append(pt)
+            self.trajectory_pub.publish(traj_msg)
+            self.wait_for_execution_completion(approach[:3])
 
-                    # live FK trail (optional)
-                    cp = self.forward_kinematics(pt.positions)
-                    if cp:
-                        self.path_points.append(cp)
-                        self.publish_path_marker()
+            # Update start_state after approach
+            start_state = JointState.from_position(
+                torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order,
+            )
 
-                self.trajectory_pub.publish(traj_msg)
-                self.wait_for_execution_completion(sub_goal[:3])
+            # ---------- 2) RE-DETECT / REACQUIRE AT PRE-GRASP ----------
+            seed = [x, y, z]  # original target before refinement
+            reacq = self.reacquire_goal_pose(seed_xyz=seed, timeout=0.5,
+                                            stable_eps=0.004, stable_need=3)
+            if reacq:
+                x, y, z = reacq  # refine using the fresh detection
+                self.publish_goal_marker([x, y, z])
+            else:
+                self.get_logger().info("Proceeding with original target (no reacquire).")
+
+            # ---------- 3) PLAN & EXECUTE FINAL INSERT / GRASP ----------
+            final_target = [x, y, z] + list(orientation)
+            goal_pose = Pose.from_list(final_target)
+            result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
+            )
+
+            if not result.success:
+                self.get_logger().warn("Failed to generate a motion plan for FINAL target. Skipping this goal.")
+                continue
+
+            traj_msg = JointTrajectory()
+            traj_msg.joint_names = self.joint_order
+            interpolated = result.get_interpolated_plan()
+            if isinstance(interpolated, JointState):
+                interpolated = interpolated.position
+            if not isinstance(interpolated, torch.Tensor):
+                interpolated = torch.tensor(interpolated, dtype=torch.float32)
+            interpolated = interpolated.to("cpu")
+
+            tfs = 0.0
+            for point in interpolated:
+                if self.stop_requested:
+                    self.get_logger().warn("🛑 Stop requested during final move. Aborting.")
+                    self.stop_requested = False
+                    return
+                pt = JointTrajectoryPoint()
+                pt.positions = point.numpy().tolist()
+                pt.velocities = [0.1] * len(self.joint_order)
+                pt.time_from_start.sec = int(tfs)
+                pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                tfs += 0.03
+                traj_msg.points.append(pt)
+
+            self.trajectory_pub.publish(traj_msg)
+            self.wait_for_execution_completion(final_target[:3])
 
                 # update start_state for next leg
-                start_state = JointState.from_position(
+            start_state = JointState.from_position(
                     torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
                     joint_names=self.joint_order,
                 )
 
-            else:
-                # Only runs if we didn't break: we reached the target successfully
-                # 2) Grip or checks around the goal
-                self.control_gripper("CLOSE")
-                time.sleep(1)
+            # Only runs if we didn't break: we reached the target successfully
+            # 2) Grip or checks around the goal
+            self.control_gripper("CLOSE")
+            time.sleep(1)
 
-                if self.abort_flag:
-                    #self.get_logger().info("🚨 Abort triggered → opening gripper and returning home.")
-                    self.control_gripper("OPEN")
-                    self.move_to_home_position()
-                    self.abort_flag = False
-                    continue  # move on to the next saved goal
-
-                if self.slip_detection or self.grap_miss:
-                    self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
-                    self.control_gripper("OPEN")
-                    cur = self.get_end_effector_pose()
-                    if cur:
-                        up_goal = [cur[0], cur[1], cur[2] + 0.015] + cur[3:]
-                        self.execute_single_pose(up_goal)
-                    self.slip_detection = False
-                    self.grap_miss = False
-                    self.control_gripper("CLOSE")
-
-                # 3) Optional micro-motions
-                self.move_backward(-0.02)
-                self.rotate_wrist(90)
-                time.sleep(0.5)
-                self.rotate_wrist(-90)
-
-
-                #retract
-                self.move_to_predropoff_position()
-
-                # 4) Drop-off and open gripper
-                self.move_to_dropoff_position()
+            if self.abort_flag:
+                #self.get_logger().info("🚨 Abort triggered → opening gripper and returning home.")
                 self.control_gripper("OPEN")
-
-                # 5) Return home before next goal
                 self.move_to_home_position()
+                self.abort_flag = False
+                continue  # move on to the next saved goal
 
-        self.get_logger().info("✅ Finished all goals.")
+            if self.slip_detection or self.grap_miss:
+                self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
+                self.control_gripper("OPEN")
+                cur = self.get_end_effector_pose()
+                if cur:
+                    up_goal = [cur[0], cur[1], cur[2] + 0.015] + cur[3:]
+                    self.execute_single_pose(up_goal)
+                self.slip_detection = False
+                self.grap_miss = False
+                self.control_gripper("CLOSE")
+
+            # 3) Optional micro-motions
+            #self.move_backward(-0.02)
+            self.rotate_wrist(90)
+            time.sleep(0.5)
+            #self.rotate_wrist(-90)
+
+
+            #retract
+            self.move_to_predropoff_position()
+
+            # 4) Drop-off and open gripper
+            self.move_to_dropoff_position()
+            self.control_gripper("OPEN")
+
+            # ✅ This goal is done—remove it from the snapshot so it’s not an obstacle next time
+            try:
+                all_goals_snapshot.remove(goal)
+            except ValueError:
+                pass
+
+
+            # 5) Return home before next goal
+            self.move_to_home_position()
+
+            self.get_logger().info("✅ Finished all goals.")
 
 
 
@@ -767,7 +837,7 @@ class UR10eCuroboMoveIt(Node):
 
         if self.is_robot_moving():
             self.get_logger().warn("⚠️ Robot is moving. Delaying subscription to external goal pose.")
-            self.create_timer(2.0, self.subscribe_to_goal_pose_topic_once_stationary)
+            self.create_timer(0.5, self.subscribe_to_goal_pose_topic_once_stationary)
             return
 
         if hasattr(self, 'goal_pose_sub'):
@@ -788,9 +858,12 @@ class UR10eCuroboMoveIt(Node):
 
         def goal_callback(msg):
             # Stop idle motion if running
+            self.goal_received = True            # prevents more patrol steps
+
             if hasattr(self, 'idle_timer'):
                 self.idle_timer.cancel()
                 self.get_logger().info("🛑 Idle motion stopped.")
+                self._publish_stop_trajectory()
 
             if self.is_robot_moving():
                 self.get_logger().warn("⚠️ Goal received while robot is moving. Ignoring.")
@@ -833,7 +906,7 @@ class UR10eCuroboMoveIt(Node):
 
         # Motion pattern: Up → Left → Right → Down → Left → Right
         self.idle_motion_sequence = [
-            ('UP',    0.0,  0.0,  0.1),
+            ('UP',    0.0,  0.0,  0.4),
             ('LEFT',  0.0,  0.1, 0.0),
             ('RIGHT', 0.0, -0.1, 0.0),
             ('DOWN',  0.0,  0.0, -0.1),
@@ -867,8 +940,63 @@ class UR10eCuroboMoveIt(Node):
         self.idle_timer = self.create_timer(5.0, idle_motion_callback)
 
 
+    def reacquire_goal_pose(self, seed_xyz, timeout=1.0, radius=0.20,
+                            stable_eps=0.004, stable_need=3):
+        latest = None
+        stable = 0
+        picked = None
+
+        # ensure we're not moving
+        start = time.time()
+        while self.is_robot_moving() and (time.time() - start) < 0.5:
+            time.sleep(0.01)
+
+        # track last time we saw an in-radius detection (for inactivity timeout)
+        last_inradius_ts = time.time()
+
+        def _cb(msg):
+            nonlocal latest, stable, picked, last_inradius_ts
+            if self.is_robot_moving():
+                return
+
+            x = msg.pose.position.x
+            y = msg.pose.position.y
+            z = msg.pose.position.z
+            print(f"Reacquire got detection: {(x,y,z)}")
+            # keep the radius gate
+            dx, dy, dz = x - seed_xyz[0], y - seed_xyz[1], z - seed_xyz[2]
+            if (dx*dx + dy*dy + dz*dz) > (radius * radius):
+                return
+
+            # refresh "activity" timer and count an in-radius hit
+            last_inradius_ts = time.time()
+            latest = (x, y, z)
+            stable += 1                               # ✅ no inter-sample consistency required
+
+            if stable >= max(1, stable_need):         # accept after N in-radius detections
+                picked = latest
+
+        sub = self.create_subscription(PoseStamped, '/external_goal_pose', _cb, self.qos)
+
+        try:
+            while picked is None:
+                # give up only after no in-radius hits for `timeout` seconds
+                if timeout is not None and (time.time() - last_inradius_ts) > timeout:
+                    break
+                time.sleep(0.01)
+        finally:
+            self.destroy_subscription(sub)
+
+        if picked is not None:
+            self.get_logger().info(f"🔎 Reacquired (N in-radius hits) near seed {seed_xyz} → {picked}")
+            return list(picked)
+        else:
+            self.get_logger().warn("⚠️ Reacquire timed out (no in-radius detections); keeping original target.")
+            return None
 
 
+        
+    
     def execute_single_pose(self, pose):
         """Plan and execute a single target pose directly."""
         if self.current_joint_positions is None:
@@ -923,7 +1051,12 @@ class UR10eCuroboMoveIt(Node):
         if self.current_joint_positions is None:
             self.get_logger().warn("No joint state; skipping home move.")
             return
-
+        
+        if not self.robot_running:
+            self.get_logger().error("❌ Cannot execute goals: robot program is OFF. Please turn it ON first.")
+            return
+        
+        
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         start_state = JointState.from_position(
             torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
@@ -970,7 +1103,7 @@ class UR10eCuroboMoveIt(Node):
             trajectory_msg.points.append(traj_pt)
 
             # apply global speed scaling if you have one
-            time_from_start += 0.03 / getattr(self, "speed_scale", 1.0)
+            time_from_start += 0.01 / getattr(self, "speed_scale", 1.0)
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("🏠 Moving to HOME joints…")
@@ -1115,7 +1248,7 @@ class UR10eCuroboMoveIt(Node):
             pt.time_from_start.nanosec = int((time_from_start % 1.0) * 1e9)
 
             trajectory_msg.points.append(pt)
-            time_from_start += 0.03/self.speed_scale                                    # same 30 ms increment
+            time_from_start += 0.01/self.speed_scale                                    # same 30 ms increment
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("📦 Moving to DROP-OFF joints…")
@@ -1180,7 +1313,7 @@ class UR10eCuroboMoveIt(Node):
             pt.time_from_start.nanosec = int((time_from_start % 1.0) * 1e9)
 
             trajectory_msg.points.append(pt)
-            time_from_start += 0.03/self.speed_scale                                    # same 30 ms increment
+            time_from_start += 0.04/ getattr(self, "speed_scale", 1.0)                                 # same 30 ms increment
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("📦 Moving to preDROP-OFF joints…")
@@ -1197,12 +1330,17 @@ class UR10eCuroboMoveIt(Node):
         """Publish a zero-time trajectory at the current joint positions to halt immediately."""
         if self.current_joint_positions is None:
             return
+        
         stop_msg = JointTrajectory()
         stop_msg.joint_names = self.joint_order
         pt = JointTrajectoryPoint()
         pt.positions = list(self.current_joint_positions)
+        pt.velocities = [0.0] * len(self.joint_order)     # <-- add
+        pt.accelerations = [0.0] * len(self.joint_order)  # <-- add
         pt.time_from_start.sec = 0
-        pt.time_from_start.nanosec = 0
+        pt.time_from_start.nanosec = 1_000_000            # <-- tiny >0 duration helps preemption
+
+
         stop_msg.points = [pt]
         self.trajectory_pub.publish(stop_msg)        
             
@@ -1510,6 +1648,47 @@ class UR10eCuroboMoveIt(Node):
                 qz = 0.25 * s
 
         return [qw, qx, qy, qz]
+    
+
+    def _mk_world_with_goal_obstacles(self, others_xyz, sphere_r=0.06):
+        """
+        Update poses of preallocated spheres gobs_0..N with other-goal positions.
+        Never add/remove objects; only move them. Return the SAME world dict.
+        """
+        world = self.world_config                          # <-- use our own dict
+        spheres = world.setdefault("sphere", {})
+
+        # ensure all preallocated names exist
+        for name in self.goal_obs_names:
+            if name not in spheres:
+                spheres[name] = {
+                    "radius": float(self.goal_obs_radius),
+                    "pose": [999.0, 999.0, 999.0, 1.0, 0.0, 0.0, 0.0],
+                }
+
+        # activate first K as obstacles
+        for i, (x, y, z) in enumerate(others_xyz[:len(self.goal_obs_names)]):
+            name = self.goal_obs_names[i]
+            spheres[name]["radius"] = float(self.goal_obs_radius)  # or sphere_r
+            spheres[name]["pose"]   = [float(x), float(y), float(z), 1.0, 0.0, 0.0, 0.0]
+
+        # park the rest
+        for i in range(len(others_xyz), len(self.goal_obs_names)):
+            name = self.goal_obs_names[i]
+            spheres[name]["pose"] = [999.0, 999.0, 999.0, 1.0, 0.0, 0.0, 0.0]
+
+        return world
+
+    def _set_world_for_planning(self, world_cfg):
+        try:
+            self.motion_gen.update_world(world_cfg)  # fast path (poses changed only)
+        except Exception:
+            print("REBUILDING MotionGen with new world...")
+            self.motion_gen_config = MotionGenConfig.load_from_robot_config(
+                "ur10e.yml", world_cfg, interpolation_dt=0.004
+            )
+            self.motion_gen = MotionGen(self.motion_gen_config)
+            self.motion_gen.warmup()
 
 
 

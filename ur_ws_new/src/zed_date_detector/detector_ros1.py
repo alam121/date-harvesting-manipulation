@@ -6,6 +6,10 @@ import cv2
 import pyzed.sl as sl
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
+from rclpy.executors import MultiThreadedExecutor
+
+
+
 
 from threading import Lock, Thread
 from time import sleep, time
@@ -133,9 +137,14 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2, iou_thre
                 for i in range(len(det.boxes)):
                     m = det.masks.data[i].cpu().numpy()
                     m_bin = (m > 0.5).astype(np.uint8)
+
+                    if m.sum() > 5000:
+                        continue
+
                     M = cv2.moments(m_bin)
                     if M["m00"] == 0:
                         continue
+
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     cls_i = int(det.boxes.cls[i].item())
@@ -261,10 +270,18 @@ def main_(args: argparse.Namespace):
     rclpy.init()
     node = rclpy.create_node('zed_date_detector_ros')
 
+    # Run ROS callbacks in a background thread (no spin_once needed)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    spin_thread = Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+
+
     fast_qos = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=1,
+    depth=5,
     durability=DurabilityPolicy.VOLATILE,
     )
     point_pub = node.create_publisher(PointStamped, '/datefruit_3d_point', 10)
@@ -394,11 +411,13 @@ def main_(args: argparse.Namespace):
             for (cx, cy, cls_i, conf_i) in centroid_list:
                 if 0 <= cx < Wxyz and 0 <= cy < Hxyz:
                     Xp, Yp, Zp, _ = xyz_np[cy, cx]  # meters, CAMERA frame
+                    if np.isnan(Xp) or np.linalg.norm([Xp, Yp, Zp]) > 1.5:
+                        continue
                     if np.isfinite(Xp) and np.isfinite(Yp) and np.isfinite(Zp):
                        # print(f"     mask-centroid[ DESIRED(mm)=[{Xp:.3f}, {Yp:.3f}, {Zp:.3f}]") 
                         
-                        
-                        rclpy.spin_once(node, timeout_sec=0.0)
+                        Z_MAX = 1.34
+                        #rclpy.spin_once(node, timeout_sec=0.0)
                         # Publish to ROS2 topic
                         point_msg = PointStamped()
                         point_msg.header.frame_id = 'zed2_left_camera_frame'
@@ -407,7 +426,11 @@ def main_(args: argparse.Namespace):
                         point_msg.point.y = float(Yp)
                         point_msg.point.z = float(Zp)
                         try:
-                            pt_base = tf_buffer.transform(point_msg, 'base_link', timeout=rclpyDuration(seconds=0.5))
+                            pt_base = tf_buffer.transform(point_msg, 'base_link', timeout=rclpyDuration(seconds=0.0))
+
+                            if pt_base.point.z > Z_MAX:
+                                continue
+                            print(f"✅ 3D POINT (base_link) PUBLISHED: [{pt_base.point.x:.3f}, {pt_base.point.y:.3f}, {pt_base.point.z:.3f}] m")
                             point_pub.publish(pt_base)
                             goal = PoseStamped()
                             goal.pose.position = pt_base.point
@@ -415,12 +438,8 @@ def main_(args: argparse.Namespace):
                             goal.pose.orientation.y = 0.0
                             goal.pose.orientation.z = 0.0
                             goal.pose.orientation.w = 1.0
-                            if not goal_sent:
-                                goal_pub.publish(goal)
-                                goal_sent = False
-                                #print(f"✅ Published FIRST fruit pose:\n    position = ({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f}, {goal.pose.position.z:.3f})\n    orientation = ({goal.pose.orientation.x:.3f}, {goal.pose.orientation.y:.3f}, {goal.pose.orientation.z:.3f}, {goal.pose.orientation.w:.3f})")
-                            else:
-                                print("Skipping further goal publications.")
+                            goal_pub.publish(goal)
+                            #print(f"✅ Published FIRST fruit pose:\n    position = ({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f}, {goal.pose.position.z:.3f})\n    orientation = ({goal.pose.orientation.x:.3f}, {goal.pose.orientation.y:.3f}, {goal.pose.orientation.z:.3f}, {goal.pose.orientation.w:.3f})")
                         except Exception as e:
                             print(f"TF or publish failed: [{type(e).__name__}] {e}\n  looking for transform '{point_msg.header.frame_id}' → 'base_link'")                       # overlay on display (scaled coords)
     
@@ -446,8 +465,8 @@ def main_(args: argparse.Namespace):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255, 255), 2, cv2.LINE_AA)
 
             # 3D rendering viewer (point cloud + tracks)
-            point_cloud.copy_to(point_cloud_render)
-            viewer.updateData(point_cloud_render, objects)
+            #point_cloud.copy_to(point_cloud_render)
+            #viewer.updateData(point_cloud_render, objects)
 
             # Side-by-side display
             global_image = cv2.hconcat([image_left_ocv, image_track_ocv])
@@ -465,6 +484,8 @@ def main_(args: argparse.Namespace):
     viewer.exit()
     exit_signal = True
     zed.close()
+    executor.shutdown()
+    spin_thread.join(timeout=1.0)
     rclpy.shutdown()
 
 
