@@ -19,7 +19,9 @@ import numpy as np
 from geometry_msgs.msg import Quaternion
 from scipy.spatial.transform import Rotation as R
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-
+import json
+from std_msgs.msg import String
+from grasp_outcome_classifier import GraspOutcomeClassifier
 
 import torch
 import time
@@ -67,7 +69,7 @@ class UR10eCuroboMoveIt(Node):
 
 
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
-
+        self.weak_grab = False
         # Store the path points
         self.path_points = []
         self.last_force = None
@@ -77,6 +79,10 @@ class UR10eCuroboMoveIt(Node):
         self.stop_requested = False  # Flag to request stopping the current motion
         self.slip_detection = False   # Flag to see slip
         self.abort_flag = False
+
+        self.grap_miss = False
+        self.last_grasp_end_template = None   # e.g., "OPEN" | "CLOSED_NOTHING" | "WEAK" | "PROPER"
+
 
         # ROS2 subscriber for MoveIt interactive marker feedback
         self.marker_sub = self.create_subscription(
@@ -141,7 +147,7 @@ class UR10eCuroboMoveIt(Node):
 
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
-        self. qos = QoSProfile(
+        self.qos = QoSProfile(
                     reliability=ReliabilityPolicy.BEST_EFFORT,
                     history=HistoryPolicy.KEEP_LAST,
                     depth=1,
@@ -152,15 +158,25 @@ class UR10eCuroboMoveIt(Node):
         self.timer = self.create_timer(0.5, self.check_joint_states)
         #self.home_joints =  [-1.7429350058185022, -2.118960682545797, 2.262824058532715, -4.16720420518984, 4.74897575378418, 0.008626394905149937]
 
-        #self.home_joints = [-1.730377499257223, -2.06564170518984, 2.350080728530884, -4.355106298123495, 4.711179733276367, 0.027907514944672585]
-        #self.home_joints = [-1.7171486059771937, -2.121176067982809, 2.4437646865844727, -4.073089901600973, 4.712892055511475, 0.006838873028755188]
-        self.home_joints =  [-1.5914891401873987, -1.7436569372760218, 2.196291923522949, -4.470575277005331, 4.604394912719727, -0.05696469942201787]
+      
+        #self.home_joints =  [-1.5916569868670862, -1.649402920399801, 2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334]
+
+
+        self.home_joints = [-1.584970776234762, -1.942885700856344, 2.652297019958496, -4.72780412832369, 4.599160671234131, -0.059208218251363576]
+
         self.dropoff_joints = [-2.16858417192568, -1.3347657362567347, 2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704]
         self.predropoff_joints = [-1.6832264105426233, -2.020153347645895, 2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341]
 
         self.gripper_controller = DeltoGripperController(self)
-
         self.robot_running = False
+
+        self.classifier = GraspOutcomeClassifier(
+        on_outcome=self._on_grasp_outcome,    # callback below
+        dead_time_thresh_s=1.40,
+        hold_time_s=0.5
+    )
+    # call tick from a fast timer (20–50 Hz)
+        self.create_timer(0.02, self.classifier.tick)  # 50 Hz
         self.create_subscription(
             Bool,
             "/io_and_status_controller/robot_program_running",
@@ -318,12 +334,16 @@ class UR10eCuroboMoveIt(Node):
                 print("Exiting...")
                 self.running = False
                 break
+
               
     def get_end_effector_pose(self):
         """Compute current end-effector pose using CuRobo forward kinematics."""
         if self.current_joint_positions is None:
             self.get_logger().warn("Joint states not yet received.")
             return None
+        
+        #if self.gripper_closed:
+            #self.control_gripper("OPEN")
 
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -351,7 +371,7 @@ class UR10eCuroboMoveIt(Node):
         """
         if not self.robot_running:
             self.get_logger().error("❌ Cannot execute goals: robot program is OFF. Please turn it ON first.")
-            return
+            #return
 
         if self.current_joint_positions is None:
             self.get_logger().warn("Current joint state not received yet!")
@@ -375,9 +395,10 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().info(f"Processing goal: {goal}")
             x, y, z = goal[:3]
             # orientation depends on whether date is high or low
-            if z > 1.15:
+            if z > 1.23:
                 # high → approach from SIDE, gripper faces inward
-                orientation = goal[3:]#self.quaternion_from_approach(pitch_deg=-20.0)
+                #orientation = goal[3:]
+                orientation = self.quaternion_from_approach(pitch_deg=-35.0)
                 self.get_logger().info("Using SIDE orientation (high date).")
             else:
                 # low → approach from ABOVE, gripper faces downward
@@ -389,120 +410,153 @@ class UR10eCuroboMoveIt(Node):
             # Decide approach offset based on height:
             # - If the point is high (z > 1.18), approach from the side (x - 0.10)
             # - Otherwise, approach from above (z - 0.10)
-            if z > 1.15:
-                approach = [x, y+0.10, z] + list(orientation)
+            if z > 1.23:
+                approach = [x, y+0.12, z] + list(orientation)
                 y = y-0.004
-                z= z +0.02
+                z= z-0.4
                 self.get_logger().info(f"High goal (z={z:.3f}) → side approach (x-0.10)")
             else:
-                approach = [x, y +0.1, z - 0.10] + list(orientation)
+                approach = [x, y +0.1, z - 0.12] + list(orientation)
                 self.get_logger().info(f"Normal goal (z={z:.3f}) → top approach (z-0.10)")
-                z= z + 0.02
+                z= z + 0.055
                 #y = y+0.8
                 y = y-0.003
 
-            sub_goals = [
-                approach,                # approach first
-                [x, y, z] + list(orientation)  # then the actual target
-]
+            # ---------- 1) PLAN & EXECUTE APPROACH (pre-grasp) ----------
+            goal_pose = Pose.from_list(approach)
+            result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
+            )
 
+            if not result.success:
+                self.get_logger().warn("Failed to generate a motion plan for APPROACH. Skipping this goal.")
+                continue
 
-            for sub_goal in sub_goals:
-                goal_pose = Pose.from_list(sub_goal)
-                result = self.motion_gen.plan_single(
-                    start_state,
-                    goal_pose,
-                    MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
-                )
+            traj_msg = JointTrajectory()
+            traj_msg.joint_names = self.joint_order
+            interpolated = result.get_interpolated_plan()
+            if isinstance(interpolated, JointState):
+                interpolated = interpolated.position
+            if not isinstance(interpolated, torch.Tensor):
+                interpolated = torch.tensor(interpolated, dtype=torch.float32)
+            interpolated = interpolated.to("cpu")
 
-                if not result.success:
-                    self.get_logger().warn("Failed to generate a motion plan for sub-goal! Skipping this goal.")
-                    # break out of sub-goals; continue with next saved goal
-                    break
+            tfs = 0.0
+            for point in interpolated:
+                if self.stop_requested:
+                    self.get_logger().warn("🛑 Stop requested during approach. Aborting.")
+                    self.stop_requested = False
+                    return
+                pt = JointTrajectoryPoint()
+                pt.positions = point.numpy().tolist()
+                pt.velocities = [0.1] * len(self.joint_order)
+                pt.time_from_start.sec = int(tfs)
+                pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                tfs += 0.01
+                traj_msg.points.append(pt)
 
-                # build & publish trajectory
-                traj_msg = JointTrajectory()
-                traj_msg.joint_names = self.joint_order
+            self.trajectory_pub.publish(traj_msg)
+            self.wait_for_execution_completion(approach[:3])
 
-                interpolated = result.get_interpolated_plan()
-                if isinstance(interpolated, JointState):
-                    interpolated = interpolated.position
-                if not isinstance(interpolated, torch.Tensor):
-                    interpolated = torch.tensor(interpolated, dtype=torch.float32)
-                interpolated = interpolated.to("cpu")
+            # Update start_state after approach
+            start_state = JointState.from_position(
+                torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order,
+            )
 
-                tfs = 0.0
-                for point in interpolated:
-                    if self.stop_requested:
-                        self.get_logger().warn("🛑 Stop requested! Aborting current goal execution.")
-                        self.stop_requested = False
-                        return  # hard exit from execution immediately
+            # ---------- 2) RE-DETECT / REACQUIRE AT PRE-GRASP ----------
+            seed = [x, y, z]  # original target before refinement
+            reacq = self.reacquire_goal_pose(seed_xyz=seed, timeout=3.5,
+                                            stable_eps=0.004, stable_need=3)
+            if reacq:
+                x, y, z = reacq  # refine using the fresh detection
+                self.publish_goal_marker([x, y, z])
+            else:
+                self.get_logger().warn("❌ No reacquire — skipping this goal, returning HOME, continuing to next.")
+                continue
+                
+            # ---------- 3) PLAN & EXECUTE FINAL INSERT / GRASP ----------
+            final_target = [x, y+0.008, z +0.018 ] + list(orientation)
+            goal_pose = Pose.from_list(final_target)
+            result = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
+            )
 
-                    pt = JointTrajectoryPoint()
-                    pt.positions = point.numpy().tolist()
-                    pt.velocities = [0.1] * len(self.joint_order)
-                    pt.time_from_start.sec = int(tfs)
-                    pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
-                    tfs += 0.03
-                    traj_msg.points.append(pt)
+            if not result.success:
+                self.get_logger().warn("Failed to generate a motion plan for FINAL target. Skipping this goal.")
+                continue
 
-                    # live FK trail (optional)
-                    cp = self.forward_kinematics(pt.positions)
-                    if cp:
-                        self.path_points.append(cp)
-                        self.publish_path_marker()
+            traj_msg = JointTrajectory()
+            traj_msg.joint_names = self.joint_order
+            interpolated = result.get_interpolated_plan()
+            if isinstance(interpolated, JointState):
+                interpolated = interpolated.position
+            if not isinstance(interpolated, torch.Tensor):
+                interpolated = torch.tensor(interpolated, dtype=torch.float32)
+            interpolated = interpolated.to("cpu")
 
-                self.trajectory_pub.publish(traj_msg)
-                self.wait_for_execution_completion(sub_goal[:3])
+            tfs = 0.0
+            for point in interpolated:
+                if self.stop_requested:
+                    self.get_logger().warn("🛑 Stop requested during final move. Aborting.")
+                    self.stop_requested = False
+                    return
+                pt = JointTrajectoryPoint()
+                pt.positions = point.numpy().tolist()
+                pt.velocities = [0.1] * len(self.joint_order)
+                pt.time_from_start.sec = int(tfs)
+                pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                tfs += 0.03
+                traj_msg.points.append(pt)
+
+            self.trajectory_pub.publish(traj_msg)
+            self.wait_for_execution_completion(final_target[:3])
 
                 # update start_state for next leg
-                start_state = JointState.from_position(
+            start_state = JointState.from_position(
                     torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
                     joint_names=self.joint_order,
                 )
 
-            else:
-                # Only runs if we didn't break: we reached the target successfully
-                # 2) Grip or checks around the goal
-                self.control_gripper("CLOSE")
-                time.sleep(1)
+            # Only runs if we didn't break: we reached the target successfully
+            # 2) Grip or checks around the goal
+            self.control_gripper("CLOSE")
+            time.sleep(0.7)
+            print(self.slip_detection ,self.grap_miss,self.weak_grab)
 
-                if self.abort_flag:
-                    #self.get_logger().info("🚨 Abort triggered → opening gripper and returning home.")
-                    self.control_gripper("OPEN")
-                    self.move_to_home_position()
-                    self.abort_flag = False
-                    continue  # move on to the next saved goal
-
-                if self.slip_detection or self.grap_miss:
-                    self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
-                    self.control_gripper("OPEN")
-                    cur = self.get_end_effector_pose()
-                    if cur:
-                        up_goal = [cur[0], cur[1], cur[2] + 0.015] + cur[3:]
-                        self.execute_single_pose(up_goal)
-                    self.slip_detection = False
-                    self.grap_miss = False
-                    self.control_gripper("CLOSE")
-
-                # 3) Optional micro-motions
-                self.move_backward(-0.02)
-                self.rotate_wrist(90)
-                time.sleep(0.5)
-                self.rotate_wrist(-90)
-
-
-                #retract
-                self.move_to_predropoff_position()
-
-                # 4) Drop-off and open gripper
-                self.move_to_dropoff_position()
+            if not self.slip_detection or self.grap_miss or self.weak_grab:
+                self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
                 self.control_gripper("OPEN")
+                cur = self.get_end_effector_pose()
+                if cur:
+                    up_goal = [cur[0], cur[1], cur[2] + 0.015] + cur[3:]
+                    self.execute_single_pose(up_goal)
+                self.slip_detection = False
+                self.grap_miss = False
+                self.control_gripper("CLOSE")
 
-                # 5) Return home before next goal
-                self.move_to_home_position()
+            # 3) Optional micro-motions
+            #self.move_backward(-0.02)
+            self.rotate_wrist(90)
+            time.sleep(0.7)
+            #self.rotate_wrist(-90)
 
-        self.get_logger().info("✅ Finished all goals.")
+
+            #retract
+            self.move_to_predropoff_position()
+            #self.move_to_home_position()
+            # 4) Drop-off and open gripper
+            self.move_to_dropoff_position()
+            self.control_gripper("OPEN")
+
+            # 5) Return home before next goal
+            self.move_to_home_position()
+
+            self.get_logger().info("✅ Finished all goals.")
 
 
 
@@ -530,51 +584,6 @@ class UR10eCuroboMoveIt(Node):
         # Publish the marker
         self.path_marker_pub.publish(marker)
         #self.get_logger().info("Published real-time path marker to RViz.")
-
-    def nudge_wrist2(self, delta_rad: float, duration: float = 1.0):
-        """
-        Move only the wrist_2_joint by delta_rad (radians) over `duration` seconds,
-        then return to its original position.
-        """
-        if self.current_joint_positions is None:
-            self.get_logger().error("No joint state – cannot nudge wrist_2.")
-            return
-
-        # 1) Save original full joint state
-        orig = list(self.current_joint_positions)
-
-        # 2) Build target joint state, bump wrist_2 (index 4)
-        target = orig.copy()
-        target[4] += delta_rad  # wrist_2_joint is the 5th in joint_order
-
-        # 3) Publish the 6-joint trajectory to move out
-        traj_out = JointTrajectory()
-        traj_out.joint_names = self.joint_order
-        pt_out = JointTrajectoryPoint()
-        pt_out.positions = target
-        pt_out.time_from_start.sec     = int(duration)
-        pt_out.time_from_start.nanosec = int((duration % 1.0) * 1e9)
-        traj_out.points = [pt_out]
-        self.trajectory_pub.publish(traj_out)
-        self.get_logger().info(f"Nudging wrist_2 by {math.degrees(delta_rad):.1f}°")
-
-        # 4) Wait for motion to complete
-        time.sleep(duration + 0.05)
-
-        # 5) Publish the 6-joint trajectory to return to original
-        traj_back = JointTrajectory()
-        traj_back.joint_names = self.joint_order
-        pt_back = JointTrajectoryPoint()
-        pt_back.positions = orig
-        pt_back.time_from_start.sec     = int(duration)
-        pt_back.time_from_start.nanosec = int((duration % 1.0) * 1e9)
-        traj_back.points = [pt_back]
-        self.trajectory_pub.publish(traj_back)
-        self.get_logger().info("Returning wrist_2 to original orientation")
-
-        traj2.points = [pt2]
-        self.wrist_publisher_.publish(traj2)
-        self.get_logger().info(f"wrist_2_joint → back to original over {duration:.1f}s")
 
         
     def forward_kinematics(self, joint_positions):
@@ -767,7 +776,7 @@ class UR10eCuroboMoveIt(Node):
 
         if self.is_robot_moving():
             self.get_logger().warn("⚠️ Robot is moving. Delaying subscription to external goal pose.")
-            self.create_timer(2.0, self.subscribe_to_goal_pose_topic_once_stationary)
+            self.create_timer(0.5, self.subscribe_to_goal_pose_topic_once_stationary)
             return
 
         if hasattr(self, 'goal_pose_sub'):
@@ -788,9 +797,12 @@ class UR10eCuroboMoveIt(Node):
 
         def goal_callback(msg):
             # Stop idle motion if running
+            self.goal_received = True            # prevents more patrol steps
+
             if hasattr(self, 'idle_timer'):
                 self.idle_timer.cancel()
                 self.get_logger().info("🛑 Idle motion stopped.")
+                self._publish_stop_trajectory()
 
             if self.is_robot_moving():
                 self.get_logger().warn("⚠️ Goal received while robot is moving. Ignoring.")
@@ -820,6 +832,13 @@ class UR10eCuroboMoveIt(Node):
                 
                 self.get_logger().info(f"✅ Goal received and saved: {goal_position}")
                 self.goal_received = True
+                x, y, z = goal_position[:3]
+                if z > 1.23:
+                    self.get_logger().info(f"High goal (z={z:.3f}) → side approach (x-0.10)")
+                else:
+                    self.get_logger().info(f"Normal goal (z={z:.3f}) → top approach (z-0.10)")
+
+
 
             # Unsubscribe
             if hasattr(self, 'goal_pose_sub'):
@@ -833,7 +852,7 @@ class UR10eCuroboMoveIt(Node):
 
         # Motion pattern: Up → Left → Right → Down → Left → Right
         self.idle_motion_sequence = [
-            ('UP',    0.0,  0.0,  0.1),
+            ('UP',    0.0,  0.0,  0.2),
             ('LEFT',  0.0,  0.1, 0.0),
             ('RIGHT', 0.0, -0.1, 0.0),
             ('DOWN',  0.0,  0.0, -0.1),
@@ -866,6 +885,87 @@ class UR10eCuroboMoveIt(Node):
 
         self.idle_timer = self.create_timer(5.0, idle_motion_callback)
 
+
+    def reacquire_goal_pose(self, seed_xyz, timeout=3.5, radius=0.12,
+                            stable_eps=0.004, stable_need=2):
+        """Try to reacquire near seed. On timeout, retreat a bit, then try once more."""
+        import math, time
+        latest = None
+        stable = 0
+        picked = None
+
+        # ensure we're not moving
+        start = time.time()
+        while self.is_robot_moving() and (time.time() - start) < 0.25:
+            time.sleep(0.01)
+
+        def _try_once(seed, timeout_s, rad, need):
+            nonlocal latest, stable, picked
+            latest = None
+            stable = 0
+            picked = None
+            last_inradius_ts = time.time()
+
+            def _cb(msg):
+                nonlocal latest, stable, picked, last_inradius_ts
+                if self.is_robot_moving():
+                    return
+                x = msg.pose.position.x
+                y = msg.pose.position.y
+                z = msg.pose.position.z
+                print(f"Reacquire got detection: {(x,y,z)}")
+                dx, dy, dz = x - seed[0], y - seed[1], z - seed[2]
+                d_xy = math.hypot(dx, dy)
+                print(f"Reacquire checking radius: d_xy={d_xy:.4f} (<= {rad:.3f})")
+                if d_xy > rad:
+                    return
+                last_inradius_ts = time.time()
+                latest = (x, y, z)
+                stable += 1
+                print(f"Reacquire: in-radius hit #{stable} at {latest}")
+                if stable >= max(1, need):
+                    picked = latest
+
+            sub = self.create_subscription(PoseStamped, '/external_goal_pose', _cb, self.qos)
+            try:
+                while picked is None:
+                    if timeout_s is not None and (time.time() - last_inradius_ts) > timeout_s:
+                        break
+                    time.sleep(0.01)
+            finally:
+                self.destroy_subscription(sub)
+
+            return picked
+
+        # -------- first attempt --------
+        first = _try_once(seed_xyz, timeout, radius, stable_need)
+        if first is not None:
+            self.get_logger().info(f"🔎 Reacquired near seed {seed_xyz} → {first}")
+            return list(first)
+
+        # -------- retreat then second attempt --------
+        self.get_logger().warn("⚠️ Reacquire timed out; backing off, then retrying…")
+        cur = self.get_end_effector_pose()
+        if cur:
+            # small lateral back-off; keep orientation
+            retreat = [cur[0], cur[1] + 0.10, cur[2], *cur[3:]]
+            self.execute_single_pose(retreat)
+            # wait until the retreat finishes (prevents filtering while moving)
+            self.wait_until_motion_finishes()
+
+        # optional: expand search a bit & accept 1 stable hit
+        retry_radius = max(radius, 0.15)
+        retry_timeout = 2.0
+        retry_need = max(1, stable_need - 1)
+
+        second = _try_once(seed_xyz, retry_timeout, retry_radius, retry_need)
+
+        if second is not None:
+            self.get_logger().info(f"🔎 Reacquired after retreat → {second}")
+            return list(second)
+
+        self.get_logger().warn("❌ Reacquire failed after retreat.")
+        return None
 
 
 
@@ -923,7 +1023,10 @@ class UR10eCuroboMoveIt(Node):
         if self.current_joint_positions is None:
             self.get_logger().warn("No joint state; skipping home move.")
             return
-
+        
+        if not self.robot_running:
+            self.get_logger().error("❌ Cannot execute goals: robot program is OFF. Please turn it ON first.")
+            #return
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         start_state = JointState.from_position(
             torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
@@ -970,7 +1073,7 @@ class UR10eCuroboMoveIt(Node):
             trajectory_msg.points.append(traj_pt)
 
             # apply global speed scaling if you have one
-            time_from_start += 0.03 / getattr(self, "speed_scale", 1.0)
+            time_from_start += 0.008 / getattr(self, "speed_scale", 1.0)
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("🏠 Moving to HOME joints…")
@@ -1115,7 +1218,7 @@ class UR10eCuroboMoveIt(Node):
             pt.time_from_start.nanosec = int((time_from_start % 1.0) * 1e9)
 
             trajectory_msg.points.append(pt)
-            time_from_start += 0.03/self.speed_scale                                    # same 30 ms increment
+            time_from_start += 0.008/self.speed_scale                                    # same 30 ms increment
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("📦 Moving to DROP-OFF joints…")
@@ -1165,7 +1268,7 @@ class UR10eCuroboMoveIt(Node):
             traj_tensor = interpolated_plan
 
         traj_tensor = traj_tensor.to("cpu")
-        time_from_start = 0.0
+        time_from_start = 0.08
 
         for point in traj_tensor:
             if self.stop_requested:
@@ -1175,12 +1278,12 @@ class UR10eCuroboMoveIt(Node):
 
             pt = JointTrajectoryPoint()
             pt.positions = point.tolist()
-            pt.velocities = [0.1] * len(self.joint_order)        # same 0.1 rad/s feed-forward
+            #pt.velocities = [0.1] * len(self.joint_order)        # same 0.1 rad/s feed-forward
             pt.time_from_start.sec     = int(time_from_start)
             pt.time_from_start.nanosec = int((time_from_start % 1.0) * 1e9)
 
             trajectory_msg.points.append(pt)
-            time_from_start += 0.03/self.speed_scale                                    # same 30 ms increment
+            time_from_start += 0.04/ getattr(self, "speed_scale", 1.0)                                 # same 30 ms increment
 
         self.trajectory_pub.publish(trajectory_msg)
         self.get_logger().info("📦 Moving to preDROP-OFF joints…")
@@ -1197,12 +1300,17 @@ class UR10eCuroboMoveIt(Node):
         """Publish a zero-time trajectory at the current joint positions to halt immediately."""
         if self.current_joint_positions is None:
             return
+        
         stop_msg = JointTrajectory()
         stop_msg.joint_names = self.joint_order
         pt = JointTrajectoryPoint()
         pt.positions = list(self.current_joint_positions)
+        pt.velocities = [0.0] * len(self.joint_order)     # <-- add
+        pt.accelerations = [0.0] * len(self.joint_order)  # <-- add
         pt.time_from_start.sec = 0
-        pt.time_from_start.nanosec = 0
+        pt.time_from_start.nanosec = 1_000_000            # <-- tiny >0 duration helps preemption
+
+
         stop_msg.points = [pt]
         self.trajectory_pub.publish(stop_msg)        
             
@@ -1212,80 +1320,19 @@ class UR10eCuroboMoveIt(Node):
             self.gripper_closed = False
             self.slip_detection = False
             self.grap_miss = False
-            self.open_baseline = self.filtered_forces.copy()
+            self.classifier.start_opening()
             self.get_logger().info("Gripper opened → slip detection paused")
+
         elif action.upper() == "CLOSE":
-            self.gripper_controller.run_closure_loop()           
+            self.classifier.start_closing()
+            self.gripper_controller.run_closure_loop()
+            self.classifier.mark_close_done()            
             self.gripper_closed = True
             self.get_logger().info("Gripper closed → slip detection active")
 
     def force_callback(self, msg):
         raw = list(msg.data)
-
-        # initialize filtered_forces on first pass
-        if self.filtered_forces is None:
-            self.filtered_forces = raw.copy()
-        else:
-            # EWMA: filtered = α·raw + (1–α)·prev_filtered
-            self.filtered_forces = [
-                self.alpha * r + (1 - self.alpha) * f
-                for r, f in zip(raw, self.filtered_forces)
-            ]
-
-        # only check when gripper truly closed
-        if not self.gripper_closed:
-            return
-
-        f = self.filtered_forces  # short name
-        self.get_logger().info(f"Updated open Filtetrerd force: {self.filtered_forces}")
-        self.get_logger().info(f"Updated open baseline: {self.open_baseline}")
-        d = [fi - bi for fi, bi in zip(self.open_baseline, self.filtered_forces)]
-        print("delta", d)
-
-        # --- thresholds ---
-        POS_TH = 0.02     # "pushing out" vs baseline
-        NEG_TH = -0.08    # "squeezing in" vs baseline
-        HARD_ABORT = -0.35
-
-        # 1) Safety abort: very strong squeeze on any channel
-        if any(di <= HARD_ABORT for di in d):
-            if not self.abort_flag:
-                self.get_logger().error(f"🛑 ABORT (hard): Δ={d}")
-            self.abort_flag = False
-            self.slip_detection = False
-            self.grap_miss = False
-            return
-
-        # 2) Classify grip using deltas
-        positives = sum(di > POS_TH for di in d)
-        negatives = sum(di < NEG_TH for di in d)
-
-        if negatives == len(d):
-            # All channels squeezed inward: likely closed on air → MISS
-            if not self.grap_miss:
-                self.get_logger().warn(f"❗ Likely miss: Δ={d}")
-            self.grap_miss = False
-            self.slip_detection = False
-
-        elif positives >= 1 and negatives >= 1:
-            # Opposing forces: object pinched between fingers → GOOD
-            if self.grap_miss:
-                self.get_logger().info(f"✅ Good grip: Δ={d}")
-            self.grap_miss = False
-
-        else:
-            # Not clearly miss nor strong opposing contact → BAD/weak
-            if not self.grap_miss:
-                self.get_logger().warn(f"⚠️ Weak/unstable grip: Δ={d}")
-            self.grap_miss = False
-            self.slip_detection = False
-
-        # Optional: a friendly status when everything is calm & good
-        if not self.grap_miss and not self.slip_detection and self.abort_flag is not False:
-            self.get_logger().info("👍 Gripper stable.")
-
-        # finally, stash raw if you want
-        self.last_force = raw
+        self.classifier.on_force(raw[:3])
 
     def start_goal_capture(self, duration: float = 30.0):
         """Subscribe to /external_goal_pose and collect unique goals for `duration` seconds, sorted by distance."""
@@ -1511,6 +1558,16 @@ class UR10eCuroboMoveIt(Node):
 
         return [qw, qx, qy, qz]
 
+
+    def _on_grasp_outcome(self, outcome: str, end: str):
+        # flags
+        self.slip_detection = (outcome == "SLIPPED")
+        self.grap_miss      = (outcome == "NO_GRAB")
+        self.weak_grab      = (outcome == "GRABBED" and end == "WEAK")
+        self.last_grasp_end_template = end
+
+        self.get_logger().info(f"[grasp] outcome={outcome} end={end} "
+                            f"-> slip={self.slip_detection} miss={self.grap_miss} weak={self.weak_grab}")
 
 
 
