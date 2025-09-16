@@ -1,0 +1,50 @@
+{
+  "attempt_id": 7,
+  "label": "Failure",
+  "params": {
+    "contact_sigma": 5.0,
+    "detach_sigma": 1.0,
+    "pre_buffer_s": 2.0,
+    "post_buffer_s": 2.0,
+    "min_baseline_s": 1.0,
+    "min_baseline_samples": 50,
+    "use_abs_for_thresholds": true,
+    "rearm_hold_s": 1.0,
+    "contact_floor": 0.0,
+    "contact_hold_s": 0.0,
+    "detach_hold_s": 0.0,
+    "min_slope_contact": 0.0,
+    "min_slope_detach": 0.0,
+    "end_only_on_detach": true,
+    "enable_timeout": false,
+    "enable_damage_abort": false
+  },
+  "finger_names": [
+    "left",
+    "center",
+    "right"
+  ],
+  "baseline_mean_per_finger": [
+    0.0935433088726024,
+    0.08682415026222934,
+    0.08401575050954747
+  ],
+  "baseline_std_per_finger": [
+    0.02108357676312818,
+    0.015782837635240878,
+    0.019108824027552724
+  ],
+  "features": {
+    "duration_s": 7.501579761505127,
+    "peak_force": 0.23999999463558197,
+    "peak_per_finger": [
+      0.17000000178813934,
+      0.23999999463558197,
+      0.18000000715255737
+    ],
+    "imbalance_ratio": 0.29166664338360176,
+    "contact_time_s": 240.14936542510986,
+    "detach_time_s": 244.14711713790894,
+    "time_to_detach_s": 3.9977517127990723
+  }
+}
