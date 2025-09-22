@@ -82,4 +82,25 @@ Train the nextwork
 4. ```sudo systemctl restart ssh```
 5. ```sudo apt install xauth```
 
+## RUNNING COLMAP on the NVIDIA Jetson AGX ORIN
 
+1. Install dependencies:
+sudo apt update
+sudo apt install git cmake build-essential ninja-build libboost-all-dev libeigen3-dev /
+libsuitesparse-dev qtbase5-dev libglew-dev libfreeimage-dev 
+libgoogle-glog-dev libflags-dev libopencv-dev libatlas-base-dev 
+libceres-dev libsqlite3-dev libcgal-dev libqt5opengl5-dev libmetis-dev
+
+
+2. Download Colmap package from github and install: git clone https://github.com/colmap/colmap.git
+cd colmap
+mkdir build
+cd build
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=native
+ninja
+sudo ninja
+
+
+3. Check colmap
+colmap -h
+colmap gui
