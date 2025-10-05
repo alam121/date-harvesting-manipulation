@@ -141,7 +141,7 @@ class UR10eCuroboMoveIt(Node):
         }
 
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            "ur10e.yml", world_config, interpolation_dt=0.004) #,trajopt_dt=0.05, num_trajopt_seeds=5)
+            "ur10e.yml", world_config, interpolation_dt=0.004,trajopt_dt=0.05, num_trajopt_seeds=5)
         
         
 
@@ -162,7 +162,8 @@ class UR10eCuroboMoveIt(Node):
         #self.home_joints =  [-1.5916569868670862, -1.649402920399801, 2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334]
 
 
-        self.home_joints = [-1.584970776234762, -1.942885700856344, 2.652297019958496, -4.72780412832369, 4.599160671234131, -0.059208218251363576]
+        self.home_joints = [-1.5892723242389124, -1.696021858845846, 2.4897632598876953, -4.738286916409628, 4.602346420288086, -0.05749255815614873]
+
 
         self.dropoff_joints = [-2.16858417192568, -1.3347657362567347, 2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704]
         self.predropoff_joints = [-1.6832264105426233, -2.020153347645895, 2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341]
@@ -286,6 +287,15 @@ class UR10eCuroboMoveIt(Node):
                     print("Subscribing to external goal pose topic...")
                     self.subscribe_to_goal_pose_topic()
 
+            elif key == "b":
+                    print("going creazy")
+                    self.descend_z_wrist_osc_simple(
+                        dz=-0.06,       # go down 6 cm
+                        duration=1.0,   # total time
+                        yaw_amp_deg=40.0,
+                        osc_hz=4.0,
+                        max_points=180  # ~6 ms spacing over 1s
+                    )
 
             elif key == "p":
                 print("Capturing external goals for 30 seconds…")
@@ -312,7 +322,13 @@ class UR10eCuroboMoveIt(Node):
                 self.control_gripper("CLOSE")
                 self.rotate_wrist(90)
                 time.sleep(0.7)
-                self.nudge_wrist1(100.0)      # move wrist_1 “down” ~1°
+                self.descend_z_wrist_osc_simple(
+                        dz=-0.13,       # go down 6 cm
+                        duration=5.0,   # total time
+                        yaw_amp_deg=90.0,
+                        osc_hz=3.0,
+                        max_points=180  # ~6 ms spacing over 1s
+                    )
                 
             elif key == "h":
                 self.move_to_home_position()
@@ -475,10 +491,10 @@ class UR10eCuroboMoveIt(Node):
                 self.publish_goal_marker([x, y, z])
             else:
                 self.get_logger().warn("❌ No reacquire — skipping this goal, returning HOME, continuing to next.")
-                #continue
+                continue
                 
             # ---------- 3) PLAN & EXECUTE FINAL INSERT / GRASP ----------
-            final_target = [x, y+0.008, z +0.040 ] + list(orientation)
+            final_target = [x, y+0.01, z +0.040 ] + list(orientation)
             goal_pose = Pose.from_list(final_target)
             result = self.motion_gen.plan_single(
                 start_state,
@@ -521,12 +537,31 @@ class UR10eCuroboMoveIt(Node):
                     torch.tensor([traj_msg.points[-1].positions], dtype=torch.float32, device=device),
                     joint_names=self.joint_order,
                 )
+            
+            goal_quat = list(orientation)  # [qw, qx, qy, qz]
+            self.converge_to_goal(
+                goal_xyz=[x, y+0.01, z + 0.040],
+                goal_quat=goal_quat,
+                pos_tol=0.0015,         # ~1.5 mm
+                step=0.003,             # 3 mm hops
+                max_iters=25,
+                max_secs=1.25,
+                orient_quat=goal_quat,  # also converge orientation
+                orient_tol_deg=2.0
+            )
+
 
             # Only runs if we didn't break: we reached the target successfully
             # 2) Grip or checks around the goal
             self.control_gripper("CLOSE")
             time.sleep(0.7)
-
+            self.descend_z_wrist_osc_simple(
+                        dz=-0.13,       # go down 6 cm
+                        duration=5.0,   # total time
+                        yaw_amp_deg=90.0,
+                        osc_hz=3.0,
+                        max_points=180  # ~6 ms spacing over 1s
+                    )
             # print(self.slip_detection ,self.grap_miss,self.weak_grab)
 
             # if self.slip_detection or self.grap_miss or self.weak_grab:
@@ -1694,6 +1729,190 @@ class UR10eCuroboMoveIt(Node):
         traj.points = [p0, p1, p2]
         self.trajectory_pub.publish(traj)
         self.get_logger().info(f"Wrist_1 nudged {delta_deg:+.2f}° in {duration:.2f}s")
+
+
+
+    def converge_to_goal(self, goal_xyz, goal_quat, pos_tol=0.0015, step=0.003, max_iters=25,
+                        max_secs=1.25, orient_quat=None, orient_tol_deg=2.0):
+        """
+        Micro-servo: iteratively 'nudge' toward goal using tiny plans.
+        - pos_tol: meters (1.5 mm default)
+        - step:    meters per hop (3 mm default)
+        - orient_quat: optional [w,x,y,z] to enforce orientation simultaneously
+        """
+        if self.current_joint_positions is None:
+            self.get_logger().warn("No joint state; skipping convergence.")
+            return
+
+        t0 = time.time()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        prev_dist = None
+        stagnation = 0
+        orient_tol = math.radians(orient_tol_deg)
+
+        for it in range(max_iters):
+            if self.stop_requested or not self.running:
+                break
+            if (time.time() - t0) > max_secs:
+                self.get_logger().info("Convergence time cap reached.")
+                break
+
+            cur = self.get_end_effector_pose()
+            if not cur:
+                break
+            cx, cy, cz, cqw, cqx, cqy, cqz = cur
+            ex, ey, ez = goal_xyz[0]-cx, goal_xyz[1]-cy, goal_xyz[2]-cz
+            dist = math.sqrt(ex*ex + ey*ey + ez*ez)
+
+
+            if dist <= pos_tol:
+                self.get_logger().info(f"Converged: {dist*1000:.1f} mm")
+                return
+
+            # stagnation guard (<0.05 mm improvement over 3 iters)
+            if prev_dist is not None and abs(prev_dist - dist) < 0.00005:
+                stagnation += 1
+            else:
+                stagnation = 0
+            prev_dist = dist
+            if stagnation >= 3:
+                self.get_logger().info("Convergence stagnating; stopping.")
+                return
+
+            # clamp step and build micro-target
+            s = min(step, dist)
+            nx, ny, nz = cx + (ex/dist)*s, cy + (ey/dist)*s, cz + (ez/dist)*s
+            tiny_target = [nx, ny, nz, *goal_quat]
+
+            # plan a tiny hop
+            start_state = JointState.from_position(
+                torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=self.joint_order,
+            )
+            goal_pose = Pose.from_list(tiny_target)
+            res = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                MotionGenPlanConfig(max_attempts=6, enable_finetune_trajopt=True)
+            )
+            if not res.success:
+                # reduce step and try next iteration
+                step = max(0.0008, step * 0.6)
+                continue
+
+            # execute tiny hop with slow velocities
+            traj_msg = JointTrajectory()
+            traj_msg.joint_names = self.joint_order
+            interp = res.get_interpolated_plan()
+            if isinstance(interp, JointState): interp = interp.position
+            if not isinstance(interp, torch.Tensor):
+                interp = torch.tensor(interp, dtype=torch.float32)
+            interp = interp.to("cpu")
+
+            tfs = 0.0
+            for point in interp:
+                if self.stop_requested:
+                    break
+                pt = JointTrajectoryPoint()
+                pt.positions = point.numpy().tolist()
+                pt.velocities = [0.03] * len(self.joint_order)  # slow for accuracy
+                pt.time_from_start.sec = int(tfs)
+                pt.time_from_start.nanosec = int((tfs % 1) * 1e9)
+                tfs += 0.02
+                traj_msg.points.append(pt)
+
+            self.trajectory_pub.publish(traj_msg)
+            # wait tightly on each micro-hop
+            self.wait_for_execution_completion([nx, ny, nz])
+
+
+    def descend_z_wrist_osc_simple(self,
+                                dz=-0.06,          # meters (negative = down)
+                                duration=1.0,      # seconds
+                                yaw_amp_deg=40.0,  # ± amplitude around 0°
+                                osc_hz=2.0,        # oscillations per second
+                                max_points=200,    # cap points to keep it light
+                                yaw_joint_index=5  # UR10e wrist_3
+                                ):
+
+
+        if self.current_joint_positions is None:
+            self.get_logger().error("No joint state yet.")
+            return
+
+        # Current pose
+        cur = self.get_end_effector_pose()
+        if not cur:
+            self.get_logger().warn("EE pose unavailable; aborting.")
+            return
+        x0, y0, z0 = cur[0], cur[1], cur[2]
+        qw, qx, qy, qz = cur[3], cur[4], cur[5], cur[6]   # keep base orientation
+
+        # Plan ONCE: start joints -> same (x,y) but z+dz, same orientation
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        start_state = JointState.from_position(
+            torch.tensor([self.current_joint_positions], dtype=torch.float32, device=device),
+            joint_names=self.joint_order,
+        )
+        goal_pose = Pose.from_list([x0, y0, z0 + dz, qw, qx, qy, qz])
+        res = self.motion_gen.plan_single(
+            start_state, goal_pose,
+            MotionGenPlanConfig(max_attempts=12, enable_finetune_trajopt=True)
+        )
+        if not res.success:
+            self.get_logger().warn("Plan to final Z failed.")
+            return
+
+        interp = res.get_interpolated_plan()
+        if isinstance(interp, JointState):
+            interp = interp.position
+        if not isinstance(interp, torch.Tensor):
+            interp = torch.tensor(interp, dtype=torch.float32)
+        pts = interp.to("cpu")
+        N  = pts.shape[0]
+        K  = min(max_points, N) if N > 1 else 1
+        idxs = np.linspace(0, N - 1, num=K, dtype=int)
+
+        # Build one JointTrajectory (seed t=0)
+        traj = JointTrajectory()
+        traj.joint_names = self.joint_order
+        traj.header.stamp = self.get_clock().now().to_msg()
+
+        p0 = JointTrajectoryPoint()
+        p0.positions  = self.current_joint_positions.copy()
+        p0.velocities = [0.0] * len(self.joint_order)
+        p0.time_from_start.sec = 0
+        p0.time_from_start.nanosec = 0
+        traj.points.append(p0)
+
+        amp = math.radians(yaw_amp_deg)
+        for k, idx in enumerate(idxs):
+            t = duration * (k + 1) / K
+            q = pts[idx].numpy().tolist()
+
+            # add sinusoid around 0° to wrist_3 (tool yaw)
+            
+            q[yaw_joint_index] += amp * math.sin(2.0 * math.pi * osc_hz * t)
+
+            pt = JointTrajectoryPoint()
+            pt.positions  = q
+            pt.velocities = [0.0] * len(self.joint_order)  # let controller time-interpolate
+            pt.time_from_start.sec     = int(t)
+            pt.time_from_start.nanosec = int((t - int(t)) * 1e9)
+            traj.points.append(pt)
+
+        # Small preempt to avoid any leftover motion, then publish once
+        self._publish_stop_trajectory()
+        time.sleep(0.02)
+        self.trajectory_pub.publish(traj)
+
+        self.get_logger().info(
+            f"descend_z_wrist_osc_simple: dz={dz:.3f} m in {duration:.2f}s, "
+            f"amp=±{yaw_amp_deg:.1f}°, f={osc_hz:.2f} Hz, points={len(traj.points)}"
+        )
+
+
+
 
 def main():
     print("Starting UR10e MoveIt Node...")

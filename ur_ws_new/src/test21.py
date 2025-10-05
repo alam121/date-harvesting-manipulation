@@ -159,10 +159,10 @@ class UR10eCuroboMoveIt(Node):
         #self.home_joints =  [-1.7429350058185022, -2.118960682545797, 2.262824058532715, -4.16720420518984, 4.74897575378418, 0.008626394905149937]
 
       
-        #self.home_joints =  [-1.5916569868670862, -1.649402920399801, 2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334]
+        self.home_joints =  [-1.5916569868670862, -1.649402920399801, 2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334]
 
 
-        self.home_joints = [-1.584970776234762, -1.942885700856344, 2.652297019958496, -4.72780412832369, 4.599160671234131, -0.059208218251363576]
+        #self.home_joints = [-1.584970776234762, -1.942885700856344, 2.652297019958496, -4.72780412832369, 4.599160671234131, -0.059208218251363576]
 
         self.dropoff_joints = [-2.16858417192568, -1.3347657362567347, 2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704]
         self.predropoff_joints = [-1.6832264105426233, -2.020153347645895, 2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341]
@@ -395,7 +395,7 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().info(f"Processing goal: {goal}")
             x, y, z = goal[:3]
             # orientation depends on whether date is high or low
-            if z > 1.23:
+            if z > 1.30:
                 # high → approach from SIDE, gripper faces inward
                 #orientation = goal[3:]
                 orientation = self.quaternion_from_approach(pitch_deg=-35.0)
@@ -410,7 +410,7 @@ class UR10eCuroboMoveIt(Node):
             # Decide approach offset based on height:
             # - If the point is high (z > 1.18), approach from the side (x - 0.10)
             # - Otherwise, approach from above (z - 0.10)
-            if z > 1.23:
+            if z > 1.30:
                 approach = [x, y+0.12, z] + list(orientation)
                 y = y-0.004
                 z= z-0.4
@@ -478,7 +478,7 @@ class UR10eCuroboMoveIt(Node):
                 continue
                 
             # ---------- 3) PLAN & EXECUTE FINAL INSERT / GRASP ----------
-            final_target = [x, y+0.008, z +0.018 ] + list(orientation)
+            final_target = [x, y-0.001, z+0.001] + list(orientation)
             goal_pose = Pose.from_list(final_target)
             result = self.motion_gen.plan_single(
                 start_state,
@@ -528,7 +528,7 @@ class UR10eCuroboMoveIt(Node):
             time.sleep(0.7)
             print(self.slip_detection ,self.grap_miss,self.weak_grab)
 
-            if not self.slip_detection or self.grap_miss or self.weak_grab:
+            if self.slip_detection or self.grap_miss or self.weak_grab:
                 self.get_logger().info("🛠 Slip/miss → nudge up, reopen/close to retry.")
                 self.control_gripper("OPEN")
                 cur = self.get_end_effector_pose()
@@ -886,7 +886,7 @@ class UR10eCuroboMoveIt(Node):
         self.idle_timer = self.create_timer(5.0, idle_motion_callback)
 
 
-    def reacquire_goal_pose(self, seed_xyz, timeout=3.5, radius=0.12,
+    def reacquire_goal_pose(self, seed_xyz, timeout=3.5, radius=0.08,
                             stable_eps=0.004, stable_need=2):
         """Try to reacquire near seed. On timeout, retreat a bit, then try once more."""
         import math, time
