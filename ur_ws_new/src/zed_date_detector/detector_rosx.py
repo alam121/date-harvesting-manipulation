@@ -125,10 +125,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2, iou_thre
             img = cv2.cvtColor(image_net, cv2.COLOR_RGBA2RGB)
             t0 = time()
             
-            det = next(model.predict(img, save=False,
-                retina_masks=True,imgsz= img_size, device='cuda', conf=conf_thres,
-                iou=iou_thres,
-                verbose=False, stream=True))
+            det = next(model.predict(img, device='cuda', stream=True))
 
                 #save         = False,
                 #retina_masks = True,
@@ -503,8 +500,8 @@ def main_(args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='best_720.engine', help='model.pt path')
-    parser.add_argument('--svo', type=str, default=None, help='optional svo file')
+    parser.add_argument('--weights', type=str, default='exp_aug.engine', help='model.pt path')
+    parser.add_argument('--svo', type=str, default='HD1080_SN31146225_10-51-03.svo2', help='optional svo file')
     parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf_thres', type=float, default=0.4, help='object confidence threshold')
     args = parser.parse_args()
