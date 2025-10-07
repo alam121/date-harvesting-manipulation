@@ -4,16 +4,24 @@ from typing import Iterable, List, Optional, Callable
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
-def read_key(timeout: float = 0.1) -> Optional[str]:
+def read_key(timeout=0.1):
+    """Non-blocking single key read that keeps Ctrl-C working."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
+        # start from raw
         tty.setraw(fd)
+        # re-enable signals so ^C (^Z) still generate SIGINT/SIGTSTP
+        new = termios.tcgetattr(fd)
+        lflag = new[3]  # lflags
+        lflag |= termios.ISIG      # keep signals
+        new[3] = lflag
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+
         r, _, _ = select.select([sys.stdin], [], [], timeout)
         return sys.stdin.read(1) if r else None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
 
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float, dt: float,
                      stop_flag: Optional[Callable[[], bool]] = None) -> JointTrajectory:

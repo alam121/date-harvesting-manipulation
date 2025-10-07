@@ -1,6 +1,7 @@
 # ruff: noqa
 import threading
 import rclpy
+import os
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
@@ -17,7 +18,7 @@ from . import markers as markers_mod
 from . import motions as motions_mod
 from . import goals as goals_mod
 from . import gripper as gripper_mod
-
+from .perception import ZedYoloPerception
 
 class UR10eCuroboMoveIt(Node):
     def __init__(self):
@@ -69,6 +70,17 @@ class UR10eCuroboMoveIt(Node):
         # keyboard thread
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True); self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
+        
+        # # Perception: ZED + YOLO
+        # self.perception = ZedYoloPerception(
+        #     self,
+        #     weights=os.getenv("UR10E_YOLO_WEIGHTS", "exp_aug.pt"),
+        #     img_size=int(os.getenv("UR10E_YOLO_IMGSZ", "640")),
+        #     conf_thres=float(os.getenv("UR10E_YOLO_CONF", "0.4")),
+        #     cam_frame=os.getenv("UR10E_CAM_FRAME", "zed2_left_camera_frame"),
+        #     show_view=bool(int(os.getenv("UR10E_SHOW_VIEW", "0"))),
+        # )
+        # self.perception.start()
 
     # callbacks
     def _check_joint_states(self):
