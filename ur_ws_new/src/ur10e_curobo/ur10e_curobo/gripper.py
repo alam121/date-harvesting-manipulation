@@ -1,6 +1,6 @@
 # ruff: noqa
-from grasp_outcome_classifier import GraspOutcomeClassifier
-from delto_gripper_controller import DeltoGripperController
+from .grasp_outcome_classifier import GraspOutcomeClassifier
+from .delto_gripper_controller import DeltoGripperController
 
 
 def init_gripper(node):
