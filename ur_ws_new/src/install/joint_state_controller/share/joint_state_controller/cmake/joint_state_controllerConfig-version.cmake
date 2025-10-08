@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/joint_state_controller/ament_cmake_core/joint_state_controllerConfig-version.cmake

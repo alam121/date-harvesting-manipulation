@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ros2_robotiqgripper/rosidl_generator_cpp/ros2_robotiqgripper/srv/robotiq_gripper.hpp

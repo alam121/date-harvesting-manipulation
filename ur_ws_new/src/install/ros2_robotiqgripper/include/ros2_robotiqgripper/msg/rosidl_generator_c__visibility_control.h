@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ros2_robotiqgripper/rosidl_generator_c/ros2_robotiqgripper/msg/rosidl_generator_c__visibility_control.h

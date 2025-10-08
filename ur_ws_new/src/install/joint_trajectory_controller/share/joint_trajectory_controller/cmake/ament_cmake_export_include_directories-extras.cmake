@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/joint_trajectory_controller/ament_cmake_export_include_directories/ament_cmake_export_include_directories-extras.cmake

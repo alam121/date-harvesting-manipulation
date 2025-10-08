@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/moveit2_tutorials/doc/motion_planning_api/launch/motion_planning_api_tutorial.launch.py
