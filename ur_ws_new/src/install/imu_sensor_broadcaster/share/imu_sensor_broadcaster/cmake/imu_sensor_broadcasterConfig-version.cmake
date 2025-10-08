@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/imu_sensor_broadcaster/ament_cmake_core/imu_sensor_broadcasterConfig-version.cmake

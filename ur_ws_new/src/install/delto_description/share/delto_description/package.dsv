@@ -1,0 +1,9 @@
+source;share/delto_description/hook/pythonpath.ps1
+source;share/delto_description/hook/pythonpath.dsv
+source;share/delto_description/hook/pythonpath.sh
+source;share/delto_description/hook/ament_prefix_path.ps1
+source;share/delto_description/hook/ament_prefix_path.dsv
+source;share/delto_description/hook/ament_prefix_path.sh
+source;../../build/delto_description/share/delto_description/hook/pythonpath_develop.ps1
+source;../../build/delto_description/share/delto_description/hook/pythonpath_develop.dsv
+source;../../build/delto_description/share/delto_description/hook/pythonpath_develop.sh

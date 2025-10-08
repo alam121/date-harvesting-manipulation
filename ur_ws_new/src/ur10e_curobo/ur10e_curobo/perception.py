@@ -6,13 +6,15 @@ from time import sleep, time
 from typing import List, Optional, Tuple
 import tf2_geometry_msgs
 
+from ultralytics import YOLO
+
 import os
 import math
 import numpy as np
 import cv2
 import torch
 import pyzed.sl as sl
-
+import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.duration import Duration as rclpyDuration
 
@@ -150,7 +152,6 @@ class ZedYoloPerception:
         self.point_pub = node.create_publisher(PointStamped, "/datefruit_3d_point", 10)
 
         # YOLO
-        from ultralytics import YOLO
         self.model = YOLO(self.weights)
         # CPU by default unless user sets env to allow GPU
         use_gpu = os.getenv("UR10E_PERCEPTION_USE_GPU", "0") == "1" and torch.cuda.is_available()
@@ -257,16 +258,17 @@ class ZedYoloPerception:
                 # point in camera frame
                 pt_cam = PointStamped()
                 pt_cam.header.frame_id = self.cam_frame
-                pt_cam.header.stamp = rclpy.time.Time().to_msg()
+                pt_cam.header.stamp = rclpy.time.Time().to_msg()   # <-- time=0 (LATEST), not now()
                 pt_cam.point.x, pt_cam.point.y, pt_cam.point.z = Xc, Yc, Zc
-
+                print("im here")
                 try:
                     # transform to base
+                    print("HERE BOSS")
                     pt_base = self.node.tf_buffer.transform(pt_cam, "base_link", timeout=rclpyDuration(seconds=0.2))
                     # axis via PCA in camera → rotate to base
                     axis_cam = pca_long_axis_from_mask(mbin_vis, xyz_np)
                     if axis_cam[2] < 0: axis_cam = -axis_cam
-                    tf_cb = self.node.tf_buffer.lookup_transform("base_link", self.cam_frame, self.node.get_clock().now().to_msg())
+                    tf_cb = self.node.tf_buffer.lookup_transform("base_link", self.cam_frame, rclpy.time.Time().to_msg())
                     q = tf_cb.transform.rotation
                     axis_base = np.array(quat_rotate_vec((q.w, q.x, q.y, q.z), axis_cam), float)
                     axis_base = _unit(axis_base)
@@ -285,6 +287,7 @@ class ZedYoloPerception:
                     self.point_pub.publish(pt_base)
 
                     # optional: on-screen preview
+                    print(self.show_view)
                     if self.show_view:
                         if disp_img is None:
                             disp_img = np.zeros_like(img_rgba)

@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/DELTO_ROS2/delto_3f_moveit/launch/static_virtual_joint_tfs.launch.py

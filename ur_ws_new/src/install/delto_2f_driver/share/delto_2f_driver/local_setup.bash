@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/delto_2f_driver/ament_cmake_environment_hooks/local_setup.bash

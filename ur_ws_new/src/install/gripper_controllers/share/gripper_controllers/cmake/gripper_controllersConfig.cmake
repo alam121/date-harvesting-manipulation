@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/gripper_controllers/ament_cmake_core/gripper_controllersConfig.cmake
