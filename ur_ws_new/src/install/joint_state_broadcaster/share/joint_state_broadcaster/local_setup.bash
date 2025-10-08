@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/joint_state_broadcaster/ament_cmake_environment_hooks/local_setup.bash

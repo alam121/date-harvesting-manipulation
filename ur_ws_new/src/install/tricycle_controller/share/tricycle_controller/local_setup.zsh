@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/tricycle_controller/ament_cmake_environment_hooks/local_setup.zsh

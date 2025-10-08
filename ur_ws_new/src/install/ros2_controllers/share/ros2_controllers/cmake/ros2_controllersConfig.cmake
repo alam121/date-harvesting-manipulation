@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ros2_controllers/ament_cmake_core/ros2_controllersConfig.cmake

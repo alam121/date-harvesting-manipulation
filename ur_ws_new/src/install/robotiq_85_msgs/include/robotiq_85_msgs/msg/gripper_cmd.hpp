@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/robotiq_85_msgs/rosidl_generator_cpp/robotiq_85_msgs/msg/gripper_cmd.hpp

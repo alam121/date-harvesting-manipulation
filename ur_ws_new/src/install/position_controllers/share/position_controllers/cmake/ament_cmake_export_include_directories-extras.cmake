@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/position_controllers/ament_cmake_export_include_directories/ament_cmake_export_include_directories-extras.cmake

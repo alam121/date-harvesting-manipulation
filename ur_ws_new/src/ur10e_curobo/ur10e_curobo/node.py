@@ -2,6 +2,8 @@
 import threading
 import rclpy
 import os
+from rclpy.timer import Timer
+
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
@@ -72,15 +74,7 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
         
         # # Perception: ZED + YOLO
-        # self.perception = ZedYoloPerception(
-        #     self,
-        #     weights=os.getenv("UR10E_YOLO_WEIGHTS", "exp_aug.pt"),
-        #     img_size=int(os.getenv("UR10E_YOLO_IMGSZ", "640")),
-        #     conf_thres=float(os.getenv("UR10E_YOLO_CONF", "0.4")),
-        #     cam_frame=os.getenv("UR10E_CAM_FRAME", "zed2_left_camera_frame"),
-        #     show_view=bool(int(os.getenv("UR10E_SHOW_VIEW", "0"))),
-        # )
-        # self.perception.start()
+        #self._maybe_start_perception()
 
     # callbacks
     def _check_joint_states(self):
@@ -184,3 +178,44 @@ class UR10eCuroboMoveIt(Node):
     # expose some helpers for external callers
     def control_gripper(self, action: str):
         gripper_mod.control_gripper(self, action)
+
+
+    def _start_perception_once(self):
+        # run exactly once
+        self.perception_timer.cancel()
+        try:
+            from .perception import ZedYoloPerception
+
+            # resolve defaults safely (tiny model; no window)
+            weights = os.getenv("UR10E_YOLO_WEIGHTS", "exp_aug.pt")
+            imgsz   = int(os.getenv("UR10E_YOLO_IMGSZ", "640"))
+            conf    = float(os.getenv("UR10E_YOLO_CONF", "0.45"))
+            cam_fr  = os.getenv("UR10E_CAM_FRAME", "zed2_left_camera_frame")
+            show    = bool(int(os.getenv("UR10E_SHOW_VIEW", "1")))
+            cpu_only = os.getenv("CUDA_VISIBLE_DEVICES", "") == ""
+
+            self.get_logger().info(
+                f"Starting perception (weights={weights}, imgsz={imgsz}, conf={conf}, "
+                f"cam={cam_fr}, show={int(show)}, cpu_only={cpu_only})"
+            )
+
+            self.perception = ZedYoloPerception(
+                self,
+                weights=weights,
+                img_size=imgsz,
+                conf_thres=conf,
+                cam_frame=cam_fr,
+                show_view=show,
+            )
+            self.perception.start()
+            self.get_logger().info("Perception started.")
+        except Exception as e:
+            self.get_logger().error(f"Perception failed to start: [{type(e).__name__}] {e}")
+            self.perception = None  # don’t crash the whole node
+
+    def _maybe_start_perception(self):
+        if os.getenv("UR10E_DISABLE_PERCEPTION", "0") == "1":
+            self.get_logger().info("Perception disabled by UR10E_DISABLE_PERCEPTION=1")
+            return
+        # Delay startup to avoid RAM spikes colliding with cuRobo init
+        self.perception_timer: Timer = self.create_timer(5.0, self._start_perception_once)

@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ur_description/ament_cmake_core/ur_descriptionConfig-version.cmake

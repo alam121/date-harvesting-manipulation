@@ -1,0 +1,1 @@
+/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/moveit_resources_pr2_description/ament_cmake_core/moveit_resources_pr2_descriptionConfig.cmake
