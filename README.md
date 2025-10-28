@@ -1,5 +1,18 @@
 # ManipulatorsDatePalm 
 
+
+## Overview
+
+This system provides a complete ROS 2 Foxy-based control stack for the UR10e robot arm integrated with:
+
+1. cuRobo for GPU-accelerated motion planning
+2. MoveIt! for trajectory management
+3. Delto 3-Finger Suction Gripper for grasp control
+4. ZED 2i Camera + YOLOv8-Segmentation for 3D visual detection and goal generation
+5. RViz + Matplotlib for live visualization and debugging
+
+
+
 ## Dependencies 
 1. Install ```ros2 humble``` via debian package
 2. Install [Curobo](https://curobo.org/get_started/5_docker_development.html#docker-dev) in docker for native usage on jetson
