@@ -1,27 +1,40 @@
 # ManipulatorsDatePalm 
 
+
+## Overview
+
+This system provides a complete ROS 2 Foxy-based control stack for the UR10e robot arm integrated with:
+
+1. cuRobo for GPU-accelerated motion planning
+2. MoveIt! for trajectory management
+3. Delto 3-Finger Suction Gripper for grasp control
+4. ZED 2i Camera + YOLOv8-Segmentation for 3D visual detection and goal generation
+5. RViz + Matplotlib for live visualization and debugging
+
+
+
 ## Dependencies 
-1. Install ```ros2 foxy``` via debian package
+1. Install ```ros2 humble``` via debian package
 2. Install [Curobo](https://curobo.org/get_started/5_docker_development.html#docker-dev) in docker for native usage on jetson
 3. Install the following dependencies:
 ```
-sudo apt install ros-foxy-ur-msgs
-sudo apt install ros-foxy-ur-client-library
-sudo apt install ros-foxy-moveit
-sudo apt install ros-foxy-moveit-servo
-sudo apt install ros-foxy-moveit-visual-tools
-sudo apt install ros-foxy-moveit-resources
-sudo apt install ros-foxy-moveit-planners-ompl
-sudo apt install ros-foxy-moveit-ros-perception
-sudo apt install ros-foxy-ros2-control
-sudo apt install ros-foxy-ros2-controllers
-sudo apt install ros-foxy-controller-interface
-sudo apt install ros-foxy-controller-manager
-sudo apt install ros-foxy-control-toolbox
-sudo apt install ros-foxy-realtime-tools
-sudo apt install ros-foxy-rviz2
-sudo apt install ros-foxy-rviz-visual-tools
-sudo apt install ros-foxy-ackermann-msgs
+sudo apt install ros-humble-ur-msgs
+sudo apt install ros-humble-ur-client-library
+sudo apt install ros-humble-moveit
+sudo apt install ros-humble-moveit-servo
+sudo apt install ros-humble-moveit-visual-tools
+sudo apt install ros-humble-moveit-resources
+sudo apt install ros-humble-moveit-planners-ompl
+sudo apt install ros-humble-moveit-ros-perception
+sudo apt install ros-humble-ros2-control
+sudo apt install ros-humble-ros2-controllers
+sudo apt install ros-humble-controller-interface
+sudo apt install ros-humble-controller-manager
+sudo apt install ros-humble-control-toolbox
+sudo apt install ros-humble-realtime-tools
+sudo apt install ros-humble-rviz2
+sudo apt install ros-humble-rviz-visual-tools
+sudo apt install ros-humble-ackermann-msgs
 pip install warp-lang==1.0.0
 
 ```
