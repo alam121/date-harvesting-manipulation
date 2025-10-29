@@ -25,7 +25,10 @@ def read_key(timeout=0.1):
 
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float, dt: float,
                      stop_flag: Optional[Callable[[], bool]] = None) -> JointTrajectory:
-    msg = JointTrajectory(); msg.joint_names = joint_names
+    
+    msg = JointTrajectory()
+    msg.joint_names = joint_names
+    
     t = 0.0
     for q in states:
         if stop_flag and stop_flag():
