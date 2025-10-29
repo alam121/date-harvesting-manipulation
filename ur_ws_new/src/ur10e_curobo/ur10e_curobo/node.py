@@ -3,13 +3,14 @@ import threading
 import rclpy
 import os
 from rclpy.timer import Timer
-
+import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
 from std_msgs.msg import Bool, Float32MultiArray
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import Buffer, TransformListener
+from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
 
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 
@@ -21,111 +22,269 @@ from . import motions as motions_mod
 from . import goals as goals_mod
 from . import gripper as gripper_mod
 from .perception import ZedYoloPerception
+from trajectory_msgs.msg import JointTrajectory
+
+
+# Callback	Trigger	Purpose
+
+# _check_joint_states()	    timer	                  Confirms joint feedback received
+# _joint_state_cb(msg)	    /joint_states	          Updates position & velocity arrays
+# _marker_cb(msg)	        RViz interactive marker	  Stores last clicked pose
+# _robot_running_cb(msg)	/robot_program_running	  Logs robot program state
+# _stop_cb(msg)	            /emergency_stop	          Stops motion immediately
+# _force_cb(msg)	        /gripper/force	          Sends force readings to classifier
+# _classifier_tick()	    timer	                  Runs periodic classifier update
+
 
 class UR10eCuroboMoveIt(Node):
     def __init__(self):
-        super().__init__("ur10e_curobo_moveit_node")
-        # pubs
-        from trajectory_msgs.msg import JointTrajectory  # type: ignore
+        super().__init__(
+            "ur10e_curobo_moveit_node",
+            automatically_declare_parameters_from_overrides=True
+        )
+
+        # ========= PARAMS: defaults → ROS params → env overrides =========
+        self.cfg = AppConfig()  # 1) start with code defaults
+
+        # 2) declare ROS parameters
+        self.declare_parameter("planner.speed_scale", self.cfg.planner.speed_scale)
+        self.declare_parameter("planner.urdf_config", self.cfg.planner.urdf_config)
+        self.declare_parameter("planner.interpolation_dt", self.cfg.planner.interpolation_dt)
+
+        self.declare_parameter("perception.enabled", self.cfg.perception.enabled)
+        self.declare_parameter("perception.weights", self.cfg.perception.weights)
+        self.declare_parameter("perception.img_size", self.cfg.perception.img_size)
+        self.declare_parameter("perception.conf_thres", self.cfg.perception.conf_thres)
+        self.declare_parameter("perception.cam_frame", self.cfg.perception.cam_frame)
+        self.declare_parameter("perception.show_view", self.cfg.perception.show_view)
+        self.declare_parameter("perception.use_gpu", self.cfg.perception.use_gpu)
+
+        self.declare_parameter("joints.home", self.cfg.joints.home)
+        self.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
+        self.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
+
+        # 3) read back ROS parameters
+        self.cfg.planner.speed_scale = self.get_parameter("planner.speed_scale").value
+        self.cfg.planner.urdf_config = self.get_parameter("planner.urdf_config").value
+        self.cfg.planner.interpolation_dt = float(self.get_parameter("planner.interpolation_dt").value)
+
+        self.cfg.perception.enabled    = bool(self.get_parameter("perception.enabled").value)
+        self.cfg.perception.weights    = self.get_parameter("perception.weights").value
+        self.cfg.perception.img_size   = int(self.get_parameter("perception.img_size").value)
+        self.cfg.perception.conf_thres = float(self.get_parameter("perception.conf_thres").value)
+        self.cfg.perception.cam_frame  = self.get_parameter("perception.cam_frame").value
+        self.cfg.perception.show_view  = bool(self.get_parameter("perception.show_view").value)
+        self.cfg.perception.use_gpu    = bool(self.get_parameter("perception.use_gpu").value)
+
+        # arrays come back as tuples in Foxy—cast to list
+        self.cfg.joints.home       = list(self.get_parameter("joints.home").value)
+        self.cfg.joints.dropoff    = list(self.get_parameter("joints.dropoff").value)
+        self.cfg.joints.predropoff = list(self.get_parameter("joints.predropoff").value)
+
+        # 4) env overrides (UR10E_*), e.g. UR10E_SHOW_VIEW=1
+        self.cfg = AppConfig.from_env(self.cfg)
+
+        # 5) expose to the rest of the class
+        self.speed_scale       = self.cfg.planner.speed_scale
+        self.home_joints       = self.cfg.joints.home
+        self.dropoff_joints    = self.cfg.joints.dropoff
+        self.predropoff_joints = self.cfg.joints.predropoff
+
+        # ======== pubs/subs after config so QoS/params exist ========
         self.trajectory_pub = self.create_publisher(JointTrajectory, "/joint_trajectory_controller/joint_trajectory", 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
-        # subs
+
         self.create_subscription(ROSJointState, "/joint_states", self._joint_state_cb, 10)
-        self.create_subscription(InteractiveMarkerFeedback,
-                                 "/rviz_moveit_motion_planning_display/robot_interaction_interactive_marker_topic/feedback",
-                                 self._marker_cb, 10)
+        self.create_subscription(
+            InteractiveMarkerFeedback,
+            "/rviz_moveit_motion_planning_display/robot_interaction_interactive_marker_topic/feedback",
+            self._marker_cb, 10
+        )
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
         self.create_subscription(Bool, "/emergency_stop", self._stop_cb, 10)
         self.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
+
         # tf
-        self.tf_buffer = Buffer(); self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         # timers
-        self.create_timer(0.1, lambda: markers_mod.track_robot_path(self))
-        self.create_timer(0.02, self._classifier_tick)
-        self.timer_wait_js = self.create_timer(0.5, self._check_joint_states)
+        self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers
+        self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)
+        self.timer_wait_js = self.create_timer(0.5, self._check_joint_states) #Check if joint states received
+
         # cuRobo
-        self.motion_gen_config = MotionGenConfig.load_from_robot_config("ur10e.yml", WORLD_CONFIG, interpolation_dt=0.004)
-        self.motion_gen = MotionGen(self.motion_gen_config); self.motion_gen.warmup()
-        print('warming up done')
-        # state
+        self.motion_gen_config = MotionGenConfig.load_from_robot_config(
+            self.cfg.planner.urdf_config, WORLD_CONFIG, interpolation_dt=self.cfg.planner.interpolation_dt
+        )
+        self.motion_gen = MotionGen(self.motion_gen_config)
+        self.motion_gen.warmup()
+        print("warming up done")
+
+        # state: keep track of robot state, path history, and goals in memory.
         self.qos = DEFAULT_QOS
         self.joint_order = JOINT_ORDER
+        
         self.current_joint_positions = None
         self.current_joint_velocities = None
         self.latest_marker_pose = None
+        
         self.goal_poses = []
         self.path_points = []
+        
+        
         self.running = True
-        self.speed_scale = 1.8
         self.stop_requested = False
         self.robot_running = False
-        # joints presets
-        self.home_joints = [-1.5916569868670862, -1.649402920399801, 2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334]
-        self.dropoff_joints = [-2.16858417192568, -1.3347657362567347, 2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704]
-        self.predropoff_joints = [-1.6832264105426233, -2.020153347645895, 2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341]
-        # goal capture
-        self.goal_capture_active = False; self.goal_capture_timer = None; self.goal_capture_count = 0
-        self.goal_sort_ref = None; self.goal_sort_ascending = True
+        
+        # --- capture state ---
+        self.goal_capture_active = False
+        self.goal_capture_timer = None
+        self.goal_pose_sub = None
+        self.goal_capture_count = 0
+        
+        self.goal_sort_ref = None
+        self.goal_sort_ascending = True
+
         # gripper/classifier
         gripper_mod.init_gripper(self)
-        # keyboard thread
-        self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True); self.keyboard_thread.start()
+
+        # keyboard
+        self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
+        self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
         
         # # Perception: ZED + YOLO
         #self._maybe_start_perception()
 
     # callbacks
-    def _check_joint_states(self):
+    def _check_joint_states(self):  #Confirms joint feedback received
         if self.current_joint_positions is not None:
             self.get_logger().info("Initial joints received."); self.destroy_timer(self.timer_wait_js)
 
-    def _joint_state_cb(self, msg):
-        jm = dict(zip(msg.name, msg.position)); vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+    def _joint_state_cb(self, msg):  #Updates position & velocity arrays
+        jm = dict(zip(msg.name, msg.position))
+        vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        
         self.current_joint_positions = [jm[j] for j in self.joint_order if j in jm]
         self.current_joint_velocities = [vm.get(j, 0.0) for j in self.joint_order]
 
-    def _marker_cb(self, msg):
+    def _marker_cb(self, msg): ##Stores last clicked pose
         self.latest_marker_pose = msg.pose
 
-    def _robot_running_cb(self, msg):
+    def _robot_running_cb(self, msg): ##Logs robot program state
         self.robot_running = msg.data
         self.get_logger().info("✅ Robot program is running." if msg.data else "⚠️ Robot program is NOT running.")
 
-    def _stop_cb(self, msg):
+    def _stop_cb(self, msg): ##Stops motion immediately
         if not msg.data: return
         self.get_logger().warn("🛑 Emergency stop!"); self.stop_requested = True; from .motions import publish_stop_trajectory; publish_stop_trajectory(self)
 
-    def _force_cb(self, msg):
+    def _force_cb(self, msg): ##Sends force readings to classifier
         self.classifier.on_force(list(msg.data)[:3])
 
-    def _classifier_tick(self):
+    def _classifier_tick(self):   ##Runs periodic classifier update
         self.classifier.tick()
 
     # methods used by helpers (so helpers can call like node.get_end_effector_pose())
     def get_end_effector_pose(self):
         return fk_mod.get_end_effector_pose(self)
+    
+    
 
     # keyboard UI
+    # keyboard UI (verbose)
     def _wait_for_key_press(self):
-        print("Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, q=quit")
+        def ts():
+            # short timestamp for prints
+            import time
+            return time.strftime("%H:%M:%S")
+
+        print("[{}] Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, q=quit".format(ts()))
+        last_key = None
         while self.running:
             key = read_key()
-            if key is None: continue
-            if key == 'y' and self.latest_marker_pose:
-                from .goals import pose_to_vec7
-                g = pose_to_vec7(self.latest_marker_pose); self.goal_poses.append(g); print(f"Saved goal: {g}"); markers_mod.publish_goal_marker(self, g[:3])
-            elif key == 'm': self._manual_goal()
-            elif key == 's': goals_mod.subscribe_to_goal_pose(self)
-            elif key == 'p': self.start_goal_capture(10.0)
-            elif key == 'n' and self.goal_poses: self._prep_and_execute()
-            elif key == 'o': gripper_mod.control_gripper(self, 'OPEN')
-            elif key == 'c': gripper_mod.control_gripper(self, 'CLOSE'); motions_mod.move_backward(self, -0.01); motions_mod.rotate_wrist(self, 120)
-            elif key == 'h': motions_mod.move_to_home_position(self)
-            elif key == 'd': motions_mod.move_to_dropoff_position(self); gripper_mod.control_gripper(self, 'OPEN')
-            elif key == 'k': self.stop_requested = True; motions_mod.publish_stop_trajectory(self)
-            elif key == 'q': self.running = False; break
+            if key is None:
+                continue
+
+            # echo keypress
+            print(f"[{ts()}] key='{key}'")
+
+            if key == 'y':
+                if self.latest_marker_pose:
+                    
+                    from .goals import pose_to_vec7
+                    g = pose_to_vec7(self.latest_marker_pose)
+                    self.goal_poses.append(g)
+                    print(f"[{ts()}] saved goal #{len(self.goal_poses)} from marker: {g}")
+                    
+                    markers_mod.publish_goal_marker(self, g[:3])
+                else:
+                    print(f"[{ts()}] WARN: no latest_marker_pose yet; press 'y' again after moving the interactive marker in RViz.")
+
+            elif key == 'm':
+                print(f"[{ts()}] manual goal entry requested…")
+                self._manual_goal()
+                print(f"[{ts()}] manual goal entry done. total goals={len(self.goal_poses)}")
+
+            elif key == 's':
+                print(f"[{ts()}] subscribing to /external_goal_pose…")
+                goals_mod.subscribe_to_goal_pose(self)
+                self.goal_capture_active = False 
+                print(f"[{ts()}] subscribe called. waiting for external goal…")
+
+            elif key == 'p':
+                print(f"[{ts()}] starting timed goal capture (10s)…")
+                self.start_goal_capture(10.0)
+                print(f"[{ts()}] capture armed. current collected={getattr(self, 'goal_capture_count', 0)}")
+
+            elif key == 'n':
+                if self.goal_poses:
+                    print(f"[{ts()}] executing {len(self.goal_poses)} stored goal(s)…")
+                    self._prep_and_execute()
+                    print(f"[{ts()}] execute finished. remaining goals={len(self.goal_poses)}")
+                else:
+                    print(f"[{ts()}] INFO: no goals to execute. add with 'y', 'm', or 's'.")
+
+            elif key == 'o':
+                print(f"[{ts()}] gripper → OPEN")
+                gripper_mod.control_gripper(self, 'OPEN')
+
+            elif key == 'c':
+                print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
+                gripper_mod.control_gripper(self, 'CLOSE')
+                motions_mod.move_backward(self, -0.01)
+                motions_mod.rotate_wrist(self, 120)
+                print(f"[{ts()}] post-close micro-motions done")
+
+            elif key == 'h':
+                print(f"[{ts()}] going HOME…")
+                motions_mod.move_to_home_position(self)
+                print(f"[{ts()}] reached HOME (or attempted)")
+
+            elif key == 'd':
+                print(f"[{ts()}] going to DROPOFF…")
+                motions_mod.move_to_dropoff_position(self)
+                gripper_mod.control_gripper(self, 'OPEN')
+                print(f"[{ts()}] at drop-off; gripper opened")
+
+            elif key == 'k':
+                print(f"[{ts()}] STOP requested → publishing hold trajectory")
+                self.stop_requested = True
+                motions_mod.publish_stop_trajectory(self)
+
+            elif key == 'q':
+                print(f"[{ts()}] quitting…")
+                self.running = False
+                break
+
+            else:
+                # unknown key helper
+                if key != last_key:  # avoid spamming if someone holds a key
+                    print(f"[{ts()}] NOTE: key '{key}' has no action. valid keys: y m s p n o c h d k q")
+            last_key = key
+
 
     def _manual_goal(self):
         cur = self.get_end_effector_pose()
@@ -136,44 +295,63 @@ class UR10eCuroboMoveIt(Node):
         except ValueError:
             print("Invalid input."); return
         goal = [x, y, z] + (cur[3:] if cur else [1.0,0.0,0.0,0.0])
-        self.goal_poses.append(goal); markers_mod.publish_goal_marker(self, goal[:3]); print("Manual goal saved.")
+        self.goal_poses.append(goal)
+        markers_mod.publish_goal_marker(self, goal[:3]) 
+        print("Manual goal saved.")
 
     # goal capture (timed)
     def start_goal_capture(self, duration: float = 30.0):
-        if self.goal_capture_active: self.stop_goal_capture()
-        self.goal_poses.clear(); self.goal_capture_count = 0
-        ee = self.get_end_effector_pose(); self.goal_sort_ref = ee[:3] if ee else [0.0,0.0,0.0]
+        if self.goal_capture_active: 
+            self.stop_goal_capture()
+            
+        self.goal_poses.clear()
+        self.goal_capture_count = 0
+        ee = self.get_end_effector_pose()
+        self.goal_sort_ref = ee[:3] if ee else [0.0,0.0,0.0]
         self.goal_pose_sub = self.create_subscription(PoseStamped, '/external_goal_pose', self._capture_goal_cb, self.qos)
         self.goal_capture_active = True
         self.get_logger().info(f"Started goal capture for {duration:.0f}s")
+        
         def _stop_once():
             if self.goal_capture_timer: self.goal_capture_timer.cancel()
             self.stop_goal_capture()
         self.goal_capture_timer = self.create_timer(duration, _stop_once)
 
     def stop_goal_capture(self):
-        if not self.goal_capture_active: return
+        if not self.goal_capture_active: 
+            return
         self.goal_capture_active = False
+    
         if hasattr(self, 'goal_pose_sub'):
             self.destroy_subscription(self.goal_pose_sub); del self.goal_pose_sub
         self.goal_poses.sort(key=lambda g: __import__('math').dist(g[:3], self.goal_sort_ref or [0,0,0]))
         self.get_logger().info(f"Goal capture stopped. Collected {self.goal_capture_count} goals.")
 
     def _capture_goal_cb(self, msg: PoseStamped):
-        if goals_mod.is_robot_moving(self): return
+        if goals_mod.is_robot_moving(self): 
+            return
         gx,gy,gz = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
-        cur = self.get_end_effector_pose();
+        cur = self.get_end_effector_pose()
         qw,qx,qy,qz = (cur[3:] if cur else [1.0,0.0,0.0,0.0])
-        import math
-        if any(math.dist([gx,gy,gz], g[:3]) < 0.01 for g in (self.goal_poses or [])): return
-        goal = [gx,gy,gz,qw,qx,qy,qz]; self.goal_poses.append(goal)
+        
+        if any(math.dist([gx,gy,gz], g[:3]) < 0.01 for g in (self.goal_poses or [])): 
+            return
+        goal = [gx,gy,gz,qw,qx,qy,qz]
+        self.goal_poses.append(goal)
         self.goal_poses.sort(key=lambda g: math.dist(g[:3], self.goal_sort_ref or [0,0,0]))
-        self.goal_capture_count += 1; markers_mod.publish_goal_marker(self, goal[:3])
+        self.goal_capture_count += 1
+        markers_mod.publish_goal_marker(self, goal[:3])
 
     def _prep_and_execute(self):
+        
         if self.goal_capture_active: self.stop_goal_capture()
-        if hasattr(self, 'goal_pose_sub'): self.destroy_subscription(self.goal_pose_sub); del self.goal_pose_sub
-        self.get_logger().info("Executing stored goals…"); goals_mod.plan_and_execute(self); self.get_logger().info("Done.")
+        if hasattr(self, 'goal_pose_sub'): 
+            self.destroy_subscription(self.goal_pose_sub)
+            del self.goal_pose_sub
+            
+        self.get_logger().info("Executing stored goals…")
+        goals_mod.plan_and_execute(self)
+        self.get_logger().info("Done.")
 
     # expose some helpers for external callers
     def control_gripper(self, action: str):

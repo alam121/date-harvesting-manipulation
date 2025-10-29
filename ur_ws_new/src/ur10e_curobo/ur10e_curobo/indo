@@ -1,0 +1,175 @@
+config.py — Central Configuration & System Defaults
+
+Purpose
+
+config.py defines every core parameter that controls robot behavior, motion-planning settings, perception options, and communication reliability. It ensures all other modules: node.py, motions.py, perception.py, etc.—share consistent values for frames, joints, QoS, and URDF configuration.
+
+
+
+It also allows you to override defaults from:
+
+ROS 2 parameters (declared in node.py)
+
+Environment variables (loaded by AppConfig.from_env())
+
+ROS 2 Quality-of-Service (QoS) profiles
+
+Robot model & world definitions
+
+Default motion-planner parameters
+
+Joint position presets (home / drop-off)
+
+Perception (YOLO + ZED) parameters
+
+Environment variable overrides for runtime customization
+
+
+Quality of Service (QoS) Definitions
+
+DEFAULT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=5,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+reliability=RELIABLE	Guarantees message delivery.	Essential for command topics.
+depth=5	Stores last 5 messages.	Prevents buffer overflow.
+durability=VOLATILE	No re-delivery to late subscribers.	Keeps real-time freshness.
+
+
+
+New stuff:
+@dataclass is a shortcut in Python.
+It helps you make a class that’s just used to store data — without writing extra code.
+Normally, you’d write:
+class Person:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+
+Now you can do:
+
+p = Person("Ali", 25)
+print(p.name)  # Ali
+
+With @dataclass, you just write:
+from dataclasses import dataclass
+
+@dataclass
+class Person:
+    name: str
+    age: int
+    
+    __init__
+
+This is the constructor — the function that runs when you make an object from a class.
+
+Example: 
+
+class Person:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+
+Now when you do:
+
+p = Person("Ali", 25)
+
+Python calls __init__ automatically and sets:
+
+p.name = "Ali"
+p.age = 25
+
+If you use @dataclass, Python writes this function for you automatically — so you don’t have to.
+🧩 2. __repr__
+
+This is the string version of your object — what Python shows when you print it.
+
+Example:
+
+class Person:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+    def __repr__(self):
+        return f"Person(name={self.name}, age={self.age})"
+
+Now:
+
+p = Person("Ali", 25)
+print(p)
+
+Output:
+
+Person(name=Ali, age=25)
+
+If you use @dataclass, Python automatically creates this pretty-print version for you too.
+🧩 3. __eq__
+
+This is used when you compare two objects with ==.
+
+Example:
+
+a = Person("Ali", 25)
+b = Person("Ali", 25)
+print(a == b)  # False normally
+
+Normally, Python would say False because it thinks they are different objects in memory.
+
+But if you use @dataclass, it automatically adds __eq__, which means:
+
+    “Two dataclass objects are equal if all their variables have the same values.”
+
+So now:
+
+from dataclasses import dataclass
+
+@dataclass
+class Person:
+    name: str
+    age: int
+
+a = Person("Ali", 25)
+b = Person("Ali", 25)
+print(a == b)  # True ✅
+
+
+2) home: List[float] = field(default_factory=lambda: [0.0, -1.57, 1.57, 0.0, 1.57, 0.0])
+
+home:	This defines a variable (or attribute) named home.
+List[float]	The type of data: it’s a list of numbers (floats).
+=	We’re giving it a default value.
+field(...)	This is a helper from the dataclasses module that lets you control how defaults are made.
+default_factory=lambda: [...]	This means: “When creating a new object, make a fresh copy of this list each time.”
+
+2. class AppConfig:
+
+This defines a class called AppConfig, which means “Application Configuration.”
+It stores all your settings in one place.
+
+Think of it like a big folder that contains four smaller folders:
+
+one for topics,
+
+one for joint presets,
+
+one for planner settings,
+
+one for perception settings.
+
+3. Each line inside the class
+
+Let’s go line by line 👇
+
+🧩 topics: Topics = field(default_factory=Topics)
+
+topics is the name of this setting group.
+
+Its type is another class called Topics.
+
+field(default_factory=Topics) means:
+
+“When you create a new AppConfig, automatically make a new Topics object inside it.”
+
