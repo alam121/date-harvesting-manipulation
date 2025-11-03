@@ -12,7 +12,9 @@ except Exception:
     pass
 
 def _handle_signal(signum, frame):
-    # try to stop nicely
+    global exit_signal
+    exit_signal = True
+    print("\n[Signal] Graceful shutdown requested.")
     rclpy.shutdown()
 
 signal.signal(signal.SIGINT, _handle_signal)   # Ctrl-C
@@ -24,11 +26,14 @@ def main():
     try:
         rclpy.spin(node)
     finally:
+        node.stop_requested = True
         try:
             node.destroy_node()
         except Exception:
             pass
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+        print("[System] Shutdown complete.")
 
 if __name__ == "__main__":
     main()

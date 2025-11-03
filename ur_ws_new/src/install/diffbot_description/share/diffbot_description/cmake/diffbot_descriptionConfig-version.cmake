@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/diffbot_description/ament_cmake_core/diffbot_descriptionConfig-version.cmake

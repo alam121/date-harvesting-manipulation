@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ros2_controllers/joint_trajectory_controller/include/joint_trajectory_controller/trajectory.hpp

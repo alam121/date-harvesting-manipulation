@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/moveit2_tutorials/ament_cmake_core/moveit2_tutorialsConfig-version.cmake

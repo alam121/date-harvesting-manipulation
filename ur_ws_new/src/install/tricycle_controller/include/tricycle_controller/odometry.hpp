@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ros2_controllers/tricycle_controller/include/tricycle_controller/odometry.hpp

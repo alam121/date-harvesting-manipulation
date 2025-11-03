@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ur_robot_driver/ur_controllers/include/ur_controllers/speed_scaling_state_broadcaster.hpp

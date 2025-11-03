@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ur_robot_driver/ament_cmake_environment_hooks/local_setup.zsh

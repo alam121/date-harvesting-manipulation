@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/robotiq_85_gripper/ament_cmake_core/robotiq_85_gripperConfig.cmake

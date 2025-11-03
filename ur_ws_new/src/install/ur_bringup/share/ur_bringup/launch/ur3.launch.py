@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ur_robot_driver/ur_bringup/launch/ur3.launch.py

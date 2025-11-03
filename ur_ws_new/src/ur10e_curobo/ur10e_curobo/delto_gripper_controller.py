@@ -66,7 +66,7 @@ class DeltoGripperController:
         if self.frozen_fingers:
             prev = sorted(list(self.frozen_fingers))
             self.frozen_fingers.clear()
-            self.node.get_logger().info(f"🧊→🔥 Unfroze fingers: {prev} (ready for next cycle).")
+            #self.node.get_logger().info(f"🧊→🔥 Unfroze fingers: {prev} (ready for next cycle).")
         self.first_contact_index = None
 
     def set_close_debounce(self, seconds: float = 0.25):
@@ -161,9 +161,10 @@ class DeltoGripperController:
         if hasattr(self.node, "classifier"):
             self.node.classifier.note_target_update()
 
-        self.node.get_logger().info(
-            f"Step {self.current_step}/{self.steps} — closing... (frozen: {sorted(list(self.frozen_fingers))})"
-        )
+        # self.node.get_logger().info(
+        #     f"Step {self.current_step}/{self.steps} — closing... (frozen: {sorted(list(self.frozen_fingers))})"
+        # )
+        
         self.current_step += 1
         return True
 

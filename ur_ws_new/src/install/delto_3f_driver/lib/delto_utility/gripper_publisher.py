@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/DELTO_ROS2/delto_3f_driver/delto_utility/gripper_publisher.py

@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/robotiq_85_msgs/rosidl_typesupport_introspection_cpp/robotiq_85_msgs/msg/detail/gripper_cmd__rosidl_typesupport_introspection_cpp.hpp
