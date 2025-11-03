@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ros2_robotiqgripper/rosidl_cmake/srv/RobotiqGripper_Request.msg

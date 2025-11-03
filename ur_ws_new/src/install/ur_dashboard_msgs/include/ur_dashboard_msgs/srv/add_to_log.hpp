@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/ur_dashboard_msgs/rosidl_generator_cpp/ur_dashboard_msgs/srv/add_to_log.hpp

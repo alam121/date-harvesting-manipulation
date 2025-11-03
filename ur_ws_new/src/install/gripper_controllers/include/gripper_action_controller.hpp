@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ros2_controllers/gripper_controllers/include/gripper_controllers/gripper_action_controller.hpp

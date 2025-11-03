@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/robotiq_85_msgs/rosidl_generator_c/robotiq_85_msgs/msg/detail/gripper_stat__type_support.h

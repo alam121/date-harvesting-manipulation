@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ros2_controllers/effort_controllers/include/effort_controllers/joint_group_effort_controller.hpp

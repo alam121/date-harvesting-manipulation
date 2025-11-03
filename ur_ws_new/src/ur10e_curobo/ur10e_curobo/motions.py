@@ -47,8 +47,16 @@ def execute_single_pose(node, pose: list):
     res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT) #cuRobo Cartesian planner
     if not res.success:
         node.get_logger().warn("Plan failed for single pose."); return
-    traj = build_trajectory(node.joint_order, interpolated_positions(res), vel=0.1, dt=0.03,
-                            stop_flag=lambda: node.stop_requested)
+    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
+
+    traj = build_trajectory(
+        node.joint_order,
+        interpolated_positions(res),
+        vel=0.1 * scale,
+        dt=base_dt / scale,
+        stop_flag=lambda: node.stop_requested
+)
     node.trajectory_pub.publish(traj)
 
 
@@ -58,7 +66,7 @@ def execute_single_pose(node, pose: list):
         # dt: Time step for trajectory interpolation.
         
 # Publishes /joint_trajectory_controller/joint_trajectory.
-def plan_execute_js(node, target_joints: List[float], label: str, dt: float = 0.008):
+def plan_execute_js(node, target_joints: List[float], label: str, motion_type: str = "default"):
     
     if node.current_joint_positions is None:
         node.get_logger().warn(f"No joint state; skipping {label} move."); return
@@ -73,15 +81,30 @@ def plan_execute_js(node, target_joints: List[float], label: str, dt: float = 0.
         torch.tensor([target_joints], dtype=torch.float32, device=device),
         joint_names=node.joint_order,
     )
-    
+    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
     res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_DEFAULT)
     if not res.success:
         node.get_logger().warn(f"Joint-space plan to {label} failed."); return
         
+        
+    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
+    if motion_type == "home":
+        scale = getattr(node.cfg.planner, "speed_home", 1.0)
+    elif motion_type == "dropoff":
+        scale = getattr(node.cfg.planner, "speed_dropoff", 1.0)
+    elif motion_type == "predropoff":
+        scale = getattr(node.cfg.planner, "speed_predropoff", 1.0)
+    else:
+        scale = 1.0  # default
+        
     states = interpolated_positions(res)
-    traj = build_trajectory(node.joint_order, states, vel=0.1,
-                            dt=dt/max(getattr(node, "speed_scale", 1.0), 1e-6),
-                            stop_flag=lambda: node.stop_requested)
+    traj = build_trajectory(
+        node.joint_order,
+        states,
+        vel=0.1 * scale,                     # scale velocity
+        dt=base_dt / scale,                  # apply uniform dt
+        stop_flag=lambda: node.stop_requested,
+    )
     
     node.trajectory_pub.publish(traj)
     node.get_logger().info(f"Moving to {label} joints…")
@@ -91,15 +114,15 @@ def plan_execute_js(node, target_joints: List[float], label: str, dt: float = 0.
 
 
 def move_to_home_position(node):
-    plan_execute_js(node, node.home_joints, label="HOME", dt=0.008)
+    plan_execute_js(node, node.home_joints, label="HOME", motion_type="home")
 
 
 def move_to_dropoff_position(node):
-    plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", dt=0.008)
+    plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", motion_type="dropoff")
  
 
 def move_to_predropoff_position(node):
-    plan_execute_js(node, node.predropoff_joints, label="preDROP-OFF", dt=0.04)
+    plan_execute_js(node, node.predropoff_joints, label="preDROP-OFF", motion_type="predropoff")
 
 
 def rotate_wrist(node, degrees: float, duration: float = 0.30):
@@ -128,3 +151,14 @@ def move_backward(node, delta: float):
     p = JointTrajectoryPoint(); p.positions = q; p.time_from_start.sec = 1
     traj.points.append(p); node.trajectory_pub.publish(traj)
 
+def blend_motion(node, pause=0.2):
+    # maintains smoothness, avoids jerk
+    traj = build_trajectory(
+        node.joint_order,
+        [node.current_joint_positions],
+        vel=0.05,
+        dt=0.02,
+        stop_flag=lambda: node.stop_requested
+    )
+    node.trajectory_pub.publish(traj)
+    time.sleep(pause)

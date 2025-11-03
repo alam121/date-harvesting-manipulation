@@ -3,6 +3,7 @@ import time, math, torch
 from geometry_msgs.msg import Pose as ROSPose, PoseStamped
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
+from .motions import execute_single_pose as _exec
 
 from .config import PLAN_CFG_DEFAULT
 from .utils import build_trajectory, wait_until_xyz
@@ -10,21 +11,38 @@ from .markers import publish_goal_marker
 from .motions import interpolated_positions, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
-
+from .motions import blend_motion
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
 
 
-def plan_and_send(node, start_state, goal_pose: Pose, dt: float, label: str) -> bool:
+def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
     res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
     if not res.success:
         node.get_logger().warn(f"Plan failed for {label}."); return False
     states = interpolated_positions(res)
     
     
-    traj = build_trajectory(node.joint_order, states, vel=0.1, dt=dt,
-                            stop_flag=lambda: node.stop_requested)
+    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
+    
+    if motion_type == "approach":
+        scale = getattr(node.cfg.planner, "speed_approach", 1.0)
+    elif motion_type == "final":
+        scale = getattr(node.cfg.planner, "speed_final", 1.0)
+    elif motion_type in ["home", "dropoff", "predropoff"]:
+        scale = getattr(node.cfg.planner, f"speed_{motion_type}", 1.0)
+    else:
+        scale = getattr(node.cfg.planner, "speed_home", 1.0)  # default fast
+
+    traj = build_trajectory(
+        node.joint_order,
+        states,
+        vel=0.1 * scale,
+        dt=base_dt / scale,
+        stop_flag=lambda: node.stop_requested
+    )
     
     
     node.get_logger().info(f"Planned {label} trajectory with {len(states)} steps.")
@@ -43,17 +61,26 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
             nonlocal latest, stable, last_hit
             if is_robot_moving(node): 
                 return
+            
             x,y,z = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
             print(f"Reacquire candidate: {(x,y,z)}")
             
-            if math.hypot(x-seed[0], y-seed[1]) > rad: return
-            latest = (x,y,z); stable += 1; last_hit = time.time()
+            if math.hypot(x-seed[0], y-seed[1]) > rad: 
+                print("  Out of radius.")
+                return
+            latest = (x,y,z)
+            stable += 1
+            last_hit = time.time()
             print(f"  Stable {stable}/{need}")
-        sub = node.create_subscription(PoseStamped, '/external_goal_pose', _cb, node.qos)
+            
+        sub = node.create_subscription(PoseStamped, '/external_goal_pose', _cb, node.qos) #temp subscriber
         try:
             while stable < max(1, need):
-                if timeout_s is not None and (time.time() - last_hit) > timeout_s: break
+                if timeout_s is not None and (time.time() - last_hit) > timeout_s:
+                    print("  Timeout reached.")
+                    break
                 time.sleep(0.01)
+                
         finally:
             node.destroy_subscription(sub)
         return latest
@@ -61,19 +88,23 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
     t0 = time.time()
     
     while is_robot_moving(node) and (time.time()-t0) < 0.25: time.sleep(0.01)
+    
     first = _try_once(seed_xyz, timeout, radius, stable_need)
+    
     if first: 
         return list(first)
     
-    cur = node.get_end_effector_pose()
+    # --- Retry after small lift --- TO DO
     
-    if cur:
-        execute_single_pose(node, [cur[0], cur[1]+0.10, cur[2], *cur[3:]])
-        wait_until_xyz(node, [cur[0], cur[1]+0.10, cur[2]])
+    # cur = node.get_end_effector_pose()
+    
+    # if cur:
+    #     #execute_single_pose(node, [cur[0], cur[1]+0.10, cur[2], *cur[3:]])
+    #     wait_until_xyz(node, [cur[0], cur[1]+0.10, cur[2]])
         
-    second = _try_once(seed_xyz, 2.0, max(radius,0.15), max(1, stable_need-1))
+    # second = _try_once(seed_xyz, 2.0, max(radius,0.15), max(1, stable_need-1))
     
-    return list(second) if second else None
+    # return list(second) if second else None
 
 
 def subscribe_to_goal_pose(node):
@@ -110,7 +141,6 @@ def subscribe_to_goal_pose(node):
         if curp and not is_robot_moving(node):
             dx,dy,dz = sequence[idx['i']]
             tgt = [curp[0]+dx, curp[1]+dy, curp[2]+dz, *current_orientation]
-            from .motions import execute_single_pose as _exec
             print(f"Idle move to: {tgt}");
             _exec(node, tgt); idx['i'] += 1
     node.idle_timer = node.create_timer(5.0, _idle_cb)
@@ -140,34 +170,47 @@ def plan_and_execute(node):
             joint_names=node.joint_order,
         )
         
+        
+        # 0. Get next goal
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
         
+        # 1. Plan approach
         if z > 1.30:
             orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-            approach = [x, y+0.12, z, *orientation]; y -= 0.004; z -= 0.4
+            approach = [x, y+0.12, z, *orientation]
+            y -= 0.004; z -= 0.4
         else:
-            orientation = goal[3:]; approach = [x, y+0.10, z-0.12, *orientation]; z += 0.055; y -= 0.003
+            orientation = goal[3:]; approach = [x, y+0.10, z-0.12, *orientation]
+            z -= 0.055; y -= 0.003
             
-        if not plan_and_send(node, start, Pose.from_list(approach), dt=0.01, label="APPROACH"): 
+        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
             continue
         wait_until_xyz(node, approach[:3])
+        blend_motion(node)
         
         start = JointState.from_position(
             torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
             joint_names=node.joint_order,
         )
-        seed = [x,y,z]; reacq = reacquire_goal_pose(node, seed_xyz=seed, timeout=3.5, stable_eps=0.004, stable_need=3)
+        
+        # 2. Reacquire
+        seed = [x,y,z]
+        reacq = reacquire_goal_pose(node, seed_xyz=seed, timeout=3.5, stable_eps=0.004, stable_need=3)
         
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
-            node.get_logger().warn("No reacquire; skipping goal."); continue
+            node.get_logger().warn("No reacquire; skipping goal.")
+            continue
             
+        # 3. Final slow precise grasp
         final_target = [x, y-0.001, z+0.001, *orientation]
-        if not plan_and_send(node, start, Pose.from_list(final_target), dt=0.03, label="FINAL"): 
+        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
+        blend_motion(node)
+
         node.control_gripper("CLOSE"); time.sleep(0.7)
         
         
@@ -177,12 +220,13 @@ def plan_and_execute(node):
             node.slip_detection = node.grab_miss = False
             node.control_gripper("CLOSE")
             
-        
-        rotate_wrist(node, 90); time.sleep(0.7)
-        
+        # 4. Drop-off and return
+        rotate_wrist(node, 90); time.sleep(0.9)
         move_to_predropoff_position(node)
+        blend_motion(node)
         move_to_dropoff_position(node)
-        time.sleep(0.7)
+        time.sleep(0.2)  # small delay to allow state update
+            
         node.control_gripper("OPEN")
         move_to_home_position(node)
 
