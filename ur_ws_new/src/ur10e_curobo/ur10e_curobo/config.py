@@ -56,6 +56,12 @@ class Planner:
     urdf_config: str = "ur10e.yml"
     interpolation_dt: float = 0.004
     speed_scale: float = 2.5
+    base_dt: float = 0.02          # common base timestep (s)
+    speed_home: float = 4.5        # for move_to_home_position
+    speed_dropoff: float = 4.5     # for move_to_dropoff_position
+    speed_predropoff: float = 1.5  # for pre-dropoff
+    speed_approach: float = 2.5    # for approach motion
+    speed_final: float = 0.7       # for precise grasp
 
 @dataclass
 class Perception:

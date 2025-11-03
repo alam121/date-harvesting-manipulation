@@ -35,6 +35,7 @@ def publish_path_marker(node):
 
 
 def track_robot_path(node):
+
     try:
         tf = node.tf_buffer.lookup_transform(
             "base_link", "tool0", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
@@ -42,6 +43,12 @@ def track_robot_path(node):
         p = Point(x=tf.transform.translation.x, y=tf.transform.translation.y, z=tf.transform.translation.z)
         if not node.path_points or (p.x != node.path_points[-1].x or p.y != node.path_points[-1].y or p.z != node.path_points[-1].z):
             node.path_points.append(p); publish_path_marker(node)
+            if not node.tf_printed:
+                node.tf_printed = True
+                node.get_logger().info("Tracked robot path point. TF READY.")
+
             
     except (LookupException, ConnectivityException, ExtrapolationException) as e:
-        node.get_logger().warn(f"Path trace TF failed: {e}")
+        if not node.tf_warning_printed:
+            node.get_logger().warn(f"Waiting for TF. Path trace TF failed: {e}")
+            node.tf_warning_printed = True

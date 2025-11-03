@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ur_robot_driver/ur_robot_driver/include/ur_robot_driver/urcl_log_handler.hpp

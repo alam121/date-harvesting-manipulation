@@ -1,9 +1,0 @@
-source;share/ur10e_curobo/hook/pythonpath.ps1
-source;share/ur10e_curobo/hook/pythonpath.dsv
-source;share/ur10e_curobo/hook/pythonpath.sh
-source;share/ur10e_curobo/hook/ament_prefix_path.ps1
-source;share/ur10e_curobo/hook/ament_prefix_path.dsv
-source;share/ur10e_curobo/hook/ament_prefix_path.sh
-source;../../build/ur10e_curobo/share/ur10e_curobo/hook/pythonpath_develop.ps1
-source;../../build/ur10e_curobo/share/ur10e_curobo/hook/pythonpath_develop.dsv
-source;../../build/ur10e_curobo/share/ur10e_curobo/hook/pythonpath_develop.sh

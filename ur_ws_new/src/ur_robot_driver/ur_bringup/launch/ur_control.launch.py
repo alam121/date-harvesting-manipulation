@@ -20,7 +20,10 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import PathJoinSubstitution
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 def generate_launch_description():
     declared_arguments = []
@@ -315,6 +318,21 @@ def generate_launch_description():
         executable="spawner.py",
         arguments=[robot_controller, "-c", "/controller_manager"],
     )
+    
+    delto_launch = IncludeLaunchDescription(
+    PythonLaunchDescriptionSource(
+        PathJoinSubstitution([
+            FindPackageShare("delto_3f_driver"),
+            "launch",
+            "delto_3f_bringup.launch.py"
+        ])
+    ),
+    launch_arguments={
+        "delto_ip": "169.254.186.72",
+        "delto_port": "502",
+        "launch_rviz": "false"    # ✅ disable RViz for gripper
+    }.items(),
+)
 
     nodes_to_start = [
         control_node,
@@ -327,6 +345,7 @@ def generate_launch_description():
         speed_scaling_state_broadcaster_spawner,
         force_torque_sensor_broadcaster_spawner,
         robot_controller_spawner,
+        delto_launch,
     ]
 
     return LaunchDescription(declared_arguments + nodes_to_start)

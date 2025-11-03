@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/build/rrbot_description/ament_cmake_core/rrbot_descriptionConfig.cmake

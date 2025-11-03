@@ -1,3 +1,69 @@
+--------------------demo commands----
+
+
+
+0) The repo is Document/v2/datemanipulator ->dev branch
+if something unexpected source from this folder again (ros2)
+
+1)Check ip
+
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.1.101/24 dev eth0
+sudo ip addr add 169.254.186.100/24 dev eth0
+sudo ip link set eth0 up
+
+Result: 
+
+ip a | grep eth0
+3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 169.254.186.100/24 scope global eth0
+    inet 192.168.1.101/24 scope global eth0
+
+
+If no ips, please try the same step again.
+If you close the terminal, you will have to do it again
+
+
+
+2)
+
+ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true
+
+ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 
+
+
+This will show rviz with arm and gripper.
+
+if something goes wrong, please source and check ips.
+
+3) GO to tablet of arm. POwer it on, start and release break go to program, and load ucra file and press start button
+sometimes the connection drops, in that case : Connection to reverse interface dropped.
+in this case start the program again
+
+4)
+
+2 python files
+
+for motion: datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src$ python3 test21.py 
+for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 dete2.py --weights exp_aug.pt --img_size 640 --conf_thres 0.1
+
+
+*Make sure that the start button of program is pressed, otherwise: [ERROR] [1759327538.950381504] [ur10e_curobo_moveit_node]: ❌ Cannot execute goals: robot program is OFF. Please turn it ON first.
+
+For vision: the opencv window will open with detection. Topics of external goals will be filled.
+
+5)
+
+IN motion window, press s to subsribe one goal. and p to sibsribe multiple goals for 10 seconds
+confirm in rviz that red dot, goals are showing
+
+6) final step: press n to execute motion.
+
+Extra: o: open gripper and c for close gripper
+
+------------------------------------------------------------------------------------------------------------------
+
+
 ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=yyy.yyy.yyy.yyy use_fake_hardware:=true launch_rviz:=false
 
 
@@ -10,18 +76,6 @@ python3 test3.py
 
 
 
-
-
-
-
-sudo ip addr flush dev eth0
-sudo ip addr add 192.168.1.101/24 dev eth0
-sudo ip addr add 169.254.186.100/24 dev eth0
-sudo ip link set eth0 up
-ip a | grep eth0
-3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 169.254.186.100/24 scope global eth0
-    inet 192.168.1.101/24 scope global eth0
 
 
 

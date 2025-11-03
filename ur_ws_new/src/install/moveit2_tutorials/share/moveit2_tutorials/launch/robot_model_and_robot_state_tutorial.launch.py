@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/moveit2_tutorials/doc/robot_model_and_robot_state/launch/robot_model_and_robot_state_tutorial.launch.py

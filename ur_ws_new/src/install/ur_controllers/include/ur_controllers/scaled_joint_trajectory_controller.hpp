@@ -1,1 +1,0 @@
-/home/datepalm/Documents/v3/manipulatorsdatepalm/ur_ws_new/src/ur_robot_driver/ur_controllers/include/ur_controllers/scaled_joint_trajectory_controller.hpp

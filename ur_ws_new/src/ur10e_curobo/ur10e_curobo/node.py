@@ -23,6 +23,7 @@ from . import goals as goals_mod
 from . import gripper as gripper_mod
 from .perception import ZedYoloPerception
 from trajectory_msgs.msg import JointTrajectory
+from ur_msgs.srv import SetIO
 
 
 # Callback	Trigger	Purpose
@@ -104,6 +105,10 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
         self.create_subscription(Bool, "/emergency_stop", self._stop_cb, 10)
         self.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
+        
+        self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
+        #while not self.io_client.wait_for_service(timeout_sec=1.0):
+            #self.get_logger().info("Waiting for /set_io service...")
 
         # tf
         self.tf_buffer = Buffer()
@@ -146,6 +151,10 @@ class UR10eCuroboMoveIt(Node):
         
         self.goal_sort_ref = None
         self.goal_sort_ascending = True
+        
+        self.tf_warning_printed = False
+        self.tf_printed = False
+
 
         # gripper/classifier
         gripper_mod.init_gripper(self)
@@ -225,6 +234,8 @@ class UR10eCuroboMoveIt(Node):
 
             elif key == 'm':
                 print(f"[{ts()}] manual goal entry requested…")
+                curr_pose = self.get_end_effector_pose()
+                print(f"  current pose: {curr_pose}")
                 self._manual_goal()
                 print(f"[{ts()}] manual goal entry done. total goals={len(self.goal_poses)}")
 
@@ -277,6 +288,8 @@ class UR10eCuroboMoveIt(Node):
             elif key == 'q':
                 print(f"[{ts()}] quitting…")
                 self.running = False
+                self.stop_requested = True
+                rclpy.shutdown()
                 break
 
             else:
@@ -344,7 +357,8 @@ class UR10eCuroboMoveIt(Node):
 
     def _prep_and_execute(self):
         
-        if self.goal_capture_active: self.stop_goal_capture()
+        if self.goal_capture_active: 
+            self.stop_goal_capture()
         if hasattr(self, 'goal_pose_sub'): 
             self.destroy_subscription(self.goal_pose_sub)
             del self.goal_pose_sub
