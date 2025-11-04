@@ -379,7 +379,7 @@ def world_to_camera(point_world: np.ndarray, cam_pose_world: sl.Pose) -> np.ndar
 # =========================
 # Tier-2 visibility primitives
 # =========================
-def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=1):
+def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0):
     """
     Assign each pixel to the nearest instance (z-buffer).
     returns: visible_masks (front-only pixels per instance), vis_ratios in [0,1].
@@ -579,7 +579,7 @@ def main_(args: argparse.Namespace):
                 scores = list(yolo_scores)
 
             visible_masks, vis_ratios = zbuffer_visible_masks(
-                masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003, erode_px=1
+                masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0
             )
 
             # Build candidate picks from visibility-resolved masks
