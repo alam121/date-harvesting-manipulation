@@ -4,7 +4,7 @@ from geometry_msgs.msg import Pose as ROSPose, PoseStamped
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
 from .motions import execute_single_pose as _exec
-
+from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker
@@ -110,34 +110,49 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
 def subscribe_to_goal_pose(node):
     
     if is_robot_moving(node):
-        node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node)); return
+        node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node))
+        return
+    
     if hasattr(node, 'goal_pose_sub'):
-        node.destroy_subscription(node.goal_pose_sub); del node.goal_pose_sub
+        node.destroy_subscription(node.goal_pose_sub)
+        del node.goal_pose_sub
         
-    cur = node.get_end_effector_pose(); current_orientation = cur[3:] if cur else [1.0,0.0,0.0,0.0]
-    node.goal_received = False; node.goal_poses.clear()
+    cur = node.get_end_effector_pose()
+    current_orientation = cur[3:] if cur else [1.0,0.0,0.0,0.0]
+    node.goal_received = False
+    node.goal_poses.clear()
     
     def _goal_cb(msg: PoseStamped):
         node.goal_received = True
-        if hasattr(node, 'idle_timer'): node.idle_timer.cancel(); from .motions import publish_stop_trajectory; publish_stop_trajectory(node)
-        if is_robot_moving(node): return
+        if hasattr(node, 'idle_timer'): node.idle_timer.cancel(); 
+        
+        publish_stop_trajectory(node)
+        if is_robot_moving(node): 
+            return
+        
         time.sleep(0.1)
         g = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z, *current_orientation]
-        import math
         if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
             node.goal_poses.append(g); publish_goal_marker(node, g[:3])
             print(f"Received goal pose: {g}")
+            
+            
         if hasattr(node, 'goal_pose_sub'):
             node.destroy_subscription(node.goal_pose_sub); del node.goal_pose_sub
             
     node.goal_pose_sub = node.create_subscription(PoseStamped, '/external_goal_pose', _goal_cb, node.qos)
     sequence = [(0.0,0.0,0.2),(0.0,0.1,0.0),(0.0,-0.1,0.0),(0.0,0.0,-0.1)]
+    
     idx = {"i":0}
     
     def _idle_cb():
         if node.goal_received or idx["i"]>=len(sequence):
-            if hasattr(node,'idle_timer'): node.idle_timer.cancel(); return
+            if hasattr(node,'idle_timer'): 
+                node.idle_timer.cancel()
+                return
+            
         curp = node.get_end_effector_pose()
+        
         if curp and not is_robot_moving(node):
             dx,dy,dz = sequence[idx['i']]
             tgt = [curp[0]+dx, curp[1]+dy, curp[2]+dz, *current_orientation]
