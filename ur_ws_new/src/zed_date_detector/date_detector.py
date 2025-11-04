@@ -80,13 +80,13 @@ def _smooth_vec(new, old, alpha):
     out = (1.0 - alpha) * old + alpha * new
     return _unit(out)
 
-def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z_max=2.5):
+def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z_max=2.5, min_points=3):
     """
     Robust 3D centroid inside a binary mask using per-pixel depth (CAMERA frame).
     Returns: (cx_px, cy_px, Xm, Ym, Zm) or None if not enough valid points.
     """
     ys, xs = np.where(mask_bin == 1)
-    if ys.size < 8:
+    if ys.size < min_points:  # Changed: now parametric, default to 3
         return None
 
     X = xyz_cam[ys, xs, 0]
@@ -94,7 +94,7 @@ def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z
     Z = xyz_cam[ys, xs, 2]
 
     valid = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z) & (Z > z_min) & (Z < z_max)
-    if valid.sum() < 8:
+    if valid.sum() < min_points:  # Changed: consistent with above
         return None
 
     # robust to outliers
@@ -382,7 +382,7 @@ def world_to_camera(point_world: np.ndarray, cam_pose_world: sl.Pose) -> np.ndar
 # =========================
 # Tier-2 visibility primitives
 # =========================
-def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=1):
+def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0):
     """
     Assign each pixel to the nearest instance (z-buffer).
     returns: visible_masks (front-only pixels per instance), vis_ratios in [0,1].
@@ -599,7 +599,7 @@ def main_(args: argparse.Namespace):
             picks = []
             for mbin_vis, vis_ratio, cls_i, conf_i in zip(visible_masks, vis_ratios, labels, scores):
                 # Remove all filtering: publish every valid detection
-                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=1.60)
+                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=1.60, min_points=3)
                 if res is None:
                     continue
                 vx, vy, Xc, Yc, Zc = res
