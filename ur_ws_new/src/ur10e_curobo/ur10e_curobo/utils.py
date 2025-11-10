@@ -43,20 +43,49 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
     return msg
 
 
-def wait_until_xyz(node, target_xyz, tol: float = 0.005):
-    node.get_logger().info(f"Waiting for EE→{[round(x,3) for x in target_xyz]}…")
-    while getattr(node, "running", True):
-        if getattr(node, "stop_requested", False):
-            node.get_logger().warn("Stop during wait; holding.")
-            from .motions import publish_stop_trajectory
-            publish_stop_trajectory(node)
-            node.stop_requested = False
-            break
-        cur = node.get_end_effector_pose()
-        if not cur:
-            time.sleep(0.05); continue
-        if math.dist(cur[:3], target_xyz) < tol:
-            node.get_logger().info("Goal reached.")
-            break
-        time.sleep(0.05)
+def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0):
+    """
+    Wait until the end-effector reaches the target XYZ (within tolerance).
+    Stops gracefully if stop_requested or timeout occurs.
+    """
+    from .motions import publish_stop_trajectory
+    start_time = time.time()
 
+    try:
+        node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
+        while getattr(node, "running", True):
+            # Safety exit: timeout
+            if time.time() - start_time > timeout:
+                node.get_logger().warn("Timeout waiting for EE to reach target.")
+                publish_stop_trajectory(node)
+                break
+
+            # Safety exit: stop signal
+            if getattr(node, "stop_requested", False):
+                node.get_logger().warn("Stop requested during wait; holding.")
+                publish_stop_trajectory(node)
+                node.stop_requested = False
+                break
+
+            # Try to get current pose (catch FK/TF errors)
+            try:
+                cur = node.get_end_effector_pose()
+            except Exception as e:
+                node.get_logger().warn(f"FK/TF error in wait loop: {e}")
+                cur = None
+
+            # Skip if no valid FK
+            if not cur or any(math.isnan(v) for v in cur[:3]):
+                time.sleep(0.05)
+                continue
+
+            # Check distance to goal
+            if math.dist(cur[:3], target_xyz) < tol:
+                node.get_logger().info("✅ End-effector reached target position.")
+                break
+
+            time.sleep(0.05)
+
+    except Exception as e:
+        node.get_logger().error(f"Error during wait_until_xyz: {e}")
+        publish_stop_trajectory(node)

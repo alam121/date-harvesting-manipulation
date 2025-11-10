@@ -44,10 +44,16 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.5916569868670862, -1.649402920399801,
-        2.113215446472168, -4.4819199482547205, 4.604945659637451, -0.05743295351137334])
+    home: List[float] = field(default_factory=lambda: [-1.5008023420916956, -1.5742222271361292, 2.3116706053363245, 
+        -4.775422235528463, 4.615280628204346, 0.06076143682003021]
+
+)
     dropoff: List[float] = field(default_factory=lambda: [-2.16858417192568, -1.3347657362567347,
         2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704])
+    
+    
+    + 
+    
     predropoff: List[float] = field(default_factory=lambda: [-1.6832264105426233, -2.020153347645895,
         2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341])
 
@@ -55,13 +61,16 @@ class JointsPreset:
 class Planner:
     urdf_config: str = "ur10e.yml"
     interpolation_dt: float = 0.004
-    speed_scale: float = 2.5
+    speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
-    speed_home: float = 4.5        # for move_to_home_position
+    speed_home: float = 6.0        # for move_to_home_position
     speed_dropoff: float = 4.5     # for move_to_dropoff_position
-    speed_predropoff: float = 1.5  # for pre-dropoff
-    speed_approach: float = 2.5    # for approach motion
-    speed_final: float = 0.7       # for precise grasp
+    speed_predropoff: float = 2.5  # for pre-dropoff
+    speed_approach: float = 3.5    # for approach motion
+    speed_final: float = 1.7       # for precise grasp
+    
+    pre_droffoff_z_offset: float = 0.12  # m above dropoff
+    pre_droffoff_y_offset: float = 0.10  # m back from dropoff
 
 @dataclass
 class Perception:

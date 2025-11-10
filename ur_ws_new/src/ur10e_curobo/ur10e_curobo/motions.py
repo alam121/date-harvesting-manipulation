@@ -101,7 +101,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     traj = build_trajectory(
         node.joint_order,
         states,
-        vel=0.1 * scale,                     # scale velocity
+        vel=0.08 * scale,                     # scale velocity
         dt=base_dt / scale,                  # apply uniform dt
         stop_flag=lambda: node.stop_requested,
     )

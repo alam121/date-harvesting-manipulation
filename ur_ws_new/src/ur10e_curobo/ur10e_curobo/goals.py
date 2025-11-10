@@ -27,6 +27,8 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
     base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
     
+
+    
     if motion_type == "approach":
         scale = getattr(node.cfg.planner, "speed_approach", 1.0)
     elif motion_type == "final":
@@ -45,11 +47,13 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     )
     
     
-    node.get_logger().info(f"Planned {label} trajectory with {len(states)} steps.")
+    #node.get_logger().info(f"Planned {label} trajectory with {len(states)} steps.")
     
     if node.stop_requested:
         node.get_logger().warn(f"Stop before sending {label} trajectory."); node.stop_requested = False; return False
-    node.trajectory_pub.publish(traj); return True
+    node.trajectory_pub.publish(traj)
+    
+    return True
 
 
 def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.004, stable_need=2):
@@ -87,7 +91,8 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
     
     t0 = time.time()
     
-    while is_robot_moving(node) and (time.time()-t0) < 0.25: time.sleep(0.01)
+    while is_robot_moving(node) and (time.time()-t0) < 0.25:
+        time.sleep(0.01)
     
     first = _try_once(seed_xyz, timeout, radius, stable_need)
     
@@ -108,57 +113,104 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
 
 
 def subscribe_to_goal_pose(node):
-    
+    """Subscribe to /external_goal_pose and stop idle motion immediately when goal is received."""
+
+    # Wait until robot stops before subscribing
     if is_robot_moving(node):
         node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node))
         return
-    
+
+    # Destroy previous subscription if it exists
     if hasattr(node, 'goal_pose_sub'):
         node.destroy_subscription(node.goal_pose_sub)
         del node.goal_pose_sub
-        
+
     cur = node.get_end_effector_pose()
-    current_orientation = cur[3:] if cur else [1.0,0.0,0.0,0.0]
+    current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
     node.goal_received = False
     node.goal_poses.clear()
-    
+
     def _goal_cb(msg: PoseStamped):
+        """Triggered immediately on receiving a goal pose."""
+        if node.goal_received:
+            return  # Ignore duplicates
+
         node.goal_received = True
-        if hasattr(node, 'idle_timer'): node.idle_timer.cancel(); 
-        
-        publish_stop_trajectory(node)
-        if is_robot_moving(node): 
-            return
-        
-        time.sleep(0.1)
-        g = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z, *current_orientation]
-        if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
-            node.goal_poses.append(g); publish_goal_marker(node, g[:3])
-            print(f"Received goal pose: {g}")
-            
-            
-        if hasattr(node, 'goal_pose_sub'):
-            node.destroy_subscription(node.goal_pose_sub); del node.goal_pose_sub
-            
-    node.goal_pose_sub = node.create_subscription(PoseStamped, '/external_goal_pose', _goal_cb, node.qos)
-    sequence = [(0.0,0.0,0.2),(0.0,0.1,0.0),(0.0,-0.1,0.0),(0.0,0.0,-0.1)]
-    
-    idx = {"i":0}
-    
-    def _idle_cb():
-        if node.goal_received or idx["i"]>=len(sequence):
-            if hasattr(node,'idle_timer'): 
+        print("✅ Goal received, stopping all idle activity...")
+
+        # Stop idle timer immediately
+        if hasattr(node, 'idle_timer'):
+            try:
                 node.idle_timer.cancel()
-                return
-            
+                del node.idle_timer
+            except Exception:
+                pass
+
+        # Stop robot motion
+        publish_stop_trajectory(node)
+
+        # Wait a bit for safety
+        time.sleep(0.05)
+
+        # Extract goal position + keep current orientation
+        g = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            *current_orientation
+        ]
+
+        # Add goal only if it's new
+        if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
+            node.goal_poses.append(g)
+            publish_goal_marker(node, g[:3])
+            print(f"🟢 Received goal pose: {g}")
+
+        # Destroy the subscription — stop listening after first goal
+        try:
+            if hasattr(node, 'goal_pose_sub'):
+                node.destroy_subscription(node.goal_pose_sub)
+                del node.goal_pose_sub
+        except Exception:
+            pass
+
+    # Subscribe to /external_goal_pose
+    node.goal_pose_sub = node.create_subscription(
+        PoseStamped,
+        '/external_goal_pose',
+        _goal_cb,
+        node.qos
+    )
+
+    # Define idle micro-motions while waiting for goals
+    sequence = [
+        (0.0, 0.0, 0.2),
+        (0.0, 0.1, 0.0),
+        (0.0, -0.1, 0.0),
+        (0.0, 0.0, -0.1)
+    ]
+    idx = {"i": 0}
+
+    def _idle_cb():
+        """Perform gentle idle motions until a goal is received."""
+        if node.goal_received or idx["i"] >= len(sequence):
+            if hasattr(node, 'idle_timer'):
+                node.idle_timer.cancel()
+                del node.idle_timer
+            return
+
         curp = node.get_end_effector_pose()
-        
         if curp and not is_robot_moving(node):
-            dx,dy,dz = sequence[idx['i']]
-            tgt = [curp[0]+dx, curp[1]+dy, curp[2]+dz, *current_orientation]
-            print(f"Idle move to: {tgt}");
-            _exec(node, tgt); idx['i'] += 1
+            print("Performing idle micro-motion...")
+            dx, dy, dz = sequence[idx['i']]
+            tgt = [curp[0] + dx, curp[1] + dy, curp[2] + dz, *current_orientation]
+            print(f"Idle move to: {tgt}")
+            _exec(node, tgt)
+            idx['i'] += 1
+
+    # Start idle motion timer
     node.idle_timer = node.create_timer(5.0, _idle_cb)
+
 
 
 def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
@@ -189,15 +241,17 @@ def plan_and_execute(node):
         # 0. Get next goal
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
+        yoffset = node.yoffset
         
         # 1. Plan approach
-        if z > 1.30:
+        if z > 1.30:  #high targets: top-down approach
             orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-            approach = [x, y+0.12, z, *orientation]
-            y -= 0.004; z -= 0.4
+            approach = [x, y+0.12, z, *orientation] #top approach
+            #y -= 0.004; z -= 0.4
         else:
-            orientation = goal[3:]; approach = [x, y+0.10, z-0.12, *orientation]
-            z -= 0.055; y -= 0.003
+            orientation = goal[3:]
+            approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
+            #z -= 0.055; y -= 0.003
             
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
             continue
@@ -220,7 +274,7 @@ def plan_and_execute(node):
             continue
             
         # 3. Final slow precise grasp
-        final_target = [x, y-0.001, z+0.001, *orientation]
+        final_target = [x, y+0.025, z, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
@@ -243,7 +297,11 @@ def plan_and_execute(node):
         time.sleep(0.2)  # small delay to allow state update
             
         node.control_gripper("OPEN")
-        move_to_home_position(node)
+        if len(node.goal_poses) == 0:
+            move_to_home_position(node)
+            node.get_logger().info("All goals completed; returned HOME.")
+        else:
+            node.get_logger().info("Preparing for next goal...")
 
 
 def quaternion_from_approach(node, direction_xyz=None, pitch_deg=None, world=False):

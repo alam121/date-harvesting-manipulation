@@ -291,8 +291,11 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2, iou_thre
                 H, W = det.orig_shape
                 for i in range(len(det.boxes)):
                     m = det.masks.data[i].float().cpu().numpy()   # [Hm,Wm] in 0..1
+                    
                     m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+                    
                     m_bin = (m > 0.5).astype(np.uint8)
+                    
                     if m.sum() > 5000:
                         continue
                     export_masks.append(m_bin)
@@ -586,7 +589,7 @@ def main_(args: argparse.Namespace):
             picks = []
             for mbin_vis, vis_ratio, cls_i, conf_i in zip(visible_masks, vis_ratios, labels, scores):
                 # Remove all filtering: publish every valid detection
-                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=1.60, min_points=3)
+                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=0.4, min_points=3)
                 if res is None:
                     continue
                 vx, vy, Xc, Yc, Zc = res
