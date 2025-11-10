@@ -18,22 +18,22 @@ def init_gripper(node):
 def control_gripper(node, action: str):
     act = action.upper()
     if act == "OPEN":
-        node.get_logger().info("🟡 Releasing suction before opening gripper...")
+        #node.get_logger().info("🟡 Releasing suction before opening gripper...")
         activate_suction(node, False)  # Turn off suction before opening
         node.gripper_controller.open_gripper()
         node.gripper_closed = False
         node.slip_detection = False
         node.grab_miss = False
         node.classifier.start_opening()
-        node.get_logger().info("Gripper OPEN → slip detection paused")
+        #node.get_logger().info("Gripper OPEN → slip detection paused")
     elif act == "CLOSE":
-        node.get_logger().info("🟢 Activating suction before grip...")
-        activate_suction(node, True)
+        #node.get_logger().info("🟢 Activating suction before grip...")
+        #activate_suction(node, True)
         node.classifier.start_closing()
         node.gripper_controller.run_closure_loop()
         node.classifier.mark_close_done()
         node.gripper_closed = True
-        node.get_logger().info("Gripper CLOSED → slip detection active")
+        #node.get_logger().info("Gripper CLOSED → slip detection active")
         
         #TO-DO Gripper close confirmation
 
@@ -55,4 +55,4 @@ def activate_suction(node, state: bool):
     for pin in [0, 1, 3]:
         req.pin = pin
         future = node.io_client.call_async(req)
-        node.get_logger().info(f"{'🟢 Activated' if state else '⚪ Deactivated'} suction pin {pin}")
+        #node.get_logger().info(f"{'🟢 Activated' if state else '⚪ Deactivated'} suction pin {pin}")

@@ -63,6 +63,9 @@ class UR10eCuroboMoveIt(Node):
         self.declare_parameter("joints.home", self.cfg.joints.home)
         self.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
         self.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
+        
+        self.declare_parameter("planner.pre_droffoff_z_offset", self.cfg.planner.pre_droffoff_z_offset)
+        self.declare_parameter("planner.pre_droffoff_y_offset", self.cfg.planner.pre_droffoff_y_offset)
 
         # 3) read back ROS parameters
         self.cfg.planner.speed_scale = self.get_parameter("planner.speed_scale").value
@@ -81,6 +84,9 @@ class UR10eCuroboMoveIt(Node):
         self.cfg.joints.home       = list(self.get_parameter("joints.home").value)
         self.cfg.joints.dropoff    = list(self.get_parameter("joints.dropoff").value)
         self.cfg.joints.predropoff = list(self.get_parameter("joints.predropoff").value)
+        
+        self.cfg.planner.pre_droffoff_z_offset = float(self.get_parameter("planner.pre_droffoff_z_offset").value)
+        self.cfg.planner.pre_droffoff_y_offset = float(self.get_parameter("planner.pre_droffoff_y_offset").value)
 
         # 4) env overrides (UR10E_*), e.g. UR10E_SHOW_VIEW=1
         self.cfg = AppConfig.from_env(self.cfg)
@@ -90,6 +96,9 @@ class UR10eCuroboMoveIt(Node):
         self.home_joints       = self.cfg.joints.home
         self.dropoff_joints    = self.cfg.joints.dropoff
         self.predropoff_joints = self.cfg.joints.predropoff
+        
+        self.yoffset = self.cfg.planner.pre_droffoff_y_offset
+        self.zoffset = self.cfg.planner.pre_droffoff_z_offset
 
         # ======== pubs/subs after config so QoS/params exist ========
         self.trajectory_pub = self.create_publisher(JointTrajectory, "/joint_trajectory_controller/joint_trajectory", 10)
@@ -265,8 +274,8 @@ class UR10eCuroboMoveIt(Node):
             elif key == 'c':
                 print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
                 gripper_mod.control_gripper(self, 'CLOSE')
-                motions_mod.move_backward(self, -0.01)
-                motions_mod.rotate_wrist(self, 120)
+                #motions_mod.move_backward(self, -0.01)
+                #motions_mod.rotate_wrist(self, 120)
                 print(f"[{ts()}] post-close micro-motions done")
 
             elif key == 'h':
@@ -291,7 +300,16 @@ class UR10eCuroboMoveIt(Node):
                 self.stop_requested = True
                 rclpy.shutdown()
                 break
-
+            elif key == "f":
+                print("finding current joint positions…")
+                print(self.current_joint_positions)
+                print("finding current end-effector pose…")
+                print(self.get_end_effector_pose()) 
+                
+            elif key == "t":
+                print("Test…")
+                gripper_mod.activate_suction(self, True)
+                
             else:
                 # unknown key helper
                 if key != last_key:  # avoid spamming if someone holds a key
