@@ -60,6 +60,13 @@ class UR10eCuroboMoveIt(Node):
         self.declare_parameter("perception.show_view", self.cfg.perception.show_view)
         self.declare_parameter("perception.use_gpu", self.cfg.perception.use_gpu)
 
+        #topics
+        self.declare_parameter("topics.joint_traj", self.cfg.topics.traj_cmd)
+        self.declare_parameter("topics.goal_marker", self.cfg.topics.goal_marker)
+        self.declare_parameter("topics.path_marker", self.cfg.topics.path_marker)
+        self.declare_parameter("topics.joint_states", self.cfg.topics.joint_states)
+        #joints
+
         self.declare_parameter("joints.home", self.cfg.joints.home)
         self.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
         self.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
@@ -79,6 +86,13 @@ class UR10eCuroboMoveIt(Node):
         self.cfg.perception.cam_frame  = self.get_parameter("perception.cam_frame").value
         self.cfg.perception.show_view  = bool(self.get_parameter("perception.show_view").value)
         self.cfg.perception.use_gpu    = bool(self.get_parameter("perception.use_gpu").value)
+
+        #ros topics
+        self.cfg.topics.traj_cmd      = self.get_parameter("topics.joint_traj").value
+        self.cfg.topics.goal_marker    = self.get_parameter("topics.goal_marker").value
+        self.cfg.topics.path_marker    = self.get_parameter("topics.path_marker").value
+        self.cfg.topics.joint_states   = self.get_parameter("topics.joint_states").value
+
 
         # arrays come back as tuples in Foxy—cast to list
         self.cfg.joints.home       = list(self.get_parameter("joints.home").value)
@@ -100,8 +114,14 @@ class UR10eCuroboMoveIt(Node):
         self.yoffset = self.cfg.planner.pre_droffoff_y_offset
         self.zoffset = self.cfg.planner.pre_droffoff_z_offset
 
+        self.traj_cmd_topic    = self.cfg.topics.traj_cmd
+        self.joint_states_topic = self.cfg.topics.joint_states
+        self.goal_marker_topic  = self.cfg.topics.goal_marker
+        self.path_marker_topic  = self.cfg.topics.path_marker
+
         # ======== pubs/subs after config so QoS/params exist ========
-        self.trajectory_pub = self.create_publisher(JointTrajectory, "/joint_trajectory_controller/joint_trajectory", 10)
+
+        self.trajectory_pub = self.create_publisher(JointTrajectory, self.traj_cmd_topic, 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
 

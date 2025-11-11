@@ -1,16 +1,30 @@
 // Copyright 2019, FZI Forschungszentrum Informatik
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the {copyright_holder} nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
 
 //----------------------------------------------------------------------
 /*!\file
@@ -37,7 +51,7 @@
 // UR client library
 #include "ur_client_library/ur/dashboard_client.h"
 #include "ur_client_library/exceptions.h"
-#include "ur_dashboard_msgs/msg/program_state.hpp"
+#include "ur_client_library/primary/primary_client.h"
 #include "ur_dashboard_msgs/srv/add_to_log.hpp"
 #include "ur_dashboard_msgs/srv/get_loaded_program.hpp"
 #include "ur_dashboard_msgs/srv/get_program_state.hpp"
@@ -48,6 +62,7 @@
 #include "ur_dashboard_msgs/srv/load.hpp"
 #include "ur_dashboard_msgs/srv/popup.hpp"
 #include "ur_dashboard_msgs/srv/raw_request.hpp"
+#include "ur_dashboard_msgs/srv/is_in_remote_control.hpp"
 
 namespace ur_robot_driver
 {
@@ -101,10 +116,16 @@ private:
   bool handleRobotModeQuery(ur_dashboard_msgs::srv::GetRobotMode::Request::SharedPtr req,
                             ur_dashboard_msgs::srv::GetRobotMode::Response::SharedPtr resp);
 
+  bool handleRemoteControlQuery(ur_dashboard_msgs::srv::IsInRemoteControl::Request::SharedPtr req,
+                                ur_dashboard_msgs::srv::IsInRemoteControl::Response::SharedPtr resp);
+
   bool connect();
 
   std::shared_ptr<rclcpp::Node> node_;
   urcl::DashboardClient client_;
+
+  urcl::comm::INotifier notifier_;
+  urcl::primary_interface::PrimaryClient primary_client_;
 
   // Commanding services
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr brake_release_service_;
@@ -134,6 +155,7 @@ private:
   rclcpp::Service<ur_dashboard_msgs::srv::GetProgramState>::SharedPtr program_state_service_;
   rclcpp::Service<ur_dashboard_msgs::srv::GetSafetyMode>::SharedPtr safety_mode_service_;
   rclcpp::Service<ur_dashboard_msgs::srv::GetRobotMode>::SharedPtr robot_mode_service_;
+  rclcpp::Service<ur_dashboard_msgs::srv::IsInRemoteControl>::SharedPtr is_in_remote_control_service_;
 };
 }  // namespace ur_robot_driver
 

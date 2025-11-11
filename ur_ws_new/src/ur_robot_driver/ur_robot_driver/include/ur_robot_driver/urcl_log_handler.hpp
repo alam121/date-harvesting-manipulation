@@ -1,16 +1,30 @@
 // Copyright 2021 Universal Robots A/S
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the {copyright_holder} nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
 
 // All source code contained in and/or linked to in this message (the “Source Code”) is subject to the copyright of
 // Universal Robots A/S and/or its licensors. THE SOURCE CODE IS PROVIDED “AS IS” WITHOUT WARRANTY OF ANY KIND, EXPRESS
@@ -29,10 +43,22 @@
 #ifndef UR_ROBOT_DRIVER__URCL_LOG_HANDLER_HPP_
 #define UR_ROBOT_DRIVER__URCL_LOG_HANDLER_HPP_
 
+#include <string>
 #include "ur_client_library/log.h"
-
 namespace ur_robot_driver
 {
+
+/*!
+ * \brief Register the UrclLoghHandler, this will start logging messages from the client library with ROS2 logging.
+ * This function has to be called inside your node, to enable the log handler.
+ */
+void registerUrclLogHandler(const std::string& tf_prefix = "");
+
+/*!
+ * \brief Unregister the UrclLoghHandler, stop logging messages from the client library with ROS2 logging.
+ */
+void unregisterUrclLogHandler();
+
 /*!
  * \brief Loghandler for handling messages logged with the C++ client library. This loghandler will log the messages
  * from the client library with ROS2s logging.
@@ -55,18 +81,31 @@ public:
    * \param log Log message
    */
   void log(const char* file, int line, urcl::LogLevel loglevel, const char* message) override;
+
+  /**
+   * @brief getTFPrefix - obtain the currently set tf_prefix
+   * @return
+   */
+  const std::string& getTFPrefix() const
+  {
+    return tf_prefix_;
+  }
+
+private:
+  std::string tf_prefix_{};
+
+  /**
+   * @brief setTFPrefix - set the tf_prefix the logger will append to the node name
+   * @param tf_prefix
+   */
+  void setTFPrefix(const std::string& tf_prefix)
+  {
+    tf_prefix_ = tf_prefix;
+  }
+
+  // Declare the register method as a friend so that we can access setTFPrefix from it
+  friend void registerUrclLogHandler(const std::string& tf_prefix);
 };
-
-/*!
- * \brief Register the UrclLoghHandler, this will start logging messages from the client library with ROS2 logging.
- * This function has to be called inside your node, to enable the log handler.
- */
-void registerUrclLogHandler();
-
-/*!
- * \brief Unregister the UrclLoghHandler, stop logging messages from the client library with ROS2 logging.
- */
-void unregisterUrclLogHandler();
 
 }  // namespace ur_robot_driver
 

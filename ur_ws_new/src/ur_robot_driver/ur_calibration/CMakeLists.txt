@@ -2,10 +2,10 @@ cmake_minimum_required(VERSION 3.5)
 project(ur_calibration)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 endif()
 
-add_compile_options(-Wno-unused-parameter)
+set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   message("${PROJECT_NAME}: You did not request a specific build type: selecting 'RelWithDebInfo'.")
@@ -17,35 +17,42 @@ find_package(rclcpp REQUIRED)
 find_package(ur_robot_driver REQUIRED)
 
 find_package(Eigen3 REQUIRED)
-find_package(yaml-cpp REQUIRED)
+find_package(yaml_cpp_vendor REQUIRED)
 find_package(ur_client_library REQUIRED)
-
-set(YAML_CPP_INCLUDE_DIRS ${YAML_CPP_INCLUDE_DIR})
 
 ###########
 ## Build ##
 ###########
 
-include_directories(
-  include
-  ${EIGEN3_INCLUDE_DIRS}
-  ${YAML_CPP_INCLUDE_DIRS}
+add_library(calibration
+  src/calibration.cpp
+  src/calibration_consumer.cpp
+)
+target_include_directories(calibration
+  PUBLIC
+    include
+    ${EIGEN3_INCLUDE_DIRS}
+)
+target_link_libraries(calibration
+  yaml-cpp
+)
+ament_target_dependencies(calibration
+  rclcpp
+  ur_robot_driver
 )
 
 add_executable(calibration_correction
-  src/calibration.cpp
-  src/calibration_consumer.cpp
   src/calibration_correction.cpp
 )
-target_include_directories(calibration_correction PRIVATE include)
-target_link_libraries(calibration_correction
-        ${YAML_CPP_LIBRARIES}
-        ur_client_library::urcl
+target_include_directories(calibration_correction
+  PRIVATE
+    include
 )
-ament_target_dependencies(
-        calibration_correction
-        rclcpp
-        ur_robot_driver
+target_link_libraries(calibration_correction
+  ur_client_library::urcl
+)
+target_link_libraries(calibration_correction
+  calibration
 )
 
 install(TARGETS calibration_correction
@@ -74,10 +81,10 @@ if(BUILD_TESTING)
   ament_add_gmock(
           calibration_test
           test/calibration_test.cpp
-          src/calibration.cpp
   )
-  target_include_directories(calibration_test PRIVATE include ${EIGEN3_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
-  target_link_libraries(calibration_test ${rclcpp_LIBRARIES} ${EIGEN3_LIBRARIES} ${YAML_CPP_LIBRARIES} ur_client_library::urcl)
+  target_link_libraries(calibration_test
+    calibration
+  )
 endif()
 
 ament_export_include_directories(
