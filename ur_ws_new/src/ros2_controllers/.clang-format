@@ -1,6 +1,6 @@
 ---
-Language:        Cpp
-BasedOnStyle:  Google
+Language: Cpp
+BasedOnStyle: Google
 
 ColumnLimit: 100
 AccessModifierOffset: -2
@@ -10,6 +10,5 @@ ConstructorInitializerIndentWidth: 0
 ContinuationIndentWidth: 2
 DerivePointerAlignment: false
 PointerAlignment: Middle
-ReflowComments: false
+ReflowComments: true
 IncludeBlocks: Preserve
-...

@@ -31,7 +31,7 @@ PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=
 # ---------- Runtime parameters (override via ROS params / env) ----------
 @dataclass
 class Topics:
-    traj_cmd: str = "/joint_trajectory_controller/joint_trajectory"
+    traj_cmd: str = "/scaled_joint_trajectory_controller/joint_trajectory"
     goal_marker: str = "/goal_positions_marker"
     path_marker: str = "/robot_path_marker"
     joint_states: str = "/joint_states"
@@ -51,8 +51,6 @@ class JointsPreset:
     dropoff: List[float] = field(default_factory=lambda: [-2.16858417192568, -1.3347657362567347,
         2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704])
     
-    
-    + 
     
     predropoff: List[float] = field(default_factory=lambda: [-1.6832264105426233, -2.020153347645895,
         2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341])

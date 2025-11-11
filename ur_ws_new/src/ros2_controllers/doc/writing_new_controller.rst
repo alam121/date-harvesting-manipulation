@@ -1,18 +1,19 @@
+:github_url: https://github.com/ros-controls/ros2_controllers/blob/{REPOS_FILE_BRANCH}/doc/writing_new_controller.rst
+
 .. _writing_new_controllers:
 
 Writing a new controller
 ========================
 
-In this framework controllers are libraries, dynamically loaded by the controller manager using the `pluginlib <ros.org/wiki/pluginlib>`_ interface.
+In this framework controllers are libraries, dynamically loaded by the controller manager using the `pluginlib <https://docs.ros.org/en/{DISTRO}/Tutorials/Beginner-Client-Libraries/Pluginlib.html>`_ interface.
 The following is a step-by-step guide to create source files, basic tests, and compile rules for a new controller.
 
 1. **Preparing package**
 
    If the package for the controller does not exist, then create it first.
    The package should have ``ament_cmake`` as a build type.
-   The easiest way is to search online for the most recent manual.
-   A helpful command to support this process is ``ros2 pkg create``.
-   Use the ``--help`` flag for more information on how to use it.
+   Generally, you can use ``ros2 pkg create <controller_name_package> --build-type ament_cmake``.
+   Use the ``--help`` flag for more information on how to use this command.
    There is also an option to create library source files and compile rules to help you in the following steps.
 
 2. **Preparing source files**
@@ -25,17 +26,34 @@ The following is a step-by-step guide to create source files, basic tests, and c
 
 3. **Adding declarations into header file (.hpp)**
 
-   1. Take care that you use header guards. ROS2-style is using ``#ifndef`` and ``#define`` preprocessor directives. (For more information on this, a search engine is your friend :) ).
+   1. Take care that you use header guards. ROS 2-style is using ``#ifndef`` and ``#define`` preprocessor directives.
 
    2. include ``"controller_interface/controller_interface.hpp"`` and ``visibility_control.h`` if you are using one.
 
    3. Define a unique namespace for your controller. This is usually a package name written in ``snake_case``.
 
-   4. Define the class of the controller, extending ``ControllerInterface``, e.g.,
-      .. code:: c++
-      class ControllerName : public controller_interface::ControllerInterface
+   4. Define the class of the controller, extending ``ControllerInterface``. Now, your code should look similar to this:
 
-   5. Add a constructor without parameters and the following public methods overriding the ``ControllerInterface`` definition: ``init``, ``command_interface_configuration``, ``state_interface_configuration``, ``on_configure``, ``on_activate``, ``on_deactivate``, ``update``.
+      .. code:: c++
+
+         #ifndef <CONTROLLER_NAME>_HPP_
+         #define <CONTROLLER_NAME>_HPP_
+
+         #include "controller_interface/controller_interface.hpp"
+
+         namespace <controller_name>
+         {
+
+         class ControllerName : public controller_interface::ControllerInterface
+         {
+           // ...
+         };
+
+         }  // namespace <controller_name>
+
+         #endif  // <CONTROLLER_NAME>_HPP_
+
+   5. Add a constructor without parameters and the following public methods overriding the ``ControllerInterface`` definition: ``on_init``, ``command_interface_configuration``, ``state_interface_configuration``, ``on_configure``, ``on_activate``, ``on_deactivate``, ``update``.
       For exact definitions check the ``controller_interface/controller_interface.hpp`` header or one of the controllers from `ros2_controllers <https://github.com/ros-controls/ros2_controllers>`_.
 
    6. (optional) Often, controllers accept lists of joint names and interface names as parameters.
@@ -46,10 +64,10 @@ The following is a step-by-step guide to create source files, basic tests, and c
    1. Include the header file of your controller and add a namespace definition to simplify further development.
 
    2. (optional) Implement a constructor if needed. There, you could initialize member variables.
-      This could also be done in the ``init`` method.
+      This could also be done in the ``on_init`` method.
 
-   3. Implement the ``init`` method. The first line usually calls the parent ``init`` method.
-      Here is the best place to initialize the variables, reserve memory, and most importantly, declare node parameters used by the controller. If everything works fine return ``controller_interface::return_type::OK`` or ``controller_interface::return_type::ERROR`` otherwise.
+   3. Implement the ``on_init`` method. The first line usually calls the parent ``on_init`` method.
+      Here is the best place to initialize the variables, reserve memory, and most importantly, declare node parameters used by the controller. If everything works fine return ``controller_interface::CallbackReturn::SUCCESS`` or ``controller_interface::CallbackReturn::ERROR`` otherwise.
 
    4. Write the ``on_configure`` method. Parameters are usually read here, and everything is prepared so that the controller can be started.
 
@@ -60,7 +78,6 @@ The following is a step-by-step guide to create source files, basic tests, and c
 
    6. Implement the ``on_activate`` method with checking, and potentially sorting, the interfaces and assigning members' initial values.
       This method is part of the real-time loop, therefore avoid any reservation of memory and, in general, keep it as short as possible.
-
 
    7. Implement the ``on_deactivate`` method, which does the opposite of ``on_activate``.
       In many cases, this method is empty.
@@ -81,7 +98,7 @@ The following is a step-by-step guide to create source files, basic tests, and c
    2. Usually, the plugin name is defined by the package (namespace) and the class name, e.g.,
       ``<controller_name_package>/<ControllerName>``.
       This name defines the controller's type when the controller manager searches for it.
-      The other two files have to correspond to the definition done in macro at the bottom of the ``<controller_name>.cpp`` file.
+      The other two parameters have to correspond to the definition done in macro at the bottom of the ``<controller_name>.cpp`` file.
 
 6. **Writing simple test to check if the controller can be found and loaded**
 
@@ -103,6 +120,7 @@ The following is a step-by-step guide to create source files, basic tests, and c
    4. Add ament dependencies needed by the library. You should add at least those listed under 1.
 
    5. Export for pluginlib description file using the following command:
+
       .. code:: cmake
 
          pluginlib_export_plugin_description_file(controller_interface <controller_name>.xml)
@@ -124,10 +142,10 @@ The following is a step-by-step guide to create source files, basic tests, and c
 
 9. **Compiling and testing the controller**
 
-   1. Now everything is ready to compile the controller using the ``colcon build <controller_name_package>`` command.
+   1. Now everything is ready to compile the controller using the ``colcon build --packages-select <controller_name_package>`` command.
       Remember to go into the root of your workspace before executing this command.
 
-   2. If compilation was successful, source the ``setup.bash`` file from the install folder and execute ``colcon test <controller_name_package>`` to check if the new controller can be found through ``pluginlib`` library and be loaded by the controller manager.
+   2. If compilation was successful, source the ``setup.bash`` file from the install folder and execute ``colcon test --packages-select <controller_name_package>`` to check if the new controller can be found through ``pluginlib`` library and be loaded by the controller manager.
 
 
 That's it! Enjoy writing great controllers!
@@ -136,4 +154,7 @@ That's it! Enjoy writing great controllers!
 Useful External References
 ---------------------------
 
-- `Templates and scripts for generating controllers shell <https://stoglrobotics.github.io/ros_team_workspace/use-cases/ros2_control/setup_controller.html>`_
+- `Templates and scripts for generating controllers shell <https://rtw.b-robotized.com/master/use-cases/ros2_control/setup_controller.html>`_
+
+
+  .. NOTE:: The script is currently only recommended to use with Humble, not compatible with the API from Jazzy and onwards.

@@ -1,16 +1,30 @@
-// Copyright 2019 FZI Forschungszentrum Informatik, Created on behalf of Universal Robots A/S
+// Copyright 2019, FZI Forschungszentrum Informatik, Created on behalf of Universal Robots A/S
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the {copyright_holder} nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
 
 //----------------------------------------------------------------------
 /*!\file
@@ -27,6 +41,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <rclcpp/utilities.hpp>
 
 #include "ur_robot_driver/controller_stopper.hpp"
 
@@ -56,8 +72,7 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
   controller_list_srv_->wait_for_service();
   RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Service available");
 
-  consistent_controllers_ =
-      node_->declare_parameter<std::vector<std::string>>("consistent_controllers", std::vector<std::string>(0));
+  consistent_controllers_ = node_->declare_parameter<std::vector<std::string>>("consistent_controllers");
 
   if (stop_controllers_on_startup_ == true) {
     while (stopped_controllers_.empty()) {
@@ -76,10 +91,11 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
           }
         }
       }
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
     }
     auto request_switch_controller = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
     request_switch_controller->strictness = request_switch_controller->STRICT;
-    request_switch_controller->stop_controllers = stopped_controllers_;
+    request_switch_controller->deactivate_controllers = stopped_controllers_;
     auto future = controller_manager_srv_->async_send_request(request_switch_controller);
     rclcpp::spin_until_future_complete(node_, future);
     if (future.get()->ok == false) {
@@ -122,7 +138,7 @@ void ControllerStopper::findAndStopControllers()
         }
         request_switch_controller->strictness = request_switch_controller->STRICT;
         if (!stopped_controllers_.empty()) {
-          request_switch_controller->stop_controllers = stopped_controllers_;
+          request_switch_controller->deactivate_controllers = stopped_controllers_;
           auto future =
               controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
         }
@@ -143,7 +159,7 @@ void ControllerStopper::startControllers()
   if (!stopped_controllers_.empty()) {
     auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
     request->strictness = request->STRICT;
-    request->start_controllers = stopped_controllers_;
+    request->activate_controllers = stopped_controllers_;
     auto future = controller_manager_srv_->async_send_request(request, callback);
   }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /*
- * Author: Tony Najjar, Borong Yuan
+ * Author: Tony Najjar
  */
 
 #ifndef TRICYCLE_CONTROLLER__TRICYCLE_CONTROLLER_HPP_
@@ -24,6 +24,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "ackermann_msgs/msg/ackermann_drive.hpp"
@@ -34,11 +35,11 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/state.hpp"
-#include "realtime_tools/realtime_box.h"
-#include "realtime_tools/realtime_buffer.h"
-#include "realtime_tools/realtime_publisher.h"
+#include "realtime_tools/realtime_box.hpp"
+#include "realtime_tools/realtime_publisher.hpp"
 #include "std_srvs/srv/empty.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
+
 #include "tricycle_controller/odometry.hpp"
 #include "tricycle_controller/steering_limiter.hpp"
 #include "tricycle_controller/traction_limiter.hpp"
@@ -65,10 +66,11 @@ public:
   controller_interface::InterfaceConfiguration state_interface_configuration() const override;
 
   TRICYCLE_CONTROLLER_PUBLIC
-  controller_interface::return_type update() override;
+  controller_interface::return_type update(
+    const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
   TRICYCLE_CONTROLLER_PUBLIC
-  controller_interface::return_type init(const std::string & controller_name) override;
+  CallbackReturn on_init() override;
 
   TRICYCLE_CONTROLLER_PUBLIC
   CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
@@ -84,9 +86,6 @@ public:
 
   TRICYCLE_CONTROLLER_PUBLIC
   CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
-
-  TRICYCLE_CONTROLLER_PUBLIC
-  CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
 
 protected:
   struct TractionHandle
@@ -164,13 +163,6 @@ protected:
   // speed limiters
   TractionLimiter limiter_traction_;
   SteeringLimiter limiter_steering_;
-
-  rclcpp::Time previous_update_timestamp_{0};
-
-  // publish rate limiter
-  double publish_rate_ = 50.0;
-  rclcpp::Duration publish_period_{0, 0};
-  rclcpp::Time previous_publish_timestamp_{0};
 
   bool is_halted = false;
   bool use_stamped_vel_ = true;

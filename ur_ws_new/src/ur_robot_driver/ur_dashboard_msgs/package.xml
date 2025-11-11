@@ -2,17 +2,21 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ur_dashboard_msgs</name>
-  <version>2.0.2</version>
+  <version>2.10.0</version>
   <description>Messages around the UR Dashboard server.</description>
 
-  <author>Felix Exner</author>
+  <maintainer email="feex@universal-robots.com">Felix Exner</maintainer>
+  <maintainer email="rsk@universal-robots.com">Rune Søe-Knudsen</maintainer>
+  <maintainer email="ros@universal-robots.com">Universal Robots A/S</maintainer>
 
-  <maintainer email="grosse@fzi.de">Marvin Große Besselmann</maintainer>
-
-  <license>Apache License 2.0</license>
+  <license>BSD-3-Clause</license>
 
   <url type="bugtracker">https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver/issues</url>
   <url type="repository">https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver</url>
+
+  <author email="denis@stoglrobotics.de">Denis Stogl</author>
+  <author email="lovro.ivanov@gmail.com">Lovro Ivanov</author>
+  <author email="zelenak@picknik.ai">Andy Zelenak</author>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
