@@ -27,19 +27,8 @@
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "test_joint_group_position_controller.hpp"
 
-using CallbackReturn = forward_command_controller::ForwardCommandController::CallbackReturn;
+using CallbackReturn = controller_interface::CallbackReturn;
 using hardware_interface::LoanedCommandInterface;
-
-namespace
-{
-rclcpp::WaitResultKind wait_for(rclcpp::SubscriptionBase::SharedPtr subscription)
-{
-  rclcpp::WaitSet wait_set;
-  wait_set.add_subscription(subscription);
-  const auto timeout = std::chrono::seconds(10);
-  return wait_set.wait(timeout).kind();
-}
-}  // namespace
 
 void JointGroupPositionControllerTest::SetUpTestCase() { rclcpp::init(0, nullptr); }
 
@@ -62,6 +51,7 @@ void JointGroupPositionControllerTest::SetUpController()
   command_ifs.emplace_back(joint_2_pos_cmd_);
   command_ifs.emplace_back(joint_3_pos_cmd_);
   controller_->assign_interfaces(std::move(command_ifs), {});
+  executor.add_node(controller_->get_node()->get_node_base_interface());
 }
 
 TEST_F(JointGroupPositionControllerTest, JointsParameterNotSet)
@@ -99,12 +89,13 @@ TEST_F(JointGroupPositionControllerTest, ActivateWithWrongJointsNamesFails)
   // activate failed, 'joint4' is not a valid joint name for the hardware
   ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
   ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), CallbackReturn::ERROR);
+  ASSERT_EQ(controller_->on_cleanup(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 
   controller_->get_node()->set_parameter({"joints", std::vector<std::string>{"joint1", "joint2"}});
 
-  // activate failed, 'acceleration' is not a registered interface for `joint1`
+  // activate should succeed now
   ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
-  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), CallbackReturn::ERROR);
+  ASSERT_EQ(controller_->on_activate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 }
 
 TEST_F(JointGroupPositionControllerTest, CommandSuccessTest)
@@ -114,7 +105,9 @@ TEST_F(JointGroupPositionControllerTest, CommandSuccessTest)
   ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 
   // update successful though no command has been send yet
-  ASSERT_EQ(controller_->update(), controller_interface::return_type::OK);
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
 
   // check joint commands are still the default ones
   ASSERT_EQ(joint_1_pos_cmd_.get_value(), 1.1);
@@ -127,7 +120,9 @@ TEST_F(JointGroupPositionControllerTest, CommandSuccessTest)
   controller_->rt_command_ptr_.writeFromNonRT(command_ptr);
 
   // update successful, command received
-  ASSERT_EQ(controller_->update(), controller_interface::return_type::OK);
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
 
   // check joint commands have been modified
   ASSERT_EQ(joint_1_pos_cmd_.get_value(), 10.0);
@@ -147,7 +142,9 @@ TEST_F(JointGroupPositionControllerTest, WrongCommandCheckTest)
   controller_->rt_command_ptr_.writeFromNonRT(command_ptr);
 
   // update failed, command size does not match number of joints
-  ASSERT_EQ(controller_->update(), controller_interface::return_type::ERROR);
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::ERROR);
 
   // check joint commands are still the default ones
   ASSERT_EQ(joint_1_pos_cmd_.get_value(), 1.1);
@@ -162,7 +159,9 @@ TEST_F(JointGroupPositionControllerTest, NoCommandCheckTest)
   ASSERT_EQ(controller_->on_configure(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
 
   // update successful, no command received yet
-  ASSERT_EQ(controller_->update(), controller_interface::return_type::OK);
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
 
   // check joint commands are still the default ones
   ASSERT_EQ(joint_1_pos_cmd_.get_value(), 1.1);
@@ -180,10 +179,10 @@ TEST_F(JointGroupPositionControllerTest, CommandCallbackTest)
   ASSERT_EQ(joint_2_pos_cmd_.get_value(), 2.1);
   ASSERT_EQ(joint_3_pos_cmd_.get_value(), 3.1);
 
-  auto node_state = controller_->configure();
+  auto node_state = controller_->get_node()->configure();
   ASSERT_EQ(node_state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
 
-  node_state = controller_->activate();
+  node_state = controller_->get_node()->activate();
   ASSERT_EQ(node_state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
 
   // send a new command
@@ -195,13 +194,18 @@ TEST_F(JointGroupPositionControllerTest, CommandCallbackTest)
   command_pub->publish(command_msg);
 
   // wait for command message to be passed
-  ASSERT_EQ(wait_for(controller_->joints_command_subscriber_), rclcpp::WaitResultKind::Ready);
-
-  // process callbacks
-  rclcpp::spin_some(controller_->get_node()->get_node_base_interface());
+  const auto timeout = std::chrono::milliseconds{10};
+  const auto until = controller_->get_node()->get_clock()->now() + timeout;
+  while (controller_->get_node()->get_clock()->now() < until)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::microseconds(10));
+  }
 
   // update successful
-  ASSERT_EQ(controller_->update(), controller_interface::return_type::OK);
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
 
   // check command in handle was set
   ASSERT_EQ(joint_1_pos_cmd_.get_value(), 10.0);

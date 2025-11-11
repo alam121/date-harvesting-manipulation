@@ -1,16 +1,30 @@
 // Copyright 2019, FZI Forschungszentrum Informatik
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the {copyright_holder} nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
 
 //----------------------------------------------------------------------
 /*!\file
@@ -23,16 +37,27 @@
  */
 //----------------------------------------------------------------------
 
-#include <ur_robot_driver/dashboard_client_ros.hpp>
+#include <ur_client_library/exceptions.h>
+#include <ur_client_library/primary/primary_client.h>
 
 #include <string>
+
+#include <ur_robot_driver/dashboard_client_ros.hpp>
 
 namespace ur_robot_driver
 {
 DashboardClientROS::DashboardClientROS(const rclcpp::Node::SharedPtr& node, const std::string& robot_ip)
-  : node_(node), client_(robot_ip)
+  : node_(node), client_(robot_ip), primary_client_(robot_ip, notifier_)
 {
   node_->declare_parameter<double>("receive_timeout", 1);
+
+  primary_client_.start(10, std::chrono::seconds(10));
+  auto robot_version = primary_client_.getRobotVersion();
+
+  if (robot_version->major > 5) {
+    throw(urcl::UrException("The dashboard server is only available for CB3 and e-Series robots."));
+  }
+
   connect();
 
   // Service to release the brakes. If the robot is currently powered off, it will get powered on on the fly.
@@ -244,13 +269,18 @@ DashboardClientROS::DashboardClientROS(const rclcpp::Node::SharedPtr& node, cons
         }
         return true;
       });
+
+  // Service to query whether the robot is in remote control.
+  is_in_remote_control_service_ = node_->create_service<ur_dashboard_msgs::srv::IsInRemoteControl>(
+      "~/is_in_remote_control",
+      std::bind(&DashboardClientROS::handleRemoteControlQuery, this, std::placeholders::_1, std::placeholders::_2));
 }
 
 bool DashboardClientROS::connect()
 {
   timeval tv;
   // Timeout after which a call to the dashboard server will be considered failure if no answer has been received.
-  double time_buffer;
+  double time_buffer = 0;
   node_->get_parameter("receive_timeout", time_buffer);
   tv.tv_sec = time_buffer;
   tv.tv_usec = 0;
@@ -385,4 +415,20 @@ bool DashboardClientROS::handleRobotModeQuery(const ur_dashboard_msgs::srv::GetR
   }
   return true;
 }
+
+bool DashboardClientROS::handleRemoteControlQuery(
+    const ur_dashboard_msgs::srv::IsInRemoteControl::Request::SharedPtr req,
+    ur_dashboard_msgs::srv::IsInRemoteControl::Response::SharedPtr resp)
+{
+  try {
+    resp->remote_control = this->client_.commandIsInRemoteControl();
+    resp->success = true;
+  } catch (const urcl::UrException& e) {
+    RCLCPP_ERROR(rclcpp::get_logger("Dashboard_Client"), "Service Call failed: '%s'", e.what());
+    resp->answer = e.what();
+    resp->success = false;
+  }
+  return true;
+}
+
 }  // namespace ur_robot_driver

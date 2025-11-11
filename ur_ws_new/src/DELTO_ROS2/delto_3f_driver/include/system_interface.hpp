@@ -13,7 +13,6 @@
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "std_msgs/msg/bool.hpp"
-  #include "hardware_interface/types/hardware_interface_return_values.hpp"
 
 #include "delto_external_TCP.hpp"
 
@@ -27,15 +26,10 @@ public:
 
   RCLCPP_SHARED_PTR_DEFINITIONS(SystemInterface)
 
-
-
-  hardware_interface::return_type configure(const hardware_interface::HardwareInfo & system_info) override;
-  hardware_interface::return_type start() override;
-  hardware_interface::return_type stop() override;
-  std::string get_name() const override;
-  hardware_interface::status get_status() const override;
-
-
+  CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
+  CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
   
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
@@ -44,9 +38,8 @@ public:
     const std::vector<std::string> & start_interfaces,
     const std::vector<std::string> & stop_interfaces) override;
 
-  return_type read() override;
-  return_type write() override;
-
+  return_type read(const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
   std::vector<double> calc_duty(std::vector<double> tq_u);
   std::vector<double> JointControl(std::vector<double> target_joint_state,
                                    std::vector<double> current_joint_state,
@@ -61,8 +54,6 @@ private:
   std::thread m_init_thread;
   std::shared_ptr<rclcpp::Node> m_node;
   std::unique_ptr<DeltoTCP::Communication> delto_client;
-  hardware_interface::HardwareInfo info_;
-
 
   // std::vector<double> position_commands;
   std::vector<double> effort_commands;
