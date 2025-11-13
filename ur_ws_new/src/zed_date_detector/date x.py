@@ -77,13 +77,13 @@ def _smooth_vec(new, old, alpha):
     out = (1.0 - alpha) * old + alpha * new
     return _unit(out)
 
-def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z_max=2.5, min_points=3):
+def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z_max=2.5):
     """
     Robust 3D centroid inside a binary mask using per-pixel depth (CAMERA frame).
     Returns: (cx_px, cy_px, Xm, Ym, Zm) or None if not enough valid points.
     """
     ys, xs = np.where(mask_bin == 1)
-    if ys.size < min_points:  # Changed: now parametric, default to 3
+    if ys.size < 8:
         return None
 
     X = xyz_cam[ys, xs, 0]
@@ -91,7 +91,7 @@ def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z
     Z = xyz_cam[ys, xs, 2]
 
     valid = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z) & (Z > z_min) & (Z < z_max)
-    if valid.sum() < min_points:  # Changed: consistent with above
+    if valid.sum() < 8:
         return None
 
     # robust to outliers
@@ -291,13 +291,8 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2, iou_thre
                 H, W = det.orig_shape
                 for i in range(len(det.boxes)):
                     m = det.masks.data[i].float().cpu().numpy()   # [Hm,Wm] in 0..1
-                    
                     m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-                    
                     m_bin = (m > 0.5).astype(np.uint8)
-                    
-                    if m.sum() > 5000:
-                        continue
                     export_masks.append(m_bin)
                     export_classes.append(int(det.boxes.cls[i].item()))
                     export_scores.append(float(det.boxes.conf[i].item()))
@@ -382,7 +377,7 @@ def world_to_camera(point_world: np.ndarray, cam_pose_world: sl.Pose) -> np.ndar
 # =========================
 # Tier-2 visibility primitives
 # =========================
-def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0):
+def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=1):
     """
     Assign each pixel to the nearest instance (z-buffer).
     returns: visible_masks (front-only pixels per instance), vis_ratios in [0,1].
@@ -582,22 +577,37 @@ def main_(args: argparse.Namespace):
                 scores = list(yolo_scores)
 
             visible_masks, vis_ratios = zbuffer_visible_masks(
-                masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0
+                masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003, erode_px=1
             )
 
             # Build candidate picks from visibility-resolved masks
             picks = []
             for mbin_vis, vis_ratio, cls_i, conf_i in zip(visible_masks, vis_ratios, labels, scores):
-                # Remove all filtering: publish every valid detection
-                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=0.4, min_points=3)
+                if vis_ratio < PARTIAL_VISIBLE_THRESH:
+                    continue
+
+                res = centroid_xyz_in_mask(mbin_vis, xyz_np, z_min=0.10, z_max=1.60)
                 if res is None:
                     continue
+
                 vx, vy, Xc, Yc, Zc = res
                 visibility_state = "FULL" if vis_ratio >= FULLY_VISIBLE_THRESH else "PARTIAL"
                 picks.append((Zc, vx, vy, Xc, Yc, Zc, cls_i, conf_i, mbin_vis, vis_ratio, visibility_state))
+                
+            # Prefer the same instance across frames, else fallback to nearest by depth
+            # if last_pos_cam is not None and len(picks) > 1:
+            #     px, py, pz = last_pos_cam
+            #     picks.sort(key=lambda t: (t[3]-px)**2 + (t[4]-py)**2 + (t[5]-pz)**2)
+            # else:
+            picks.sort(key=lambda t: t[3]**2 + t[4]**2 + t[5]**2)
 
-            # Publish ALL valid picks (no sorting, no smoothing, no tracking, no jump rejection)
+            # Publish only the tracked/primary pick (stabilized)
+            published_this_frame = False
             for (_, vx, vy, Xc, Yc, Zc, cls_i, conf_i, mbin_vis, vis_ratio, visibility_state) in picks:
+                # Remember camera-frame pos for consistency sorting next frame
+                last_pos_cam = (Xc, Yc, Zc)
+
+                # 3D point in CAMERA frame → transform to base_link
                 point_msg = PointStamped()
                 point_msg.header.frame_id = cam_frame
                 point_msg.header.stamp = rclpy.time.Time().to_msg()
@@ -606,10 +616,24 @@ def main_(args: argparse.Namespace):
                 point_msg.point.z = Zc
                 try:
                     pt_base = tf_buffer.transform(point_msg, 'base_link', timeout=rclpyDuration(seconds=0.2))
-                    # Compute long-axis from mask (CAMERA frame) via PCA fit
+
+                    Z_MAX = 1.34
+                    if pt_base.point.z > Z_MAX:
+                        continue
+
+                    # ---- compute long-axis from mask (CAMERA frame) via PCA fit ----
                     axis_cam = pca_long_axis_from_mask(mbin_vis, xyz_np)
+                    # Ensure axis points away from camera (positive Z in camera frame)
                     if axis_cam[2] < 0:
                         axis_cam = -axis_cam
+                    # Ensure axis direction is consistent with previous frame
+                    if last_axis_base is not None and np.dot(axis_cam, last_axis_base) < 0:
+                        axis_cam = -axis_cam
+                    # Stronger smoothing for stability
+                    if last_axis_base is not None:
+                        axis_cam = _smooth_vec(axis_cam, last_axis_base, 0.05)  # Lower alpha for more smoothing
+
+                    # cam->base rotation for axis
                     try:
                         tf_cb = tf_buffer.lookup_transform('base_link', cam_frame, rclpy.time.Time())
                         q_cb = tf_cb.transform.rotation  # quaternion cam->base
@@ -620,37 +644,95 @@ def main_(args: argparse.Namespace):
                     except Exception as e:
                         print(f"TF axis rotation failed, using camera axis: {e}")
                         axis_base_meas = axis_cam
-                    # Publish pose for each detection (no smoothing)
-                    qw, qx, qy, qz = quat_align_x_to_axis(axis_base_meas, up_hint=(0, 0, 1))
+
+                    # --- Stabilize position + axis ---
+                    pos_base_meas = np.array([pt_base.point.x, pt_base.point.y, pt_base.point.z], float)
+
+                    axis_jump = _angle_deg(axis_base_meas, last_axis_base)
+                    pos_jump  = 0.0 if last_pos_base is None else float(np.linalg.norm(pos_base_meas - last_pos_base))
+
+                    good_vis = (vis_ratio >= GOOD_VIS_THRESH)
+                    if not good_vis:
+                        # Poor visibility: just re-publish last stable pose if available
+                        if last_pos_base is not None and last_axis_base is not None:
+                            qw, qx, qy, qz = quat_align_x_to_axis(last_axis_base, up_hint=(0,0,1))
+                            goal = PoseStamped()
+                            goal.header = pt_base.header
+                            goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = last_pos_base.tolist()
+                            goal.pose.orientation.w, goal.pose.orientation.x, goal.pose.orientation.y, goal.pose.orientation.z = qw, qx, qy, qz
+                            goal_pub.publish(goal)
+                        # Draw 2D marker anyway
+                        sx = int(vx * image_scale[0]); sy = int(vy * image_scale[1])
+                        cv2.circle(image_left_ocv, (sx, sy), 4, (128, 128, 128, 255), -1)
+                        cv2.putText(image_left_ocv, "low vis – holding", (sx+6, sy-6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (128, 128, 128, 255), 1, cv2.LINE_AA)
+                        published_this_frame = True
+                        break
+
+                    # Reject implausible jumps; otherwise low-pass filter
+                    # if (last_axis_base is not None and axis_jump > MAX_AXIS_JUMP_DEG) or \
+                    #    (last_pos_base  is not None and pos_jump  > MAX_POS_JUMP_M):
+                    #     axis_base = last_axis_base if last_axis_base is not None else axis_base_meas
+                    #     pos_base  = last_pos_base  if last_pos_base  is not None else pos_base_meas
+                    # else:
+                    axis_base = _smooth_vec(axis_base_meas, last_axis_base, AXIS_ALPHA)
+                    pos_base  = (1.0 - POS_ALPHA) * (last_pos_base if last_pos_base is not None else pos_base_meas) \
+                                    + POS_ALPHA * pos_base_meas
+
+                    # commit state
+                    last_axis_base = axis_base
+                    last_pos_base  = pos_base
+
+                    # publish stabilized pose
+                    qw, qx, qy, qz = quat_align_x_to_axis(axis_base, up_hint=(0, 0, 1))
                     goal = PoseStamped()
-                    goal.header = pt_base.header
-                    goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = pt_base.point.x, pt_base.point.y, pt_base.point.z
+                    goal.header = pt_base.header             # frame_id='base_link'
+                    goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = pos_base.tolist()
                     goal.pose.orientation.w = qw
                     goal.pose.orientation.x = qx
                     goal.pose.orientation.y = qy
                     goal.pose.orientation.z = qz
                     goal_pub.publish(goal)
-                    # Also publish point
+                    #print(goal)
+                    print("[Published NEW stabilized pose:", pos_base.tolist())
+                    # Also publish stabilized point message if you still need it
                     pt_pub = PointStamped()
                     pt_pub.header = pt_base.header
-                    pt_pub.point.x, pt_pub.point.y, pt_pub.point.z = pt_base.point.x, pt_base.point.y, pt_base.point.z
+                    pt_pub.point.x, pt_pub.point.y, pt_pub.point.z = pos_base.tolist()
                     point_pub.publish(pt_pub)
+
                     # Overlay debug on image
+                    bx, by, bz = pos_base.tolist()
+                    base_xyz_txt = f"base XYZ: {bx:.3f}, {by:.3f}, {bz:.3f} m"
                     sx = int(vx * image_scale[0]); sy = int(vy * image_scale[1])
                     cv2.circle(image_left_ocv, (sx, sy), 4, (0, 255, 0, 255), -1)
-                    cv2.putText(
-                        image_left_ocv,
-                        f"{visibility_state} {vis_ratio*100:.0f}% X:{Xc:.2f} Y:{Yc:.2f} Z:{Zc:.2f}m",
-                        (sx + 6, sy - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 255, 0, 255),
-                        1,
-                        cv2.LINE_AA
-                    )
+                    cv2.putText(image_left_ocv,
+                                f"{visibility_state} {vis_ratio*100:.0f}% Zc={Zc:.2f}m",
+                                (sx + 6, sy - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(image_left_ocv, base_xyz_txt,
+                                (sx + 8, sy + 32),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255, 255), 2, cv2.LINE_AA)
+                    # small axis arrow in image pixels (projected direction only for viz; cam XY components)
+                    tip = (sx + int(30 * axis_cam[0]), sy + int(30 * axis_cam[1]))
+                    cv2.arrowedLine(image_left_ocv, (sx, sy), tip, (0, 200, 255, 255), 2, tipLength=0.3)
+
+                    published_this_frame = True
+                    break  # publish only one stabilized target this frame
 
                 except Exception as e:
                     print(f"TF or publish failed: [{type(e).__name__}] {e}")
+
+            if not published_this_frame:
+                # Nothing published this frame; if we have last stable, re-emit to keep consumers happy
+                if last_pos_base is not None and last_axis_base is not None:
+                    qw, qx, qy, qz = quat_align_x_to_axis(last_axis_base, up_hint=(0,0,1))
+                    goal = PoseStamped()
+                    goal.header.stamp = rclpy.time.Time().to_msg()
+                    goal.header.frame_id = 'base_link'
+                    goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = last_pos_base.tolist()
+                    goal.pose.orientation.w, goal.pose.orientation.x, goal.pose.orientation.y, goal.pose.orientation.z = qw, qx, qy, qz
+                    goal_pub.publish(goal)
 
             # Tracking/bird's-eye view
             zed.get_position(cam_w_pose, sl.REFERENCE_FRAME.CAMERA)  # for the tracking viewer
@@ -696,3 +778,4 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         main_(args)
+

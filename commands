@@ -1,5 +1,6 @@
 --------------------demo commands----
 
+export ROS_DOMAIN_ID=5
 
 
 0) The repo is Document/v2/datemanipulator ->dev branch
@@ -43,6 +44,7 @@ in this case start the program again
 4)
 
 2 python files
+ python3 -m ur10e_curobo.main
 
 for motion: datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src$ python3 test21.py 
 for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 dete2.py --weights exp_aug.pt --img_size 640 --conf_thres 0.1
