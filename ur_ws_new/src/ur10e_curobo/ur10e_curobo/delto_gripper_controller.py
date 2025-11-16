@@ -18,17 +18,17 @@ class DeltoGripperController:
         # Simple state machine
         self.state = 'IDLE'  # 'IDLE' | 'OPENING' | 'CLOSING'
 
-        # Joint mapping: left=2, center=7, right=10
-        self.finger_joint_idx = {0: 2, 1: 7, 2: 10}
+        # Joint mapping: left=2, center=6, right=10
+        self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
 
         self.open_position = [
             -0.0942, -0.1500, 2.0660, -0.5062,
-            -1.6318, 0.1309, 1.6753, 0.0887,
+            -1.6318, 0.1309, 1.6753, -0.4887,
             0.3333, 0.2234, 2.0673, -0.4311
         ]
         self.closed_position = self.open_position.copy()
         self.closed_position[self.finger_joint_idx[0]] = 2.5660  # left
-        self.closed_position[self.finger_joint_idx[1]] = 0.7753  # center
+        self.closed_position[self.finger_joint_idx[1]] = 2.3753  # center
         self.closed_position[self.finger_joint_idx[2]] = 2.5673  # right
         self.current_position = self.open_position.copy()
 
@@ -66,7 +66,7 @@ class DeltoGripperController:
         if self.frozen_fingers:
             prev = sorted(list(self.frozen_fingers))
             self.frozen_fingers.clear()
-            #self.node.get_logger().info(f"🧊→🔥 Unfroze fingers: {prev} (ready for next cycle).")
+            self.node.get_logger().info(f"🧊→🔥 Unfroze fingers: {prev} (ready for next cycle).")
         self.first_contact_index = None
 
     def set_close_debounce(self, seconds: float = 0.25):
@@ -135,44 +135,35 @@ class DeltoGripperController:
         return self.all_channels_contacted()
 
     def step_close(self):
-        """
-        Close center finger (1) first, then the outer fingers (0, 2).
-        """
         if self.current_step >= self.steps or self.is_force_threshold_reached():
             self.node.get_logger().info("✅ Gripper fully closed or force limit reached on all fingers.")
             self.current_step = 0
+            # We're done closing
             self.set_state('IDLE')
             return False
 
         alpha = self.current_step / self.steps
 
-        # Determine which fingers to move based on phase
-        # Phase 1: close center finger (1)
-        # Phase 2: close others after center is near closed
-        phase_split = int(self.steps * 0.9)  # 60% of steps for center finger first
-
-        if self.current_step < phase_split:
-            fingers_to_move = [1]  # center finger only
-        else:
-            fingers_to_move = [0, 1, 2]  # all fingers (finish close together)
-
-        for ch in fingers_to_move:
+        # Move each finger unless it is frozen
+        for ch in (0, 1, 2):
             j_idx = self.finger_joint_idx[ch]
             if ch in self.frozen_fingers:
-                continue
+                continue  # keep current (frozen) value
             self.current_position[j_idx] = (
                 (1 - alpha) * self.open_position[j_idx] + alpha * self.closed_position[j_idx]
             )
 
-        # Publish positions
         msg = Float32MultiArray()
         msg.data = self.current_position
         self.publisher.publish(msg)
 
-        # Optional: tell classifier
+        # NEW: tell the classifier we’re still actively closing
         if hasattr(self.node, "classifier"):
             self.node.classifier.note_target_update()
 
+        self.node.get_logger().info(
+            f"Step {self.current_step}/{self.steps} — closing... (frozen: {sorted(list(self.frozen_fingers))})"
+        )
         self.current_step += 1
         return True
 

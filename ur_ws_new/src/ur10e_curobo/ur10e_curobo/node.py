@@ -7,7 +7,7 @@ import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray,Float64MultiArray
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
@@ -124,6 +124,7 @@ class UR10eCuroboMoveIt(Node):
         self.trajectory_pub = self.create_publisher(JointTrajectory, self.traj_cmd_topic, 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
+        self.velocity_pub = self.create_publisher(Float64MultiArray, "/forward_velocity_controller/commands",10)
 
         self.create_subscription(ROSJointState, "/joint_states", self._joint_state_cb, 10)
         self.create_subscription(
@@ -294,8 +295,9 @@ class UR10eCuroboMoveIt(Node):
             elif key == 'c':
                 print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
                 gripper_mod.control_gripper(self, 'CLOSE')
-                #motions_mod.move_backward(self, -0.01)
-                #motions_mod.rotate_wrist(self, 120)
+                motions_mod.move_backward(self, -0.01)
+
+                motions_mod.rotate_wrist(self, 50)
                 print(f"[{ts()}] post-close micro-motions done")
 
             elif key == 'h':

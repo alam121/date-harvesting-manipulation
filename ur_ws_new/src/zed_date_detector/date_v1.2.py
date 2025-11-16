@@ -48,6 +48,78 @@ def _unit(v):
     n = np.linalg.norm(v)
     return v / n if n > 1e-9 else v
 
+def zbuffer_visible_masks(masks, xyz_cam, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0):
+    """
+    Assign each pixel to the nearest instance (z-buffer).
+    Returns: visible_masks (front-only pixels per instance), vis_ratios in [0,1].
+    """
+    if not masks:
+        return [], []
+
+    H, W = xyz_cam.shape[:2]
+    Z = xyz_cam[..., 2].copy()
+    Z[~np.isfinite(Z)] = np.inf
+    Z[(Z < z_min) | (Z > z_max)] = np.inf
+
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+        masks_proc = [cv2.erode(m.astype(np.uint8), k, iterations=1) for m in masks]
+    else:
+        masks_proc = [m.astype(np.uint8) for m in masks]
+
+    N = len(masks_proc)
+    z_stack = np.full((N, H, W), np.inf, dtype=np.float32)
+    sizes = np.zeros(N, dtype=np.int64)
+
+    for i, mbin in enumerate(masks_proc):
+        if mbin.shape != (H, W):
+            mbin = cv2.resize(mbin, (W, H), interpolation=cv2.INTER_NEAREST)
+        m = (mbin == 1)
+        sizes[i] = int(m.sum())
+        z_slice = z_stack[i]
+        z_slice[m] = Z[m]
+
+    front_z = np.min(z_stack, axis=0)
+
+    visible_masks = []
+    vis_ratios = []
+    for i in range(N):
+        vis = (z_stack[i] <= (front_z + eps)) & np.isfinite(front_z)
+        vis_u8 = vis.astype(np.uint8)
+        visible_masks.append(vis_u8)
+        kept = int(vis.sum())
+        total = max(1, int(sizes[i]))
+        vis_ratios.append(kept / total)
+
+    return visible_masks, vis_ratios
+
+def centroid_xyz_in_mask(mask_bin: np.ndarray, xyz_cam: np.ndarray, z_min=0.1, z_max=2.5, min_points=3):
+    """
+    Robust 3D centroid inside a binary mask using per-pixel depth (CAMERA frame).
+    Returns: (cx_px, cy_px, Xm, Ym, Zm) or None if not enough valid points.
+    """
+    ys, xs = np.where(mask_bin == 1)
+    if ys.size < min_points:
+        return None
+
+    X = xyz_cam[ys, xs, 0]
+    Y = xyz_cam[ys, xs, 1]
+    Z = xyz_cam[ys, xs, 2]
+
+    valid = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z) & (Z > z_min) & (Z < z_max)
+    if valid.sum() < min_points:
+        return None
+
+    # robust to outliers using median
+    Xm = float(np.median(X[valid]))
+    Ym = float(np.median(Y[valid]))
+    Zm = float(np.median(Z[valid]))
+    
+    cx_px = float(np.mean(xs[valid]))
+    cy_px = float(np.mean(ys[valid]))
+    
+    return (cx_px, cy_px, Xm, Ym, Zm)
+
 def quat_mul(q, r):
     w, x, y, z = q
     W, X, Y, Z = r
@@ -245,6 +317,10 @@ def main_(args: argparse.Namespace):
     obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters()
     cam_w_pose = sl.Pose()
     objects = sl.Objects()
+    
+    # For zbuffer visibility filtering
+    xyz_full = sl.Mat()
+    camera_res_full = camera_res  # full resolution XYZ
 
     display_resolution = sl.Resolution(min(camera_res.width, 1280), min(camera_res.height, 720))
     image_left_ocv = np.full(
@@ -291,6 +367,24 @@ def main_(args: argparse.Namespace):
                 # Get image for display
                 zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU, display_resolution)
                 np.copyto(image_left_ocv, image_left.get_data())
+
+                # ===============================
+                # Z-BUFFER: Visibility resolution
+                # ===============================
+                # Retrieve full-res XYZ for zbuffer filtering
+                zed.retrieve_measure(xyz_full, sl.MEASURE.XYZ, sl.MEM.CPU)  # full camera res, CAMERA frame
+                xyz_np = xyz_full.get_data()  # (H, W, 4) float32; meters in CAMERA frame
+
+                # Get YOLO masks (shared with detection thread)
+                with yolo_lock:
+                    masks = list(yolo_masks)
+                    labels = list(yolo_classes)
+                    scores = list(yolo_scores)
+
+                # Apply zbuffer to get front-only visible masks
+                visible_masks, vis_ratios = zbuffer_visible_masks(
+                    masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003, erode_px=0
+                )
 
                 # Process each detected object
                 for o in objects.object_list:

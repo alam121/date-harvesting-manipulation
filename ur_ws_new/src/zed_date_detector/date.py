@@ -620,6 +620,8 @@ def main_(args: argparse.Namespace):
                     except Exception as e:
                         print(f"TF axis rotation failed, using camera axis: {e}")
                         axis_base_meas = axis_cam
+
+                        
                     # Publish pose for each detection (no smoothing)
                     qw, qx, qy, qz = quat_align_x_to_axis(axis_base_meas, up_hint=(0, 0, 1))
                     goal = PoseStamped()

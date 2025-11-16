@@ -56,7 +56,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.004, stable_need=2):
+def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.12, stable_eps=0.004, stable_need=2):
     
     def _try_once(seed, timeout_s, rad, need):
         latest = None; stable = 0; last_hit = time.time()
@@ -70,6 +70,7 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.0
             print(f"Reacquire candidate: {(x,y,z)}")
             
             if math.hypot(x-seed[0], y-seed[1]) > rad: 
+                print(x-seed[0], y-seed[1], rad)
                 print("  Out of radius.")
                 return
             latest = (x,y,z)
@@ -150,7 +151,7 @@ def subscribe_to_goal_pose(node):
         publish_stop_trajectory(node)
 
         # Wait a bit for safety
-        time.sleep(0.05)
+        time.sleep(0.01)
 
         # Extract goal position + keep current orientation
         g = [
@@ -280,21 +281,25 @@ def plan_and_execute(node):
         wait_until_xyz(node, final_target[:3])
         blend_motion(node)
 
-        node.control_gripper("CLOSE"); time.sleep(0.7)
+        node.control_gripper("CLOSE")
         
         
         if node.slip_detection or node.grab_miss or node.weak_grab:
-            node.control_gripper("OPEN"); cur = node.get_end_effector_pose()
-            if cur: exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
-            node.slip_detection = node.grab_miss = False
+            node.control_gripper("OPEN")
+            cur = node.get_end_effector_pose()
+
+            if cur: 
+                exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
+
+            node.slip_detection = node.grab_miss = False  
             node.control_gripper("CLOSE")
             
         # 4. Drop-off and return
-        rotate_wrist(node, 90); time.sleep(0.9)
+        rotate_wrist(node, 55)
+        time.sleep(0.1)
         move_to_predropoff_position(node)
-        blend_motion(node)
         move_to_dropoff_position(node)
-        time.sleep(0.2)  # small delay to allow state update
+        time.sleep(0.05)  # small delay to allow state update
             
         node.control_gripper("OPEN")
         if len(node.goal_poses) == 0:
