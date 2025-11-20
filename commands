@@ -38,8 +38,18 @@ This will show rviz with arm and gripper.
 if something goes wrong, please source and check ips.
 
 3) GO to tablet of arm. POwer it on, start and release break go to program, and load ucra file and press start button
-sometimes the connection drops, in that case : Connection to reverse interface dropped.
+sometimes the connection drops, in that case : Connection to reverse interface dropped.\\
+
+
+
+
 in this case start the program again
+
+
+
+
+
+
 
 4)
 
@@ -47,7 +57,7 @@ in this case start the program again
  python3 -m ur10e_curobo.main
 
 for motion: datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src$ python3 test21.py 
-for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 dete2.py --weights exp_aug.pt --img_size 640 --conf_thres 0.1
+for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 date_v1.2.py --weights models/lab_dates_realbunch.pt  --conf_thres 0.5
 
 
 *Make sure that the start button of program is pressed, otherwise: [ERROR] [1759327538.950381504] [ur10e_curobo_moveit_node]: ❌ Cannot execute goals: robot program is OFF. Please turn it ON first.
