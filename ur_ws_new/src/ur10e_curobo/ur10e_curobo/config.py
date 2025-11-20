@@ -39,7 +39,7 @@ class Topics:
     gripper_force: str = "/gripper/force"
     e_stop: str = "/emergency_stop"
     prog_running: str = "/io_and_status_controller/robot_program_running"
-    external_goal: str = "/external_goal_pose_tester"
+    external_goal: str = "/external_goal_pose"
     ee_point_out: str = "/datefruit_3d_point"
 
 @dataclass
