@@ -177,7 +177,7 @@ def subscribe_to_goal_pose(node):
     # Subscribe to /external_goal_pose
     node.goal_pose_sub = node.create_subscription(
         PoseStamped,
-        '/external_goal_pose_tester',
+        '/external_goal_pose',
         _goal_cb,
         node.qos
     )
