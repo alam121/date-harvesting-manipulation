@@ -39,21 +39,23 @@ class Topics:
     gripper_force: str = "/gripper/force"
     e_stop: str = "/emergency_stop"
     prog_running: str = "/io_and_status_controller/robot_program_running"
-    external_goal: str = "/external_goal_pose"
+    external_goal: str = "/external_goal_pose_tester"
     ee_point_out: str = "/datefruit_3d_point"
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.5008023420916956, -1.5742222271361292, 2.3116706053363245, 
-        -4.775422235528463, 4.615280628204346, 0.06076143682003021]
+    home: List[float] = field(default_factory=lambda: [-1.4759066740619105, 
+        -1.723757883111471, 2.339076105748312, -4.582828184167379, 4.561577796936035, 0.02548658289015293]
+
 
 )
     dropoff: List[float] = field(default_factory=lambda: [-2.16858417192568, -1.3347657362567347,
         2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704])
     
     
-    predropoff: List[float] = field(default_factory=lambda: [-1.6832264105426233, -2.020153347645895,
-        2.238132953643799, -3.9681833426104944, 4.682962894439697, -0.010893646870748341])
+    predropoff: List[float] = field(default_factory=lambda: [-1.5063117186175745, -1.512526014154293, 2.141698662434713, -4.593678136865133, 4.582080364227295, 0.047529518604278564]
+
+)
 
 @dataclass
 class Planner:

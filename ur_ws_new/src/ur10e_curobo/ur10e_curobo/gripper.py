@@ -28,7 +28,7 @@ def control_gripper(node, action: str):
         #node.get_logger().info("Gripper OPEN → slip detection paused")
     elif act == "CLOSE":
         #node.get_logger().info("🟢 Activating suction before grip...")
-        #activate_suction(node, True)
+        activate_suction(node, True)
         node.classifier.start_closing()
         node.gripper_controller.run_closure_loop()
         node.classifier.mark_close_done()
