@@ -177,7 +177,7 @@ def subscribe_to_goal_pose(node):
     # Subscribe to /external_goal_pose
     node.goal_pose_sub = node.create_subscription(
         PoseStamped,
-        '/external_goal_pose',
+        '/external_goal_pose_tester',
         _goal_cb,
         node.qos
     )
@@ -265,16 +265,15 @@ def plan_and_execute(node):
         
         # 2. Reacquire
         seed = [x,y,z]
-        reacq = reacquire_goal_pose(node, seed_xyz=seed, timeout=3.5, stable_eps=0.004, stable_need=3)
+        reacq = None
         
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
             node.get_logger().warn("No reacquire; skipping goal.")
-            continue
             
         # 3. Final slow precise grasp
-        final_target = [x, y+0.025, z, *orientation]
+        final_target = [x, y, z-0.02, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
@@ -295,10 +294,10 @@ def plan_and_execute(node):
         blend_motion(node)
         move_to_dropoff_position(node)
         time.sleep(0.2)  # small delay to allow state update
-            
         node.control_gripper("OPEN")
+        move_to_home_position(node)
+
         if len(node.goal_poses) == 0:
-            move_to_home_position(node)
             node.get_logger().info("All goals completed; returned HOME.")
         else:
             node.get_logger().info("Preparing for next goal...")

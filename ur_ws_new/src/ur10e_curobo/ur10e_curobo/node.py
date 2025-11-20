@@ -359,7 +359,7 @@ class UR10eCuroboMoveIt(Node):
         self.goal_capture_count = 0
         ee = self.get_end_effector_pose()
         self.goal_sort_ref = ee[:3] if ee else [0.0,0.0,0.0]
-        self.goal_pose_sub = self.create_subscription(PoseStamped, '/external_goal_pose', self._capture_goal_cb, self.qos)
+        self.goal_pose_sub = self.create_subscription(PoseStamped, '/external_goal_pose_tester', self._capture_goal_cb, self.qos)
         self.goal_capture_active = True
         self.get_logger().info(f"Started goal capture for {duration:.0f}s")
         
