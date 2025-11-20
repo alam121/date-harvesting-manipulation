@@ -32,7 +32,7 @@ Each time the terminal is closed, you must configure the IPs again.
 ---
 
 ## 2. Launch UR10e + Gripper + RViz
-
+build: colcon build --cmake-args -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython3.10.so (if colcon build dosn't work)
 Run: ros2 launch ur_bringup ur_control.launch.py
 ur_type:=ur10e
 robot_ip:=192.168.1.190
