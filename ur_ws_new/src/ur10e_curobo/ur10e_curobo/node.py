@@ -24,7 +24,7 @@ from . import gripper as gripper_mod
 from .perception import ZedYoloPerception
 from trajectory_msgs.msg import JointTrajectory
 from ur_msgs.srv import SetIO
-
+from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
 # Callback	Trigger	Purpose
 
@@ -154,6 +154,15 @@ class UR10eCuroboMoveIt(Node):
         )
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
+
+        self.micro_ik_config = IKSolverConfig.load_from_robot_config(
+            self.cfg.planner.urdf_config,
+            WORLD_CONFIG,
+            num_seeds=1,
+            use_cuda_graph=True)
+        self.micro_ik_solver = IKSolver(self.micro_ik_config)
+
+        
         print("warming up done")
 
         # state: keep track of robot state, path history, and goals in memory.
@@ -286,6 +295,8 @@ class UR10eCuroboMoveIt(Node):
                     print(f"[{ts()}] execute finished. remaining goals={len(self.goal_poses)}")
                 else:
                     print(f"[{ts()}] INFO: no goals to execute. add with 'y', 'm', or 's'.")
+                curr_pose = self.get_end_effector_pose()
+
 
             elif key == 'o':
                 print(f"[{ts()}] gripper → OPEN")

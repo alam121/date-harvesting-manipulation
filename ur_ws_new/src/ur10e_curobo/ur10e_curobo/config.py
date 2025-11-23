@@ -59,7 +59,7 @@ class JointsPreset:
 
 @dataclass
 class Planner:
-    urdf_config: str = "ur10e.yml"
+    urdf_config: str = "ur10e_curobo.yml"
     interpolation_dt: float = 0.004
     speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
@@ -67,7 +67,7 @@ class Planner:
     speed_dropoff: float = 4.5     # for move_to_dropoff_position
     speed_predropoff: float = 2.5  # for pre-dropoff
     speed_approach: float = 3.5    # for approach motion
-    speed_final: float = 1.7       # for precise grasp
+    speed_final: float = 0.5       # for precise grasp
     
     pre_droffoff_z_offset: float = 0.12  # m above dropoff
     pre_droffoff_y_offset: float = 0.10  # m back from dropoff

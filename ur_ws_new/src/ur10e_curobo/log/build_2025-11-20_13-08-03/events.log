@@ -1,0 +1,11 @@
+[0.000000] (-) TimerEvent: {}
+[0.000313] (ur10e_curobo) JobQueued: {'identifier': 'ur10e_curobo', 'dependencies': OrderedDict()}
+[0.000366] (ur10e_curobo) JobStarted: {'identifier': 'ur10e_curobo'}
+[0.098597] (-) TimerEvent: {}
+[0.198950] (-) TimerEvent: {}
+[0.299375] (-) TimerEvent: {}
+[0.399718] (-) TimerEvent: {}
+[0.500165] (-) TimerEvent: {}
+[0.600589] (-) TimerEvent: {}
+[0.649117] (ur10e_curobo) JobEnded: {'identifier': 'ur10e_curobo', 'rc': 0}
+[0.659902] (-) EventReactorShutdown: {}

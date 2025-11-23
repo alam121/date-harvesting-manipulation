@@ -7,6 +7,7 @@ from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT
 from .utils import build_trajectory, wait_until_xyz
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from .markers import publish_goal_marker
 from .motions import interpolated_positions, execute_single_pose
 from .motions import execute_single_pose as exec_pose
@@ -18,17 +19,22 @@ def pose_to_vec7(p: ROSPose):
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
-    res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
-    if not res.success:
-        node.get_logger().warn(f"Plan failed for {label}."); return False
-    states = interpolated_positions(res)
-    
-    
-    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
-    
+    if motion_type == "final":
+        print("IK for final approach...")
+        seed_tensor = start_state.position
+        res = node.micro_ik_solver.solve_single(goal_pose,seed_config=seed_tensor,return_seeds=1, num_seeds=1)
+        print(f"IK result: success={res.success}, num_solutions={len(res.solution)}")
+        ik_states = res.solution[0][0].cpu().tolist()
+        print(f"IK solution: {ik_states}")
+        max_joint_diff = max(abs(t - c) for t, c in zip(ik_states, node.current_joint_positions))
+        print(f"Max joint diff: {max_joint_diff:.4f} rad")
+        calculated_duration = max_joint_diff / 0.5
+        duration = calculated_duration + 0.5
+    else:
+        res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
+        duration = 0.00001
 
-    
+
     if motion_type == "approach":
         scale = getattr(node.cfg.planner, "speed_approach", 1.0)
     elif motion_type == "final":
@@ -37,22 +43,41 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         scale = getattr(node.cfg.planner, f"speed_{motion_type}", 1.0)
     else:
         scale = getattr(node.cfg.planner, "speed_home", 1.0)  # default fast
-
-    traj = build_trajectory(
-        node.joint_order,
-        states,
-        vel=0.1 * scale,
-        dt=base_dt / scale,
-        stop_flag=lambda: node.stop_requested
-    )
-    
+   
+    if not res.success:
+        node.get_logger().warn(f"Plan failed for {label}."); return False
+    else:
+        if motion_type == "final":
+            traj= JointTrajectory()
+            traj.joint_names = node.joint_order
+            pt = JointTrajectoryPoint()
+            pt.positions = ik_states
+            pt.velocities = [0.0] * 6
+            pt.time_from_start.sec = int(duration)
+            pt.time_from_start.nanosec = int((duration - int(duration)) * 1e9)
+            traj.points.append(pt)
+            node.get_logger().info(f" Moving: max_diff={max_joint_diff:.3f} rad, time={duration:.2f}s")
+        else:
+            states = interpolated_positions(res)
+            scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+            base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
+            
+            traj = build_trajectory(
+                node.joint_order,
+                states,
+                vel=0.1 * scale,
+                dt=base_dt / scale,
+                stop_flag=lambda: node.stop_requested
+            )
+        
     
     #node.get_logger().info(f"Planned {label} trajectory with {len(states)} steps.")
     
     if node.stop_requested:
         node.get_logger().warn(f"Stop before sending {label} trajectory."); node.stop_requested = False; return False
     node.trajectory_pub.publish(traj)
-    
+
+    time.sleep(duration)
     return True
 
 
@@ -276,7 +301,11 @@ def plan_and_execute(node):
         final_target = [x, y, z-0.02, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
+        curr_pose = node.get_end_effector_pose()
+        print(f"  current joint poses: {node.current_joint_positions}")
+        print(f"  current ee pose: {curr_pose}")
         wait_until_xyz(node, final_target[:3])
+        
         blend_motion(node)
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
