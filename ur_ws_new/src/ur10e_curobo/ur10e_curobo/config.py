@@ -44,8 +44,11 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.4759066740619105, 
-        -1.723757883111471, 2.339076105748312, -4.582828184167379, 4.561577796936035, 0.02548658289015293]
+    home: List[float] = field(default_factory=lambda: [-1.5034225622760218, -1.5057066318443795, 2.2289393583880823, 
+                                                       -4.545150896111959, 4.573554992675781, 0.052810169756412506]
+
+
+
 
 
 )
@@ -63,11 +66,11 @@ class Planner:
     interpolation_dt: float = 0.004
     speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
-    speed_home: float = 6.0        # for move_to_home_position
+    speed_home: float = 4.0        # for move_to_home_position
     speed_dropoff: float = 4.5     # for move_to_dropoff_position
     speed_predropoff: float = 2.5  # for pre-dropoff
-    speed_approach: float = 3.5    # for approach motion
-    speed_final: float = 1.7       # for precise grasp
+    speed_approach: float = 0.5    # for approach motion
+    speed_final: float = 0.5       # for precise grasp
     
     pre_droffoff_z_offset: float = 0.12  # m above dropoff
     pre_droffoff_y_offset: float = 0.10  # m back from dropoff
