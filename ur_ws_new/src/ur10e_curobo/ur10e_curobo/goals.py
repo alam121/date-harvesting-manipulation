@@ -12,6 +12,8 @@ from .motions import interpolated_positions, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
 from .motions import blend_motion
+from .dynamic_obstacle import DynamicObstacleManager
+from .utils import compute_visibility_approach
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
@@ -56,60 +58,91 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=3.5, radius=0.08, stable_eps=0.004, stable_need=2):
-    
-    def _try_once(seed, timeout_s, rad, need):
-        latest = None; stable = 0; last_hit = time.time()
+def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=2, radius=0.15):
+    """
+    Wait in place (no robot motion) until 2 stable goal poses appear.
+    If no stable pose -> return best candidate by score.
+    """
+
+    stable_count = 0
+    last_pose = None
+    best_candidate = None
+    best_score = float("inf")
+
+    def _cb(msg):
+        nonlocal stable_count, last_pose, best_candidate, best_score
+
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+
+        # must match same fruit
+        if math.hypot(x - seed_xyz[0], y - seed_xyz[1]) > radius:
+            return
         
-        def _cb(msg: PoseStamped):
-            nonlocal latest, stable, last_hit
-            if is_robot_moving(node): 
-                return
-            
-            x,y,z = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
-            print(f"Reacquire candidate: {(x,y,z)}")
-            
-            if math.hypot(x-seed[0], y-seed[1]) > rad: 
-                print("  Out of radius.")
-                return
-            latest = (x,y,z)
-            stable += 1
-            last_hit = time.time()
-            print(f"  Stable {stable}/{need}")
-            
-        sub = node.create_subscription(PoseStamped, '/external_goal_pose', _cb, node.qos) #temp subscriber
-        try:
-            while stable < max(1, need):
-                if timeout_s is not None and (time.time() - last_hit) > timeout_s:
-                    print("  Timeout reached.")
-                    break
-                time.sleep(0.01)
-                
-        finally:
-            node.destroy_subscription(sub)
-        return latest
-    
-    t0 = time.time()
-    
-    while is_robot_moving(node) and (time.time()-t0) < 0.25:
-        time.sleep(0.01)
-    
-    first = _try_once(seed_xyz, timeout, radius, stable_need)
-    
-    if first: 
-        return list(first)
-    
-    # --- Retry after small lift --- TO DO
-    
-    # cur = node.get_end_effector_pose()
-    
-    # if cur:
-    #     #execute_single_pose(node, [cur[0], cur[1]+0.10, cur[2], *cur[3:]])
-    #     wait_until_xyz(node, [cur[0], cur[1]+0.10, cur[2]])
-        
-    # second = _try_once(seed_xyz, 2.0, max(radius,0.15), max(1, stable_need-1))
-    
-    # return list(second) if second else None
+        print(f"🍎 Reacquire candidate: {[x, y, z]}")
+        pose = [x, y, z]
+
+        # stability measure
+        if last_pose is not None:
+            if math.dist(last_pose, pose) < 0.004:   # <4mm
+                stable_count += 1
+                print(f"   Stable count: {stable_count}")
+            else:
+                stable_count = 0
+
+        last_pose = pose
+
+        # also track best candidate by EE distance (for fallback)
+        ee = node.get_end_effector_pose()
+        if ee is not None:
+            dx = x - ee[0]; dy = y - ee[1]; dz = z - ee[2]
+            score = math.sqrt(dx*dx + dy*dy + dz*dz)
+        else:
+            score = z
+
+        if score < best_score:
+            best_score = score
+            best_candidate = pose
+
+    # temporary subscriber
+    sub = node.create_subscription(
+        PoseStamped,
+        "/external_goal_pose",
+        _cb,
+        getattr(node, "goal_qos", node.qos),
+    )
+
+    try:
+        start = time.time()
+        while time.time() - start < timeout:
+            if stable_count >= stable_needed:
+                print(f"🍏 Stable reacquired goal: {last_pose}")
+                return last_pose
+            time.sleep(0.01)
+
+        # --------------------------------------------
+        # Updated fallback order using continuous tracker
+        # --------------------------------------------
+
+        # 1) Use continuously tracked BEST if available
+        if hasattr(node, "best_goal_xyz") and node.best_goal_xyz is not None:
+            print(f"⚠️ No stable hits. Using continuous tracker BEST = {node.best_goal_xyz}")
+            return node.best_goal_xyz
+
+        # 2) If no continuous BEST → use frame best candidate
+        if best_candidate:
+            print(f"⚠️ No stable hits. Using best_candidate = {best_candidate}")
+            return best_candidate
+
+        # 3) Final fallback → seed (safe old fruit)
+        print("❌ No reacquire candidates. Using seed_xyz.")
+        return seed_xyz
+
+    finally:
+        node.destroy_subscription(sub)
+
+
 
 
 def subscribe_to_goal_pose(node):
@@ -131,9 +164,26 @@ def subscribe_to_goal_pose(node):
     node.goal_poses.clear()
 
     def _goal_cb(msg: PoseStamped):
+
+        # ---- ALWAYS STORE LATEST GOAL POSE ----
+        node.latest_goal_pose = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+        ]
+        node.latest_goal_time = time.time()
+
+        print("Stored latest global goal pose.")
+        # ---------------------------------------
         """Triggered immediately on receiving a goal pose."""
         if node.goal_received:
             return  # Ignore duplicates
+        
+
 
         node.goal_received = True
         print("✅ Goal received, stopping all idle activity...")
@@ -148,6 +198,20 @@ def subscribe_to_goal_pose(node):
 
         # Stop robot motion
         publish_stop_trajectory(node)
+
+        # ------------------------------------------
+        # Start tracking this fruit based on the first goal message
+        node.goal_seed_xy = [
+            msg.pose.position.x,
+            msg.pose.position.y
+        ]
+        node.best_goal_xyz = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ]
+        node.best_goal_score = float("inf")
+        # ------------------------------------------
 
         # Wait a bit for safety
         time.sleep(0.05)
@@ -165,7 +229,7 @@ def subscribe_to_goal_pose(node):
             node.goal_poses.append(g)
             publish_goal_marker(node, g[:3])
             print(f"🟢 Received goal pose: {g}")
-
+            node.obstacles.update_pose("fruit_obstacle", g[:3])
         # Destroy the subscription — stop listening after first goal
         try:
             if hasattr(node, 'goal_pose_sub'):
@@ -179,7 +243,7 @@ def subscribe_to_goal_pose(node):
         PoseStamped,
         '/external_goal_pose',
         _goal_cb,
-        node.qos
+        getattr(node, "goal_qos", node.qos),
     )
 
     # Define idle micro-motions while waiting for goals
@@ -242,7 +306,7 @@ def plan_and_execute(node):
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
         yoffset = node.yoffset
-        
+        ax, ay, az = compute_visibility_approach(node, x, y, z, dist=0.18)
         # 1. Plan approach
         if z > 1.30:  #high targets: top-down approach
             orientation = quaternion_from_approach(node, pitch_deg=-35.0)
@@ -250,7 +314,8 @@ def plan_and_execute(node):
             #y -= 0.004; z -= 0.4
         else:
             orientation = goal[3:]
-            approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
+            #approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
+            approach = [ax, ay, az, *orientation]
             #z -= 0.055; y -= 0.003
             
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
@@ -265,12 +330,13 @@ def plan_and_execute(node):
         
         # 2. Reacquire
         seed = [x,y,z]
-        reacq = None
+        reacq = reacquire_goal_pose(node, seed_xyz=seed)
         
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
             node.get_logger().warn("No reacquire; skipping goal.")
+            continue
             
         # 3. Final slow precise grasp
         final_target = [x, y, z-0.02, *orientation]
@@ -346,4 +412,3 @@ def quaternion_from_approach(node, direction_xyz=None, pitch_deg=None, world=Fal
             s = math.sqrt(1.0+Rm[2,2]-Rm[0,0]-Rm[1,1])*2.0; qw = (Rm[1,0]-Rm[0,1])/s
             qx = (Rm[0,2]+Rm[2,0])/s; qy = (Rm[1,2]+Rm[2,1])/s; qz = 0.25*s
     return [qw, qx, qy, qz]
-

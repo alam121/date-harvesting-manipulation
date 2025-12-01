@@ -98,14 +98,23 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         scale = 1.0  # default
         
     states = interpolated_positions(res)
+
+    raw_dt = base_dt / scale
+    dt = max(0.008, min(raw_dt, 0.02))     # clamp dt
+
+    # ------------------------------
+    # Smooth velocity scaling
+    # ------------------------------
+    base_vel = 0.10
+    vel = base_vel * math.sqrt(scale)
+
     traj = build_trajectory(
         node.joint_order,
         states,
-        vel=0.08 * scale,                     # scale velocity
-        dt=base_dt / scale,                  # apply uniform dt
+        vel=vel,
+        dt=dt,
         stop_flag=lambda: node.stop_requested,
     )
-    
     node.trajectory_pub.publish(traj)
     node.get_logger().info(f"Moving to {label} joints…")
     fk_last = forward_kinematics(node, states[-1])
