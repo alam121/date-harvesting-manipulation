@@ -1,5 +1,9 @@
-# ManipulatorsDatePalm 
 
+# ManipulatorsDatePalm 
+## Current Latest 
+- Branch ```Humble_Refactor6.1_labdatesrealbunch```
+- Visioncode ```date_v1.2.py```
+- Manipulator ```python3 -m ur10e_curobo.main```
 
 ## Overview
 
