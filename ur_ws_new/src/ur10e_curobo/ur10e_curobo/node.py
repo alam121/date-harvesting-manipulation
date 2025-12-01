@@ -2,7 +2,10 @@
 import threading
 import rclpy
 import os
+import numpy as np
+
 from rclpy.timer import Timer
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
@@ -13,7 +16,7 @@ from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
 
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
-
+from curobo.geom.types import Sphere, Cuboid
 from .config import JOINT_ORDER, WORLD_CONFIG, DEFAULT_QOS
 from .utils import read_key
 from . import fk as fk_mod
@@ -21,6 +24,7 @@ from . import markers as markers_mod
 from . import motions as motions_mod
 from . import goals as goals_mod
 from . import gripper as gripper_mod
+from .dynamic_obstacle import DynamicObstacleManager
 from .perception import ZedYoloPerception
 from trajectory_msgs.msg import JointTrajectory
 from ur_msgs.srv import SetIO
@@ -113,6 +117,7 @@ class UR10eCuroboMoveIt(Node):
         
         self.yoffset = self.cfg.planner.pre_droffoff_y_offset
         self.zoffset = self.cfg.planner.pre_droffoff_z_offset
+        self.cam_frame = self.cfg.perception.cam_frame
 
         self.traj_cmd_topic    = self.cfg.topics.traj_cmd
         self.joint_states_topic = self.cfg.topics.joint_states
@@ -138,7 +143,6 @@ class UR10eCuroboMoveIt(Node):
         self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
         #while not self.io_client.wait_for_service(timeout_sec=1.0):
             #self.get_logger().info("Waiting for /set_io service...")
-
         # tf
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -148,16 +152,36 @@ class UR10eCuroboMoveIt(Node):
         self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)
         self.timer_wait_js = self.create_timer(0.5, self._check_joint_states) #Check if joint states received
 
-        # cuRobo
+       # 1. Load cuRobo config
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            self.cfg.planner.urdf_config, WORLD_CONFIG, interpolation_dt=self.cfg.planner.interpolation_dt
+            self.cfg.planner.urdf_config, WORLD_CONFIG,
+            interpolation_dt=self.cfg.planner.interpolation_dt
         )
+
+        # 2. Create MotionGen
         self.motion_gen = MotionGen(self.motion_gen_config)
         self.motion_gen.warmup()
-        print("warming up done")
+        self.get_logger().info("cuRobo warmup done")
 
+
+        self.obstacles = DynamicObstacleManager(
+            node=self,
+            motion_gen=self.motion_gen,
+            world_model=self.motion_gen.world_model
+        )
+
+        # 4. Add a dynamic sphere
+        self.obstacles.add_sphere("dyn_sphere", radius=0.1)
+        self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
+        
         # state: keep track of robot state, path history, and goals in memory.
         self.qos = DEFAULT_QOS
+        self.goal_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.joint_order = JOINT_ORDER
         
         self.current_joint_positions = None
@@ -183,6 +207,23 @@ class UR10eCuroboMoveIt(Node):
         
         self.tf_warning_printed = False
         self.tf_printed = False
+
+        self.latest_goal_pose = None        # [x, y, z, qw, qx, qy, qz]
+        self.latest_goal_time = 0.0         # timestamp of last valid pos
+
+
+        self.best_goal_xyz = None
+        self.best_goal_score = float("inf")
+        self.goal_seed_xy = None
+
+        self.last_frames = [] # last few frames for stability checking
+
+        self.goal_tracker_sub = self.create_subscription(
+            PoseStamped,
+            '/external_goal_pose',        # always listen to new poses
+            self._continuous_goal_tracker,  # callback function below
+            self.goal_qos
+        )
 
 
         # gripper/classifier
@@ -327,9 +368,12 @@ class UR10eCuroboMoveIt(Node):
                 print(self.get_end_effector_pose()) 
                 
             elif key == "t":
-                print("Test…")
-                gripper_mod.activate_suction(self, True)
-                
+                print("Update dynamic obstacle position:")
+
+                pos = self.obstacles.ask_user_position("dyn_sphere")
+                if pos is not None:
+                    self.obstacles.update_pose("dyn_sphere", pos)
+                    self.obstacles.print_world()
             else:
                 # unknown key helper
                 if key != last_key:  # avoid spamming if someone holds a key
@@ -350,6 +394,54 @@ class UR10eCuroboMoveIt(Node):
         markers_mod.publish_goal_marker(self, goal[:3]) 
         print("Manual goal saved.")
 
+    def _continuous_goal_tracker(self, msg: PoseStamped):
+
+        # 0. seed check
+        if self.goal_seed_xy is None:
+            return
+
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+
+        seed_x, seed_y = self.goal_seed_xy
+
+        # 1. Strict XY lock (prevent switching fruits)
+        if math.hypot(x - seed_x, y - seed_y) > 0.045:
+            return  
+
+        # 2. Depth sanity check
+        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.025:
+            return
+
+        # 3. Distance to EE
+        ee = self.get_end_effector_pose()
+        if ee:
+            dx = x - ee[0]
+            dy = y - ee[1]
+            dz = z - ee[2]
+            dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        else:
+            dist = z
+
+        # 4. Stability buffer (last 8 frames)
+        self.last_frames.append([x, y, z])
+        if len(self.last_frames) > 8:
+            self.last_frames.pop(0)
+
+        variance = np.var(self.last_frames, axis=0).sum()
+
+        # 5. Scoring
+        score = dist - variance * 2.5
+
+
+        if score > self.best_goal_score + 0.002:
+            self.best_goal_score = score
+            self.best_goal_xyz = [x, y, z]
+            print(f"Updated BEST (far) goal = {self.best_goal_xyz}, score={score}")
+
+
+
     # goal capture (timed)
     def start_goal_capture(self, duration: float = 30.0):
         if self.goal_capture_active: 
@@ -359,7 +451,12 @@ class UR10eCuroboMoveIt(Node):
         self.goal_capture_count = 0
         ee = self.get_end_effector_pose()
         self.goal_sort_ref = ee[:3] if ee else [0.0,0.0,0.0]
-        self.goal_pose_sub = self.create_subscription(PoseStamped, '/external_goal_pose', self._capture_goal_cb, self.qos)
+        self.goal_pose_sub = self.create_subscription(
+            PoseStamped,
+            '/external_goal_pose',
+            self._capture_goal_cb,
+            getattr(self, "goal_qos", self.qos),
+        )
         self.goal_capture_active = True
         self.get_logger().info(f"Started goal capture for {duration:.0f}s")
         
@@ -409,6 +506,60 @@ class UR10eCuroboMoveIt(Node):
     def control_gripper(self, action: str):
         gripper_mod.control_gripper(self, action)
 
+    def debug_print_world(self):
+        wm = self.motion_gen.world_model
+
+        print("\n========== CURRENT CUROBO WORLD ==========")
+
+        # ----- SPHERES -----
+        print("SPHERES:")
+        if wm.sphere:
+            for s in wm.sphere:
+                print(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
+        else:
+            print("  (none)")
+
+        # ----- CUBOIDS -----
+        print("\nCUBOIDS:")
+        if wm.cuboid:
+            for c in wm.cuboid:
+                print(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
+        else:
+            print("  (none)")
+
+        # ----- CAPSULES -----
+        print("\nCAPSULES:")
+        if wm.capsule:
+            for cap in wm.capsule:
+                print(f"  - name={cap.name}, dims={cap.dims}, pose={cap.pose}")
+        else:
+            print("  (none)")
+
+        # ----- CYLINDERS -----
+        print("\nCYLINDERS:")
+        if wm.cylinder:
+            for cyl in wm.cylinder:
+                print(f"  - name={cyl.name}, dims={cyl.dims}, pose={cyl.pose}")
+        else:
+            print("  (none)")
+
+        # ----- MESH -----
+        print("\nMESHES:")
+        if wm.mesh:
+            for m in wm.mesh:
+                print(f"  - name={m.name}, pose={m.pose}")
+        else:
+            print("  (none)")
+
+        # ----- VOXEL -----
+        print("\nVOXEL GRIDS:")
+        if wm.voxel:
+            for v in wm.voxel:
+                print(f"  - name={v.name}, pose={v.pose}")
+        else:
+            print("  (none)")
+
+        print("============================================\n")
 
     def _start_perception_once(self):
         # run exactly once

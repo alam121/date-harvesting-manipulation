@@ -21,9 +21,9 @@ from rclpy.duration import Duration as rclpyDuration
 # ----------- simple QoS (or import from your config.py) -----------
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 FAST_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
-    depth=5,
+    depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -312,4 +312,3 @@ class ZedYoloPerception:
             cv2.destroyAllWindows()
         except Exception:
             pass
-
