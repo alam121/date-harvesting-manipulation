@@ -385,8 +385,23 @@ def main_(args: argparse.Namespace):
             # --------------------------------------------------
             # each target: {"Xc","Yc","Zc","bb","mask_resized","pt_base","pt_grip","dist"}
             targets = []
+            rejected_targets = []
 
             for o in objects.object_list:
+                bb = o.bounding_box_2d
+                x1 = int(bb[0][0] * image_scale[0])
+                y1 = int(bb[0][1] * image_scale[1])
+                x2 = int(bb[2][0] * image_scale[0])
+                y2 = int(bb[2][1] * image_scale[1])
+
+                x1 = max(0, min(x1, image_left_ocv.shape[1] - 1))
+                x2 = max(0, min(x2, image_left_ocv.shape[1]))
+                y1 = max(0, min(y1, image_left_ocv.shape[0] - 1))
+                y2 = max(0, min(y2, image_left_ocv.shape[0]))
+
+                def mark_reject(reason: str):
+                    rejected_targets.append({"bb": (x1, y1, x2, y2), "reason": reason})
+
                 # Choose mask source
                 mask_mat = None
                 if hasattr(o, "mask") and o.mask is not None and o.mask.is_init():
@@ -399,26 +414,17 @@ def main_(args: argparse.Namespace):
                     mask_mat = o.box_mask
 
                 if mask_mat is None:
+                    mark_reject("No mask")
+                    continue
+
+                if x2 <= x1 or y2 <= y1:
+                    mark_reject("Invalid box")
                     continue
 
                 try:
                     mask_local = mask_mat.get_data()
                     if mask_local.ndim == 3:
                         mask_local = mask_local[:, :, 0]
-
-                    bb = o.bounding_box_2d
-                    x1 = int(bb[0][0] * image_scale[0])
-                    y1 = int(bb[0][1] * image_scale[1])
-                    x2 = int(bb[2][0] * image_scale[0])
-                    y2 = int(bb[2][1] * image_scale[1])
-
-                    x1 = max(0, min(x1, image_left_ocv.shape[1] - 1))
-                    x2 = max(0, min(x2, image_left_ocv.shape[1]))
-                    y1 = max(0, min(y1, image_left_ocv.shape[0] - 1))
-                    y2 = max(0, min(y2, image_left_ocv.shape[0]))
-
-                    if x2 <= x1 or y2 <= y1:
-                        continue
 
                     w_roi = x2 - x1
                     h_roi = y2 - y1
@@ -429,13 +435,10 @@ def main_(args: argparse.Namespace):
                         (w_roi, h_roi),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                    mask_bool = mask_resized > 0
-
-                    # CLEAN MASK
-                    kernel = np.ones((3, 3), np.uint8)
-                    mask_clean = cv2.erode(mask_resized, kernel, iterations=1)
-                    mask_clean = cv2.dilate(mask_clean, kernel, iterations=2)
-
+                    # Morphological cleanup: close small holes then open to remove specks
+                    kernel = np.ones((5, 5), np.uint8)
+                    mask_clean = cv2.morphologyEx(mask_resized, cv2.MORPH_CLOSE, kernel)
+                    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel)
                     mask_bool = mask_clean > 0
                     # Take 3D points from XYZ map only where mask is true
                     roi_xyz = pc_np[y1:y2, x1:x2, :]  # H x W x 3
@@ -444,6 +447,7 @@ def main_(args: argparse.Namespace):
 
                     if np.count_nonzero(valid) < 30:
                         # Not enough 3D points to trust (relaxed)
+                        mark_reject("Too few depth pts")
                         continue
 
                     pts = roi_xyz[valid]  # N x 3
@@ -456,6 +460,7 @@ def main_(args: argparse.Namespace):
 
                     Z_std = float(np.std(pts_front[:, 2]))
                     if Z_std > 0.05:  # >10 cm variance → unreliable (dense/occluded)
+                        mark_reject("Depth variance")
                         continue
 
                     Xc = float(np.mean(pts_front[:, 0]))
@@ -463,6 +468,7 @@ def main_(args: argparse.Namespace):
                     Zc = float(np.mean(pts_front[:, 2]))
 
                     if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+                        mark_reject("Z out of range")
                         continue
 
                     # Transform this fruit’s 3D point to base_link and gripper_tip
@@ -518,10 +524,12 @@ def main_(args: argparse.Namespace):
 
                     except Exception as e:
                         print(f"[WARN] TF transform failed: {e}")
+                        mark_reject("TF transform failed")
                         continue
 
                 except Exception as e:
                     print(f"[WARN] 3D extraction failed: {e}")
+                    mark_reject("3D extraction failed")
                     continue
 
             # --------------------------------------------------
@@ -663,6 +671,35 @@ def main_(args: argparse.Namespace):
             # Best fruit centroid = BLUE dot + “BEST”
             # Others = RED dots
             # --------------------------------------------------
+            # Gray out filtered detections so we can see what was rejected
+            for rej in rejected_targets:
+                x1, y1, x2, y2 = rej["bb"]
+                if x2 > x1 and y2 > y1:
+                    roi = image_left_ocv[y1:y2, x1:x2]
+                    if roi.size:
+                        gray_patch = np.full_like(roi, 128)
+                        image_left_ocv[y1:y2, x1:x2] = cv2.addWeighted(
+                            gray_patch, 0.45, roi, 0.55, 0.0
+                        )
+                cv2.rectangle(
+                    image_left_ocv,
+                    (x1, y1),
+                    (x2, y2),
+                    (150, 150, 150, 255),
+                    2,
+                )
+                if rej.get("reason"):
+                    cv2.putText(
+                        image_left_ocv,
+                        f"REJECT: {rej['reason']}",
+                        (x1 + 6, y1 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (180, 180, 180, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
             for i, t in enumerate(targets):
                 x1, y1, x2, y2 = t["bb"]
                 mask_resized = t["mask_resized"]
