@@ -13,6 +13,9 @@ sudo ip addr add 192.168.1.101/24 dev eno1
 sudo ip addr add 169.254.186.100/24 dev eno1
 sudo ip link set eno1 up
 
+
+
+, , 
 Result: 
 
 ip a show eno1
