@@ -59,89 +59,57 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
 
 def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=2, radius=0.15):
-    """
-    Wait in place (no robot motion) until 2 stable goal poses appear.
-    If no stable pose -> return best candidate by score.
-    """
 
     stable_count = 0
     last_pose = None
-    best_candidate = None
-    best_score = float("inf")
+    start = time.time()
 
-    def _cb(msg):
-        nonlocal stable_count, last_pose, best_candidate, best_score
+    # Track small movements
+    small_movements = []
 
-        x = msg.pose.position.x
-        y = msg.pose.position.y
-        z = msg.pose.position.z
+    while time.time() - start < timeout:
 
-        # must match same fruit
+        pose = node.best_goal_xyz
+        if pose is None:
+            time.sleep(0.005)
+            continue
+
+        x, y, z = pose
+
         if math.hypot(x - seed_xyz[0], y - seed_xyz[1]) > radius:
-            return
-        
-        print(f"🍎 Reacquire candidate: {[x, y, z]}")
-        pose = [x, y, z]
+            time.sleep(0.005)
+            continue
 
-        # stability measure
+        # Distance change between frames
         if last_pose is not None:
-            if math.dist(last_pose, pose) < 0.004:   # <4mm
+            delta = math.dist(last_pose, pose)
+
+            # Collect last few deltas
+            small_movements.append(delta)
+            if len(small_movements) > 5:
+                small_movements.pop(0)
+
+            # Movement below 2 mm consistently
+            if len(small_movements) >= 4 and max(small_movements) < 0.002:
+                print("🍏 Fruit is static — early exit")
+                return pose
+
+            # Standard stability counter
+            if delta < 0.004:  # 4 mm
                 stable_count += 1
-                print(f"   Stable count: {stable_count}")
             else:
                 stable_count = 0
 
         last_pose = pose
 
-        # also track best candidate by EE distance (for fallback)
-        ee = node.get_end_effector_pose()
-        if ee is not None:
-            dx = x - ee[0]; dy = y - ee[1]; dz = z - ee[2]
-            score = math.sqrt(dx*dx + dy*dy + dz*dz)
-        else:
-            score = z
+        if stable_count >= stable_needed:
+            print(f"🍏 Stable reacquired goal = {pose}")
+            return pose
 
-        if score < best_score:
-            best_score = score
-            best_candidate = pose
+        time.sleep(0.005)
 
-    # temporary subscriber
-    sub = node.create_subscription(
-        PoseStamped,
-        "/external_goal_pose",
-        _cb,
-        getattr(node, "goal_qos", node.qos),
-    )
-
-    try:
-        start = time.time()
-        while time.time() - start < timeout:
-            if stable_count >= stable_needed:
-                print(f"🍏 Stable reacquired goal: {last_pose}")
-                return last_pose
-            time.sleep(0.01)
-
-        # --------------------------------------------
-        # Updated fallback order using continuous tracker
-        # --------------------------------------------
-
-        # 1) Use continuously tracked BEST if available
-        if hasattr(node, "best_goal_xyz") and node.best_goal_xyz is not None:
-            print(f"⚠️ No stable hits. Using continuous tracker BEST = {node.best_goal_xyz}")
-            return node.best_goal_xyz
-
-        # 2) If no continuous BEST → use frame best candidate
-        if best_candidate:
-            print(f"⚠️ No stable hits. Using best_candidate = {best_candidate}")
-            return best_candidate
-
-        # 3) Final fallback → seed (safe old fruit)
-        print("❌ No reacquire candidates. Using seed_xyz.")
-        return seed_xyz
-
-    finally:
-        node.destroy_subscription(sub)
-
+    print("⚠️ Reacquire timeout — using best estimate.")
+    return node.best_goal_xyz or seed_xyz
 
 
 

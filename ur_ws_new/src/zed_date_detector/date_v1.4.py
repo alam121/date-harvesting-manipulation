@@ -8,6 +8,7 @@ from ultralytics import YOLO
 from threading import Lock, Thread
 from time import sleep, time
 from typing import List
+from collections import deque
 import ogl_viewer.viewer as gl
 import tf2_geometry_msgs
 import cv_viewer.tracking_viewer as cv_viewer
@@ -39,9 +40,15 @@ yolo_masks = []
 yolo_classes = []
 yolo_scores = []
 yolo_lock = Lock()
+# Rendering knobs to save CPU (publishing unaffected)
+DRAW_ONLY_BEST = True
+SHOW_REJECTED = False
+SKIP_DRAW = False
 # --- Persistent BEST fruit tracking ---
 best_target_prev = None          # store previous best fruit
 BEST_REUSE_THRESH = 0.05         # 5 cm positional tolerance in base_link
+# --- Track-by-detection smoothing ---
+best_history = deque(maxlen=3)   # shorter window for snappier response
 
 # ============================================================
 # Utility Functions
@@ -197,8 +204,11 @@ def detections_to_custom_masks_(dets) -> List[sl.CustomMaskObjectData]:
 def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
     global image_net, exit_signal, run_signal, detections, net_fps
     print("Initializing Network...")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for YOLO; GPU not available.")
+    device = torch.device("cuda")
     model = YOLO(weights)
-    model.to("cuda").eval()
+    model.to(device).eval()
     print("Network Initialized...")
     while not exit_signal:
         if run_signal:
@@ -211,6 +221,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
                 retina_masks=True,
                 imgsz=img_size,
                 conf=conf_thres,
+                device=device,
                 verbose=False,
             )[0]
             dt = time() - t0
@@ -230,7 +241,7 @@ def main_(args: argparse.Namespace):
     # --- ROS2 setup ---
     rclpy.init()
     node = rclpy.create_node("zed_date_detector_ros")
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     spin_thread = Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -667,179 +678,34 @@ def main_(args: argparse.Namespace):
                 )
 
             # --------------------------------------------------
-            # Draw all targets (centroids, boxes, masks)
-            # Best fruit centroid = BLUE dot + “BEST”
-            # Others = RED dots
-            # --------------------------------------------------
-            # Gray out filtered detections so we can see what was rejected
-            for rej in rejected_targets:
-                x1, y1, x2, y2 = rej["bb"]
-                if x2 > x1 and y2 > y1:
-                    roi = image_left_ocv[y1:y2, x1:x2]
-                    if roi.size:
-                        gray_patch = np.full_like(roi, 128)
-                        image_left_ocv[y1:y2, x1:x2] = cv2.addWeighted(
-                            gray_patch, 0.45, roi, 0.55, 0.0
-                        )
-                cv2.rectangle(
-                    image_left_ocv,
-                    (x1, y1),
-                    (x2, y2),
-                    (150, 150, 150, 255),
-                    2,
-                )
-                if rej.get("reason"):
-                    cv2.putText(
-                        image_left_ocv,
-                        f"REJECT: {rej['reason']}",
-                        (x1 + 6, y1 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (180, 180, 180, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-            for i, t in enumerate(targets):
-                x1, y1, x2, y2 = t["bb"]
-                mask_resized = t["mask_resized"]
-                Xc = t["Xc"]
-                Yc = t["Yc"]
-                Zc = t["Zc"]
-
-                # Overlay mask
-                try:
-                    h_roi, w_roi = mask_resized.shape
-                    colored_mask = np.zeros((h_roi, w_roi, 4), dtype=np.uint8)
-                    colored_mask[:, :, 1] = mask_resized  # green
-                    colored_mask[:, :, 3] = mask_resized  # alpha-like
-
-                    roi = image_left_ocv[y1:y2, x1:x2]
-                    blended = cv2.addWeighted(colored_mask, 0.45, roi, 0.55, 0.0)
-                    image_left_ocv[y1:y2, x1:x2] = blended
-                except Exception as e:
-                    print(f"[WARN] Mask overlay failed: {e}")
-
-                # Draw bounding box
-                cv2.rectangle(
-                    image_left_ocv,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 255, 0, 255),
-                    2,
-                )
-
-                # 2D centroid
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-
-                # Color: best fruit = BLUE, others = RED
-                if i == best_idx:
-                    color = (255, 0, 0, 255)  # blue
-                    radius = 7
-                else:
-                    color = (0, 0, 255, 255)  # red
-                    radius = 5
-
-                cv2.circle(image_left_ocv, (cx, cy), radius, color, -1)
-
-                # Visualize PCA/approach axis projected to image
-                # -------------------------------------------------
-                # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW)
-                # -------------------------------------------------
-                axis_dir = t.get("approach_axis")
-                if axis_dir is None:
-                    axis_dir = t.get("long_axis")
-
-                if axis_dir is not None:
-                    ax, ay, az = axis_dir
-
-                    # convert 3D axis → 2D direction (drop Z)
-                    vx = ax
-                    vy = ay
-
-                    # normalize 2D vector
-                    n = math.sqrt(vx*vx + vy*vy)
-                    if n < 1e-6:
-                        vx, vy = 1.0, 0.0
-                    else:
-                        vx /= n
-                        vy /= n
-
-                    # arrow length in pixels
-                    L = 60
-
-                    ax2 = int(cx + vx * L)
-                    ay2 = int(cy + vy * L)
-                    ax1 = int(cx - vx * L)
-                    ay1 = int(cy - vy * L)
-
-                    # stable PCA → yellow, unstable → orange
-                    axis_color = (
-                        (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
-                    )
-
-                    # forward arrow
-                    cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
-                    cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
-
-
-                    # show instability reason
-                    if not t.get("pca_stable") and t.get("reason"):
-                        cv2.putText(
-                            image_left_ocv,
-                            t["reason"],
-                            (cx + 12, cy - 12),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45,
-                            axis_color,
-                            1,
-                            cv2.LINE_AA,
-                        )
-
-                
-
-                # Draw 3D text near centroid
-                cv2.putText(
-                    image_left_ocv,
-                    f"X:{Xc:.2f} Y:{Yc:.2f} Z:{Zc:.2f}",
-                    (cx + 10, cy + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-                # BEST label for the chosen fruit
-                if i == best_idx:
-                    cv2.putText(
-                        image_left_ocv,
-                        "BEST",
-                        (cx + 10, cy - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 0, 0, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-
-            # --------------------------------------------------
-            # Publish goal for BEST fruit only
+            # Publish goal for BEST fruit only (before rendering to minimize latency)
             if best_idx is not None:
                 t_best = targets[best_idx]
                 pt_base = t_best["pt_base"]
                 q = t_best["quat"]
 
+                # Track-by-detection smoothing: weighted avg of recent centroids
+                pt_vec = np.array(
+                    [pt_base.point.x, pt_base.point.y, pt_base.point.z], dtype=float
+                )
+                best_history.append(pt_vec)
+                if len(best_history) >= 2:
+                    weights = np.arange(1, len(best_history) + 1, dtype=float)  # newer frames weigh more
+                    stacked = np.vstack(best_history)
+                    pt_smooth = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
+                else:
+                    pt_smooth = pt_vec.copy()
+                pt_x, pt_y, pt_z = pt_smooth
+
                 try:
-                    if pt_base.point.z <= Z_MAX:
+                    if pt_z <= Z_MAX:
                         goal = PoseStamped()
                         goal.header = pt_base.header
 
                         # direct fruit position
-                        goal.pose.position.x = float(pt_base.point.x)
-                        goal.pose.position.y = float(pt_base.point.y)
-                        goal.pose.position.z = float(pt_base.point.z)
+                        goal.pose.position.x = float(pt_x)
+                        goal.pose.position.y = float(pt_y)
+                        goal.pose.position.z = float(pt_z)
 
                         # orientation
                         goal.pose.orientation.w = q[0]
@@ -848,46 +714,213 @@ def main_(args: argparse.Namespace):
                         goal.pose.orientation.z = q[3]
 
                         goal_pub.publish(goal)
-                        point_pub.publish(pt_base)
+                        pt_base_smoothed = PointStamped()
+                        pt_base_smoothed.header = pt_base.header
+                        pt_base_smoothed.point.x = float(pt_x)
+                        pt_base_smoothed.point.y = float(pt_y)
+                        pt_base_smoothed.point.z = float(pt_z)
+                        point_pub.publish(pt_base_smoothed)
 
                 except Exception as e:
                     print(f"[WARN] Publish failed: {e}")
+            else:
+                best_history.clear()
 
-            # HUD
-            cv2.putText(
-                image_left_ocv,
-                f"YOLO FPS: {net_fps:.1f}",
-                (12, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                image_left_ocv,
-                f"Loop FPS: {loop_fps:.1f}",
-                (12, 48),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 200, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            # --------------------------------------------------
+            # Draw all targets (centroids, boxes, masks)
+            # Best fruit centroid = BLUE dot + “BEST”
+            # Others = RED dots
+            # --------------------------------------------------
+            if not SKIP_DRAW:
+                # Gray out filtered detections so we can see what was rejected
+                if SHOW_REJECTED:
+                    for rej in rejected_targets:
+                        x1, y1, x2, y2 = rej["bb"]
+                        if x2 > x1 and y2 > y1:
+                            roi = image_left_ocv[y1:y2, x1:x2]
+                            if roi.size:
+                                gray_patch = np.full_like(roi, 128)
+                                image_left_ocv[y1:y2, x1:x2] = cv2.addWeighted(
+                                    gray_patch, 0.45, roi, 0.55, 0.0
+                                )
+                        cv2.rectangle(
+                            image_left_ocv,
+                            (x1, y1),
+                            (x2, y2),
+                            (150, 150, 150, 255),
+                            2,
+                        )
+                        if rej.get("reason"):
+                            cv2.putText(
+                                image_left_ocv,
+                                f"REJECT: {rej['reason']}",
+                                (x1 + 6, y1 + 18),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (180, 180, 180, 255),
+                                1,
+                                cv2.LINE_AA,
+                            )
 
-            # Resize the displayed window to keep it smaller on screen
-            display_image = cv2.resize(
-                image_left_ocv,
-                (
-                    int(image_left_ocv.shape[1] * display_scale),
-                    int(image_left_ocv.shape[0] * display_scale),
-                ),
-                interpolation=cv2.INTER_AREA,
-            )
-            cv2.imshow("ZED | Dense-bunch 3D Position", display_image)
-            key = cv2.waitKey(10)
-            if key in (27, ord("q"), ord("Q")):
-                exit_signal = True
+                for i, t in enumerate(targets):
+                    if DRAW_ONLY_BEST and (best_idx is not None) and i != best_idx:
+                        continue
+                    x1, y1, x2, y2 = t["bb"]
+                    mask_resized = t["mask_resized"]
+                    Xc = t["Xc"]
+                    Yc = t["Yc"]
+                    Zc = t["Zc"]
+
+                    # Overlay mask
+                    try:
+                        h_roi, w_roi = mask_resized.shape
+                        colored_mask = np.zeros((h_roi, w_roi, 4), dtype=np.uint8)
+                        colored_mask[:, :, 1] = mask_resized  # green
+                        colored_mask[:, :, 3] = mask_resized  # alpha-like
+
+                        roi = image_left_ocv[y1:y2, x1:x2]
+                        blended = cv2.addWeighted(colored_mask, 0.45, roi, 0.55, 0.0)
+                        image_left_ocv[y1:y2, x1:x2] = blended
+                    except Exception as e:
+                        print(f"[WARN] Mask overlay failed: {e}")
+
+                    # Draw bounding box
+                    cv2.rectangle(
+                        image_left_ocv,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0, 255),
+                        2,
+                    )
+
+                    # 2D centroid
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+
+                    # Color: best fruit = BLUE, others = RED
+                    if i == best_idx:
+                        color = (255, 0, 0, 255)  # blue
+                        radius = 7
+                    else:
+                        color = (0, 0, 255, 255)  # red
+                        radius = 5
+
+                    cv2.circle(image_left_ocv, (cx, cy), radius, color, -1)
+
+                    # Visualize PCA/approach axis projected to image
+                    # -------------------------------------------------
+                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW)
+                    # -------------------------------------------------
+                    axis_dir = t.get("approach_axis")
+                    if axis_dir is None:
+                        axis_dir = t.get("long_axis")
+
+                    if axis_dir is not None:
+                        ax, ay, az = axis_dir
+
+                        # convert 3D axis → 2D direction (drop Z)
+                        vx = ax
+                        vy = ay
+
+                        # normalize 2D vector
+                        n = math.sqrt(vx*vx + vy*vy)
+                        if n < 1e-6:
+                            vx, vy = 1.0, 0.0
+                        else:
+                            vx /= n
+                            vy /= n
+
+                        # arrow length in pixels
+                        L = 60
+
+                        ax2 = int(cx + vx * L)
+                        ay2 = int(cy + vy * L)
+                        ax1 = int(cx - vx * L)
+                        ay1 = int(cy - vy * L)
+
+                        # stable PCA → yellow, unstable → orange
+                        axis_color = (
+                            (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
+                        )
+
+                        # forward arrow
+                        cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
+                        cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
+
+
+                        # show instability reason
+                        if not t.get("pca_stable") and t.get("reason"):
+                            cv2.putText(
+                                image_left_ocv,
+                                t["reason"],
+                                (cx + 12, cy - 12),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.45,
+                                axis_color,
+                                1,
+                                cv2.LINE_AA,
+                            )
+
+                    # Draw 3D text near centroid
+                    cv2.putText(
+                        image_left_ocv,
+                        f"X:{Xc:.2f} Y:{Yc:.2f} Z:{Zc:.2f}",
+                        (cx + 10, cy + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                    # BEST label for the chosen fruit
+                    if i == best_idx:
+                        cv2.putText(
+                            image_left_ocv,
+                            "BEST",
+                            (cx + 10, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 0, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                # HUD
+                cv2.putText(
+                    image_left_ocv,
+                    f"YOLO FPS: {net_fps:.1f}",
+                    (12, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    image_left_ocv,
+                    f"Loop FPS: {loop_fps:.1f}",
+                    (12, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 200, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                # Resize the displayed window to keep it smaller on screen
+                display_image = cv2.resize(
+                    image_left_ocv,
+                    (
+                        int(image_left_ocv.shape[1] * display_scale),
+                        int(image_left_ocv.shape[0] * display_scale),
+                    ),
+                    interpolation=cv2.INTER_AREA,
+                )
+                cv2.imshow("ZED | Dense-bunch 3D Position", display_image)
+                key = cv2.waitKey(1)
+                if key in (27, ord("q"), ord("Q")):
+                    exit_signal = True
 
     finally:
         exit_signal = True
@@ -904,7 +937,7 @@ if __name__ == "__main__":
     parser.add_argument("--weights", type=str, required=True, help="model.pt path")
     parser.add_argument("--svo", type=str, default=None, help="optional SVO file")
     parser.add_argument(
-        "--img_size", type=int, default=640, help="inference size (pixels)"
+        "--img_size", type=int, default=512, help="inference size (pixels)"
     )
     parser.add_argument(
         "--conf_thres", type=float, default=0.4, help="confidence threshold"

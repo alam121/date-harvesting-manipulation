@@ -396,7 +396,6 @@ class UR10eCuroboMoveIt(Node):
 
     def _continuous_goal_tracker(self, msg: PoseStamped):
 
-        # 0. seed check
         if self.goal_seed_xy is None:
             return
 
@@ -406,15 +405,23 @@ class UR10eCuroboMoveIt(Node):
 
         seed_x, seed_y = self.goal_seed_xy
 
-        # 1. Strict XY lock (prevent switching fruits)
-        if math.hypot(x - seed_x, y - seed_y) > 0.045:
-            return  
-
-        # 2. Depth sanity check
-        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.025:
+        # ------------------------------------------------------
+        # 1. Strict fruit-lock (XY constraint)
+        # Allow small drift (max 5–6 cm is reasonable)
+        # ------------------------------------------------------
+        if math.hypot(x - seed_x, y - seed_y) > 0.06:
             return
 
-        # 3. Distance to EE
+        # ------------------------------------------------------
+        # 2. Depth check with softer limit
+        # Allow 3.5–4 cm variation
+        # ------------------------------------------------------
+        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.04:
+            return
+
+        # ------------------------------------------------------
+        # 3. Distance to EE (we want CLOSER = BETTER)
+        # ------------------------------------------------------
         ee = self.get_end_effector_pose()
         if ee:
             dx = x - ee[0]
@@ -424,22 +431,25 @@ class UR10eCuroboMoveIt(Node):
         else:
             dist = z
 
-        # 4. Stability buffer (last 8 frames)
+        # ------------------------------------------------------
+        # 4. Variance over last few frames (stability)
+        # ------------------------------------------------------
         self.last_frames.append([x, y, z])
         if len(self.last_frames) > 8:
             self.last_frames.pop(0)
 
         variance = np.var(self.last_frames, axis=0).sum()
 
-        # 5. Scoring
-        score = dist - variance * 2.5
+        # ------------------------------------------------------
+        # 5. NEW Scoring: smaller distance & smaller noise is better
+        # ------------------------------------------------------
+        score = dist + variance * 3.0   # POSITIVE penalty
 
-
-        if score > self.best_goal_score + 0.002:
+        # Lower score = better (changed sign logic!)
+        if score < self.best_goal_score - 0.002:
             self.best_goal_score = score
             self.best_goal_xyz = [x, y, z]
-            print(f"Updated BEST (far) goal = {self.best_goal_xyz}, score={score}")
-
+            print(f"Updated BEST (continuous) = {self.best_goal_xyz}, score={score}")
 
 
     # goal capture (timed)
