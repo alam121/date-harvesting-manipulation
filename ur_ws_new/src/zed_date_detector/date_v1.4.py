@@ -41,7 +41,7 @@ yolo_classes = []
 yolo_scores = []
 yolo_lock = Lock()
 # Rendering knobs to save CPU (publishing unaffected)
-DRAW_ONLY_BEST = True
+DRAW_ONLY_BEST = False
 SHOW_REJECTED = False
 SKIP_DRAW = False
 # --- Persistent BEST fruit tracking ---
@@ -345,6 +345,7 @@ def main_(args: argparse.Namespace):
     display_scale = 0.6  # shrink window display without affecting computations
 
     t_prev = time()
+    last_best_print = 0.0
     Z_MAX = 1.34  # limit in base_link frame
 
     # --- Main Loop ---
@@ -455,6 +456,16 @@ def main_(args: argparse.Namespace):
                     roi_xyz = pc_np[y1:y2, x1:x2, :]  # H x W x 3
                     valid = np.isfinite(roi_xyz[:, :, 2])
                     valid &= mask_bool
+                    # More forgiving visibility: erode mask for ratio so edge holes hurt less
+                    vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
+                    mask_pixels = np.count_nonzero(vis_mask)
+                    vis_ratio = (
+                        float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
+                        if mask_pixels > 0
+                        else 0.0
+                    )
+                    vis_ratio = max(0.0, min(vis_ratio, 1.0))
+
 
                     if np.count_nonzero(valid) < 30:
                         # Not enough 3D points to trust (relaxed)
@@ -468,6 +479,9 @@ def main_(args: argparse.Namespace):
                     idx = np.argsort(zs)
                     k = max(10, int(0.2 * len(idx)))
                     pts_front = pts[idx[:k]]
+
+                    depth_std = np.std(pts_front[:,2])
+                    vis_quality = (vis_ratio ** 2) * np.exp(- (depth_std / 0.015)**2)
 
                     Z_std = float(np.std(pts_front[:, 2]))
                     if Z_std > 0.05:  # >10 cm variance → unreliable (dense/occluded)
@@ -530,6 +544,9 @@ def main_(args: argparse.Namespace):
                                 "pca_stable": None,
                                 "reason": "",
                                 "pts_front": pts_front,
+                                "z_std": depth_std,
+                                "vis_ratio": vis_ratio,
+                                "vis_quality": vis_quality,    # <-- REQUIRED
                             }
                         )
 
@@ -809,57 +826,56 @@ def main_(args: argparse.Namespace):
 
                     # Visualize PCA/approach axis projected to image
                     # -------------------------------------------------
-                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW)
-                    # -------------------------------------------------
-                    axis_dir = t.get("approach_axis")
-                    if axis_dir is None:
-                        axis_dir = t.get("long_axis")
+                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW) — BEST ONLY
+                    if i == best_idx:
+                        axis_dir = t.get("approach_axis")
+                        if axis_dir is None:
+                            axis_dir = t.get("long_axis")
 
-                    if axis_dir is not None:
-                        ax, ay, az = axis_dir
+                        if axis_dir is not None:
+                            ax, ay, az = axis_dir
 
-                        # convert 3D axis → 2D direction (drop Z)
-                        vx = ax
-                        vy = ay
+                            # convert 3D axis → 2D direction (drop Z)
+                            vx = ax
+                            vy = ay
 
-                        # normalize 2D vector
-                        n = math.sqrt(vx*vx + vy*vy)
-                        if n < 1e-6:
-                            vx, vy = 1.0, 0.0
-                        else:
-                            vx /= n
-                            vy /= n
+                            # normalize 2D vector
+                            n = math.sqrt(vx*vx + vy*vy)
+                            if n < 1e-6:
+                                vx, vy = 1.0, 0.0
+                            else:
+                                vx /= n
+                                vy /= n
 
-                        # arrow length in pixels
-                        L = 60
+                            # arrow length in pixels
+                            L = 60
 
-                        ax2 = int(cx + vx * L)
-                        ay2 = int(cy + vy * L)
-                        ax1 = int(cx - vx * L)
-                        ay1 = int(cy - vy * L)
+                            ax2 = int(cx + vx * L)
+                            ay2 = int(cy + vy * L)
+                            ax1 = int(cx - vx * L)
+                            ay1 = int(cy - vy * L)
 
-                        # stable PCA → yellow, unstable → orange
-                        axis_color = (
-                            (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
-                        )
-
-                        # forward arrow
-                        cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
-                        cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
-
-
-                        # show instability reason
-                        if not t.get("pca_stable") and t.get("reason"):
-                            cv2.putText(
-                                image_left_ocv,
-                                t["reason"],
-                                (cx + 12, cy - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.45,
-                                axis_color,
-                                1,
-                                cv2.LINE_AA,
+                            # stable PCA → yellow, unstable → orange
+                            axis_color = (
+                                (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
                             )
+
+                            # forward arrow
+                            cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
+                            cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
+
+                            # show instability reason
+                            if not t.get("pca_stable") and t.get("reason"):
+                                cv2.putText(
+                                    image_left_ocv,
+                                    t["reason"],
+                                    (cx + 12, cy - 12),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.45,
+                                    axis_color,
+                                    1,
+                                    cv2.LINE_AA,
+                                )
 
                     # Draw 3D text near centroid
                     cv2.putText(
@@ -883,6 +899,41 @@ def main_(args: argparse.Namespace):
                             0.6,
                             (255, 0, 0, 255),
                             2,
+                            cv2.LINE_AA,
+                        )
+                        # Depth quality + visibility stats
+                        z_std = t.get("z_std", 0.0)
+                        vis_ratio = t.get("vis_ratio", 0.0) * 100.0
+                        cv2.putText(
+                            image_left_ocv,
+                            f"Zstd:{z_std:.3f}m Vis:{vis_ratio:.0f}%",
+                            (cx + 10, cy + 36),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 200, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        dist_grip = t.get("dist", 0.0)
+                        cv2.putText(
+                            image_left_ocv,
+                            f"dist_grip:{dist_grip:.3f}m",
+                            (cx + 10, cy + 52),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 200, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        vis_quality = t.get("vis_quality", 0.0)
+                        cv2.putText(
+                            image_left_ocv,
+                            f"VisQ:{vis_quality:.2f}",
+                            (cx + 10, cy + 68),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 200, 255, 255),
+                            1,
                             cv2.LINE_AA,
                         )
 
