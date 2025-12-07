@@ -20,45 +20,64 @@ def pose_to_vec7(p: ROSPose):
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
+    # 1) Plan with cuRobo
     res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
     if not res.success:
-        node.get_logger().warn(f"Plan failed for {label}."); return False
+        node.get_logger().warn(f"Plan failed for {label}.")
+        return False
+
     states = interpolated_positions(res)
-    
-    
-    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
-    
 
-    
+    # 2) Speed scaling
+    #    - global scalar from node.speed_scale
+    #    - per-motion scalar from cfg.planner
+    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)   # e.g. 0.02 s
+    planner = node.cfg.planner
+
+    global_scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+
     if motion_type == "approach":
-        scale = getattr(node.cfg.planner, "speed_approach", 1.0)
+        type_scale = getattr(planner, "speed_approach", 1.0)
     elif motion_type == "final":
-        scale = getattr(node.cfg.planner, "speed_final", 1.0)
+        type_scale = getattr(planner, "speed_final", 1.0)
     elif motion_type in ["home", "dropoff", "predropoff"]:
-        scale = getattr(node.cfg.planner, f"speed_{motion_type}", 1.0)
+        type_scale = getattr(planner, f"speed_{motion_type}", 1.0)
     else:
-        scale = getattr(node.cfg.planner, "speed_home", 1.0)  # default fast
+        type_scale = getattr(planner, "speed_home", 1.0)  # default
 
+    scale = global_scale * type_scale
+
+    # 3) UR10e-friendly dt and velocity
+    #    - dt too small => jerk
+    #    - keep dt in [12 ms, 30 ms]
+    raw_dt = base_dt / max(scale, 1e-6)
+    dt = min(max(raw_dt, 0.012), 0.03)
+
+    # Velocity: linear scaling with cap
+    base_vel = 0.08        # slightly gentler than 0.1
+    vel = base_vel * scale
+    vel = min(vel, 0.25)   # hard cap for safety
+
+    # 4) Build trajectory
     traj = build_trajectory(
         node.joint_order,
         states,
-        vel=0.1 * scale,
-        dt=base_dt / scale,
-        stop_flag=lambda: node.stop_requested
+        vel=vel,
+        dt=dt,
+        stop_flag=lambda: node.stop_requested,
     )
-    
-    
-    #node.get_logger().info(f"Planned {label} trajectory with {len(states)} steps.")
-    
+
     if node.stop_requested:
-        node.get_logger().warn(f"Stop before sending {label} trajectory."); node.stop_requested = False; return False
+        node.get_logger().warn(f"Stop before sending {label} trajectory.")
+        node.stop_requested = False
+        return False
+
     node.trajectory_pub.publish(traj)
-    
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=2, radius=0.15):
+
+def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=3, radius=0.08):
 
     stable_count = 0
     last_pose = None
@@ -97,6 +116,7 @@ def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=2, radius=0.1
             # Standard stability counter
             if delta < 0.004:  # 4 mm
                 stable_count += 1
+                print(f"🍏 Stable count: {stable_count}/{stable_needed} (delta={delta:.4f} m)")
             else:
                 stable_count = 0
 
@@ -298,6 +318,7 @@ def plan_and_execute(node):
         
         # 2. Reacquire
         seed = [x,y,z]
+        print("Reacquiring goal pose near:", seed)
         reacq = reacquire_goal_pose(node, seed_xyz=seed)
         
         if reacq:
@@ -307,7 +328,7 @@ def plan_and_execute(node):
             continue
             
         # 3. Final slow precise grasp
-        final_target = [x, y, z-0.02, *orientation]
+        final_target = [x, y, z+0.02, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
@@ -326,6 +347,7 @@ def plan_and_execute(node):
         rotate_wrist(node, 90); time.sleep(0.9)
         move_to_predropoff_position(node)
         blend_motion(node)
+        time.sleep(0.1)
         move_to_dropoff_position(node)
         time.sleep(0.2)  # small delay to allow state update
         node.control_gripper("OPEN")
