@@ -47,10 +47,6 @@ class JointsPreset:
     home: List[float] = field(default_factory=lambda: [-1.5034225622760218, -1.5057066318443795, 2.2289393583880823, 
                                                        -4.545150896111959, 4.573554992675781, 0.052810169756412506]
 
-
-
-
-
 )
     dropoff: List[float] = field(default_factory=lambda: [-2.16858417192568, -1.3347657362567347,
         2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704])
@@ -72,8 +68,8 @@ class Planner:
     speed_approach: float = 0.5    # for approach motion
     speed_final: float = 0.5       # for precise grasp
     
-    pre_droffoff_z_offset: float = 0.12  # m above dropoff
-    pre_droffoff_y_offset: float = 0.10  # m back from dropoff
+    pre_droffoff_z_offset: float = -1.0  # m above dropoff
+    pre_droffoff_y_offset: float = 1.5  # m back from dropoff
 
 @dataclass
 class Perception:

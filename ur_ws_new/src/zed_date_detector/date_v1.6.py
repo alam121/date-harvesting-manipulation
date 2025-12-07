@@ -15,6 +15,7 @@ import cv_viewer.tracking_viewer as cv_viewer
 
 import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
@@ -36,19 +37,24 @@ sl_mats: List[sl.Mat] = None
 net_fps = 0.0
 loop_fps = 0.0
 prev_axis = None
+prev_heat_point = None
 yolo_masks = []
 yolo_classes = []
 yolo_scores = []
 yolo_lock = Lock()
+
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
 SHOW_REJECTED = False
 SKIP_DRAW = False
+
 # --- Persistent BEST fruit tracking ---
 best_target_prev = None          # store previous best fruit
 BEST_REUSE_THRESH = 0.05         # 5 cm positional tolerance in base_link
+
 # --- Track-by-detection smoothing ---
 best_history = deque(maxlen=3)   # shorter window for snappier response
+
 
 # ============================================================
 # Utility Functions
@@ -71,12 +77,17 @@ def quat_mul(q, r):
 
 
 def quat_rotate_vec(q, v3):
+    """Rotate vector v3 by quaternion q."""
     qv = (0.0, v3[0], v3[1], v3[2])
     qi = (q[0], -q[1], -q[2], -q[3])
     return quat_mul(quat_mul(q, qv), qi)[1:]
 
 
 def quat_align_x_to_axis(axis_world, up_hint=(0, 0, 1)):
+    """
+    Build quaternion that maps robot's +X axis to the given axis_world,
+    with up_hint used to resolve roll.
+    """
     X = _unit(axis_world)
     U = _unit(up_hint)
     Y = np.cross(U, X)
@@ -181,7 +192,7 @@ def detections_to_custom_masks_(dets) -> List[sl.CustomMaskObjectData]:
             y_min = int(abcd[0, 1])
             x_max = int(abcd[2, 0])
             y_max = int(abcd[2, 1])
-            mask_roi = mask_bin[y_min : y_max + 1, x_min : x_max + 1]
+            mask_roi = mask_bin[y_min: y_max + 1, x_min: x_max + 1]
             if not mask_roi.flags.c_contiguous:
                 mask_roi = np.ascontiguousarray(mask_roi)
             sl_mat = sl.Mat(
@@ -236,7 +247,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
 # Main
 # ============================================================
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_signal, detections, loop_fps
+    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -254,6 +265,7 @@ def main_(args: argparse.Namespace):
     )
     point_pub = node.create_publisher(PointStamped, "/datefruit_3d_point", 10)
     goal_pub = node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
+    dir_pub = node.create_publisher(String, "/datefruit_direction", 10)
 
     # TF listener
     tf_buffer = Buffer()
@@ -345,7 +357,6 @@ def main_(args: argparse.Namespace):
     display_scale = 0.6  # shrink window display without affecting computations
 
     t_prev = time()
-    last_best_print = 0.0
     Z_MAX = 1.34  # limit in base_link frame
 
     # --- Main Loop ---
@@ -395,7 +406,10 @@ def main_(args: argparse.Namespace):
             # --------------------------------------------------
             # Process detected objects → compute 3D + store
             # --------------------------------------------------
-            # each target: {"Xc","Yc","Zc","bb","mask_resized","pt_base","pt_grip","dist"}
+            # each target:
+            # { "Xc","Yc","Zc","bb","mask_resized","pt_base","pt_grip",
+            #   "dist","z_std","vis_ratio","vis_quality",
+            #   "long_axis_cam","long_axis_2d","ellipse_angle", ... }
             targets = []
             rejected_targets = []
 
@@ -454,41 +468,88 @@ def main_(args: argparse.Namespace):
                     mask_bool = mask_clean > 0
 
                     # ----------------------------------------------------------
-                    # 2D Ellipse Fit on the cleaned mask (orientation extraction)
+                    # 2D Ellipse Fit → SHORT AXIS extraction
                     # ----------------------------------------------------------
+                    t_short_axis = None
+                    long_axis_2d = None
+                    t_angle = None
+                    t_best_dir2d = None
+                    t_best_point = None
                     try:
-                        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                        contours, _ = cv2.findContours(
+                            mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+                        )
                         if contours:
                             cnt = max(contours, key=cv2.contourArea)
                             if len(cnt) >= 20:
                                 ellipse = cv2.fitEllipse(cnt)
-                                (xc2d, yc2d), (MA, ma), angle_deg = ellipse
+                                (xc2d, yc2d), (major, minor), angle_deg = ellipse
+
+                                theta = math.radians(angle_deg)
+                                # LONG axis in image plane (for reference only)
+                                long_dir_img = np.array(
+                                    [math.cos(theta), math.sin(theta)], dtype=float
+                                )
+                                # SHORT axis = perpendicular to long
+                                short_dir_cam = np.array(
+                                    [-long_dir_img[1], long_dir_img[0], 0.0],
+                                    dtype=float,
+                                )
+                                n_short = np.linalg.norm(short_dir_cam)
+                                if n_short > 1e-6:
+                                    short_dir_cam /= n_short
+
+                                t_short_axis = short_dir_cam
+                                long_axis_2d = long_dir_img
                                 t_angle = float(angle_deg)
-
-                                # Convert 2D angle → direction vector in image plane
-                                theta = math.radians(t_angle)
-                                vx = math.cos(theta)
-                                vy = math.sin(theta)
-
-                                t_ellipse_dir = np.array([vx, vy, 0.0], dtype=float)
-                            else:
-                                t_ellipse_dir = None
-                                t_angle = None
-                        else:
-                            t_ellipse_dir = None
-                            t_angle = None
-
                     except Exception as e:
-                        print("[WARN] Ellipse fit failed:", e)
-                        t_ellipse_dir = None
+                        print("[WARN] Ellipse axis extraction failed:", e)
+                        t_short_axis = None
+                        long_axis_2d = None
                         t_angle = None
 
                     # Take 3D points from XYZ map only where mask is true
                     roi_xyz = pc_np[y1:y2, x1:x2, :]  # H x W x 3
                     valid = np.isfinite(roi_xyz[:, :, 2])
                     valid &= mask_bool
+                    heatmap = None
+                    depth_vals = roi_xyz[:, :, 2][valid]
+                    if depth_vals.size > 0:
+                        z_lo, z_hi = np.percentile(depth_vals, [5.0, 90.0])
+                        if z_hi <= z_lo:
+                            z_hi = z_lo + 1e-3
+                        score = np.zeros_like(roi_xyz[:, :, 2], dtype=np.float32)
+                        score[valid] = (z_hi - roi_xyz[:, :, 2][valid]) / (z_hi - z_lo)
+                        score = np.clip(score, 0.0, 1.0)
+                        score_u8 = (score * 255).astype(np.uint8)
+                        heatmap = cv2.applyColorMap(score_u8, cv2.COLORMAP_JET)
+                        # ----------------------------------------------------------
+                        # Compute best point/direction from peak heatmap score
+                        # ----------------------------------------------------------
+                        if heatmap is not None and mask_clean is not None:
+                            ys, xs = np.nonzero(mask_clean)
+                            if len(xs) > 0:
+                                scores = heatmap[ys, xs, 2].astype(float)  # use RED channel
+                                idx_max = int(np.argmax(scores))
+                                peak_y = int(ys[idx_max])
+                                peak_x = int(xs[idx_max])
+                                t_best_point = np.array([peak_x, peak_y], dtype=float)
+                                cx = mask_clean.shape[1] / 2.0
+                                cy = mask_clean.shape[0] / 2.0
+                                dir_vec = np.array([peak_x - cx, peak_y - cy], dtype=float)
+                                n_dir = np.linalg.norm(dir_vec)
+                                if n_dir > 1e-6:
+                                    dir_vec /= n_dir
+                                else:
+                                    dir_vec = np.array([1.0, 0.0], dtype=float)
+                                t_best_dir2d = dir_vec
+
                     # More forgiving visibility: erode mask for ratio so edge holes hurt less
-                    vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
+                    vis_mask = cv2.erode(
+                        mask_clean,
+                        np.ones((3, 3), np.uint8),
+                        iterations=1,
+                    ) > 0
                     mask_pixels = np.count_nonzero(vis_mask)
                     vis_ratio = (
                         float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
@@ -497,9 +558,8 @@ def main_(args: argparse.Namespace):
                     )
                     vis_ratio = max(0.0, min(vis_ratio, 1.0))
 
-
                     if np.count_nonzero(valid) < 30:
-                        # Not enough 3D points to trust (relaxed)
+                        # Not enough 3D points to trust
                         mark_reject("Too few depth pts")
                         continue
 
@@ -511,11 +571,13 @@ def main_(args: argparse.Namespace):
                     k = max(10, int(0.2 * len(idx)))
                     pts_front = pts[idx[:k]]
 
-                    depth_std = np.std(pts_front[:,2])
-                    vis_quality = (vis_ratio ** 2) * np.exp(- (depth_std / 0.015)**2)
+                    depth_std = np.std(pts_front[:, 2])
+                    vis_quality = (vis_ratio ** 2) * np.exp(
+                        - (depth_std / 0.015) ** 2
+                    )
 
                     Z_std = float(np.std(pts_front[:, 2]))
-                    if Z_std > 0.05:  # >10 cm variance → unreliable (dense/occluded)
+                    if Z_std > 0.05:  # >5 cm variance → unreliable
                         mark_reject("Depth variance")
                         continue
 
@@ -530,7 +592,7 @@ def main_(args: argparse.Namespace):
                     # Transform this fruit’s 3D point to base_link and gripper_tip
                     point_msg = PointStamped()
                     point_msg.header.frame_id = cam_frame
-                    point_msg.header.stamp = rclpy.time.Time().to_msg()
+                    point_msg.header.stamp = rclpyTime().to_msg()
                     point_msg.point.x = Xc
                     point_msg.point.y = Yc
                     point_msg.point.z = Zc
@@ -542,10 +604,6 @@ def main_(args: argparse.Namespace):
                             timeout=rclpyDuration(seconds=0.2),
                         )
 
-                        # Height limit in base_link
-                        # if pt_base.point.z > Z_MAX:
-                        #     continue
-
                         pt_grip = tf_buffer.transform(
                             point_msg,
                             "gripper_tip",
@@ -554,9 +612,9 @@ def main_(args: argparse.Namespace):
 
                         # 3D distance from gripper tip
                         dist = math.sqrt(
-                            pt_grip.point.x**2
-                            + pt_grip.point.y**2
-                            + pt_grip.point.z**2
+                            pt_grip.point.x ** 2
+                            + pt_grip.point.y ** 2
+                            + pt_grip.point.z ** 2
                         )
 
                         targets.append(
@@ -570,17 +628,19 @@ def main_(args: argparse.Namespace):
                                 "pt_grip": pt_grip,
                                 "dist": dist,
                                 "quat": None,
-                                "long_axis": None,
                                 "approach_axis": None,
-                                "pca_stable": None,
+                                "pca_stable": None,  # kept for compatibility in drawing
                                 "reason": "",
                                 "pts_front": pts_front,
                                 "z_std": depth_std,
                                 "vis_ratio": vis_ratio,
-                                "vis_quality": vis_quality,    # <-- REQUIRED
-                                "ellipse_dir": t_ellipse_dir,
+                                "vis_quality": vis_quality,
+                                "short_axis_cam": t_short_axis,
+                                "long_axis_2d": long_axis_2d,
                                 "ellipse_angle": t_angle,
-
+                                "heatmap": heatmap,
+                                "best_dir2d": t_best_dir2d,
+                                "best_point2d": t_best_point,
                             }
                         )
 
@@ -609,38 +669,34 @@ def main_(args: argparse.Namespace):
 
             best_idx = frame_best_idx  # default
 
-
-            # --------------------------------------------------
             # 2. Strong Reuse (sticky lock-on)
             # We ONLY switch if previous best is completely lost.
-            # --------------------------------------------------
-
-            global best_target_prev
-
             if best_target_prev is not None:
-
-                prev_pt = np.array([
-                    best_target_prev["pt_base"].point.x,
-                    best_target_prev["pt_base"].point.y,
-                    best_target_prev["pt_base"].point.z
-                ], dtype=float)
+                prev_pt = np.array(
+                    [
+                        best_target_prev["pt_base"].point.x,
+                        best_target_prev["pt_base"].point.y,
+                        best_target_prev["pt_base"].point.z,
+                    ],
+                    dtype=float,
+                )
 
                 reuse_idx = None
                 min_dist = float("inf")
 
                 # Try to find the *same* fruit again by proximity
                 for i, t in enumerate(targets):
-
-                    cur_pt = np.array([
-                        t["pt_base"].point.x,
-                        t["pt_base"].point.y,
-                        t["pt_base"].point.z
-                    ], dtype=float)
-
+                    cur_pt = np.array(
+                        [
+                            t["pt_base"].point.x,
+                            t["pt_base"].point.y,
+                            t["pt_base"].point.z,
+                        ],
+                        dtype=float,
+                    )
                     d = np.linalg.norm(cur_pt - prev_pt)
 
-                    # 🔥 MUCH STRONGER stickiness threshold
-                    if d < BEST_REUSE_THRESH:      # recommended 0.04 → 4 cm
+                    if d < BEST_REUSE_THRESH:  # e.g. 5 cm
                         if d < min_dist:
                             min_dist = d
                             reuse_idx = i
@@ -648,56 +704,70 @@ def main_(args: argparse.Namespace):
                 # If we found a matching fruit → ALWAYS reuse it
                 if reuse_idx is not None:
                     best_idx = reuse_idx
+                # else: previous best is considered LOST → we must switch to frame_best_idx
 
-                # ❗ If we DID NOT find the previous best at all → only then switch
-                else:
-                    # previous best is considered LOST → we must switch
-                    best_idx = frame_best_idx
-
-
-            # --------------------------------------------------
             # 3. Persistent state update
-            # --------------------------------------------------
             if best_idx is not None:
                 best_target_prev = targets[best_idx]
 
             # --------------------------------------------------
-            # ELLIPSE-ONLY ORIENTATION LOGIC
+            # Use SHORT axis (minor axis) for orientation if available
             # --------------------------------------------------
             if best_idx is not None:
                 t_best = targets[best_idx]
-                ell = t_best.get("ellipse_dir")
+                short_cam = t_best.get("short_axis_cam")
+                use_axis_cam = short_cam
+                # Smooth best heatmap point to reduce jitter for arrows
+                best_pt = t_best.get("best_point2d")
+                if best_pt is not None:
+                    if prev_heat_point is None:
+                        sm_pt = best_pt.copy()
+                    else:
+                        sm_pt = 0.7 * prev_heat_point + 0.3 * best_pt
+                    prev_heat_point = sm_pt.copy()
+                    t_best["best_point2d_smooth"] = sm_pt
+                else:
+                    prev_heat_point = None
 
-                # If ellipse exists → compute approach vector
-                if ell is not None:
-                    # ellipse vector is in IMAGE plane → convert to CAMERA plane
-                    approach_cam = np.array([ell[0], ell[1], 0.0], dtype=float)
-                    approach_cam /= np.linalg.norm(approach_cam)
-
-                    # Transform to base_link
+                if use_axis_cam is not None:
                     try:
-                        T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
+                        T = tf_buffer.lookup_transform(
+                            "base_link", cam_frame, rclpyTime()
+                        )
                         q_tf = (
                             T.transform.rotation.w,
                             T.transform.rotation.x,
                             T.transform.rotation.y,
                             T.transform.rotation.z,
                         )
-                        approach_world = quat_rotate_vec(q_tf, approach_cam)
-                        approach_world /= np.linalg.norm(approach_world)
+
+                        # Rotate chosen camera-frame axis → world (base_link)
+                        axis_world = quat_rotate_vec(q_tf, use_axis_cam)
+                        n_axis = np.linalg.norm(axis_world)
+                        if n_axis > 1e-6:
+                            axis_world /= n_axis
+                        else:
+                            axis_world = np.array([1.0, 0.0, 0.0])
 
                     except Exception as e:
-                        print("[WARN] Ellipse axis TF fail:", e)
-                        approach_world = np.array([1.0, 0.0, 0.0])
-
+                        print("[WARN] Axis TF fail:", e)
+                        axis_world = np.array([1.0, 0.0, 0.0])
                 else:
-                    # fallback
-                    approach_world = np.array([1.0, 0, 0])
+                    # fallback if no ellipse
+                    axis_world = np.array([1.0, 0.0, 0.0])
 
-                # convert axis → quaternion
-                q = quat_align_x_to_axis(approach_world)
+                # stabilize axis direction (avoid flips)
+                if prev_axis is not None and axis_world is not None:
+                    dot = float(np.dot(prev_axis, axis_world))
+                    if dot < 0:
+                        axis_world = -axis_world
+                prev_axis = axis_world.copy()
+
+                # Convert axis → quaternion
+                q = quat_align_x_to_axis(axis_world)
+
                 t_best["quat"] = q
-                t_best["approach_axis"] = approach_world
+                t_best["approach_axis"] = axis_world
 
             # --------------------------------------------------
             # Publish goal for BEST fruit only (before rendering to minimize latency)
@@ -705,6 +775,23 @@ def main_(args: argparse.Namespace):
                 t_best = targets[best_idx]
                 pt_base = t_best["pt_base"]
                 q = t_best["quat"]
+                dir_msg = None
+                dir_vec = t_best.get("best_dir2d")
+                if dir_vec is not None and len(dir_vec) >= 2:
+                    vx = float(dir_vec[0])
+                    vy = float(dir_vec[1])
+                    n = math.hypot(vx, vy)
+                    if n > 1e-6:
+                        vx /= n
+                        vy /= n
+                    if abs(vx) < 0.25:
+                        direction_label = "center"
+                    elif vx > 0:
+                        direction_label = "right"
+                    else:
+                        direction_label = "left"
+                    dir_msg = String()
+                    dir_msg.data = direction_label
 
                 # Track-by-detection smoothing: weighted avg of recent centroids
                 pt_vec = np.array(
@@ -712,7 +799,9 @@ def main_(args: argparse.Namespace):
                 )
                 best_history.append(pt_vec)
                 if len(best_history) >= 2:
-                    weights = np.arange(1, len(best_history) + 1, dtype=float)  # newer frames weigh more
+                    weights = np.arange(
+                        1, len(best_history) + 1, dtype=float
+                    )  # newer frames weigh more
                     stacked = np.vstack(best_history)
                     pt_smooth = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
                 else:
@@ -729,19 +818,22 @@ def main_(args: argparse.Namespace):
                         goal.pose.position.y = float(pt_y)
                         goal.pose.position.z = float(pt_z)
 
-                        # orientation
+                        # orientation from long axis
                         goal.pose.orientation.w = q[0]
                         goal.pose.orientation.x = q[1]
                         goal.pose.orientation.y = q[2]
                         goal.pose.orientation.z = q[3]
 
                         goal_pub.publish(goal)
+
                         pt_base_smoothed = PointStamped()
                         pt_base_smoothed.header = pt_base.header
                         pt_base_smoothed.point.x = float(pt_x)
                         pt_base_smoothed.point.y = float(pt_y)
                         pt_base_smoothed.point.z = float(pt_z)
                         point_pub.publish(pt_base_smoothed)
+                        if dir_msg is not None:
+                            dir_pub.publish(dir_msg)
 
                 except Exception as e:
                     print(f"[WARN] Publish failed: {e}")
@@ -803,6 +895,27 @@ def main_(args: argparse.Namespace):
                         roi = image_left_ocv[y1:y2, x1:x2]
                         blended = cv2.addWeighted(colored_mask, 0.45, roi, 0.55, 0.0)
                         image_left_ocv[y1:y2, x1:x2] = blended
+                        # Heatmap overlay for BEST target
+                        if i == best_idx:
+                            heatmap = t.get("heatmap")
+                            vis_r = float(t.get("vis_ratio", 0.0))
+                            if heatmap is not None:
+                                hm = heatmap
+                                if hm.shape[:2] != (h_roi, w_roi):
+                                    hm = cv2.resize(
+                                        hm, (w_roi, h_roi), interpolation=cv2.INTER_NEAREST
+                                    )
+                                if hm.shape[2] == 3:
+                                    hm_rgba = np.zeros((h_roi, w_roi, 4), dtype=np.uint8)
+                                    hm_rgba[:, :, :3] = hm
+                                    alpha = int(80 + 150 * max(0.0, min(vis_r, 1.0)))
+                                    hm_rgba[:, :, 3] = alpha
+                                else:
+                                    hm_rgba = hm
+                                roi_best = image_left_ocv[y1:y2, x1:x2]
+                                image_left_ocv[y1:y2, x1:x2] = cv2.addWeighted(
+                                    hm_rgba, 0.6, roi_best, 0.4, 0.0
+                                )
                     except Exception as e:
                         print(f"[WARN] Mask overlay failed: {e}")
 
@@ -829,58 +942,77 @@ def main_(args: argparse.Namespace):
 
                     cv2.circle(image_left_ocv, (cx, cy), radius, color, -1)
 
-                    # Visualize PCA/approach axis projected to image
-                    # -------------------------------------------------
-                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW) — BEST ONLY
+                    # VISUALIZE LONG-AXIS-BASED APPROACH (2D ARROW) — BEST ONLY
                     if i == best_idx:
                         axis_dir = t.get("approach_axis")
-                        if axis_dir is None:
-                            axis_dir = t.get("long_axis")
-
                         if axis_dir is not None:
-                            ax, ay, az = axis_dir
+                            vx, vy, vz = axis_dir
 
-                            # convert 3D axis → 2D direction (drop Z)
-                            vx = ax
-                            vy = ay
-
-                            # normalize 2D vector
-                            n = math.sqrt(vx*vx + vy*vy)
+                            # Use only XY for visualization
+                            n = math.sqrt(vx * vx + vy * vy)
                             if n < 1e-6:
                                 vx, vy = 1.0, 0.0
                             else:
                                 vx /= n
                                 vy /= n
 
-                            # arrow length in pixels
                             L = 60
-
                             ax2 = int(cx + vx * L)
                             ay2 = int(cy + vy * L)
                             ax1 = int(cx - vx * L)
                             ay1 = int(cy - vy * L)
 
-                            # stable PCA → yellow, unstable → orange
-                            axis_color = (
-                                (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
+                            axis_color = (0, 255, 255, 255)
+
+                            cv2.arrowedLine(
+                                image_left_ocv,
+                                (cx, cy),
+                                (ax2, ay2),
+                                axis_color,
+                                2,
+                                tipLength=0.25,
+                            )
+                            cv2.line(
+                                image_left_ocv,
+                                (cx, cy),
+                                (ax1, ay1),
+                                axis_color,
+                                2,
                             )
 
-                            # forward arrow
-                            cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
-                            cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
+                        # Also show best heatmap peak direction (orange) toward highest score
+                        peak_pt = t.get("best_point2d_smooth")
+                        if peak_pt is None:
+                            peak_pt = t.get("best_point2d")
+                        if peak_pt is not None:
+                            dest_x = int(round(x1 + peak_pt[0]))
+                            dest_y = int(round(y1 + peak_pt[1]))
+                            # keep destination in frame
+                            dest_x = max(0, min(dest_x, image_left_ocv.shape[1] - 1))
+                            dest_y = max(0, min(dest_y, image_left_ocv.shape[0] - 1))
 
-                            # show instability reason
-                            if not t.get("pca_stable") and t.get("reason"):
-                                cv2.putText(
-                                    image_left_ocv,
-                                    t["reason"],
-                                    (cx + 12, cy - 12),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.45,
-                                    axis_color,
-                                    1,
-                                    cv2.LINE_AA,
-                                )
+                            dx = float(dest_x - cx)
+                            dy = float(dest_y - cy)
+                            n = math.hypot(dx, dy)
+                            if n < 1e-3:
+                                dx, dy, n = 1.0, 0.0, 1.0
+                            dx /= n
+                            dy /= n
+                            # start outside the box, along the opposite direction
+                            L_out = max(w_roi, h_roi) + 10.0
+                            start_x = int(round(dest_x - dx * L_out))
+                            start_y = int(round(dest_y - dy * L_out))
+                            start_x = max(0, min(start_x, image_left_ocv.shape[1] - 1))
+                            start_y = max(0, min(start_y, image_left_ocv.shape[0] - 1))
+                            axis_color = (0, 165, 255, 255)  # orange
+                            cv2.arrowedLine(
+                                image_left_ocv,
+                                (start_x, start_y),
+                                (dest_x, dest_y),
+                                axis_color,
+                                2,
+                                tipLength=0.25,
+                            )
 
                     # Draw 3D text near centroid
                     cv2.putText(
@@ -894,7 +1026,7 @@ def main_(args: argparse.Namespace):
                         cv2.LINE_AA,
                     )
 
-                    # BEST label for the chosen fruit
+                    # BEST label + stats
                     if i == best_idx:
                         cv2.putText(
                             image_left_ocv,
@@ -941,6 +1073,7 @@ def main_(args: argparse.Namespace):
                             1,
                             cv2.LINE_AA,
                         )
+                        # Heatmap overlay handled earlier in mask drawing
 
                 # HUD
                 cv2.putText(

@@ -283,6 +283,12 @@ def plan_and_execute(node):
     
     
     while node.goal_poses and getattr(node, 'running', True):
+        if getattr(node, "stop_requested", False):
+            node.get_logger().warn("Stop requested; aborting goal execution.")
+            publish_stop_trajectory(node)
+            node.goal_poses.clear()
+            node.stop_requested = False
+            break
         
         start = JointState.from_position(
             torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
@@ -345,6 +351,13 @@ def plan_and_execute(node):
             
         # 4. Drop-off and return
         rotate_wrist(node, 90); time.sleep(0.9)
+
+        # #move_to_predropoff_position(node)
+        # current_pose = node.get_end_effector_pose()
+        # execute_single_pose(node, [current_pose[0], current_pose[1]+node.cfg.planner.pre_droffoff_y_offset,
+        #                       current_pose[2]+node.cfg.planner.pre_droffoff_z_offset,
+        #                       *current_pose[3:]], motion_type="predropoff")
+
         move_to_predropoff_position(node)
         blend_motion(node)
         time.sleep(0.1)

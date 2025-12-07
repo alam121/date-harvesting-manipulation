@@ -34,7 +34,7 @@ def publish_stop_trajectory(node):
 #input: pose: List of 7 elements [x,y,z,qw,qx,qy,qz]
 
 #output: Publishes /joint_trajectory_controller/joint_trajectory.
-def execute_single_pose(node, pose: list):
+def execute_single_pose(node, pose: list, motion_type: str = "default"):
     if node.current_joint_positions is None:
         node.get_logger().warn("No joint state; cannot execute pose."); return
     
@@ -47,14 +47,35 @@ def execute_single_pose(node, pose: list):
     res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT) #cuRobo Cartesian planner
     if not res.success:
         node.get_logger().warn("Plan failed for single pose."); return
-    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
+    
+    planner = node.cfg.planner
+    base_dt = planner.base_dt  # usually 0.02
+    # ------------------------------
+    # 2. Speed scaling
+    # ------------------------------
+    speed_map = {
+        "home": planner.speed_home,
+        "dropoff": planner.speed_dropoff,
+        "predropoff": planner.speed_predropoff,
+    }
+    scale = speed_map.get(motion_type, 1.0)
+
+    dt = base_dt / scale
+    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
+
+    # ------------------------------
+    # 6. velocity smoothing
+    # ------------------------------
+    base_vel = 0.10
+    vel = min(base_vel * scale, 0.25)
+
+
 
     traj = build_trajectory(
         node.joint_order,
         interpolated_positions(res),
-        vel=0.1 * scale,
-        dt=base_dt / scale,
+        vel=vel,
+        dt=dt,
         stop_flag=lambda: node.stop_requested
 )
     node.trajectory_pub.publish(traj)
@@ -67,47 +88,66 @@ def execute_single_pose(node, pose: list):
         
 # Publishes /joint_trajectory_controller/joint_trajectory.
 def plan_execute_js(node, target_joints: List[float], label: str, motion_type: str = "default"):
-    
     if node.current_joint_positions is None:
-        node.get_logger().warn(f"No joint state; skipping {label} move."); return
-        
+        node.get_logger().warn(f"No joint state; skipping {label} move.")
+        return
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ------------------------------
+    # 1. Build joint states
+    # ------------------------------
     start = JointState.from_position(
         torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
         joint_names=node.joint_order,
     )
-    
+
     goal_js = JointState.from_position(
         torch.tensor([target_joints], dtype=torch.float32, device=device),
         joint_names=node.joint_order,
     )
-    scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+
+    # ------------------------------
+    # 2. Speed scaling
+    # ------------------------------
+    planner = node.cfg.planner
+    speed_map = {
+        "home": planner.speed_home,
+        "dropoff": planner.speed_dropoff,
+        "predropoff": planner.speed_predropoff,
+    }
+    scale = speed_map.get(motion_type, 1.0)
+
+    # ------------------------------
+    # 3. cuRobo plan
+    # ------------------------------
     res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_DEFAULT)
     if not res.success:
-        node.get_logger().warn(f"Joint-space plan to {label} failed."); return
-        
-        
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
-    if motion_type == "home":
-        scale = getattr(node.cfg.planner, "speed_home", 1.0)
-    elif motion_type == "dropoff":
-        scale = getattr(node.cfg.planner, "speed_dropoff", 1.0)
-    elif motion_type == "predropoff":
-        scale = getattr(node.cfg.planner, "speed_predropoff", 1.0)
-    else:
-        scale = 1.0  # default
-        
+        node.get_logger().warn(f"Joint-space plan to {label} failed.")
+        return
+
+    # ------------------------------
+    # 4. Interpolate (older cuRobo API)
+    # ------------------------------
+    # No args allowed
     states = interpolated_positions(res)
 
-    raw_dt = base_dt / scale
-    dt = max(0.008, min(raw_dt, 0.02))     # clamp dt
+    # ------------------------------
+    # 5. dt smoothing (critical)
+    # ------------------------------
+    base_dt = planner.base_dt  # usually 0.02
+    dt = base_dt / scale
+    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
 
     # ------------------------------
-    # Smooth velocity scaling
+    # 6. velocity smoothing
     # ------------------------------
     base_vel = 0.10
-    vel = base_vel * math.sqrt(scale)
+    vel = min(base_vel * scale, 0.25)
 
+    # ------------------------------
+    # 7. Build trajectory
+    # ------------------------------
     traj = build_trajectory(
         node.joint_order,
         states,
@@ -115,11 +155,17 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         dt=dt,
         stop_flag=lambda: node.stop_requested,
     )
+
+    node.get_logger().info(f"Moving to {label} (vel={vel:.2f}, dt={dt:.3f})")
     node.trajectory_pub.publish(traj)
-    node.get_logger().info(f"Moving to {label} joints…")
-    fk_last = forward_kinematics(node, states[-1])
-    if fk_last:
-        wait_until_xyz(node, [fk_last.x, fk_last.y, fk_last.z]) #Wait for completion
+
+    # ------------------------------
+    # 8. Wait for the robot
+    # ------------------------------
+    fk = forward_kinematics(node, states[-1])
+    if fk:
+        wait_until_xyz(node, [fk.x, fk.y, fk.z])
+
 
 
 def move_to_home_position(node):

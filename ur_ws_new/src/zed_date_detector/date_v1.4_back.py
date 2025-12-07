@@ -41,7 +41,7 @@ yolo_classes = []
 yolo_scores = []
 yolo_lock = Lock()
 # Rendering knobs to save CPU (publishing unaffected)
-DRAW_ONLY_BEST = False
+DRAW_ONLY_BEST = True
 SHOW_REJECTED = False
 SKIP_DRAW = False
 # --- Persistent BEST fruit tracking ---
@@ -452,37 +452,6 @@ def main_(args: argparse.Namespace):
                     mask_clean = cv2.morphologyEx(mask_resized, cv2.MORPH_CLOSE, kernel)
                     mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel)
                     mask_bool = mask_clean > 0
-
-                    # ----------------------------------------------------------
-                    # 2D Ellipse Fit on the cleaned mask (orientation extraction)
-                    # ----------------------------------------------------------
-                    try:
-                        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                        if contours:
-                            cnt = max(contours, key=cv2.contourArea)
-                            if len(cnt) >= 20:
-                                ellipse = cv2.fitEllipse(cnt)
-                                (xc2d, yc2d), (MA, ma), angle_deg = ellipse
-                                t_angle = float(angle_deg)
-
-                                # Convert 2D angle → direction vector in image plane
-                                theta = math.radians(t_angle)
-                                vx = math.cos(theta)
-                                vy = math.sin(theta)
-
-                                t_ellipse_dir = np.array([vx, vy, 0.0], dtype=float)
-                            else:
-                                t_ellipse_dir = None
-                                t_angle = None
-                        else:
-                            t_ellipse_dir = None
-                            t_angle = None
-
-                    except Exception as e:
-                        print("[WARN] Ellipse fit failed:", e)
-                        t_ellipse_dir = None
-                        t_angle = None
-
                     # Take 3D points from XYZ map only where mask is true
                     roi_xyz = pc_np[y1:y2, x1:x2, :]  # H x W x 3
                     valid = np.isfinite(roi_xyz[:, :, 2])
@@ -578,9 +547,6 @@ def main_(args: argparse.Namespace):
                                 "z_std": depth_std,
                                 "vis_ratio": vis_ratio,
                                 "vis_quality": vis_quality,    # <-- REQUIRED
-                                "ellipse_dir": t_ellipse_dir,
-                                "ellipse_angle": t_angle,
-
                             }
                         )
 
@@ -661,43 +627,72 @@ def main_(args: argparse.Namespace):
             if best_idx is not None:
                 best_target_prev = targets[best_idx]
 
+
             # --------------------------------------------------
-            # ELLIPSE-ONLY ORIENTATION LOGIC
+            # Run PCA only for the BEST target to reduce compute
             # --------------------------------------------------
             if best_idx is not None:
                 t_best = targets[best_idx]
-                ell = t_best.get("ellipse_dir")
+                pts_front = t_best.get("pts_front")
 
-                # If ellipse exists → compute approach vector
-                if ell is not None:
-                    # ellipse vector is in IMAGE plane → convert to CAMERA plane
-                    approach_cam = np.array([ell[0], ell[1], 0.0], dtype=float)
-                    approach_cam /= np.linalg.norm(approach_cam)
+                long_axis = None
+                pca_stable = False
+                reason = ""
+                S = np.array([0.0, 0.0, 0.0])
 
-                    # Transform to base_link
+                if pts_front is not None and len(pts_front) > 0:
                     try:
-                        T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
-                        q_tf = (
-                            T.transform.rotation.w,
-                            T.transform.rotation.x,
-                            T.transform.rotation.y,
-                            T.transform.rotation.z,
-                        )
-                        approach_world = quat_rotate_vec(q_tf, approach_cam)
-                        approach_world /= np.linalg.norm(approach_world)
+                        pts_centered = pts_front - np.mean(pts_front, axis=0)
+                        U, S, Vt = np.linalg.svd(pts_centered)
+                        long_axis = Vt[0]
+                        long_axis = long_axis / np.linalg.norm(long_axis)
+                    except Exception:
+                        long_axis = None
 
-                    except Exception as e:
-                        print("[WARN] Ellipse axis TF fail:", e)
-                        approach_world = np.array([1.0, 0.0, 0.0])
+                    if pts_front.shape[0] < 80:
+                        reason = "Not enough PCA points"
+                    elif long_axis is None or S[0] < 1.5 * S[1]:
+                        reason = "Fruit not elongated"
+                    else:
+                        pca_stable = True
 
+                    global prev_axis
+                    if "prev_axis" not in globals():
+                        prev_axis = None
+
+                    if pca_stable and prev_axis is not None and long_axis is not None:
+                        dot = float(np.dot(prev_axis, long_axis))
+                        if dot < -0.5:
+                            long_axis = -long_axis
+                            dot = -dot
+                        if dot < 0.2:
+                            pca_stable = False
+                            reason = "Axis direction unstable"
+
+                    if long_axis is not None:
+                        prev_axis = long_axis.copy()
+                    else:
+                        prev_axis = None
+
+                fruit_cam = np.array([t_best["Xc"], t_best["Yc"], t_best["Zc"]], dtype=float)
+                n = np.linalg.norm(fruit_cam)
+                if pca_stable and long_axis is not None:
+                    approach_axis = long_axis
+                elif n < 1e-6:
+                    approach_axis = np.array([0, 0, 1], dtype=float)
                 else:
-                    # fallback
-                    approach_world = np.array([1.0, 0, 0])
+                    approach_axis = fruit_cam / n
 
-                # convert axis → quaternion
-                q = quat_align_x_to_axis(approach_world)
-                t_best["quat"] = q
-                t_best["approach_axis"] = approach_world
+                q = quat_align_x_to_axis(approach_axis)
+                t_best.update(
+                    {
+                        "long_axis": long_axis,
+                        "approach_axis": approach_axis,
+                        "pca_stable": pca_stable,
+                        "reason": reason,
+                        "quat": q,
+                    }
+                )
 
             # --------------------------------------------------
             # Publish goal for BEST fruit only (before rendering to minimize latency)
@@ -831,56 +826,57 @@ def main_(args: argparse.Namespace):
 
                     # Visualize PCA/approach axis projected to image
                     # -------------------------------------------------
-                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW) — BEST ONLY
-                    if i == best_idx:
-                        axis_dir = t.get("approach_axis")
-                        if axis_dir is None:
-                            axis_dir = t.get("long_axis")
+                    # VISUALIZE PCA / APPROACH AXIS (2D IMAGE ARROW)
+                    # -------------------------------------------------
+                    axis_dir = t.get("approach_axis")
+                    if axis_dir is None:
+                        axis_dir = t.get("long_axis")
 
-                        if axis_dir is not None:
-                            ax, ay, az = axis_dir
+                    if axis_dir is not None:
+                        ax, ay, az = axis_dir
 
-                            # convert 3D axis → 2D direction (drop Z)
-                            vx = ax
-                            vy = ay
+                        # convert 3D axis → 2D direction (drop Z)
+                        vx = ax
+                        vy = ay
 
-                            # normalize 2D vector
-                            n = math.sqrt(vx*vx + vy*vy)
-                            if n < 1e-6:
-                                vx, vy = 1.0, 0.0
-                            else:
-                                vx /= n
-                                vy /= n
+                        # normalize 2D vector
+                        n = math.sqrt(vx*vx + vy*vy)
+                        if n < 1e-6:
+                            vx, vy = 1.0, 0.0
+                        else:
+                            vx /= n
+                            vy /= n
 
-                            # arrow length in pixels
-                            L = 60
+                        # arrow length in pixels
+                        L = 60
 
-                            ax2 = int(cx + vx * L)
-                            ay2 = int(cy + vy * L)
-                            ax1 = int(cx - vx * L)
-                            ay1 = int(cy - vy * L)
+                        ax2 = int(cx + vx * L)
+                        ay2 = int(cy + vy * L)
+                        ax1 = int(cx - vx * L)
+                        ay1 = int(cy - vy * L)
 
-                            # stable PCA → yellow, unstable → orange
-                            axis_color = (
-                                (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
+                        # stable PCA → yellow, unstable → orange
+                        axis_color = (
+                            (0, 255, 255, 255) if t.get("pca_stable") else (0, 128, 255, 255)
+                        )
+
+                        # forward arrow
+                        cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
+                        cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
+
+
+                        # show instability reason
+                        if not t.get("pca_stable") and t.get("reason"):
+                            cv2.putText(
+                                image_left_ocv,
+                                t["reason"],
+                                (cx + 12, cy - 12),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.45,
+                                axis_color,
+                                1,
+                                cv2.LINE_AA,
                             )
-
-                            # forward arrow
-                            cv2.arrowedLine(image_left_ocv, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
-                            cv2.line(image_left_ocv, (cx, cy), (ax1, ay1), axis_color, 2)
-
-                            # show instability reason
-                            if not t.get("pca_stable") and t.get("reason"):
-                                cv2.putText(
-                                    image_left_ocv,
-                                    t["reason"],
-                                    (cx + 12, cy - 12),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.45,
-                                    axis_color,
-                                    1,
-                                    cv2.LINE_AA,
-                                )
 
                     # Draw 3D text near centroid
                     cv2.putText(
