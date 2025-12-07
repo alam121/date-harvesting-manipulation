@@ -24,10 +24,12 @@ from . import markers as markers_mod
 from . import motions as motions_mod
 from . import goals as goals_mod
 from . import gripper as gripper_mod
+from .motions import publish_stop_trajectory
 from .dynamic_obstacle import DynamicObstacleManager
 from .perception import ZedYoloPerception
 from trajectory_msgs.msg import JointTrajectory
 from ur_msgs.srv import SetIO
+from .grasp_outcome_classifier import classify_triplet
 
 
 # Callback	Trigger	Purpose
@@ -123,7 +125,14 @@ class UR10eCuroboMoveIt(Node):
         self.joint_states_topic = self.cfg.topics.joint_states
         self.goal_marker_topic  = self.cfg.topics.goal_marker
         self.path_marker_topic  = self.cfg.topics.path_marker
-
+        # state: keep track of robot state, path history, and goals in memory.
+        self.qos = DEFAULT_QOS
+        self.goal_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         # ======== pubs/subs after config so QoS/params exist ========
 
         self.trajectory_pub = self.create_publisher(JointTrajectory, self.traj_cmd_topic, 10)
@@ -143,6 +152,14 @@ class UR10eCuroboMoveIt(Node):
         self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
         #while not self.io_client.wait_for_service(timeout_sec=1.0):
             #self.get_logger().info("Waiting for /set_io service...")
+        
+        self.goal_tracker_sub = self.create_subscription(
+            PoseStamped,
+            '/external_goal_pose',        # always listen to new poses
+            self._continuous_goal_tracker,  # callback function below
+            self.goal_qos
+        )
+        
         # tf
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -174,14 +191,7 @@ class UR10eCuroboMoveIt(Node):
         self.obstacles.add_sphere("dyn_sphere", radius=0.1)
         self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
         
-        # state: keep track of robot state, path history, and goals in memory.
-        self.qos = DEFAULT_QOS
-        self.goal_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.VOLATILE,
-        )
+
         self.joint_order = JOINT_ORDER
         
         self.current_joint_positions = None
@@ -218,16 +228,11 @@ class UR10eCuroboMoveIt(Node):
 
         self.last_frames = [] # last few frames for stability checking
 
-        self.goal_tracker_sub = self.create_subscription(
-            PoseStamped,
-            '/external_goal_pose',        # always listen to new poses
-            self._continuous_goal_tracker,  # callback function below
-            self.goal_qos
-        )
+
 
 
         # gripper/classifier
-        gripper_mod.init_gripper(self)
+        gripper_mod.init_gripper(self, suction=False)
 
         # keyboard
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
@@ -258,10 +263,16 @@ class UR10eCuroboMoveIt(Node):
 
     def _stop_cb(self, msg): ##Stops motion immediately
         if not msg.data: return
-        self.get_logger().warn("🛑 Emergency stop!"); self.stop_requested = True; from .motions import publish_stop_trajectory; publish_stop_trajectory(self)
+        self.get_logger().warn("🛑 Emergency stop!"); self.stop_requested = True
+        publish_stop_trajectory(self)
 
     def _force_cb(self, msg): ##Sends force readings to classifier
-        self.classifier.on_force(list(msg.data)[:3])
+        forces = list(msg.data)[:3]
+        self.classifier.on_force(forces)
+        if hasattr(self, "visualizer"):
+            self.visualizer.update_forces(forces)
+            tpl = classify_triplet(forces)
+            self.visualizer.update_classifier(self.classifier.phase, tpl)
 
     def _classifier_tick(self):   ##Runs periodic classifier update
         self.classifier.tick()
@@ -354,6 +365,8 @@ class UR10eCuroboMoveIt(Node):
                 print(f"[{ts()}] STOP requested → publishing hold trajectory")
                 self.stop_requested = True
                 motions_mod.publish_stop_trajectory(self)
+                # Clear any queued goals so execution loop can exit quickly
+                self.goal_poses.clear()
 
             elif key == 'q':
                 print(f"[{ts()}] quitting…")
@@ -409,14 +422,14 @@ class UR10eCuroboMoveIt(Node):
         # 1. Strict fruit-lock (XY constraint)
         # Allow small drift (max 5–6 cm is reasonable)
         # ------------------------------------------------------
-        if math.hypot(x - seed_x, y - seed_y) > 0.06:
+        if math.hypot(x - seed_x, y - seed_y) > 0.01:
             return
 
         # ------------------------------------------------------
         # 2. Depth check with softer limit
         # Allow 3.5–4 cm variation
         # ------------------------------------------------------
-        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.04:
+        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.01:
             return
 
         # ------------------------------------------------------
