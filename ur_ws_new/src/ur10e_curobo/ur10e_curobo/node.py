@@ -10,7 +10,7 @@ import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
@@ -148,6 +148,7 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
         self.create_subscription(Bool, "/emergency_stop", self._stop_cb, 10)
         self.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
+        self.create_subscription(String, "ui_command", self._ui_command_cb, 10)
         
         self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
         #while not self.io_client.wait_for_service(timeout_sec=1.0):
@@ -196,6 +197,7 @@ class UR10eCuroboMoveIt(Node):
         
         self.current_joint_positions = None
         self.current_joint_velocities = None
+        self._js_missing_warned = False
         self.latest_marker_pose = None
         
         self.goal_poses = []
@@ -250,8 +252,17 @@ class UR10eCuroboMoveIt(Node):
     def _joint_state_cb(self, msg):  #Updates position & velocity arrays
         jm = dict(zip(msg.name, msg.position))
         vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+
+        missing = [j for j in self.joint_order if j not in jm]
+        if missing:
+            if not self._js_missing_warned:
+                self.get_logger().warn(f"JointState missing joints {missing}; waiting for full state.")
+                self._js_missing_warned = True
+            return
+
+        self._js_missing_warned = False
         
-        self.current_joint_positions = [jm[j] for j in self.joint_order if j in jm]
+        self.current_joint_positions = [jm[j] for j in self.joint_order]
         self.current_joint_velocities = [vm.get(j, 0.0) for j in self.joint_order]
 
     def _marker_cb(self, msg): ##Stores last clicked pose
@@ -276,6 +287,46 @@ class UR10eCuroboMoveIt(Node):
 
     def _classifier_tick(self):   ##Runs periodic classifier update
         self.classifier.tick()
+
+    def _ui_command_cb(self, msg: String):
+        cmd = (msg.data or "").strip()
+        if not cmd:
+            return
+
+        parts = cmd.lower().split()
+        action = parts[0]
+        args = parts[1:]
+
+        try:
+            if action == "home":
+                motions_mod.move_to_home_position(self)
+            elif action == "dropoff":
+                motions_mod.move_to_dropoff_position(self)
+                gripper_mod.control_gripper(self, "OPEN")
+            elif action == "execute":
+                self._prep_and_execute()
+            elif action == "stop":
+                self.stop_requested = True
+                publish_stop_trajectory(self)
+                self.goal_poses.clear()
+            elif action == "open":
+                gripper_mod.control_gripper(self, "OPEN")
+            elif action == "close":
+                gripper_mod.control_gripper(self, "CLOSE")
+            elif action == "capture":
+                duration = float(args[0]) if args else 10.0
+                self.start_goal_capture(duration)
+            elif action == "capture_stop":
+                self.stop_goal_capture()
+            elif action == "clear":
+                self.goal_poses.clear()
+                self.get_logger().info("Cleared stored goals.")
+            elif action == "debug_world":
+                self.debug_print_world()
+            else:
+                self.get_logger().warn(f"UI command '{cmd}' not recognized.")
+        except Exception as e:
+            self.get_logger().error(f"UI command '{cmd}' failed: {e}")
 
     # methods used by helpers (so helpers can call like node.get_end_effector_pose())
     def get_end_effector_pose(self):
@@ -346,8 +397,7 @@ class UR10eCuroboMoveIt(Node):
             elif key == 'c':
                 print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
                 gripper_mod.control_gripper(self, 'CLOSE')
-                #motions_mod.move_backward(self, -0.01)
-                #motions_mod.rotate_wrist(self, 120)
+                motions_mod.rotate_wrist(self, 65, duration_s=0.38)
                 print(f"[{ts()}] post-close micro-motions done")
 
             elif key == 'h':

@@ -32,7 +32,7 @@ def init_gripper(node, suction: bool = True):
     )
     node.visualizer = grasp_viz_mod.GraspVisualizer()
     node.visual_timer = node.create_timer(
-        0.03,  # ~30 fps
+        0.03,
         lambda: node.visualizer.draw()
     )
 
