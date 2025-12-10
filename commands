@@ -55,12 +55,12 @@ in this case start the program again
 
 
 4)
-
+for motion: 
 2 python files
  python3 -m ur10e_curobo.main
 
-for motion: datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src$ python3 test21.py 
-for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 date_v1.4.py --weights models/lab_dates_realbunch.pt  --conf_thres 0.5
+
+for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 date_v1.6.py --weights models/lab_dates_realbunch.pt  --conf_thres 0.5
 
 
 *Make sure that the start button of program is pressed, otherwise: [ERROR] [1759327538.950381504] [ur10e_curobo_moveit_node]: ❌ Cannot execute goals: robot program is OFF. Please turn it ON first.

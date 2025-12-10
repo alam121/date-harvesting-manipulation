@@ -82,11 +82,32 @@ class Perception:
     use_gpu: bool = False
 
 @dataclass
+class Gripper:
+    """Gripper control parameters for dense bunch handling."""
+    # Per-finger force thresholds (negative values for compression sensors)
+    force_threshold_left: float = -0.14    # finger 0 (left)
+    force_threshold_center: float = -0.16  # finger 1 (center, stronger)
+    force_threshold_right: float = -0.14   # finger 2 (right)
+
+    # Minimum fingers required to be in contact before stopping closure
+    # Lower this for denser bunches (2 = accept partial contact)
+    # Raise this for cleaner grasps on isolated fruits (3 = all fingers must touch)
+    min_fingers_for_stop: int = 2
+
+    # Closing motion parameters
+    closing_steps: int = 10
+    step_delay_s: float = 0.2
+
+    # Suction mode (affects finger joint mapping)
+    use_suction: bool = False
+
+@dataclass
 class AppConfig:
     topics: Topics = field(default_factory=Topics)
     joints: JointsPreset = field(default_factory=JointsPreset)
     planner: Planner = field(default_factory=Planner)
     perception: Perception = field(default_factory=Perception)
+    gripper: Gripper = field(default_factory=Gripper)
 
     @staticmethod
     def from_env(cfg: "AppConfig") -> "AppConfig":

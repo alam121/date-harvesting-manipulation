@@ -272,8 +272,9 @@ def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
     
-    if node.current_joint_positions is None:
-        node.get_logger().warn("No joint state yet."); return
+    if node.current_joint_positions is None or len(node.current_joint_positions) != len(node.joint_order):
+        node.get_logger().warn("No joint state yet or incomplete state; aborting goal execution.")
+        return
     if not node.goal_poses:
         node.get_logger().warn("No stored goals."); return
     if not node.robot_running:

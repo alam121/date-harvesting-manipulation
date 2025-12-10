@@ -10,14 +10,29 @@ import time
 # ============================================================
 # INITIALIZATION
 # ============================================================
-def init_gripper(node, suction: bool = True):
+def init_gripper(node, suction: bool = None):
     """
     Initialize the gripper and classifier.
     suction = True  → use suction + suction-closing finger profile
     suction = False → finger-only mode
+    suction = None  → use config value (default)
     """
+    # Use config value if not explicitly specified
+    if suction is None:
+        suction = node.cfg.gripper.use_suction
 
-    node.gripper_controller = DeltoGripperController(node, suction=suction)
+    node.gripper_controller = DeltoGripperController(
+        node,
+        suction=suction,
+        force_thresholds={
+            0: node.cfg.gripper.force_threshold_left,
+            1: node.cfg.gripper.force_threshold_center,
+            2: node.cfg.gripper.force_threshold_right,
+        },
+        min_fingers_for_stop=node.cfg.gripper.min_fingers_for_stop,
+        steps=node.cfg.gripper.closing_steps,
+        step_delay=node.cfg.gripper.step_delay_s,
+    )
 
     node.gripper_closed = False
     node.slip_detection = False

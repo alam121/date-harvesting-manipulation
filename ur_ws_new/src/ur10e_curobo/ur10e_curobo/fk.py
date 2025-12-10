@@ -6,8 +6,8 @@ from geometry_msgs.msg import Point
 
 
 def get_end_effector_pose(node) -> Optional[list]:
-    if node.current_joint_positions is None:
-        node.get_logger().warn("Joint states not yet received.")
+    if node.current_joint_positions is None or len(node.current_joint_positions) != len(node.joint_order):
+        node.get_logger().warn("Joint states not yet received or incomplete.")
         return None
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,4 +37,3 @@ def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
     except Exception as e:
         node.get_logger().warn(f"CuRobo FK failed: {e}")
         return None
-

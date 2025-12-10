@@ -198,108 +198,44 @@ def rotate_wrist(
     hold_s: float = 0.2,
     return_to_start: bool = True,
     duration_s: float = None,
-<<<<<<< ours
-    vel: float = 1.5,
-):
-    """
-    Smooth wrist-3 twist with a short dwell and explicit return (default).
-    Uses a short interpolated path so the controller reliably executes both directions.
-    - vel is treated as wrist angular speed (rad/s) to size the steps.
-    - duration_s overrides the computed one-way time if provided.
-=======
     vel: float = 0.14,
 ):
-    """
-    Smooth wrist-3 twist with a short dwell. Defaults are quicker than before and
-    return to the starting angle. You can force a specific one-way duration via
-    duration_s or boost velocity via vel.
->>>>>>> theirs
-    """
     if not _joint_state_ready(node, "wrist rotation"):
         return
 
     rad = math.radians(degrees)
     start = list(node.current_joint_positions)
 
-<<<<<<< ours
-    if abs(rad) < 1e-6:
-        node.get_logger().info("Wrist rotation skipped (0 deg).")
-        return
-
-    # Clamp target within +/-2π to avoid rolling over joint limits
+    # UR wrist_3 is continuous → no clamping needed
     target = start.copy()
-    target[5] = max(min(start[5] + rad, math.tau), -math.tau)
+    target[5] = start[5] + rad            # <-- KEY FIX (continuous joint)
 
-    # Timing and interpolation
+    # Build interpolated path
     base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
     base_dt = min(max(base_dt, 0.015), 0.03)
 
-    if duration_s is not None:
-        one_way = max(0.15, float(duration_s))
-    else:
-        speed = max(0.5, float(vel))  # rad/s
-        one_way = abs(target[5] - start[5]) / speed
-        one_way = min(max(one_way, 0.25), 2.0)
-
-    # Number of interpolation steps for each leg
-    step_rad = max(0.05, min(one_way * vel / max(1, int(one_way / base_dt)), 0.3))
-    steps = max(8, int(abs(target[5] - start[5]) / step_rad))
-
-    states = []
-    # forward
-    for i in range(steps + 1):
-=======
-    # UR wrist_3 limits are roughly +/- 2π; clamp target to stay inside.
-    max_ang = math.tau
-    target = start.copy()
-    target[5] = max(min(start[5] + rad, max_ang), -max_ang)
-
-    # Build interpolated path for a noticeable, smooth twist.
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)
-    base_dt = min(max(base_dt, 0.015), 0.03)
     if duration_s is not None:
         steps = max(4, int(duration_s / base_dt))
     else:
-        max_step = 0.12  # rad per step (larger → faster)
+        max_step = 0.12
         steps = max(8, int(abs(rad) / max_step))
 
-    states = [start]
+    states = []
     for i in range(1, steps + 1):
->>>>>>> theirs
         frac = i / steps
         q = start.copy()
-        q[5] = start[5] + (target[5] - start[5]) * frac
+        q[5] = start[5] + rad * frac
         states.append(q)
 
-<<<<<<< ours
-    # hold at target
     hold_steps = max(1, int(hold_s / base_dt))
     states.extend([target.copy()] * hold_steps)
 
-    # return
-=======
-    hold_steps = max(1, int(hold_s / base_dt))
-    states.extend([target.copy()] * hold_steps)
-
->>>>>>> theirs
     if return_to_start:
         for i in range(1, steps + 1):
             frac = i / steps
             q = target.copy()
-            q[5] = target[5] + (start[5] - target[5]) * frac
+            q[5] = target[5] - rad * frac
             states.append(q)
-<<<<<<< ours
-        states.append(start.copy())  # settle
-
-    traj = build_trajectory(
-        node.joint_order,
-        states,
-        vel=max(0.05, vel),
-        dt=one_way / steps if steps else base_dt,
-        stop_flag=lambda: node.stop_requested,
-    )
-=======
->>>>>>> theirs
 
     traj = build_trajectory(
         node.joint_order,
@@ -308,14 +244,12 @@ def rotate_wrist(
         dt=base_dt,
         stop_flag=lambda: node.stop_requested,
     )
+
     node.get_logger().info(
-<<<<<<< ours
-        f"Twisting wrist by {degrees:.1f}deg (steps={len(states)}, dt≈{(one_way/steps if steps else base_dt):.3f}, hold={hold_s:.2f}s, return={return_to_start})"
-=======
-        f"Twisting wrist by {degrees:.1f}deg (hold {hold_s:.2f}s, return={return_to_start}, dt={base_dt:.3f}, steps={len(states)})"
->>>>>>> theirs
+        f"Twisting wrist by {degrees:.1f}deg (hold {hold_s:.2f}s, return={return_to_start})"
     )
     node.trajectory_pub.publish(traj)
+
 
 
 def move_backward(node, delta: float):

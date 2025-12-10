@@ -6,7 +6,11 @@ class DeltoGripperController:
     def __init__(self, node,
                  suction: bool = False,
                  force_topic='/gripper/force',
-                 target_topic='/gripper/target_joint'):
+                 target_topic='/gripper/target_joint',
+                 force_thresholds: dict = None,
+                 min_fingers_for_stop: int = 2,
+                 steps: int = 10,
+                 step_delay: float = 0.2):
 
         self.node = node
         self.suction = suction  # <-- master mode switch
@@ -14,11 +18,28 @@ class DeltoGripperController:
         self.force_data = [0.0, 0.0, 0.0]
 
         # Contact threshold (negative force on contact)
+        # PER-FINGER thresholds for better dense bunch handling
+        if force_thresholds is None:
+            # Default thresholds
+            self.force_thresholds = {
+                0: -0.14,  # left finger (slightly softer)
+                1: -0.16,  # center finger (stronger - contacts first in suction mode)
+                2: -0.14,  # right finger (slightly softer)
+            }
+        else:
+            self.force_thresholds = force_thresholds
+
+        # Fallback single threshold for backward compatibility
         self.force_threshold = -0.15
 
+        # Dense bunch handling: require minimum fingers touching before stopping
+        # This prevents early stop when one finger hits a neighbor fruit
+        self.min_fingers_for_stop = min_fingers_for_stop
+        self.fingers_contacted = {0: False, 1: False, 2: False}
+
         # Motion parameters
-        self.steps = 10
-        self.step_delay = 0.2
+        self.steps = steps
+        self.step_delay = step_delay
         self.current_step = 0
 
         # FSM state
@@ -37,9 +58,9 @@ class DeltoGripperController:
 
         # Positions (shared)
         self.open_position = [
-            -0.0942, -0.1500, 2.0660, -0.5062,
-            -1.6318, 0.1309, 1.6753, -0.4887,
-            0.3333, 0.2234, 2.0673, -0.4311
+            -0.0942, -0.1500, 2.1960, -0.5062,
+            -1.6318, 0.1309, 1.7753, -0.4887,
+            0.3333, 0.2234, 2.1973, -0.4311
         ]
 
         self.closed_position = self.open_position.copy()
@@ -73,10 +94,12 @@ class DeltoGripperController:
             self.state = new_state
 
     def channel_contact(self, i: int) -> bool:
+        """Check if finger i is in contact, using per-finger threshold."""
         f = float(self.force_data[i])
-        if self.force_threshold < 0:
-            return f <= self.force_threshold
-        return abs(f) >= self.force_threshold
+        threshold = self.force_thresholds.get(i, self.force_threshold)
+        if threshold < 0:
+            return f <= threshold
+        return abs(f) >= threshold
 
     def all_channels_contacted(self):
         return all(self.channel_contact(i) for i in (0, 1, 2))
@@ -112,6 +135,12 @@ class DeltoGripperController:
                     break
 
     def is_force_threshold_reached(self):
+        """Check if enough fingers are in contact to stop closing.
+
+        Dense bunch improvement: Instead of requiring ALL fingers to contact
+        (which fails when one finger hits a neighbor fruit), we only require
+        a minimum number of fingers (default: 2).
+        """
         now = time.time()
 
         if now < self.ignore_contacts_until:
@@ -123,7 +152,25 @@ class DeltoGripperController:
         if self.current_step < 2:
             return False
 
-        return self.all_channels_contacted()
+        # Count how many fingers are currently in contact
+        contacted_count = sum(1 for i in (0, 1, 2) if self.channel_contact(i))
+
+        # Update contact tracking
+        for i in (0, 1, 2):
+            self.fingers_contacted[i] = self.channel_contact(i)
+
+        # Stop closing when minimum fingers reached
+        threshold_reached = contacted_count >= self.min_fingers_for_stop
+
+        if threshold_reached and contacted_count < 3:
+            # Log when we stop with partial contact (useful for debugging dense bunches)
+            contacted_fingers = [i for i in (0,1,2) if self.fingers_contacted[i]]
+            self.node.get_logger().info(
+                f"🔶 Partial contact: {contacted_count}/3 fingers contacted {contacted_fingers} "
+                f"(forces: {[f'{self.force_data[i]:.3f}' for i in (0,1,2)]})"
+            )
+
+        return threshold_reached
 
     # --------------------------------------------------------
     # CLOSING MOTION
@@ -135,21 +182,22 @@ class DeltoGripperController:
             self.set_state('IDLE')
             return False
 
-        alpha = self.current_step / self.steps
+        # --- smoothing curve (smoothstep) ---
+        t = self.current_step / self.steps
+        alpha = t * t * (3 - 2 * t)
 
-        # --------------------------------------------------------
-        # SUCTION MODE: center-first closing (Version A behavior)
-        # NON-SUCTION: all fingers close uniformly (Version B behavior)
-        # --------------------------------------------------------
-        if self.suction:
-            phase_split = int(self.steps * 0.6)  # first 60% only center moves
-
-            if self.current_step < phase_split:
-                fingers_to_move = [1]  # ONLY center
-            else:
-                fingers_to_move = [0, 1, 2]  # then all close together
+        # --- slow down near final 20% ---
+        if t > 0.8:
+            time.sleep(self.step_delay * 1.5)
         else:
-            fingers_to_move = [0, 1, 2]  # all fingers move every step
+            time.sleep(self.step_delay)
+
+        # finger selection stays the same
+        if self.suction:
+            phase_split = int(self.steps * 0.6)
+            fingers_to_move = [1] if self.current_step < phase_split else [0, 1, 2]
+        else:
+            fingers_to_move = [0, 1, 2]
 
         for ch in fingers_to_move:
             if ch in self.frozen_fingers:
@@ -166,6 +214,7 @@ class DeltoGripperController:
 
         self.current_step += 1
         return True
+
 
     def run_closure_loop(self):
         self.set_state('CLOSING')

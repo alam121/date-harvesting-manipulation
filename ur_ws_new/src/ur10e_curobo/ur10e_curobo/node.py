@@ -66,6 +66,15 @@ class UR10eCuroboMoveIt(Node):
         self.declare_parameter("perception.show_view", self.cfg.perception.show_view)
         self.declare_parameter("perception.use_gpu", self.cfg.perception.use_gpu)
 
+        # gripper
+        self.declare_parameter("gripper.force_threshold_left", self.cfg.gripper.force_threshold_left)
+        self.declare_parameter("gripper.force_threshold_center", self.cfg.gripper.force_threshold_center)
+        self.declare_parameter("gripper.force_threshold_right", self.cfg.gripper.force_threshold_right)
+        self.declare_parameter("gripper.min_fingers_for_stop", self.cfg.gripper.min_fingers_for_stop)
+        self.declare_parameter("gripper.closing_steps", self.cfg.gripper.closing_steps)
+        self.declare_parameter("gripper.step_delay_s", self.cfg.gripper.step_delay_s)
+        self.declare_parameter("gripper.use_suction", self.cfg.gripper.use_suction)
+
         #topics
         self.declare_parameter("topics.joint_traj", self.cfg.topics.traj_cmd)
         self.declare_parameter("topics.goal_marker", self.cfg.topics.goal_marker)
@@ -92,6 +101,15 @@ class UR10eCuroboMoveIt(Node):
         self.cfg.perception.cam_frame  = self.get_parameter("perception.cam_frame").value
         self.cfg.perception.show_view  = bool(self.get_parameter("perception.show_view").value)
         self.cfg.perception.use_gpu    = bool(self.get_parameter("perception.use_gpu").value)
+
+        # gripper
+        self.cfg.gripper.force_threshold_left   = float(self.get_parameter("gripper.force_threshold_left").value)
+        self.cfg.gripper.force_threshold_center = float(self.get_parameter("gripper.force_threshold_center").value)
+        self.cfg.gripper.force_threshold_right  = float(self.get_parameter("gripper.force_threshold_right").value)
+        self.cfg.gripper.min_fingers_for_stop   = int(self.get_parameter("gripper.min_fingers_for_stop").value)
+        self.cfg.gripper.closing_steps          = int(self.get_parameter("gripper.closing_steps").value)
+        self.cfg.gripper.step_delay_s           = float(self.get_parameter("gripper.step_delay_s").value)
+        self.cfg.gripper.use_suction            = bool(self.get_parameter("gripper.use_suction").value)
 
         #ros topics
         self.cfg.topics.traj_cmd      = self.get_parameter("topics.joint_traj").value
@@ -233,8 +251,8 @@ class UR10eCuroboMoveIt(Node):
 
 
 
-        # gripper/classifier
-        gripper_mod.init_gripper(self, suction=False)
+        # gripper/classifier (uses config values)
+        gripper_mod.init_gripper(self)
 
         # keyboard
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)

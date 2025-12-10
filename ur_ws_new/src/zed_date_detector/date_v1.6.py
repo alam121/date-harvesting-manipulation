@@ -38,6 +38,9 @@ net_fps = 0.0
 loop_fps = 0.0
 prev_axis = None
 prev_heat_point = None
+last_dir_label = None
+last_dir_count = 0
+last_dir_published = None
 yolo_masks = []
 yolo_classes = []
 yolo_scores = []
@@ -132,6 +135,111 @@ def quat_align_x_to_axis(axis_world, up_hint=(0, 0, 1)):
             qy = (R[1, 2] + R[2, 1]) / s
             qz = 0.25 * s
     return (float(qw), float(qx), float(qy), float(qz))
+
+
+def optimize_grasp_orientation_for_dense_bunch(
+    preferred_axis_cam, target_fruit, all_fruits, z_std_threshold=0.03
+):
+    """
+    Adjust grasp orientation to avoid neighbor fruits in dense bunches.
+
+    Args:
+        preferred_axis_cam: Default axis from ellipse (short axis) [x, y, z]
+        target_fruit: Dict with target fruit info (must have "Xc", "Yc", "Zc")
+        all_fruits: List of all detected fruits
+        z_std_threshold: Threshold for considering bunch as dense (default: 0.03m)
+
+    Returns:
+        Optimized axis in camera frame (numpy array)
+    """
+    if preferred_axis_cam is None:
+        return None
+
+    # If not dense bunch, use default orientation
+    z_std = target_fruit.get("z_std", 0.0)
+    if z_std < z_std_threshold:
+        return preferred_axis_cam
+
+    # Get target position in camera frame
+    target_pos = np.array([
+        target_fruit["Xc"],
+        target_fruit["Yc"],
+        target_fruit["Zc"]
+    ], dtype=float)
+
+    # Test 8 orientations by rotating preferred axis
+    best_angle = 0
+    min_collision_score = float('inf')
+
+    for angle_deg in [0, 45, 90, 135, 180, 225, 270, 315]:
+        angle_rad = math.radians(angle_deg)
+
+        # Rotate axis around Z (perpendicular to image plane)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        test_axis = np.array([
+            preferred_axis_cam[0] * cos_a - preferred_axis_cam[1] * sin_a,
+            preferred_axis_cam[0] * sin_a + preferred_axis_cam[1] * cos_a,
+            preferred_axis_cam[2]
+        ], dtype=float)
+
+        # Count neighbors in grasp direction (cone ±30°)
+        collision_score = 0.0
+        for other in all_fruits:
+            if other == target_fruit:
+                continue
+
+            try:
+                other_pos = np.array([other["Xc"], other["Yc"], other["Zc"]], dtype=float)
+                vec = other_pos - target_pos
+                dist = np.linalg.norm(vec)
+
+                if dist < 0.01:  # skip if too close (likely same fruit)
+                    continue
+
+                if dist > 0.15:  # ignore far fruits (>15cm)
+                    continue
+
+                vec_norm = vec / dist
+
+                # Normalize test_axis
+                test_axis_norm = test_axis / max(np.linalg.norm(test_axis), 1e-6)
+
+                # Check if neighbor is in grasp direction (within 30° cone)
+                dot = float(np.dot(vec_norm, test_axis_norm))
+                if dot > math.cos(math.radians(30)):  # within cone
+                    # Closer neighbors are worse (weighted by inverse distance)
+                    collision_score += 1.0 / max(dist, 0.02)
+
+            except (KeyError, TypeError, ValueError):
+                # Skip fruits with missing/invalid position data
+                continue
+
+        # Track best orientation (minimum collisions)
+        if collision_score < min_collision_score:
+            min_collision_score = collision_score
+            best_angle = angle_deg
+
+    # If no rotation helps (0° is best), keep original
+    if best_angle == 0:
+        # Only log if there were actual neighbors to avoid
+        if min_collision_score > 0:
+            print(f"[ORIENT] Keeping original orientation (collision_score: {min_collision_score:.2f})")
+        return preferred_axis_cam
+
+    # Rotate preferred axis to best angle
+    angle_rad = math.radians(best_angle)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    optimized_axis = np.array([
+        preferred_axis_cam[0] * cos_a - preferred_axis_cam[1] * sin_a,
+        preferred_axis_cam[0] * sin_a + preferred_axis_cam[1] * cos_a,
+        preferred_axis_cam[2]
+    ], dtype=float)
+
+    print(f"[ORIENT] Rotated grasp by {best_angle}° to avoid neighbors (collision_score: {min_collision_score:.2f})")
+
+    return optimized_axis
 
 
 def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0):
@@ -248,6 +356,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
 # ============================================================
 def main_(args: argparse.Namespace):
     global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point
+    global last_dir_label, last_dir_count, last_dir_published
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -655,16 +764,50 @@ def main_(args: argparse.Namespace):
                     continue
 
             # --------------------------------------------------
-            # Hard-Sticky BEST Fruit Selection
+            # Hard-Sticky BEST Fruit Selection (with Occlusion Awareness)
             # --------------------------------------------------
 
-            # 1. Pick closest fruit THIS FRAME (only used if we don't reuse previous)
+            # 1. Pick best accessible fruit THIS FRAME (not just closest!)
+            # Scoring factors:
+            #   - Distance to gripper (lower = better)
+            #   - Occlusion (depth variance, higher = worse)
+            #   - Edge proximity (near image border = worse)
+            #   - Visibility quality (higher = better)
             frame_best_idx = None
-            frame_best_dist = float("inf")
+            frame_best_score = float("inf")
 
             for i, t in enumerate(targets):
-                if t["dist"] < frame_best_dist:
-                    frame_best_dist = t["dist"]
+                # Base distance to gripper
+                dist = t["dist"]
+
+                # Occlusion penalty: depth variance indicates overlapping fruits
+                # Higher z_std = more buried/occluded = harder to grasp
+                z_std = t.get("z_std", 0.0)
+                occlusion_penalty = z_std * 15.0  # scale factor tuned for meters
+
+                # Edge proximity penalty: fruits near image edges are often cut off
+                bb = t["bb"]
+                x1, y1, x2, y2 = bb
+                edge_dist_left = x1
+                edge_dist_top = y1
+                edge_dist_right = image_left_ocv.shape[1] - x2
+                edge_dist_bottom = image_left_ocv.shape[0] - y2
+                edge_dist = min(edge_dist_left, edge_dist_top, edge_dist_right, edge_dist_bottom)
+                # Penalty if within 50 pixels of edge
+                edge_penalty = max(0, 50 - edge_dist) * 0.02
+
+                # Visibility quality bonus: rewards clean, well-visible fruits
+                vis_quality = t.get("vis_quality", 0.0)
+                vis_bonus = -vis_quality * 0.3  # negative because lower score = better
+
+                # Combined score (lower = better fruit to pick)
+                score = dist + occlusion_penalty + edge_penalty + vis_bonus
+
+                # Debug: store score for visualization
+                t["accessibility_score"] = score
+
+                if score < frame_best_score:
+                    frame_best_score = score
                     frame_best_idx = i
 
             best_idx = frame_best_idx  # default
@@ -716,7 +859,15 @@ def main_(args: argparse.Namespace):
             if best_idx is not None:
                 t_best = targets[best_idx]
                 short_cam = t_best.get("short_axis_cam")
-                use_axis_cam = short_cam
+
+                # Optimize orientation to avoid neighbor fruits in dense bunches
+                if short_cam is not None:
+                    use_axis_cam = optimize_grasp_orientation_for_dense_bunch(
+                        short_cam, t_best, targets, z_std_threshold=0.03
+                    )
+                else:
+                    use_axis_cam = None
+
                 # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
                 if best_pt is not None:
@@ -784,14 +935,24 @@ def main_(args: argparse.Namespace):
                     if n > 1e-6:
                         vx /= n
                         vy /= n
-                    if abs(vx) < 0.25:
+                    if abs(vx) < 0.35:  # widened center band to reduce flicker
                         direction_label = "center"
                     elif vx > 0:
                         direction_label = "right"
                     else:
                         direction_label = "left"
+                    # Hysteresis: require persistence over frames to change label
+                    if direction_label == last_dir_label:
+                        last_dir_count += 1
+                    else:
+                        last_dir_label = direction_label
+                        last_dir_count = 1
+                    effective_label = last_dir_published or direction_label
+                    if last_dir_count >= 3:
+                        effective_label = direction_label
+                        last_dir_published = direction_label
                     dir_msg = String()
-                    dir_msg.data = direction_label
+                    dir_msg.data = effective_label
 
                 # Track-by-detection smoothing: weighted avg of recent centroids
                 pt_vec = np.array(
@@ -1070,6 +1231,31 @@ def main_(args: argparse.Namespace):
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
                             (0, 200, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        # NEW: Show accessibility score
+                        acc_score = t.get("accessibility_score", 0.0)
+                        cv2.putText(
+                            image_left_ocv,
+                            f"Score:{acc_score:.2f}",
+                            (cx + 10, cy + 84),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0, 255),  # green
+                            1,
+                            cv2.LINE_AA,
+                        )
+                    else:
+                        # Show score for non-best fruits too (in gray)
+                        acc_score = t.get("accessibility_score", 0.0)
+                        cv2.putText(
+                            image_left_ocv,
+                            f"{acc_score:.1f}",
+                            (cx + 5, cy + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            (150, 150, 150, 255),  # gray
                             1,
                             cv2.LINE_AA,
                         )
