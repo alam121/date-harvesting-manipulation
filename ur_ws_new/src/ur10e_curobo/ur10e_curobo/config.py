@@ -68,8 +68,8 @@ class Planner:
     speed_approach: float = 0.5    # for approach motion
     speed_final: float = 0.5       # for precise grasp
     
-    pre_droffoff_z_offset: float = -1.0  # m above dropoff
-    pre_droffoff_y_offset: float = 1.5  # m back from dropoff
+    pre_droffoff_z_offset: float = 0.1  # m above grab position (positive = up)
+    pre_droffoff_y_offset: float = 0.15  # m back from grab position (positive = away from fruit)
 
 @dataclass
 class Perception:

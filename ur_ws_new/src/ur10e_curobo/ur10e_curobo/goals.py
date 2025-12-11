@@ -392,28 +392,37 @@ def plan_and_execute(node):
         blend_motion(node)
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
-        
-        
+
+
         if node.slip_detection or node.grab_miss or node.weak_grab:
             node.control_gripper("OPEN"); cur = node.get_end_effector_pose()
             if cur: exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
             node.slip_detection = node.grab_miss = False
             node.control_gripper("CLOSE")
-            
-        # 4. Drop-off and return
+
+        # 4. Drop-off: go back from final position instead of fixed position
         rotate_wrist(node, 90); time.sleep(0.9)
 
-        # #move_to_predropoff_position(node)
-        # current_pose = node.get_end_effector_pose()
-        # execute_single_pose(node, [current_pose[0], current_pose[1]+node.cfg.planner.pre_droffoff_y_offset,
-        #                       current_pose[2]+node.cfg.planner.pre_droffoff_z_offset,
-        #                       *current_pose[3:]], motion_type="predropoff")
+        # Save current pose after grab and retreat back
+        grab_pose = node.get_end_effector_pose()
+        if grab_pose:
+            y_offset = node.cfg.planner.pre_droffoff_y_offset  # Back
+            z_offset = node.cfg.planner.pre_droffoff_z_offset  # Up
 
-        move_to_predropoff_position(node)
-        blend_motion(node)
-        time.sleep(0.1)
+            predrop_pose = [
+                grab_pose[0],
+                grab_pose[1] + y_offset,
+                grab_pose[2] - z_offset,
+                *grab_pose[3:]
+            ]
+            print(f"Retreating from grab: Y+{y_offset:.2f}m, Z+{z_offset:.2f}m → {predrop_pose[:3]}")
+            execute_single_pose(node, predrop_pose, motion_type="predropoff")
+            wait_until_xyz(node, predrop_pose[:3])
+            blend_motion(node)
+            time.sleep(0.1)
+
         move_to_dropoff_position(node)
-        time.sleep(0.2)  # small delay to allow state update
+        time.sleep(0.2)
         node.control_gripper("OPEN")
         move_to_home_position(node)
 

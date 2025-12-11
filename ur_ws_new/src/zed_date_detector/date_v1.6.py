@@ -120,112 +120,6 @@ def normalize_grasp_angle(angle_deg):
     return angle
 
 
-def optimize_grasp_orientation_for_dense_bunch(
-    preferred_axis_cam, target_fruit, all_fruits, z_std_threshold=0.03
-):
-    """
-    Determine optimal grasp orientation axis to avoid neighbors.
-
-    The ellipse short axis provides the BASE target orientation.
-    For dense bunches, we test ±45° adjustments around this base to avoid neighbors.
-
-    Returns the optimal AXIS DIRECTION (not angle) in camera frame.
-    The main loop will transform this to base frame and compute rotation from current orientation.
-
-    Args:
-        preferred_axis_cam: Ellipse short axis [x, y, z] in camera frame (target orientation)
-        target_fruit: Dict with target fruit info (must have "Xc", "Yc", "Zc")
-        all_fruits: List of all detected fruits
-        z_std_threshold: Threshold for considering bunch as dense (default: 0.03m)
-
-    Returns:
-        Optimized axis direction [x, y, z] in camera frame
-        For sparse: ellipse axis (no adjustment)
-        For dense: ellipse axis rotated by ±45° adjustment to avoid neighbors
-    """
-    z_std = target_fruit.get("z_std", 0.0)
-
-    # If no ellipse axis available, can't compute orientation
-    if preferred_axis_cam is None:
-        print(f"[ORIENT] No ellipse axis available")
-        return None
-
-    target_pos = np.array([
-        target_fruit["Xc"],
-        target_fruit["Yc"],
-        target_fruit["Zc"]
-    ], dtype=float)
-
-    approach_dir = target_pos / max(np.linalg.norm(target_pos), 1e-6)
-    ellipse_axis = np.array(preferred_axis_cam, dtype=float)
-    ellipse_axis /= max(np.linalg.norm(ellipse_axis), 1e-6)
-
-    ellipse_axis_proj = ellipse_axis - np.dot(ellipse_axis, approach_dir) * approach_dir
-    ellipse_axis_proj /= max(np.linalg.norm(ellipse_axis_proj), 1e-6)
-
-    if z_std < z_std_threshold:
-        print(f"[ORIENT] Sparse bunch (z_std={z_std:.4f}), using ellipse axis")
-        return ellipse_axis_proj
-
-    best_angle = 0
-    min_collision_score = float('inf')
-    cos30 = math.cos(math.radians(30))
-
-    for angle_offset_deg in [-45, -30, -15, 0, 15, 30, 45]:
-        angle_rad = math.radians(angle_offset_deg)
-        cos_a = math.cos(angle_rad)
-        sin_a = math.sin(angle_rad)
-
-        gripper_width_dir = (
-            ellipse_axis_proj * cos_a +
-            np.cross(approach_dir, ellipse_axis_proj) * sin_a +
-            approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
-        )
-
-        collision_score = 0.0
-        for other in all_fruits:
-            if other == target_fruit:
-                continue
-
-            try:
-                other_pos = np.array([other["Xc"], other["Yc"], other["Zc"]], dtype=float)
-                vec = other_pos - target_pos
-                dist = np.linalg.norm(vec)
-
-                if dist < 0.01 or dist > 0.15:
-                    continue
-
-                vec_norm = vec / dist
-                dot_width = abs(float(np.dot(vec_norm, gripper_width_dir)))
-                if dot_width > cos30:
-                    collision_score += 1.0 / max(dist, 0.02)
-
-            except (KeyError, TypeError, ValueError):
-                continue
-
-        if collision_score < min_collision_score:
-            min_collision_score = collision_score
-            best_angle = angle_offset_deg
-
-    angle_rad = math.radians(best_angle)
-    cos_a = math.cos(angle_rad)
-    sin_a = math.sin(angle_rad)
-
-    optimized_axis = (
-        ellipse_axis_proj * cos_a +
-        np.cross(approach_dir, ellipse_axis_proj) * sin_a +
-        approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
-    )
-    optimized_axis /= max(np.linalg.norm(optimized_axis), 1e-6)
-
-    if best_angle == 0:
-        print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), using ellipse axis (no adjustment, score={min_collision_score:.2f})")
-    else:
-        print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), ellipse axis + {best_angle:+d}° adjustment (score={min_collision_score:.2f})")
-
-    return optimized_axis
-
-
 def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0):
     """Spin until the requested TF is available or timeout."""
     start = time()
@@ -382,6 +276,7 @@ def main_(args: argparse.Namespace):
     capture_thread.start()
 
     # --- ZED init ---
+    #  ZED frame : positive Y pointing down, X pointing right, and Z pointing away from the camera.
     input_type = sl.InputType()
     if args.svo:
         input_type.set_from_svo_file(args.svo)
@@ -747,10 +642,16 @@ def main_(args: argparse.Namespace):
                 t_best = targets[best_idx]
                 short_cam = t_best.get("short_axis_cam")
 
-                optimized_axis_cam = optimize_grasp_orientation_for_dense_bunch(
-                    short_cam, t_best, targets, z_std_threshold=0.03
-                )
-                t_best["optimized_axis_cam"] = optimized_axis_cam
+                # USE RAW SHORT AXIS (no optimization)
+                raw_axis_cam = t_best.get("short_axis_cam")
+
+                if raw_axis_cam is not None:
+                    t_best["optimized_axis_cam"] = raw_axis_cam
+                    optimized_axis_cam = raw_axis_cam.copy()
+                else:
+                    t_best["optimized_axis_cam"] = None
+                    optimized_axis_cam = None
+                    print("[ORIENT] No short axis available")
 
                 best_pt = t_best.get("best_point2d")
                 if best_pt is not None:
@@ -808,10 +709,10 @@ def main_(args: argparse.Namespace):
 
                         relative_angle_deg = normalize_grasp_angle(math.degrees(angle_rad))
                         t_best["rotation_angle_deg"] = relative_angle_deg
-                        print(f"[ORIENT] Relative rotation: {relative_angle_deg:+.1f}° (current→target)")
+                        #print(f"[ORIENT] Relative rotation: {relative_angle_deg:+.1f}° (current→target)")
                     else:
                         t_best["rotation_angle_deg"] = 0.0
-                        print(f"[ORIENT] No target axis, rotation=0° (keep current)")
+                        #print(f"[ORIENT] No target axis, rotation=0° (keep current)")
 
                 except Exception as e:
                     print(f"[ORIENT ERROR] Failed to compute relative rotation: {e}")
@@ -1010,6 +911,25 @@ def main_(args: argparse.Namespace):
                         radius = 5
 
                     cv2.circle(image_left_ocv, (cx, cy), radius, color, -1)
+
+                    short_cam = t.get("short_axis_cam")
+                    if short_cam is not None:
+                        sx, sy, _ = short_cam  # ignore Z for drawing
+
+                        # base point = centroid
+                        cx = int((x1 + x2) / 2)
+                        cy = int((y1 + y2) / 2)
+
+                        # scale for visibility
+                        L = 50
+
+                        # end point
+                        ex = int(cx + sx * L)
+                        ey = int(cy + sy * L)
+
+                        # draw arrow (pink)
+                        cv2.arrowedLine(image_left_ocv, (cx, cy), (ex, ey),
+                                        (255, 0, 255), 2, tipLength=0.3)
 
                     # VISUALIZE LONG-AXIS-BASED APPROACH (2D ARROW) — BEST ONLY
                     if i == best_idx:

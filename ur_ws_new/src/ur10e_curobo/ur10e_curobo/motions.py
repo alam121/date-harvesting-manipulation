@@ -91,6 +91,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         dt=dt,
         stop_flag=lambda: node.stop_requested
 )
+    print(f"Executing single pose (vel={vel:.2f}, dt={dt:.3f})")
     node.trajectory_pub.publish(traj)
 
 
