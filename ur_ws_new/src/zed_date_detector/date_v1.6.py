@@ -25,28 +25,20 @@ from rclpy.executors import MultiThreadedExecutor
 import math
 from scipy.spatial.transform import Rotation as R
 
-# ============================================================
-# Globals
-# ============================================================
+# Global variables
 lock = Lock()
 run_signal = False
 exit_signal = False
-ANGLE_REF = np.array([0.0, 0.0, 1.0])  # <-- ADD HERE
 image_net: np.ndarray = None
 detections: List[sl.CustomMaskObjectData] = None
 sl_mats: List[sl.Mat] = None
 
 net_fps = 0.0
 loop_fps = 0.0
-prev_axis = None
 prev_heat_point = None
 last_dir_label = None
 last_dir_count = 0
 last_dir_published = None
-yolo_masks = []
-yolo_classes = []
-yolo_scores = []
-yolo_lock = Lock()
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
@@ -54,16 +46,14 @@ SHOW_REJECTED = False
 SKIP_DRAW = False
 
 # --- Persistent BEST fruit tracking ---
-best_target_prev = None          # store previous best fruit
-BEST_REUSE_THRESH = 0.05         # 5 cm positional tolerance in base_link
+best_target_prev = None
+BEST_REUSE_THRESH = 0.05  # 5 cm positional tolerance in base_link
 
 # --- Track-by-detection smoothing ---
-best_history = deque(maxlen=3)   # shorter window for snappier response
+best_history = deque(maxlen=3)
 
 
-# ============================================================
 # Utility Functions
-# ============================================================
 def _unit(v):
     v = np.asarray(v, float)
     n = np.linalg.norm(v)
@@ -71,22 +61,20 @@ def _unit(v):
 
 
 def quat_mul(q, r):
-    w, x, y, z = q
-    W, X, Y, Z = r
+    qw, qx, qy, qz = q
+    rw, rx, ry, rz = r
     return (
-        w * W - x * X - y * Y - z * Z,
-        w * X + x * W + y * Z - z * Y,
-        w * Y - x * Z + y * W + z * X,
-        w * Z + x * Y - y * X + z * W,
+        qw * rw - qx * rx - qy * ry - qz * rz,
+        qw * rx + qx * rw + qy * rz - qz * ry,
+        qw * ry - qx * rz + qy * rw + qz * rx,
+        qw * rz + qx * ry - qy * rx + qz * rw,
     )
 
 def quaternion_to_degrees(q):
     """Return rotation angle (in degrees) represented by quaternion q=(w,x,y,z)."""
-    w, x, y, z = q
-    # angle = 2 * acos(w)
+    w = q[0]
     angle_rad = 2.0 * math.acos(max(min(w, 1.0), -1.0))
-    angle_deg = math.degrees(angle_rad)
-    return angle_deg
+    return math.degrees(angle_rad)
 
 def quat_rotate_vec(q, v3):
     """Rotate vector v3 by quaternion q."""
@@ -94,61 +82,40 @@ def quat_rotate_vec(q, v3):
     qi = (q[0], -q[1], -q[2], -q[3])
     return quat_mul(quat_mul(q, qv), qi)[1:]
 
-def signed_angle_between(v1, v2, up=np.array([0,0,1])):
-    """
-    Returns signed angle in degrees between v1 and v2.
-    Uses `up` vector to determine sign (positive/negative).
-    """
-    v1 = v1 / np.linalg.norm(v1)
-    v2 = v2 / np.linalg.norm(v2)
-
-    dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+def signed_angle_between(v1, v2, up=np.array([0, 0, 1])):
+    """Returns signed angle in degrees between v1 and v2."""
+    v1_norm = _unit(v1)
+    v2_norm = _unit(v2)
+    dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
     angle = math.degrees(math.acos(dot))
-
-    # compute sign using cross product direction
-    cross = np.cross(v1, v2)
-    sign = np.sign(np.dot(cross, up))  # positive if rotation follows `up`
-
+    cross = np.cross(v1_norm, v2_norm)
+    sign = np.sign(np.dot(cross, up))
     return angle * sign
 
-def quat_align_axis_to_axis(src_axis, dst_axis, up_hint=(0,0,1)):
-    """
-    Build quaternion that rotates src_axis → dst_axis.
-    """
+def quat_align_axis_to_axis(src_axis, dst_axis, up_hint=(0, 0, 1)):
+    """Build quaternion that rotates src_axis → dst_axis."""
     src = _unit(np.array(src_axis, float))
     dst = _unit(np.array(dst_axis, float))
-
     v = np.cross(src, dst)
     c = np.dot(src, dst)
 
     if np.linalg.norm(v) < 1e-8:
-        # axes are parallel or antiparallel
         if c > 0:
-            return (1,0,0,0)  # no rotation
-        else:
-            # 180° rotation around any perpendicular axis
-            perp = np.cross(src, up_hint)
-            perp = _unit(perp)
-            return (0, perp[0], perp[1], perp[2])
+            return (1, 0, 0, 0)
+        perp = _unit(np.cross(src, up_hint))
+        return (0, perp[0], perp[1], perp[2])
 
     s = math.sqrt((1 + c) * 2)
     invs = 1.0 / s
-
-    qx = v[0] * invs
-    qy = v[1] * invs
-    qz = v[2] * invs
-    qw = s * 0.5
-    return (qw, qx, qy, qz)
+    return (s * 0.5, v[0] * invs, v[1] * invs, v[2] * invs)
 
 
 def normalize_grasp_angle(angle_deg):
     """Map angle to symmetric range where 180° equals 0°."""
-    # Wrap angle to [-180, 180]
     angle = (angle_deg + 180) % 360 - 180
-    # Flip 180° symmetry: treat angle and angle+180 as same
     if angle > 90:
         angle -= 180
-    if angle < -90:
+    elif angle < -90:
         angle += 180
     return angle
 
@@ -183,39 +150,29 @@ def optimize_grasp_orientation_for_dense_bunch(
         print(f"[ORIENT] No ellipse axis available")
         return None
 
-    # Get target position in camera frame
     target_pos = np.array([
         target_fruit["Xc"],
         target_fruit["Yc"],
         target_fruit["Zc"]
     ], dtype=float)
 
-    # Get gripper approach direction (from camera to fruit, in camera frame)
     approach_dir = target_pos / max(np.linalg.norm(target_pos), 1e-6)
-
-    # Ellipse short axis is the BASE target orientation for gripper width
-    # Normalize it
     ellipse_axis = np.array(preferred_axis_cam, dtype=float)
-    ellipse_axis = ellipse_axis / max(np.linalg.norm(ellipse_axis), 1e-6)
+    ellipse_axis /= max(np.linalg.norm(ellipse_axis), 1e-6)
 
-    # Project ellipse axis onto plane perpendicular to approach direction
-    # (gripper width must be perpendicular to approach)
     ellipse_axis_proj = ellipse_axis - np.dot(ellipse_axis, approach_dir) * approach_dir
-    ellipse_axis_proj = ellipse_axis_proj / max(np.linalg.norm(ellipse_axis_proj), 1e-6)
+    ellipse_axis_proj /= max(np.linalg.norm(ellipse_axis_proj), 1e-6)
 
-    # For SPARSE bunches: use ellipse orientation as-is (no adjustment)
     if z_std < z_std_threshold:
         print(f"[ORIENT] Sparse bunch (z_std={z_std:.4f}), using ellipse axis")
-        return ellipse_axis_proj  # Return the axis direction in camera frame
+        return ellipse_axis_proj
 
-    # For DENSE bunches: test ±45° adjustments around ellipse orientation
-    best_angle = 0  # relative to ellipse axis
+    best_angle = 0
     min_collision_score = float('inf')
+    cos30 = math.cos(math.radians(30))
 
     for angle_offset_deg in [-45, -30, -15, 0, 15, 30, 45]:
         angle_rad = math.radians(angle_offset_deg)
-
-        # Rotate ellipse axis by offset around approach axis (Rodrigues' formula)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
 
@@ -225,7 +182,6 @@ def optimize_grasp_orientation_for_dense_bunch(
             approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
         )
 
-        # Count neighbors in gripper width direction (±30° cone on both sides)
         collision_score = 0.0
         for other in all_fruits:
             if other == target_fruit:
@@ -236,30 +192,21 @@ def optimize_grasp_orientation_for_dense_bunch(
                 vec = other_pos - target_pos
                 dist = np.linalg.norm(vec)
 
-                if dist < 0.01:  # skip if too close (likely same fruit)
-                    continue
-
-                if dist > 0.15:  # ignore far fruits (>15cm)
+                if dist < 0.01 or dist > 0.15:
                     continue
 
                 vec_norm = vec / dist
-
-                # Check if neighbor is in gripper width direction (±30° cone)
                 dot_width = abs(float(np.dot(vec_norm, gripper_width_dir)))
-                if dot_width > math.cos(math.radians(30)):  # within ±30° of width axis
-                    # Closer neighbors are worse (weighted by inverse distance)
+                if dot_width > cos30:
                     collision_score += 1.0 / max(dist, 0.02)
 
             except (KeyError, TypeError, ValueError):
-                # Skip fruits with missing/invalid position data
                 continue
 
-        # Track best orientation (minimum collisions)
         if collision_score < min_collision_score:
             min_collision_score = collision_score
             best_angle = angle_offset_deg
 
-    # Compute the optimized axis by rotating ellipse axis by best_angle
     angle_rad = math.radians(best_angle)
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
@@ -269,14 +216,14 @@ def optimize_grasp_orientation_for_dense_bunch(
         np.cross(approach_dir, ellipse_axis_proj) * sin_a +
         approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
     )
-    optimized_axis = optimized_axis / max(np.linalg.norm(optimized_axis), 1e-6)
+    optimized_axis /= max(np.linalg.norm(optimized_axis), 1e-6)
 
     if best_angle == 0:
         print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), using ellipse axis (no adjustment, score={min_collision_score:.2f})")
     else:
         print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), ellipse axis + {best_angle:+d}° adjustment (score={min_collision_score:.2f})")
 
-    return optimized_axis  # Return the rotated axis direction in camera frame
+    return optimized_axis
 
 
 def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0):
@@ -354,9 +301,7 @@ def detections_to_custom_masks_(dets) -> List[sl.CustomMaskObjectData]:
     return output
 
 
-# ============================================================
-# YOLO Thread
-# ============================================================
+# YOLO Detection Thread
 def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
     global image_net, exit_signal, run_signal, detections, net_fps
     print("Initializing Network...")
@@ -388,11 +333,9 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
         sleep(0.005)
 
 
-# ============================================================
-# Main
-# ============================================================
+# Main Function
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point
+    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_heat_point
     global last_dir_label, last_dir_count, last_dir_published
 
     # --- ROS2 setup ---
@@ -415,7 +358,7 @@ def main_(args: argparse.Namespace):
 
     # TF listener
     tf_buffer = Buffer()
-    tf_listener = TransformListener(tf_buffer, node)
+    TransformListener(tf_buffer, node)
     cam_frame = "zed2_left_camera_frame"
 
     # Wait for camera frame TF to be available before proceeding
@@ -469,24 +412,12 @@ def main_(args: argparse.Namespace):
 
     camera_infos = zed.get_camera_information()
     camera_res = camera_infos.camera_configuration.resolution
-    left_cam = camera_infos.camera_configuration.calibration_parameters.left_cam
-    intrinsics = {
-        "fx": float(left_cam.fx),
-        "fy": float(left_cam.fy),
-        "cx": float(left_cam.cx),
-        "cy": float(left_cam.cy),
-    }
-
-    point_cloud_res = sl.Resolution(
-        min(camera_res.width, 720), min(camera_res.height, 404)
-    )
 
     image_left = sl.Mat()
     runtime_params = sl.RuntimeParameters()
     obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters()
-    cam_w_pose = sl.Pose()
     objects = sl.Objects()
-    point_cloud = sl.Mat()  # XYZ map from ZED
+    point_cloud = sl.Mat()
 
     display_resolution = sl.Resolution(
         min(camera_res.width, 1280), min(camera_res.height, 720)
@@ -549,15 +480,7 @@ def main_(args: argparse.Namespace):
             )
             pc_np = point_cloud.get_data()[:, :, :3]  # H x W x 3
 
-            # --------------------------------------------------
-            # Process detected objects → compute 3D + store
-            # --------------------------------------------------
-            # each target:
-            # { "Xc","Yc","Zc","bb","mask_resized","pt_base","pt_grip",
-            #   "dist","z_std","vis_ratio","vis_quality",
-            #   "long_axis_cam","long_axis_2d","ellipse_angle", ... }
-
-
+            # Process detected objects
             targets = []
             rejected_targets = []
 
@@ -609,20 +532,19 @@ def main_(args: argparse.Namespace):
                         (w_roi, h_roi),
                         interpolation=cv2.INTER_NEAREST,
                     )
-                    # Morphological cleanup: close small holes then open to remove specks
                     kernel = np.ones((5, 5), np.uint8)
-                    mask_clean = cv2.morphologyEx(mask_resized, cv2.MORPH_CLOSE, kernel)
-                    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_OPEN, kernel)
+                    mask_clean = cv2.morphologyEx(
+                        cv2.morphologyEx(mask_resized, cv2.MORPH_CLOSE, kernel),
+                        cv2.MORPH_OPEN, kernel
+                    )
                     mask_bool = mask_clean > 0
 
-                    # ----------------------------------------------------------
-                    # 2D Ellipse Fit → SHORT AXIS extraction
-                    # ----------------------------------------------------------
                     t_short_axis = None
                     long_axis_2d = None
                     t_angle = None
                     t_best_dir2d = None
                     t_best_point = None
+
                     try:
                         contours, _ = cv2.findContours(
                             mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
@@ -630,106 +552,67 @@ def main_(args: argparse.Namespace):
                         if contours:
                             cnt = max(contours, key=cv2.contourArea)
                             if len(cnt) >= 20:
-                                ellipse = cv2.fitEllipse(cnt)
-                                (xc2d, yc2d), (major, minor), angle_deg = ellipse
-
+                                _, _, angle_deg = cv2.fitEllipse(cnt)
                                 theta = math.radians(angle_deg)
-                                # LONG axis in image plane (for reference only)
-                                long_dir_img = np.array(
-                                    [math.cos(theta), math.sin(theta)], dtype=float
-                                )
-                                # SHORT axis = perpendicular to long
-                                short_dir_cam = np.array(
-                                    [-long_dir_img[1], long_dir_img[0], 0.0],
-                                    dtype=float,
-                                )
-                                n_short = np.linalg.norm(short_dir_cam)
-                                if n_short > 1e-6:
-                                    short_dir_cam /= n_short
+                                long_dir_img = np.array([math.cos(theta), math.sin(theta)], dtype=float)
+                                short_dir_cam = np.array([-long_dir_img[1], long_dir_img[0], 0.0], dtype=float)
+                                short_dir_cam /= max(np.linalg.norm(short_dir_cam), 1e-6)
 
                                 t_short_axis = short_dir_cam
                                 long_axis_2d = long_dir_img
                                 t_angle = float(angle_deg)
                     except Exception as e:
                         print("[WARN] Ellipse axis extraction failed:", e)
-                        t_short_axis = None
-                        long_axis_2d = None
-                        t_angle = None
 
-                    # Take 3D points from XYZ map only where mask is true
-                    roi_xyz = pc_np[y1:y2, x1:x2, :]  # H x W x 3
-                    valid = np.isfinite(roi_xyz[:, :, 2])
-                    valid &= mask_bool
-                    heatmap = None
+                    roi_xyz = pc_np[y1:y2, x1:x2, :]
+                    valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
                     depth_vals = roi_xyz[:, :, 2][valid]
-
+                    heatmap = None
 
                     if depth_vals.size > 0:
                         z_lo, z_hi = np.percentile(depth_vals, [5.0, 90.0])
-                        if z_hi <= z_lo:
-                            z_hi = z_lo + 1e-3
+                        z_hi = max(z_hi, z_lo + 1e-3)
                         score = np.zeros_like(roi_xyz[:, :, 2], dtype=np.float32)
                         score[valid] = (z_hi - roi_xyz[:, :, 2][valid]) / (z_hi - z_lo)
-                        score = np.clip(score, 0.0, 1.0)
-                        score_u8 = (score * 255).astype(np.uint8)
+                        score_u8 = (np.clip(score, 0.0, 1.0) * 255).astype(np.uint8)
                         heatmap = cv2.applyColorMap(score_u8, cv2.COLORMAP_JET)
 
-                        
-                        # ----------------------------------------------------------
-                        # Compute best point/direction from peak heatmap score
-                        # ----------------------------------------------------------
-                        if heatmap is not None and mask_clean is not None:
-                            ys, xs = np.nonzero(mask_clean)
-                            if len(xs) > 0:
-                                scores = heatmap[ys, xs, 2].astype(float)  # use RED channel
-                                idx_max = int(np.argmax(scores))
-                                peak_y = int(ys[idx_max])
-                                peak_x = int(xs[idx_max])
-                                t_best_point = np.array([peak_x, peak_y], dtype=float)
-                                cx = mask_clean.shape[1] / 2.0
-                                cy = mask_clean.shape[0] / 2.0
-                                dir_vec = np.array([peak_x - cx, peak_y - cy], dtype=float)
-                                n_dir = np.linalg.norm(dir_vec)
-                                if n_dir > 1e-6:
-                                    dir_vec /= n_dir
-                                else:
-                                    dir_vec = np.array([1.0, 0.0], dtype=float)
-                                t_best_dir2d = dir_vec
+                        ys, xs = np.nonzero(mask_clean)
+                        if len(xs) > 0:
+                            scores = heatmap[ys, xs, 2].astype(float)
+                            idx_max = int(np.argmax(scores))
+                            peak_y = int(ys[idx_max])
+                            peak_x = int(xs[idx_max])
+                            t_best_point = np.array([peak_x, peak_y], dtype=float)
+                            cx = mask_clean.shape[1] / 2.0
+                            cy = mask_clean.shape[0] / 2.0
+                            dir_vec = np.array([peak_x - cx, peak_y - cy], dtype=float)
+                            n_dir = np.linalg.norm(dir_vec)
+                            t_best_dir2d = dir_vec / n_dir if n_dir > 1e-6 else np.array([1.0, 0.0], dtype=float)
 
-                    # More forgiving visibility: erode mask for ratio so edge holes hurt less
-                    vis_mask = cv2.erode(
-                        mask_clean,
-                        np.ones((3, 3), np.uint8),
-                        iterations=1,
-                    ) > 0
+                    vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
                     mask_pixels = np.count_nonzero(vis_mask)
                     vis_ratio = (
                         float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
-                        if mask_pixels > 0
-                        else 0.0
+                        if mask_pixels > 0 else 0.0
                     )
-                    vis_ratio = max(0.0, min(vis_ratio, 1.0))
+                    vis_ratio = np.clip(vis_ratio, 0.0, 1.0)
 
                     if np.count_nonzero(valid) < 30:
-                        # Not enough 3D points to trust
                         mark_reject("Too few depth pts")
                         continue
 
-                    pts = roi_xyz[valid]  # N x 3
+                    pts = roi_xyz[valid]
                     zs = pts[:, 2]
 
-                    # Closest 20% points (= front surface)
                     idx = np.argsort(zs)
                     k = max(10, int(0.2 * len(idx)))
                     pts_front = pts[idx[:k]]
 
                     depth_std = np.std(pts_front[:, 2])
-                    vis_quality = (vis_ratio ** 2) * np.exp(
-                        - (depth_std / 0.015) ** 2
-                    )
+                    vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
-                    Z_std = float(np.std(pts_front[:, 2]))
-                    if Z_std > 0.05:  # >5 cm variance → unreliable
+                    if depth_std > 0.05:
                         mark_reject("Depth variance")
                         continue
 
@@ -806,140 +689,83 @@ def main_(args: argparse.Namespace):
                     mark_reject("3D extraction failed")
                     continue
 
-            # --------------------------------------------------
-            # Hard-Sticky BEST Fruit Selection (with Occlusion Awareness)
-            # --------------------------------------------------
-
-            # 1. Pick best accessible fruit THIS FRAME (not just closest!)
-            # Scoring factors:
-            #   - Distance to gripper (lower = better)
-            #   - Occlusion (depth variance, higher = worse)
-            #   - Edge proximity (near image border = worse)
-            #   - Visibility quality (higher = better)
+            # Best fruit selection with occlusion awareness
             frame_best_idx = None
             frame_best_score = float("inf")
 
             for i, t in enumerate(targets):
-                # Base distance to gripper
                 dist = t["dist"]
-
-                # Occlusion penalty: depth variance indicates overlapping fruits
-                # Higher z_std = more buried/occluded = harder to grasp
                 z_std = t.get("z_std", 0.0)
-                occlusion_penalty = z_std * 15.0  # scale factor tuned for meters
+                occlusion_penalty = z_std * 15.0
 
-                # Edge proximity penalty: fruits near image edges are often cut off
                 bb = t["bb"]
                 x1, y1, x2, y2 = bb
-                edge_dist_left = x1
-                edge_dist_top = y1
-                edge_dist_right = image_left_ocv.shape[1] - x2
-                edge_dist_bottom = image_left_ocv.shape[0] - y2
-                edge_dist = min(edge_dist_left, edge_dist_top, edge_dist_right, edge_dist_bottom)
-                # Penalty if within 50 pixels of edge
+                edge_dist = min(x1, y1, image_left_ocv.shape[1] - x2, image_left_ocv.shape[0] - y2)
                 edge_penalty = max(0, 50 - edge_dist) * 0.02
 
-                # Visibility quality bonus: rewards clean, well-visible fruits
                 vis_quality = t.get("vis_quality", 0.0)
-                vis_bonus = -vis_quality * 0.3  # negative because lower score = better
+                vis_bonus = -vis_quality * 0.3
 
-                # Combined score (lower = better fruit to pick)
                 score = dist + occlusion_penalty + edge_penalty + vis_bonus
-
-                # Debug: store score for visualization
                 t["accessibility_score"] = score
 
                 if score < frame_best_score:
                     frame_best_score = score
                     frame_best_idx = i
 
-            best_idx = frame_best_idx  # default
-
-            # 2. Strong Reuse (sticky lock-on)
-            # We ONLY switch if previous best is completely lost.
+            best_idx = frame_best_idx
             if best_target_prev is not None:
-                prev_pt = np.array(
-                    [
-                        best_target_prev["pt_base"].point.x,
-                        best_target_prev["pt_base"].point.y,
-                        best_target_prev["pt_base"].point.z,
-                    ],
-                    dtype=float,
-                )
+                prev_pt = np.array([
+                    best_target_prev["pt_base"].point.x,
+                    best_target_prev["pt_base"].point.y,
+                    best_target_prev["pt_base"].point.z
+                ], dtype=float)
 
                 reuse_idx = None
                 min_dist = float("inf")
 
-                # Try to find the *same* fruit again by proximity
                 for i, t in enumerate(targets):
-                    cur_pt = np.array(
-                        [
-                            t["pt_base"].point.x,
-                            t["pt_base"].point.y,
-                            t["pt_base"].point.z,
-                        ],
-                        dtype=float,
-                    )
+                    cur_pt = np.array([
+                        t["pt_base"].point.x,
+                        t["pt_base"].point.y,
+                        t["pt_base"].point.z
+                    ], dtype=float)
                     d = np.linalg.norm(cur_pt - prev_pt)
 
-                    if d < BEST_REUSE_THRESH:  # e.g. 5 cm
-                        if d < min_dist:
-                            min_dist = d
-                            reuse_idx = i
+                    if d < BEST_REUSE_THRESH and d < min_dist:
+                        min_dist = d
+                        reuse_idx = i
 
-                # If we found a matching fruit → ALWAYS reuse it
                 if reuse_idx is not None:
                     best_idx = reuse_idx
-                # else: previous best is considered LOST → we must switch to frame_best_idx
 
-            # 3. Persistent state update
             if best_idx is not None:
                 best_target_prev = targets[best_idx]
 
-            # --------------------------------------------------
-            # Orientation Optimization: Compute ROTATION ANGLE (not absolute orientation)
-            # --------------------------------------------------
+            # Orientation optimization
             if best_idx is not None:
                 t_best = targets[best_idx]
                 short_cam = t_best.get("short_axis_cam")
 
-                # Optimize orientation to avoid neighbor fruits in dense bunches
-                # This returns the optimized AXIS DIRECTION in camera frame
                 optimized_axis_cam = optimize_grasp_orientation_for_dense_bunch(
                     short_cam, t_best, targets, z_std_threshold=0.03
                 )
-
-                # Store optimized axis in target (will be used later to compute rotation)
                 t_best["optimized_axis_cam"] = optimized_axis_cam
 
-                # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
                 if best_pt is not None:
-                    if prev_heat_point is None:
-                        sm_pt = best_pt.copy()
-                    else:
-                        sm_pt = 0.7 * prev_heat_point + 0.3 * best_pt
+                    sm_pt = best_pt.copy() if prev_heat_point is None else 0.7 * prev_heat_point + 0.3 * best_pt
                     prev_heat_point = sm_pt.copy()
                     t_best["best_point2d_smooth"] = sm_pt
                 else:
                     prev_heat_point = None
-
-                # Compute relative rotation from current gripper orientation to target orientation
-                # rotation_angle_deg = how much to rotate FROM current TO target (ellipse-based)
                 try:
-                    optimized_axis_cam = t_best.get("optimized_axis_cam")
-
                     if optimized_axis_cam is not None:
-                        # Get current gripper orientation from TF (base_link -> gripper_tip)
-                        transform = tf_buffer.lookup_transform(
-                            "base_link", "gripper_tip", rclpyTime()
-                        )
+                        transform = tf_buffer.lookup_transform("base_link", "gripper_tip", rclpyTime())
                         current_quat = transform.transform.rotation
                         current_rot = R.from_quat([current_quat.x, current_quat.y, current_quat.z, current_quat.w])
                         current_matrix = current_rot.as_matrix()
 
-                        # Transform optimized axis from camera frame to base frame
-                        # Create a pose at camera origin + axis direction
                         axis_point_cam = PointStamped()
                         axis_point_cam.header.frame_id = cam_frame
                         axis_point_cam.header.stamp = rclpyTime().to_msg()
@@ -947,7 +773,6 @@ def main_(args: argparse.Namespace):
                         axis_point_cam.point.y = optimized_axis_cam[1]
                         axis_point_cam.point.z = optimized_axis_cam[2]
 
-                        # Also transform camera origin
                         origin_cam = PointStamped()
                         origin_cam.header.frame_id = cam_frame
                         origin_cam.header.stamp = rclpyTime().to_msg()
@@ -958,7 +783,6 @@ def main_(args: argparse.Namespace):
                         axis_point_base = tf_buffer.transform(axis_point_cam, "base_link")
                         origin_base = tf_buffer.transform(origin_cam, "base_link")
 
-                        # Axis direction in base frame = (axis_point - origin)
                         target_axis_base = np.array([
                             axis_point_base.point.x - origin_base.point.x,
                             axis_point_base.point.y - origin_base.point.y,
@@ -966,25 +790,18 @@ def main_(args: argparse.Namespace):
                         ])
                         target_axis_base /= max(np.linalg.norm(target_axis_base), 1e-6)
 
-                        # Current gripper Y-axis (width direction) in base frame
-                        gripper_y_current = current_matrix[:, 1]  # Y column
+                        gripper_y_current = current_matrix[:, 1]
+                        gripper_z_current = current_matrix[:, 2]
 
-                        # Current gripper Z-axis (approach direction) in base frame
-                        gripper_z_current = current_matrix[:, 2]  # Z column
-
-                        # Project target axis onto plane perpendicular to approach
                         target_proj = target_axis_base - np.dot(target_axis_base, gripper_z_current) * gripper_z_current
                         target_proj /= max(np.linalg.norm(target_proj), 1e-6)
 
-                        # Project current gripper Y onto same plane
                         gripper_y_proj = gripper_y_current - np.dot(gripper_y_current, gripper_z_current) * gripper_z_current
                         gripper_y_proj /= max(np.linalg.norm(gripper_y_proj), 1e-6)
 
-                        # Compute angle between projections
                         dot = np.clip(np.dot(gripper_y_proj, target_proj), -1.0, 1.0)
                         angle_rad = math.acos(dot)
 
-                        # Determine sign using cross product
                         cross = np.cross(gripper_y_proj, target_proj)
                         if np.dot(cross, gripper_z_current) < 0:
                             angle_rad = -angle_rad
@@ -993,7 +810,6 @@ def main_(args: argparse.Namespace):
                         t_best["rotation_angle_deg"] = relative_angle_deg
                         print(f"[ORIENT] Relative rotation: {relative_angle_deg:+.1f}° (current→target)")
                     else:
-                        # No optimized axis available, keep current orientation
                         t_best["rotation_angle_deg"] = 0.0
                         print(f"[ORIENT] No target axis, rotation=0° (keep current)")
 
@@ -1003,18 +819,13 @@ def main_(args: argparse.Namespace):
                     traceback.print_exc()
                     t_best["rotation_angle_deg"] = 0.0
 
-                # Compute approach axis for VISUALIZATION ONLY (direction from camera to fruit)
                 fruit_pos = np.array([t_best["Xc"], t_best["Yc"], t_best["Zc"]], dtype=float)
-                approach_distance = max(np.linalg.norm(fruit_pos), 1e-6)
-                approach_axis_vis = fruit_pos / approach_distance  # Normalized direction to fruit
-                t_best["approach_axis"] = approach_axis_vis
+                t_best["approach_axis"] = fruit_pos / max(np.linalg.norm(fruit_pos), 1e-6)
 
-            # --------------------------------------------------
-            # Publish goal for BEST fruit only (before rendering to minimize latency)
+            # Publish goal for BEST fruit only
             if best_idx is not None:
                 t_best = targets[best_idx]
                 pt_base = t_best["pt_base"]
-                q = t_best["quat"]
                 dir_msg = None
                 dir_vec = t_best.get("best_dir2d")
                 if dir_vec is not None and len(dir_vec) >= 2:
@@ -1207,9 +1018,9 @@ def main_(args: argparse.Namespace):
 
                         axis_dir = t.get("approach_axis")
                         if axis_dir is not None:
-                            vx, vy, vz = axis_dir
+                            vx, vy = axis_dir[0], axis_dir[1]
 
-                            # Use only XY for visualization
+                            # Normalize XY for visualization
                             n = math.sqrt(vx * vx + vy * vy)
                             if n < 1e-6:
                                 vx, vy = 1.0, 0.0
@@ -1373,19 +1184,7 @@ def main_(args: argparse.Namespace):
                             cv2.LINE_AA,
                         )
 
-                        # ROTATION ANGLE (relative to current orientation)
-                        rotation_deg = t.get("rotation_angle_deg", 0.0)
-                        # Color: green if 0°, yellow if small, orange/red if large rotation
-                        if abs(rotation_deg) < 1:
-                            rot_color = (0, 255, 0, 255)  # green (no rotation)
-                        elif abs(rotation_deg) <= 15:
-                            rot_color = (0, 255, 255, 255)  # yellow (small)
-                        elif abs(rotation_deg) <= 30:
-                            rot_color = (0, 165, 255, 255)  # orange (medium)
-                        else:
-                            rot_color = (0, 0, 255, 255)  # red (large)
-
-
+                        # Visibility quality
                         vis_quality = t.get("vis_quality", 0.0)
                         cv2.putText(
                             image_left_ocv,
@@ -1467,9 +1266,7 @@ def main_(args: argparse.Namespace):
         rclpy.shutdown()
 
 
-# ============================================================
 # Entry Point
-# ============================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, required=True, help="model.pt path")
