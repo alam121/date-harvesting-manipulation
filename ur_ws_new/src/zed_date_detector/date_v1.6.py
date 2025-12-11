@@ -717,6 +717,9 @@ def main_(args: argparse.Namespace):
                 t_best = targets[best_idx]
                 short_cam = t_best.get("short_axis_cam")
                 use_axis_cam = short_cam
+
+
+                
                 # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
                 if best_pt is not None:
