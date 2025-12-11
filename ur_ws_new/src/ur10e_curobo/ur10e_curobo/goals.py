@@ -187,6 +187,39 @@ def subscribe_to_goal_pose(node):
         # Stop robot motion
         publish_stop_trajectory(node)
 
+        # Wait a bit for safety
+        time.sleep(0.05)
+
+        # Extract goal position and RELATIVE ROTATION ANGLE from vision
+        # Vision publishes rotation angle as quaternion around Z-axis
+        # We need to extract the angle and apply it relative to current orientation
+        rotation_quat_w = msg.pose.orientation.w
+        rotation_quat_z = msg.pose.orientation.z
+
+        # Extract rotation angle from quaternion (rotation around Z-axis)
+        # quat = [cos(θ/2), 0, 0, sin(θ/2)] for Z-axis rotation
+        import math
+        rotation_angle_rad = 2.0 * math.atan2(rotation_quat_z, rotation_quat_w)
+        rotation_angle_deg = math.degrees(rotation_angle_rad)
+
+        print(f"[GOAL] Received rotation angle: {rotation_angle_deg:+.1f}° relative to current orientation")
+
+        # Get current EE orientation (this is our 0° baseline)
+        current_ee_pose = node.get_end_effector_pose()
+        if current_ee_pose:
+            current_quat = current_ee_pose[3:]  # [w, x, y, z]
+        else:
+            current_quat = [1.0, 0.0, 0.0, 0.0]  # Fallback to identity
+
+        # Apply relative rotation around approach axis (Z-axis in current frame)
+        # Multiply quaternions: final = current * rotation
+        from scipy.spatial.transform import Rotation as R
+        current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])  # scipy uses [x,y,z,w]
+        relative_rot = R.from_quat([0, 0, rotation_quat_z, rotation_quat_w])  # rotation around Z
+        final_rot = current_rot * relative_rot
+        final_quat_scipy = final_rot.as_quat()  # [x, y, z, w]
+        final_quat = [final_quat_scipy[3], final_quat_scipy[0], final_quat_scipy[1], final_quat_scipy[2]]  # [w, x, y, z]
+
         # ------------------------------------------
         # Start tracking this fruit based on the first goal message
         node.goal_seed_xy = [
@@ -198,18 +231,15 @@ def subscribe_to_goal_pose(node):
             msg.pose.position.y,
             msg.pose.position.z
         ]
+        node.best_goal_quat = final_quat.copy()  # Use computed final orientation
         node.best_goal_score = float("inf")
         # ------------------------------------------
 
-        # Wait a bit for safety
-        time.sleep(0.05)
-
-        # Extract goal position + keep current orientation
         g = [
             msg.pose.position.x,
             msg.pose.position.y,
             msg.pose.position.z,
-            *current_orientation
+            *final_quat
         ]
 
         # Add goal only if it's new
@@ -300,42 +330,62 @@ def plan_and_execute(node):
         # 0. Get next goal
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
+        optimized_orientation = goal[3:]  # Save optimized orientation from vision
         yoffset = node.yoffset
         ax, ay, az = compute_visibility_approach(node, x, y, z, dist=0.18)
+
         # 1. Plan approach
+        # Strategy: Use current EE orientation as baseline (0°)
+        # This provides smooth motion - robot doesn't rotate during approach
+        # Final optimized orientation is applied in step 3 (final grasp)
+
         if z > 1.30:  #high targets: top-down approach
-            orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-            approach = [x, y+0.12, z, *orientation] #top approach
+            approach_orientation = quaternion_from_approach(node, pitch_deg=-35.0)
+            approach = [x, y+0.12, z, *approach_orientation] #top approach
             #y -= 0.004; z -= 0.4
         else:
-            orientation = goal[3:]
-            #approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
-            approach = [ax, ay, az, *orientation]
+            # Use current EE orientation (treat as 0° baseline for approach)
+            current_ee_pose = node.get_end_effector_pose()
+            if current_ee_pose:
+                approach_orientation = current_ee_pose[3:]  # Current orientation = 0° reference
+            else:
+                approach_orientation = [1.0, 0.0, 0.0, 0.0]  # Default fallback
+
+            #approach = [x, y+node.yoffset, z-node.zoffset, *approach_orientation] #side approch: Z negative means down, y positive means back
+            approach = [ax, ay, az, *approach_orientation]
             #z -= 0.055; y -= 0.003
-            
-        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
+
+        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"):
             continue
         wait_until_xyz(node, approach[:3])
         blend_motion(node)
-        
+
         start = JointState.from_position(
             torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
             joint_names=node.joint_order,
         )
-        
+
         # 2. Reacquire
         seed = [x,y,z]
         print("Reacquiring goal pose near:", seed)
         reacq = reacquire_goal_pose(node, seed_xyz=seed)
-        
+
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
             node.get_logger().warn("No reacquire; skipping goal.")
             continue
-            
-        # 3. Final slow precise grasp
-        final_target = [x, y, z+0.02, *orientation]
+
+        # 3. Final slow precise grasp (NOW use optimized orientation from vision)
+        # Use latest tracked orientation if available, otherwise use original
+        if hasattr(node, 'best_goal_quat') and node.best_goal_quat is not None:
+            final_orientation = node.best_goal_quat
+            print(f"[GRASP] Using optimized orientation from vision tracker")
+        else:
+            final_orientation = optimized_orientation
+            print(f"[GRASP] Using initial optimized orientation")
+
+        final_target = [x, y, z+0.02, *final_orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])

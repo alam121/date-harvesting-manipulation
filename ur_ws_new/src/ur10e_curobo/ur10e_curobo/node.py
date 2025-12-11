@@ -243,6 +243,7 @@ class UR10eCuroboMoveIt(Node):
 
 
         self.best_goal_xyz = None
+        self.best_goal_quat = None  # Track best orientation quaternion [w, x, y, z]
         self.best_goal_score = float("inf")
         self.goal_seed_xy = None
 
@@ -530,6 +531,26 @@ class UR10eCuroboMoveIt(Node):
         if score < self.best_goal_score - 0.002:
             self.best_goal_score = score
             self.best_goal_xyz = [x, y, z]
+
+            # Extract and apply relative rotation (same as in goals.py)
+            rotation_quat_w = msg.pose.orientation.w
+            rotation_quat_z = msg.pose.orientation.z
+
+            # Get current EE orientation
+            current_ee_pose = self.get_end_effector_pose()
+            if current_ee_pose:
+                current_quat = current_ee_pose[3:]  # [w, x, y, z]
+            else:
+                current_quat = [1.0, 0.0, 0.0, 0.0]
+
+            # Apply relative rotation
+            from scipy.spatial.transform import Rotation as R
+            current_rot = R.from_quat([current_quat[1], current_quat[2], current_quat[3], current_quat[0]])
+            relative_rot = R.from_quat([0, 0, rotation_quat_z, rotation_quat_w])
+            final_rot = current_rot * relative_rot
+            final_quat_scipy = final_rot.as_quat()
+            self.best_goal_quat = [final_quat_scipy[3], final_quat_scipy[0], final_quat_scipy[1], final_quat_scipy[2]]
+
             print(f"Updated BEST (continuous) = {self.best_goal_xyz}, score={score}")
 
 

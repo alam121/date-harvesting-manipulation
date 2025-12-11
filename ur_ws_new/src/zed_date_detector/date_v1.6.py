@@ -23,6 +23,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.executors import MultiThreadedExecutor
 
 import math
+from scipy.spatial.transform import Rotation as R
 
 # ============================================================
 # Globals
@@ -30,6 +31,7 @@ import math
 lock = Lock()
 run_signal = False
 exit_signal = False
+ANGLE_REF = np.array([0.0, 0.0, 1.0])  # <-- ADD HERE
 image_net: np.ndarray = None
 detections: List[sl.CustomMaskObjectData] = None
 sl_mats: List[sl.Mat] = None
@@ -78,6 +80,13 @@ def quat_mul(q, r):
         w * Z + x * Y - y * X + z * W,
     )
 
+def quaternion_to_degrees(q):
+    """Return rotation angle (in degrees) represented by quaternion q=(w,x,y,z)."""
+    w, x, y, z = q
+    # angle = 2 * acos(w)
+    angle_rad = 2.0 * math.acos(max(min(w, 1.0), -1.0))
+    angle_deg = math.degrees(angle_rad)
+    return angle_deg
 
 def quat_rotate_vec(q, v3):
     """Rotate vector v3 by quaternion q."""
@@ -85,80 +94,94 @@ def quat_rotate_vec(q, v3):
     qi = (q[0], -q[1], -q[2], -q[3])
     return quat_mul(quat_mul(q, qv), qi)[1:]
 
-
-def quat_align_x_to_axis(axis_world, up_hint=(0, 0, 1)):
+def signed_angle_between(v1, v2, up=np.array([0,0,1])):
     """
-    Build quaternion that maps robot's +X axis to the given axis_world,
-    with up_hint used to resolve roll.
+    Returns signed angle in degrees between v1 and v2.
+    Uses `up` vector to determine sign (positive/negative).
     """
-    X = _unit(axis_world)
-    U = _unit(up_hint)
-    Y = np.cross(U, X)
-    if np.linalg.norm(Y) < 1e-6:
-        U = np.array([1.0, 0.0, 0.0])
-        Y = np.cross(U, X)
-    Y = _unit(Y)
-    Z = _unit(np.cross(X, Y))
+    v1 = v1 / np.linalg.norm(v1)
+    v2 = v2 / np.linalg.norm(v2)
 
-    R = np.array(
-        [
-            [X[0], Y[0], Z[0]],
-            [X[1], Y[1], Z[1]],
-            [X[2], Y[2], Z[2]],
-        ],
-        dtype=float,
-    )
-    t = np.trace(R)
-    if t > 0:
-        s = math.sqrt(t + 1.0) * 2.0
-        qw = 0.25 * s
-        qx = (R[2, 1] - R[1, 2]) / s
-        qy = (R[0, 2] - R[2, 0]) / s
-        qz = (R[1, 0] - R[0, 1]) / s
-    else:
-        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-            qw = (R[2, 1] - R[1, 2]) / s
-            qx = 0.25 * s
-            qy = (R[0, 1] + R[1, 0]) / s
-            qz = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-            qw = (R[0, 2] - R[2, 0]) / s
-            qx = (R[0, 1] + R[1, 0]) / s
-            qy = 0.25 * s
-            qz = (R[1, 2] + R[2, 1]) / s
+    dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+    angle = math.degrees(math.acos(dot))
+
+    # compute sign using cross product direction
+    cross = np.cross(v1, v2)
+    sign = np.sign(np.dot(cross, up))  # positive if rotation follows `up`
+
+    return angle * sign
+
+def quat_align_axis_to_axis(src_axis, dst_axis, up_hint=(0,0,1)):
+    """
+    Build quaternion that rotates src_axis → dst_axis.
+    """
+    src = _unit(np.array(src_axis, float))
+    dst = _unit(np.array(dst_axis, float))
+
+    v = np.cross(src, dst)
+    c = np.dot(src, dst)
+
+    if np.linalg.norm(v) < 1e-8:
+        # axes are parallel or antiparallel
+        if c > 0:
+            return (1,0,0,0)  # no rotation
         else:
-            s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-            qw = (R[1, 0] - R[0, 1]) / s
-            qx = (R[0, 2] + R[2, 0]) / s
-            qy = (R[1, 2] + R[2, 1]) / s
-            qz = 0.25 * s
-    return (float(qw), float(qx), float(qy), float(qz))
+            # 180° rotation around any perpendicular axis
+            perp = np.cross(src, up_hint)
+            perp = _unit(perp)
+            return (0, perp[0], perp[1], perp[2])
+
+    s = math.sqrt((1 + c) * 2)
+    invs = 1.0 / s
+
+    qx = v[0] * invs
+    qy = v[1] * invs
+    qz = v[2] * invs
+    qw = s * 0.5
+    return (qw, qx, qy, qz)
+
+
+def normalize_grasp_angle(angle_deg):
+    """Map angle to symmetric range where 180° equals 0°."""
+    # Wrap angle to [-180, 180]
+    angle = (angle_deg + 180) % 360 - 180
+    # Flip 180° symmetry: treat angle and angle+180 as same
+    if angle > 90:
+        angle -= 180
+    if angle < -90:
+        angle += 180
+    return angle
 
 
 def optimize_grasp_orientation_for_dense_bunch(
     preferred_axis_cam, target_fruit, all_fruits, z_std_threshold=0.03
 ):
     """
-    Adjust grasp orientation to avoid neighbor fruits in dense bunches.
+    Determine optimal grasp orientation axis to avoid neighbors.
+
+    The ellipse short axis provides the BASE target orientation.
+    For dense bunches, we test ±45° adjustments around this base to avoid neighbors.
+
+    Returns the optimal AXIS DIRECTION (not angle) in camera frame.
+    The main loop will transform this to base frame and compute rotation from current orientation.
 
     Args:
-        preferred_axis_cam: Default axis from ellipse (short axis) [x, y, z]
+        preferred_axis_cam: Ellipse short axis [x, y, z] in camera frame (target orientation)
         target_fruit: Dict with target fruit info (must have "Xc", "Yc", "Zc")
         all_fruits: List of all detected fruits
         z_std_threshold: Threshold for considering bunch as dense (default: 0.03m)
 
     Returns:
-        Optimized axis in camera frame (numpy array)
+        Optimized axis direction [x, y, z] in camera frame
+        For sparse: ellipse axis (no adjustment)
+        For dense: ellipse axis rotated by ±45° adjustment to avoid neighbors
     """
-    if preferred_axis_cam is None:
-        return None
-
-    # If not dense bunch, use default orientation
     z_std = target_fruit.get("z_std", 0.0)
-    if z_std < z_std_threshold:
-        return preferred_axis_cam
+
+    # If no ellipse axis available, can't compute orientation
+    if preferred_axis_cam is None:
+        print(f"[ORIENT] No ellipse axis available")
+        return None
 
     # Get target position in camera frame
     target_pos = np.array([
@@ -167,23 +190,42 @@ def optimize_grasp_orientation_for_dense_bunch(
         target_fruit["Zc"]
     ], dtype=float)
 
-    # Test 8 orientations by rotating preferred axis
-    best_angle = 0
+    # Get gripper approach direction (from camera to fruit, in camera frame)
+    approach_dir = target_pos / max(np.linalg.norm(target_pos), 1e-6)
+
+    # Ellipse short axis is the BASE target orientation for gripper width
+    # Normalize it
+    ellipse_axis = np.array(preferred_axis_cam, dtype=float)
+    ellipse_axis = ellipse_axis / max(np.linalg.norm(ellipse_axis), 1e-6)
+
+    # Project ellipse axis onto plane perpendicular to approach direction
+    # (gripper width must be perpendicular to approach)
+    ellipse_axis_proj = ellipse_axis - np.dot(ellipse_axis, approach_dir) * approach_dir
+    ellipse_axis_proj = ellipse_axis_proj / max(np.linalg.norm(ellipse_axis_proj), 1e-6)
+
+    # For SPARSE bunches: use ellipse orientation as-is (no adjustment)
+    if z_std < z_std_threshold:
+        print(f"[ORIENT] Sparse bunch (z_std={z_std:.4f}), using ellipse axis")
+        return ellipse_axis_proj  # Return the axis direction in camera frame
+
+    # For DENSE bunches: test ±45° adjustments around ellipse orientation
+    best_angle = 0  # relative to ellipse axis
     min_collision_score = float('inf')
 
-    for angle_deg in [0, 45, 90, 135, 180, 225, 270, 315]:
-        angle_rad = math.radians(angle_deg)
+    for angle_offset_deg in [-45, -30, -15, 0, 15, 30, 45]:
+        angle_rad = math.radians(angle_offset_deg)
 
-        # Rotate axis around Z (perpendicular to image plane)
+        # Rotate ellipse axis by offset around approach axis (Rodrigues' formula)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
-        test_axis = np.array([
-            preferred_axis_cam[0] * cos_a - preferred_axis_cam[1] * sin_a,
-            preferred_axis_cam[0] * sin_a + preferred_axis_cam[1] * cos_a,
-            preferred_axis_cam[2]
-        ], dtype=float)
 
-        # Count neighbors in grasp direction (cone ±30°)
+        gripper_width_dir = (
+            ellipse_axis_proj * cos_a +
+            np.cross(approach_dir, ellipse_axis_proj) * sin_a +
+            approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
+        )
+
+        # Count neighbors in gripper width direction (±30° cone on both sides)
         collision_score = 0.0
         for other in all_fruits:
             if other == target_fruit:
@@ -202,12 +244,9 @@ def optimize_grasp_orientation_for_dense_bunch(
 
                 vec_norm = vec / dist
 
-                # Normalize test_axis
-                test_axis_norm = test_axis / max(np.linalg.norm(test_axis), 1e-6)
-
-                # Check if neighbor is in grasp direction (within 30° cone)
-                dot = float(np.dot(vec_norm, test_axis_norm))
-                if dot > math.cos(math.radians(30)):  # within cone
+                # Check if neighbor is in gripper width direction (±30° cone)
+                dot_width = abs(float(np.dot(vec_norm, gripper_width_dir)))
+                if dot_width > math.cos(math.radians(30)):  # within ±30° of width axis
                     # Closer neighbors are worse (weighted by inverse distance)
                     collision_score += 1.0 / max(dist, 0.02)
 
@@ -218,28 +257,26 @@ def optimize_grasp_orientation_for_dense_bunch(
         # Track best orientation (minimum collisions)
         if collision_score < min_collision_score:
             min_collision_score = collision_score
-            best_angle = angle_deg
+            best_angle = angle_offset_deg
 
-    # If no rotation helps (0° is best), keep original
-    if best_angle == 0:
-        # Only log if there were actual neighbors to avoid
-        if min_collision_score > 0:
-            print(f"[ORIENT] Keeping original orientation (collision_score: {min_collision_score:.2f})")
-        return preferred_axis_cam
-
-    # Rotate preferred axis to best angle
+    # Compute the optimized axis by rotating ellipse axis by best_angle
     angle_rad = math.radians(best_angle)
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
-    optimized_axis = np.array([
-        preferred_axis_cam[0] * cos_a - preferred_axis_cam[1] * sin_a,
-        preferred_axis_cam[0] * sin_a + preferred_axis_cam[1] * cos_a,
-        preferred_axis_cam[2]
-    ], dtype=float)
 
-    print(f"[ORIENT] Rotated grasp by {best_angle}° to avoid neighbors (collision_score: {min_collision_score:.2f})")
+    optimized_axis = (
+        ellipse_axis_proj * cos_a +
+        np.cross(approach_dir, ellipse_axis_proj) * sin_a +
+        approach_dir * np.dot(approach_dir, ellipse_axis_proj) * (1 - cos_a)
+    )
+    optimized_axis = optimized_axis / max(np.linalg.norm(optimized_axis), 1e-6)
 
-    return optimized_axis
+    if best_angle == 0:
+        print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), using ellipse axis (no adjustment, score={min_collision_score:.2f})")
+    else:
+        print(f"[ORIENT] Dense bunch (z_std={z_std:.4f}), ellipse axis + {best_angle:+d}° adjustment (score={min_collision_score:.2f})")
+
+    return optimized_axis  # Return the rotated axis direction in camera frame
 
 
 def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0):
@@ -519,6 +556,8 @@ def main_(args: argparse.Namespace):
             # { "Xc","Yc","Zc","bb","mask_resized","pt_base","pt_grip",
             #   "dist","z_std","vis_ratio","vis_quality",
             #   "long_axis_cam","long_axis_2d","ellipse_angle", ... }
+
+
             targets = []
             rejected_targets = []
 
@@ -623,6 +662,8 @@ def main_(args: argparse.Namespace):
                     valid &= mask_bool
                     heatmap = None
                     depth_vals = roi_xyz[:, :, 2][valid]
+
+
                     if depth_vals.size > 0:
                         z_lo, z_hi = np.percentile(depth_vals, [5.0, 90.0])
                         if z_hi <= z_lo:
@@ -632,6 +673,8 @@ def main_(args: argparse.Namespace):
                         score = np.clip(score, 0.0, 1.0)
                         score_u8 = (score * 255).astype(np.uint8)
                         heatmap = cv2.applyColorMap(score_u8, cv2.COLORMAP_JET)
+
+                        
                         # ----------------------------------------------------------
                         # Compute best point/direction from peak heatmap score
                         # ----------------------------------------------------------
@@ -854,19 +897,20 @@ def main_(args: argparse.Namespace):
                 best_target_prev = targets[best_idx]
 
             # --------------------------------------------------
-            # Use SHORT axis (minor axis) for orientation if available
+            # Orientation Optimization: Compute ROTATION ANGLE (not absolute orientation)
             # --------------------------------------------------
             if best_idx is not None:
                 t_best = targets[best_idx]
                 short_cam = t_best.get("short_axis_cam")
 
                 # Optimize orientation to avoid neighbor fruits in dense bunches
-                if short_cam is not None:
-                    use_axis_cam = optimize_grasp_orientation_for_dense_bunch(
-                        short_cam, t_best, targets, z_std_threshold=0.03
-                    )
-                else:
-                    use_axis_cam = None
+                # This returns the optimized AXIS DIRECTION in camera frame
+                optimized_axis_cam = optimize_grasp_orientation_for_dense_bunch(
+                    short_cam, t_best, targets, z_std_threshold=0.03
+                )
+
+                # Store optimized axis in target (will be used later to compute rotation)
+                t_best["optimized_axis_cam"] = optimized_axis_cam
 
                 # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
@@ -880,45 +924,90 @@ def main_(args: argparse.Namespace):
                 else:
                     prev_heat_point = None
 
-                if use_axis_cam is not None:
-                    try:
-                        T = tf_buffer.lookup_transform(
-                            "base_link", cam_frame, rclpyTime()
+                # Compute relative rotation from current gripper orientation to target orientation
+                # rotation_angle_deg = how much to rotate FROM current TO target (ellipse-based)
+                try:
+                    optimized_axis_cam = t_best.get("optimized_axis_cam")
+
+                    if optimized_axis_cam is not None:
+                        # Get current gripper orientation from TF (base_link -> gripper_tip)
+                        transform = tf_buffer.lookup_transform(
+                            "base_link", "gripper_tip", rclpyTime()
                         )
-                        q_tf = (
-                            T.transform.rotation.w,
-                            T.transform.rotation.x,
-                            T.transform.rotation.y,
-                            T.transform.rotation.z,
-                        )
+                        current_quat = transform.transform.rotation
+                        current_rot = R.from_quat([current_quat.x, current_quat.y, current_quat.z, current_quat.w])
+                        current_matrix = current_rot.as_matrix()
 
-                        # Rotate chosen camera-frame axis → world (base_link)
-                        axis_world = quat_rotate_vec(q_tf, use_axis_cam)
-                        n_axis = np.linalg.norm(axis_world)
-                        if n_axis > 1e-6:
-                            axis_world /= n_axis
-                        else:
-                            axis_world = np.array([1.0, 0.0, 0.0])
+                        # Transform optimized axis from camera frame to base frame
+                        # Create a pose at camera origin + axis direction
+                        axis_point_cam = PointStamped()
+                        axis_point_cam.header.frame_id = cam_frame
+                        axis_point_cam.header.stamp = rclpyTime().to_msg()
+                        axis_point_cam.point.x = optimized_axis_cam[0]
+                        axis_point_cam.point.y = optimized_axis_cam[1]
+                        axis_point_cam.point.z = optimized_axis_cam[2]
 
-                    except Exception as e:
-                        print("[WARN] Axis TF fail:", e)
-                        axis_world = np.array([1.0, 0.0, 0.0])
-                else:
-                    # fallback if no ellipse
-                    axis_world = np.array([1.0, 0.0, 0.0])
+                        # Also transform camera origin
+                        origin_cam = PointStamped()
+                        origin_cam.header.frame_id = cam_frame
+                        origin_cam.header.stamp = rclpyTime().to_msg()
+                        origin_cam.point.x = 0.0
+                        origin_cam.point.y = 0.0
+                        origin_cam.point.z = 0.0
 
-                # stabilize axis direction (avoid flips)
-                if prev_axis is not None and axis_world is not None:
-                    dot = float(np.dot(prev_axis, axis_world))
-                    if dot < 0:
-                        axis_world = -axis_world
-                prev_axis = axis_world.copy()
+                        axis_point_base = tf_buffer.transform(axis_point_cam, "base_link")
+                        origin_base = tf_buffer.transform(origin_cam, "base_link")
 
-                # Convert axis → quaternion
-                q = quat_align_x_to_axis(axis_world)
+                        # Axis direction in base frame = (axis_point - origin)
+                        target_axis_base = np.array([
+                            axis_point_base.point.x - origin_base.point.x,
+                            axis_point_base.point.y - origin_base.point.y,
+                            axis_point_base.point.z - origin_base.point.z
+                        ])
+                        target_axis_base /= max(np.linalg.norm(target_axis_base), 1e-6)
 
-                t_best["quat"] = q
-                t_best["approach_axis"] = axis_world
+                        # Current gripper Y-axis (width direction) in base frame
+                        gripper_y_current = current_matrix[:, 1]  # Y column
+
+                        # Current gripper Z-axis (approach direction) in base frame
+                        gripper_z_current = current_matrix[:, 2]  # Z column
+
+                        # Project target axis onto plane perpendicular to approach
+                        target_proj = target_axis_base - np.dot(target_axis_base, gripper_z_current) * gripper_z_current
+                        target_proj /= max(np.linalg.norm(target_proj), 1e-6)
+
+                        # Project current gripper Y onto same plane
+                        gripper_y_proj = gripper_y_current - np.dot(gripper_y_current, gripper_z_current) * gripper_z_current
+                        gripper_y_proj /= max(np.linalg.norm(gripper_y_proj), 1e-6)
+
+                        # Compute angle between projections
+                        dot = np.clip(np.dot(gripper_y_proj, target_proj), -1.0, 1.0)
+                        angle_rad = math.acos(dot)
+
+                        # Determine sign using cross product
+                        cross = np.cross(gripper_y_proj, target_proj)
+                        if np.dot(cross, gripper_z_current) < 0:
+                            angle_rad = -angle_rad
+
+                        relative_angle_deg = normalize_grasp_angle(math.degrees(angle_rad))
+                        t_best["rotation_angle_deg"] = relative_angle_deg
+                        print(f"[ORIENT] Relative rotation: {relative_angle_deg:+.1f}° (current→target)")
+                    else:
+                        # No optimized axis available, keep current orientation
+                        t_best["rotation_angle_deg"] = 0.0
+                        print(f"[ORIENT] No target axis, rotation=0° (keep current)")
+
+                except Exception as e:
+                    print(f"[ORIENT ERROR] Failed to compute relative rotation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    t_best["rotation_angle_deg"] = 0.0
+
+                # Compute approach axis for VISUALIZATION ONLY (direction from camera to fruit)
+                fruit_pos = np.array([t_best["Xc"], t_best["Yc"], t_best["Zc"]], dtype=float)
+                approach_distance = max(np.linalg.norm(fruit_pos), 1e-6)
+                approach_axis_vis = fruit_pos / approach_distance  # Normalized direction to fruit
+                t_best["approach_axis"] = approach_axis_vis
 
             # --------------------------------------------------
             # Publish goal for BEST fruit only (before rendering to minimize latency)
@@ -979,11 +1068,19 @@ def main_(args: argparse.Namespace):
                         goal.pose.position.y = float(pt_y)
                         goal.pose.position.z = float(pt_z)
 
-                        # orientation from long axis
-                        goal.pose.orientation.w = q[0]
-                        goal.pose.orientation.x = q[1]
-                        goal.pose.orientation.y = q[2]
-                        goal.pose.orientation.z = q[3]
+                        # ROTATION ANGLE (relative to current orientation)
+                        # Encode as quaternion: rotation around gripper approach axis
+                        # Robot will use THIS to rotate from current orientation
+                        rotation_deg = t_best.get("rotation_angle_deg", 0.0)
+                        rotation_rad = math.radians(rotation_deg)
+
+                        # Quaternion for rotation around Z-axis (wrist rotation)
+                        # Robot will extract this angle and apply it relative to current pose
+                        half_angle = rotation_rad / 2.0
+                        goal.pose.orientation.w = math.cos(half_angle)
+                        goal.pose.orientation.x = 0.0
+                        goal.pose.orientation.y = 0.0
+                        goal.pose.orientation.z = math.sin(half_angle)
 
                         goal_pub.publish(goal)
 
@@ -1105,6 +1202,9 @@ def main_(args: argparse.Namespace):
 
                     # VISUALIZE LONG-AXIS-BASED APPROACH (2D ARROW) — BEST ONLY
                     if i == best_idx:
+                        # Get rotation angle for visualization
+                        rotation_deg = t.get("rotation_angle_deg", 0.0)
+
                         axis_dir = t.get("approach_axis")
                         if axis_dir is not None:
                             vx, vy, vz = axis_dir
@@ -1123,7 +1223,15 @@ def main_(args: argparse.Namespace):
                             ax1 = int(cx - vx * L)
                             ay1 = int(cy - vy * L)
 
-                            axis_color = (0, 255, 255, 255)
+                            # Color the axis based on rotation amount
+                            if abs(rotation_deg) < 1:
+                                axis_color = (0, 255, 255, 255)  # cyan (no rotation)
+                            elif abs(rotation_deg) <= 15:
+                                axis_color = (0, 255, 200, 255)  # yellow-cyan
+                            elif abs(rotation_deg) <= 30:
+                                axis_color = (0, 165, 255, 255)  # orange
+                            else:
+                                axis_color = (0, 100, 255, 255)  # red-orange
 
                             cv2.arrowedLine(
                                 image_left_ocv,
@@ -1140,6 +1248,45 @@ def main_(args: argparse.Namespace):
                                 axis_color,
                                 2,
                             )
+
+                            # Draw rotation arc to visualize rotation angle
+                            if abs(rotation_deg) > 1:
+                                # Draw a small arc showing rotation direction and magnitude
+                                arc_radius = 25
+                                # Current angle in image coordinates
+                                current_angle_deg = math.degrees(math.atan2(vy, vx))
+
+                                # Draw arc from current angle to rotated angle
+                                start_angle = int(current_angle_deg)
+                                end_angle = int(current_angle_deg + rotation_deg)
+
+                                # Color based on rotation direction
+                                arc_color = (0, 255, 0, 255) if rotation_deg > 0 else (255, 0, 255, 255)  # green for +, magenta for -
+
+                                cv2.ellipse(
+                                    image_left_ocv,
+                                    (cx, cy),
+                                    (arc_radius, arc_radius),
+                                    0,  # angle
+                                    -start_angle,  # negative because cv2 Y-axis is flipped
+                                    -end_angle,
+                                    arc_color,
+                                    2
+                                )
+
+                                # Add text label showing rotation near the arrow
+                                rot_text_x = ax2 + 10
+                                rot_text_y = ay2 - 10
+                                cv2.putText(
+                                    image_left_ocv,
+                                    f"{rotation_deg:+.0f}deg",
+                                    (rot_text_x, rot_text_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    arc_color,
+                                    2,
+                                    cv2.LINE_AA,
+                                )
 
                         # Also show best heatmap peak direction (orange) toward highest score
                         peak_pt = t.get("best_point2d_smooth")
@@ -1212,10 +1359,12 @@ def main_(args: argparse.Namespace):
                             1,
                             cv2.LINE_AA,
                         )
+
+                        # Distance to gripper
                         dist_grip = t.get("dist", 0.0)
                         cv2.putText(
                             image_left_ocv,
-                            f"dist_grip:{dist_grip:.3f}m",
+                            f"dist:{dist_grip:.3f}m",
                             (cx + 10, cy + 52),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -1223,11 +1372,25 @@ def main_(args: argparse.Namespace):
                             1,
                             cv2.LINE_AA,
                         )
+
+                        # ROTATION ANGLE (relative to current orientation)
+                        rotation_deg = t.get("rotation_angle_deg", 0.0)
+                        # Color: green if 0°, yellow if small, orange/red if large rotation
+                        if abs(rotation_deg) < 1:
+                            rot_color = (0, 255, 0, 255)  # green (no rotation)
+                        elif abs(rotation_deg) <= 15:
+                            rot_color = (0, 255, 255, 255)  # yellow (small)
+                        elif abs(rotation_deg) <= 30:
+                            rot_color = (0, 165, 255, 255)  # orange (medium)
+                        else:
+                            rot_color = (0, 0, 255, 255)  # red (large)
+
+
                         vis_quality = t.get("vis_quality", 0.0)
                         cv2.putText(
                             image_left_ocv,
                             f"VisQ:{vis_quality:.2f}",
-                            (cx + 10, cy + 68),
+                            (cx + 10, cy + 84),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
                             (0, 200, 255, 255),
@@ -1239,7 +1402,7 @@ def main_(args: argparse.Namespace):
                         cv2.putText(
                             image_left_ocv,
                             f"Score:{acc_score:.2f}",
-                            (cx + 10, cy + 84),
+                            (cx + 10, cy + 100),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
                             (0, 255, 0, 255),  # green
