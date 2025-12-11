@@ -45,9 +45,11 @@ class GraspOutcomeClassifier:
     def __init__(self,
                  on_outcome: Optional[Callable[[str, str], None]] = None,
                  dead_time_thresh_s: float = 0.6,
-                 hold_time_s: float = 0.5):
-        
+                 hold_time_s: float = 0.5,
+                 logger = None):
+
         self.on_outcome = on_outcome
+        self.logger = logger
         self.dead_time_thresh_s = dead_time_thresh_s
         self.hold_time_s = hold_time_s
 
@@ -118,4 +120,5 @@ class GraspOutcomeClassifier:
         if self.on_outcome:
             self.on_outcome(label, end_name)
 
-        print(f"[grasp] final forces={self.last_forces} → end={end_name}")
+        if self.logger:
+            self.logger.debug(f"Grasp classifier: final forces={self.last_forces} → end={end_name}")

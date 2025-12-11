@@ -124,33 +124,33 @@ class DynamicObstacleManager:
     # Debug Print
     # ------------------------------
     def print_world(self):
-        print("========== CURRENT CUROBO WORLD ==========")
+        self.node.get_logger().info("========== CURRENT CUROBO WORLD ==========")
 
-        print("\nSPHERES:")
+        self.node.get_logger().info("\nSPHERES:")
         if len(self.world_model.sphere) == 0:
-            print("  (none)")
+            self.node.get_logger().info("  (none)")
         else:
             for s in self.world_model.sphere:
-                print(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
+                self.node.get_logger().info(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
 
-        print("\nCUBOIDS:")
+        self.node.get_logger().info("\nCUBOIDS:")
         if len(self.world_model.cuboid) == 0:
-            print("  (none)")
+            self.node.get_logger().info("  (none)")
         else:
             for c in self.world_model.cuboid:
-                print(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
+                self.node.get_logger().info(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
 
-        print("\n============================================\n")
+        self.node.get_logger().info("\n============================================\n")
 
     def ask_user_position(self, name):
-        print(f"Enter new XYZ for obstacle '{name}'")
+        self.node.get_logger().info(f"Enter new XYZ for obstacle '{name}'")
 
         try:
             x = float(input("X: "))
             y = float(input("Y: "))
             z = float(input("Z: "))
         except ValueError:
-            print("[DynamicObstacleManager] Invalid input!")
+            self.node.get_logger().warn("Invalid input for obstacle position!")
             return None
 
         return [x, y, z]

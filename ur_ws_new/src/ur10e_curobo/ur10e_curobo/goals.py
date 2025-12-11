@@ -48,15 +48,15 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     scale = global_scale * type_scale
 
     # 3) UR10e-friendly dt and velocity
-    #    - dt too small => jerk
-    #    - keep dt in [12 ms, 30 ms]
+    #    - dt too small => jerk, dt too large => slow response
+    #    - keep dt in [15 ms, 35 ms] for smoothness
     raw_dt = base_dt / max(scale, 1e-6)
-    dt = min(max(raw_dt, 0.012), 0.03)
+    dt = min(max(raw_dt, 0.015), 0.035)
 
-    # Velocity: linear scaling with cap
-    base_vel = 0.08        # slightly gentler than 0.1
+    # Velocity: linear scaling with cap (reduced for smoother motion)
+    base_vel = 0.06        # reduced from 0.08 for smoother trajectories
     vel = base_vel * scale
-    vel = min(vel, 0.25)   # hard cap for safety
+    vel = min(vel, 0.20)   # reduced cap from 0.25 for less vibration
 
     # 4) Build trajectory
     traj = build_trajectory(
@@ -110,25 +110,25 @@ def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=3, radius=0.0
 
             # Movement below 2 mm consistently
             if len(small_movements) >= 4 and max(small_movements) < 0.002:
-                print("🍏 Fruit is static — early exit")
+                node.get_logger().debug("Fruit is static — early exit")
                 return pose
 
             # Standard stability counter
             if delta < 0.004:  # 4 mm
                 stable_count += 1
-                print(f"🍏 Stable count: {stable_count}/{stable_needed} (delta={delta:.4f} m)")
+                node.get_logger().debug(f"Stable count: {stable_count}/{stable_needed} (delta={delta:.4f} m)")
             else:
                 stable_count = 0
 
         last_pose = pose
 
         if stable_count >= stable_needed:
-            print(f"🍏 Stable reacquired goal = {pose}")
+            node.get_logger().info(f"Stable reacquired goal at {pose[:3]}")
             return pose
 
         time.sleep(0.005)
 
-    print("⚠️ Reacquire timeout — using best estimate.")
+    node.get_logger().warn("Reacquire timeout — using best estimate")
     return node.best_goal_xyz or seed_xyz
 
 
@@ -165,16 +165,16 @@ def subscribe_to_goal_pose(node):
         ]
         node.latest_goal_time = time.time()
 
-        print("Stored latest global goal pose.")
+        node.get_logger().debug("Stored latest global goal pose")
         # ---------------------------------------
         """Triggered immediately on receiving a goal pose."""
         if node.goal_received:
             return  # Ignore duplicates
-        
+
 
 
         node.goal_received = True
-        print("✅ Goal received, stopping all idle activity...")
+        node.get_logger().info("Goal received, stopping all idle activity")
 
         # Stop idle timer immediately
         if hasattr(node, 'idle_timer'):
@@ -202,7 +202,7 @@ def subscribe_to_goal_pose(node):
         rotation_angle_rad = 2.0 * math.atan2(rotation_quat_z, rotation_quat_w)
         rotation_angle_deg = math.degrees(rotation_angle_rad)
 
-        print(f"[GOAL] Received rotation angle: {rotation_angle_deg:+.1f}° relative to current orientation")
+        node.get_logger().info(f"Received rotation angle: {rotation_angle_deg:+.1f}° relative to current orientation")
 
         # Get current EE orientation (this is our 0° baseline)
         current_ee_pose = node.get_end_effector_pose()
@@ -246,7 +246,7 @@ def subscribe_to_goal_pose(node):
         if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
             node.goal_poses.append(g)
             publish_goal_marker(node, g[:3])
-            print(f"🟢 Received goal pose: {g}")
+            node.get_logger().info(f"Received goal pose at [{g[0]:.3f}, {g[1]:.3f}, {g[2]:.3f}]")
             node.obstacles.update_pose("fruit_obstacle", g[:3])
         # Destroy the subscription — stop listening after first goal
         try:
@@ -283,10 +283,10 @@ def subscribe_to_goal_pose(node):
 
         curp = node.get_end_effector_pose()
         if curp and not is_robot_moving(node):
-            print("Performing idle micro-motion...")
+            node.get_logger().debug("Performing idle micro-motion")
             dx, dy, dz = sequence[idx['i']]
             tgt = [curp[0] + dx, curp[1] + dy, curp[2] + dz, *current_orientation]
-            print(f"Idle move to: {tgt}")
+            node.get_logger().debug(f"Idle move to: [{tgt[0]:.3f}, {tgt[1]:.3f}, {tgt[2]:.3f}]")
             _exec(node, tgt)
             idx['i'] += 1
 
@@ -367,23 +367,23 @@ def plan_and_execute(node):
 
         # 2. Reacquire
         seed = [x,y,z]
-        print("Reacquiring goal pose near:", seed)
+        node.get_logger().info(f"Reacquiring goal pose near: [{seed[0]:.3f}, {seed[1]:.3f}, {seed[2]:.3f}]")
         reacq = reacquire_goal_pose(node, seed_xyz=seed)
 
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
-            node.get_logger().warn("No reacquire; skipping goal.")
+            node.get_logger().warn("No reacquire; skipping goal")
             continue
 
         # 3. Final slow precise grasp (NOW use optimized orientation from vision)
         # Use latest tracked orientation if available, otherwise use original
         if hasattr(node, 'best_goal_quat') and node.best_goal_quat is not None:
             final_orientation = node.best_goal_quat
-            print(f"[GRASP] Using optimized orientation from vision tracker")
+            node.get_logger().debug("Using optimized orientation from vision tracker")
         else:
             final_orientation = optimized_orientation
-            print(f"[GRASP] Using initial optimized orientation")
+            node.get_logger().debug("Using initial optimized orientation")
 
         final_target = [x, y, z+0.02, *final_orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
@@ -415,7 +415,7 @@ def plan_and_execute(node):
                 grab_pose[2] - z_offset,
                 *grab_pose[3:]
             ]
-            print(f"Retreating from grab: Y+{y_offset:.2f}m, Z+{z_offset:.2f}m → {predrop_pose[:3]}")
+            node.get_logger().info(f"Retreating from grab: Y+{y_offset:.2f}m, Z+{z_offset:.2f}m → [{predrop_pose[0]:.3f}, {predrop_pose[1]:.3f}, {predrop_pose[2]:.3f}]")
             execute_single_pose(node, predrop_pose, motion_type="predropoff")
             wait_until_xyz(node, predrop_pose[:3])
             blend_motion(node)

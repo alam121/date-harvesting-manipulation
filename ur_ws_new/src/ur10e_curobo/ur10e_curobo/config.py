@@ -59,14 +59,14 @@ class JointsPreset:
 @dataclass
 class Planner:
     urdf_config: str = "ur10e.yml"
-    interpolation_dt: float = 0.004
+    interpolation_dt: float = 0.002  # Finer interpolation (was 0.004) for smoother paths
     speed_scale: float = 0.5
-    base_dt: float = 0.02          # common base timestep (s)
-    speed_home: float = 4.0        # for move_to_home_position
-    speed_dropoff: float = 4.5     # for move_to_dropoff_position
-    speed_predropoff: float = 2.5  # for pre-dropoff
-    speed_approach: float = 0.5    # for approach motion
-    speed_final: float = 0.5       # for precise grasp
+    base_dt: float = 0.025           # Slightly larger timestep (was 0.02) for smoother velocity commands
+    speed_home: float = 3.5          # Slightly slower (was 4.0) for smoother motion
+    speed_dropoff: float = 4.0       # Slightly slower (was 4.5)
+    speed_predropoff: float = 2.0    # Slightly slower (was 2.5)
+    speed_approach: float = 0.45     # Slightly slower (was 0.5) for smoother approach
+    speed_final: float = 0.4         # Slightly slower (was 0.5) for precise/smooth grasp
     
     pre_droffoff_z_offset: float = 0.1  # m above grab position (positive = up)
     pre_droffoff_y_offset: float = 0.15  # m back from grab position (positive = away from fruit)

@@ -62,7 +62,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         node.get_logger().warn("Plan failed for single pose."); return
     
     planner = node.cfg.planner
-    base_dt = planner.base_dt  # usually 0.02
+    base_dt = planner.base_dt  # usually 0.025
     # ------------------------------
     # 2. Speed scaling
     # ------------------------------
@@ -74,13 +74,13 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     scale = speed_map.get(motion_type, 1.0)
 
     dt = base_dt / scale
-    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
+    dt = min(max(dt, 0.015), 0.035)   # clamp for UR stability (increased upper limit)
 
     # ------------------------------
     # 6. velocity smoothing
     # ------------------------------
-    base_vel = 0.10
-    vel = min(base_vel * scale, 0.25)
+    base_vel = 0.08  # reduced from 0.10 for smoother motion
+    vel = min(base_vel * scale, 0.20)  # reduced from 0.25
 
 
 
@@ -91,7 +91,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         dt=dt,
         stop_flag=lambda: node.stop_requested
 )
-    print(f"Executing single pose (vel={vel:.2f}, dt={dt:.3f})")
+    node.get_logger().debug(f"Executing single pose (vel={vel:.2f}, dt={dt:.3f})")
     node.trajectory_pub.publish(traj)
 
 
@@ -148,15 +148,15 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     # 5. dt smoothing (critical)
     # ------------------------------
-    base_dt = planner.base_dt  # usually 0.02
+    base_dt = planner.base_dt  # usually 0.025
     dt = base_dt / scale
-    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
+    dt = min(max(dt, 0.015), 0.035)   # clamp for UR stability (increased upper limit)
 
     # ------------------------------
     # 6. velocity smoothing
     # ------------------------------
-    base_vel = 0.10
-    vel = min(base_vel * scale, 0.25)
+    base_vel = 0.08  # reduced from 0.10 for smoother motion
+    vel = min(base_vel * scale, 0.20)  # reduced from 0.25
 
     # ------------------------------
     # 7. Build trajectory

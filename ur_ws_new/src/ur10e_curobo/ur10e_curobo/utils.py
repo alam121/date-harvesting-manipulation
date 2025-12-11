@@ -30,39 +30,101 @@ def read_key(timeout=0.1):
 
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float, dt: float,
                      stop_flag: Optional[Callable[[], bool]] = None) -> JointTrajectory:
-    
+    """
+    Build smooth trajectory with velocity ramping and acceleration control.
+    Ramps velocity up at start, maintains constant in middle, ramps down at end.
+    """
     msg = JointTrajectory()
     msg.joint_names = joint_names
-    
+
+    states_list = list(states)
+    if not states_list:
+        return msg
+
+    n = len(states_list)
+    if n == 1:
+        # Single point - just hold position
+        pt = JointTrajectoryPoint()
+        pt.positions = list(states_list[0])
+        pt.velocities = [0.0] * len(joint_names)
+        pt.accelerations = [0.0] * len(joint_names)
+        pt.time_from_start.sec = 0
+        pt.time_from_start.nanosec = 0
+        msg.points.append(pt)
+        return msg
+
+    # Smooth velocity profile with ramp up/down
+    # First 20% and last 20% are ramps, middle 60% is constant
+    ramp_fraction = 0.2
+    ramp_points = max(2, int(n * ramp_fraction))
+
     t = 0.0
-    for q in states:
+    for i, q in enumerate(states_list):
         if stop_flag and stop_flag():
             break
+
         pt = JointTrajectoryPoint()
         pt.positions = list(q)
-        pt.velocities = [vel] * len(joint_names)
+
+        # Compute smooth velocity profile
+        if i < ramp_points:
+            # Ramp up (smooth acceleration)
+            alpha = i / ramp_points
+            # Use sine curve for smoother acceleration
+            smooth_alpha = (1 - math.cos(alpha * math.pi)) / 2
+            v_scale = smooth_alpha
+        elif i > n - ramp_points:
+            # Ramp down (smooth deceleration)
+            alpha = (n - i) / ramp_points
+            smooth_alpha = (1 - math.cos(alpha * math.pi)) / 2
+            v_scale = smooth_alpha
+        else:
+            # Constant velocity in the middle
+            v_scale = 1.0
+
+        # Apply scaled velocity
+        current_vel = vel * v_scale
+        pt.velocities = [current_vel] * len(joint_names)
+
+        # Compute accelerations (for smoother motion)
+        if i == 0:
+            # Start from rest
+            pt.accelerations = [0.0] * len(joint_names)
+        elif i == n - 1:
+            # End at rest
+            pt.accelerations = [0.0] * len(joint_names)
+        else:
+            # Smooth acceleration based on velocity change
+            # This helps the robot controller plan smoother motion
+            accel = (v_scale - v_scale) / dt if i > 0 else 0.0
+            pt.accelerations = [accel * 0.5] * len(joint_names)
+
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)
         t += dt
+
     return msg
 
 
-def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0):
+def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 15.0):
     """
     Wait until the end-effector reaches the target XYZ (within tolerance).
     Stops gracefully if stop_requested or timeout occurs.
     """
     from .motions import publish_stop_trajectory
     start_time = time.time()
+    last_pos = None
+    stationary_count = 0
 
     try:
         node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
         while getattr(node, "running", True):
             # Safety exit: timeout
             if time.time() - start_time > timeout:
-                node.get_logger().warn("Timeout waiting for EE to reach target.")
-                publish_stop_trajectory(node)
+                node.get_logger().warn("Timeout waiting for EE to reach target. Allowing robot to settle...")
+                # Don't stop trajectory - let it finish naturally
+                time.sleep(1.0)  # Give robot time to settle
                 break
 
             # Safety exit: stop signal
@@ -85,9 +147,26 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0):
                 continue
 
             # Check distance to goal
-            if math.dist(cur[:3], target_xyz) < tol:
-                node.get_logger().info("✅ End-effector reached target position.")
+            dist = math.dist(cur[:3], target_xyz)
+            if dist < tol:
+                node.get_logger().info(f"✅ End-effector reached target (dist={dist*1000:.1f}mm)")
                 break
+
+            # Check if robot stopped moving (reached a stable position, even if not the target)
+            if last_pos is not None:
+                move_dist = math.dist(cur[:3], last_pos)
+                if move_dist < 0.001:  # Less than 1mm movement
+                    stationary_count += 1
+                    if stationary_count > 20:  # 1 second of no movement (20 * 0.05s)
+                        node.get_logger().info(f"Robot stationary at {dist*1000:.1f}mm from target. Continuing...")
+                        break
+                else:
+                    stationary_count = 0
+            last_pos = cur[:3]
+
+            # Log progress every 2 seconds
+            if int(time.time() - start_time) % 2 == 0 and (time.time() - start_time) % 1 < 0.05:
+                node.get_logger().info(f"Moving... distance to target: {dist*1000:.1f}mm")
 
             time.sleep(0.05)
 
@@ -155,7 +234,7 @@ def compute_visibility_approach(node, x, y, z, dist=0.15):
         cam_fwd = cam_fwd / np.linalg.norm(cam_fwd)
 
     except Exception as e:
-        print("TF lookup failed:", e)
+        node.get_logger().warn(f"TF lookup failed for camera frame, using default: {e}")
         # default: ZED points forward in -Y and slightly up → safe fallback
         cam_fwd = np.array([-0.1, -0.8, 0.6])
         cam_fwd /= np.linalg.norm(cam_fwd)

@@ -17,7 +17,7 @@ exit_signal = False
 def _handle_signal(signum, frame):
     global exit_signal  # Declare that you are modifying the global variable
     exit_signal = True
-    print("\n[Signal] Graceful shutdown requested.")
+    sys.stderr.write("\n[Signal] Graceful shutdown requested.\n")
     # We removed rclpy.shutdown() from here, which is correct.
 
 signal.signal(signal.SIGINT, _handle_signal)   # Ctrl-C
@@ -44,7 +44,7 @@ def main():
             pass
         if rclpy.ok():
             rclpy.shutdown()
-        print("[System] Shutdown complete.")
+        sys.stderr.write("[System] Shutdown complete.\n")
 
 if __name__ == "__main__":
     main()

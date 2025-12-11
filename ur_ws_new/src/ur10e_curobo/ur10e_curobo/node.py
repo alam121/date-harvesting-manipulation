@@ -321,6 +321,9 @@ class UR10eCuroboMoveIt(Node):
                 motions_mod.move_to_home_position(self)
             elif action == "dropoff":
                 motions_mod.move_to_dropoff_position(self)
+                # Wait for robot to stabilize before opening gripper
+                import time
+                time.sleep(0.5)
                 gripper_mod.control_gripper(self, "OPEN")
             elif action == "execute":
                 self._prep_and_execute()
@@ -361,7 +364,7 @@ class UR10eCuroboMoveIt(Node):
             import time
             return time.strftime("%H:%M:%S")
 
-        print("[{}] Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, q=quit".format(ts()))
+        self.get_logger().info("Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, q=quit")
         last_key = None
         while self.running:
             key = read_key()
@@ -369,88 +372,88 @@ class UR10eCuroboMoveIt(Node):
                 continue
 
             # echo keypress
-            print(f"[{ts()}] key='{key}'")
+            self.get_logger().debug(f"key='{key}'")
 
             if key == 'y':
                 if self.latest_marker_pose:
-                    
+
                     from .goals import pose_to_vec7
                     g = pose_to_vec7(self.latest_marker_pose)
                     self.goal_poses.append(g)
-                    print(f"[{ts()}] saved goal #{len(self.goal_poses)} from marker: {g}")
-                    
+                    self.get_logger().info(f"Saved goal #{len(self.goal_poses)} from marker: {g}")
+
                     markers_mod.publish_goal_marker(self, g[:3])
                 else:
-                    print(f"[{ts()}] WARN: no latest_marker_pose yet; press 'y' again after moving the interactive marker in RViz.")
+                    self.get_logger().warn("No latest_marker_pose yet; press 'y' again after moving the interactive marker in RViz.")
 
             elif key == 'm':
-                print(f"[{ts()}] manual goal entry requested…")
+                self.get_logger().info("Manual goal entry requested")
                 curr_pose = self.get_end_effector_pose()
-                print(f"  current pose: {curr_pose}")
+                self.get_logger().info(f"Current pose: {curr_pose}")
                 self._manual_goal()
-                print(f"[{ts()}] manual goal entry done. total goals={len(self.goal_poses)}")
+                self.get_logger().info(f"Manual goal entry done. Total goals={len(self.goal_poses)}")
 
             elif key == 's':
-                print(f"[{ts()}] subscribing to /external_goal_pose…")
+                self.get_logger().info("Subscribing to /external_goal_pose")
                 goals_mod.subscribe_to_goal_pose(self)
-                self.goal_capture_active = False 
-                print(f"[{ts()}] subscribe called. waiting for external goal…")
+                self.goal_capture_active = False
+                self.get_logger().info("Subscribe called. Waiting for external goal")
 
             elif key == 'p':
-                print(f"[{ts()}] starting timed goal capture (10s)…")
+                self.get_logger().info("Starting timed goal capture (10s)")
                 self.start_goal_capture(10.0)
-                print(f"[{ts()}] capture armed. current collected={getattr(self, 'goal_capture_count', 0)}")
+                self.get_logger().info(f"Capture armed. Current collected={getattr(self, 'goal_capture_count', 0)}")
 
             elif key == 'n':
                 if self.goal_poses:
-                    print(f"[{ts()}] executing {len(self.goal_poses)} stored goal(s)…")
+                    self.get_logger().info(f"Executing {len(self.goal_poses)} stored goal(s)")
                     self._prep_and_execute()
-                    print(f"[{ts()}] execute finished. remaining goals={len(self.goal_poses)}")
+                    self.get_logger().info(f"Execute finished. Remaining goals={len(self.goal_poses)}")
                 else:
-                    print(f"[{ts()}] INFO: no goals to execute. add with 'y', 'm', or 's'.")
+                    self.get_logger().info("No goals to execute. Add with 'y', 'm', or 's'.")
 
             elif key == 'o':
-                print(f"[{ts()}] gripper → OPEN")
+                self.get_logger().info("Gripper → OPEN")
                 gripper_mod.control_gripper(self, 'OPEN')
 
             elif key == 'c':
-                print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
+                self.get_logger().info("Gripper → CLOSE; nudge back & rotate wrist")
                 gripper_mod.control_gripper(self, 'CLOSE')
                 motions_mod.rotate_wrist(self, 65, duration_s=0.38)
-                print(f"[{ts()}] post-close micro-motions done")
+                self.get_logger().info("Post-close micro-motions done")
 
             elif key == 'h':
-                print(f"[{ts()}] going HOME…")
+                self.get_logger().info("Going HOME")
                 motions_mod.move_to_home_position(self)
-                print(f"[{ts()}] reached HOME (or attempted)")
+                self.get_logger().info("Reached HOME (or attempted)")
 
             elif key == 'd':
-                print(f"[{ts()}] going to DROPOFF…")
+                self.get_logger().info("Going to DROPOFF")
                 motions_mod.move_to_dropoff_position(self)
                 gripper_mod.control_gripper(self, 'OPEN')
-                print(f"[{ts()}] at drop-off; gripper opened")
+                self.get_logger().info("At drop-off; gripper opened")
 
             elif key == 'k':
-                print(f"[{ts()}] STOP requested → publishing hold trajectory")
+                self.get_logger().info("STOP requested → publishing hold trajectory")
                 self.stop_requested = True
                 motions_mod.publish_stop_trajectory(self)
                 # Clear any queued goals so execution loop can exit quickly
                 self.goal_poses.clear()
 
             elif key == 'q':
-                print(f"[{ts()}] quitting…")
+                self.get_logger().info("Quitting")
                 self.running = False
                 self.stop_requested = True
                 rclpy.shutdown()
                 break
             elif key == "f":
-                print("finding current joint positions…")
-                print(self.current_joint_positions)
-                print("finding current end-effector pose…")
-                print(self.get_end_effector_pose()) 
-                
+                self.get_logger().info("Finding current joint positions")
+                self.get_logger().info(str(self.current_joint_positions))
+                self.get_logger().info("Finding current end-effector pose")
+                self.get_logger().info(str(self.get_end_effector_pose()))
+
             elif key == "t":
-                print("Update dynamic obstacle position:")
+                self.get_logger().info("Update dynamic obstacle position:")
 
                 pos = self.obstacles.ask_user_position("dyn_sphere")
                 if pos is not None:
@@ -459,7 +462,7 @@ class UR10eCuroboMoveIt(Node):
             else:
                 # unknown key helper
                 if key != last_key:  # avoid spamming if someone holds a key
-                    print(f"[{ts()}] NOTE: key '{key}' has no action. valid keys: y m s p n o c h d k q")
+                    self.get_logger().info(f"Key '{key}' has no action. Valid keys: y m s p n o c h d k q")
             last_key = key
 
 
@@ -470,11 +473,12 @@ class UR10eCuroboMoveIt(Node):
             y = float(input("Enter Y: "))
             z = float(input("Enter Z: "))
         except ValueError:
-            print("Invalid input."); return
+            self.get_logger().warn("Invalid input.")
+            return
         goal = [x, y, z] + (cur[3:] if cur else [1.0,0.0,0.0,0.0])
         self.goal_poses.append(goal)
-        markers_mod.publish_goal_marker(self, goal[:3]) 
-        print("Manual goal saved.")
+        markers_mod.publish_goal_marker(self, goal[:3])
+        self.get_logger().info("Manual goal saved.")
 
     def _continuous_goal_tracker(self, msg: PoseStamped):
 
@@ -551,7 +555,7 @@ class UR10eCuroboMoveIt(Node):
             final_quat_scipy = final_rot.as_quat()
             self.best_goal_quat = [final_quat_scipy[3], final_quat_scipy[0], final_quat_scipy[1], final_quat_scipy[2]]
 
-            print(f"Updated BEST (continuous) = {self.best_goal_xyz}, score={score}")
+            self.get_logger().debug(f"Updated BEST (continuous) = {self.best_goal_xyz}, score={score}")
 
 
     # goal capture (timed)
@@ -621,57 +625,57 @@ class UR10eCuroboMoveIt(Node):
     def debug_print_world(self):
         wm = self.motion_gen.world_model
 
-        print("\n========== CURRENT CUROBO WORLD ==========")
+        self.get_logger().info("\n========== CURRENT CUROBO WORLD ==========")
 
         # ----- SPHERES -----
-        print("SPHERES:")
+        self.get_logger().info("SPHERES:")
         if wm.sphere:
             for s in wm.sphere:
-                print(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
+                self.get_logger().info(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
         # ----- CUBOIDS -----
-        print("\nCUBOIDS:")
+        self.get_logger().info("\nCUBOIDS:")
         if wm.cuboid:
             for c in wm.cuboid:
-                print(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
+                self.get_logger().info(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
         # ----- CAPSULES -----
-        print("\nCAPSULES:")
+        self.get_logger().info("\nCAPSULES:")
         if wm.capsule:
             for cap in wm.capsule:
-                print(f"  - name={cap.name}, dims={cap.dims}, pose={cap.pose}")
+                self.get_logger().info(f"  - name={cap.name}, dims={cap.dims}, pose={cap.pose}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
         # ----- CYLINDERS -----
-        print("\nCYLINDERS:")
+        self.get_logger().info("\nCYLINDERS:")
         if wm.cylinder:
             for cyl in wm.cylinder:
-                print(f"  - name={cyl.name}, dims={cyl.dims}, pose={cyl.pose}")
+                self.get_logger().info(f"  - name={cyl.name}, dims={cyl.dims}, pose={cyl.pose}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
         # ----- MESH -----
-        print("\nMESHES:")
+        self.get_logger().info("\nMESHES:")
         if wm.mesh:
             for m in wm.mesh:
-                print(f"  - name={m.name}, pose={m.pose}")
+                self.get_logger().info(f"  - name={m.name}, pose={m.pose}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
         # ----- VOXEL -----
-        print("\nVOXEL GRIDS:")
+        self.get_logger().info("\nVOXEL GRIDS:")
         if wm.voxel:
             for v in wm.voxel:
-                print(f"  - name={v.name}, pose={v.pose}")
+                self.get_logger().info(f"  - name={v.name}, pose={v.pose}")
         else:
-            print("  (none)")
+            self.get_logger().info("  (none)")
 
-        print("============================================\n")
+        self.get_logger().info("============================================\n")
 
     def _start_perception_once(self):
         # run exactly once

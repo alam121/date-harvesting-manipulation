@@ -260,10 +260,9 @@ class ZedYoloPerception:
                 pt_cam.header.frame_id = self.cam_frame
                 pt_cam.header.stamp = rclpy.time.Time().to_msg()   # <-- time=0 (LATEST), not now()
                 pt_cam.point.x, pt_cam.point.y, pt_cam.point.z = Xc, Yc, Zc
-                print("im here")
+
                 try:
                     # transform to base
-                    print("HERE BOSS")
                     pt_base = self.node.tf_buffer.transform(pt_cam, "base_link", timeout=rclpyDuration(seconds=0.2))
                     # axis via PCA in camera → rotate to base
                     axis_cam = pca_long_axis_from_mask(mbin_vis, xyz_np)
@@ -287,7 +286,6 @@ class ZedYoloPerception:
                     self.point_pub.publish(pt_base)
 
                     # optional: on-screen preview
-                    print(self.show_view)
                     if self.show_view:
                         if disp_img is None:
                             disp_img = np.zeros_like(img_rgba)
