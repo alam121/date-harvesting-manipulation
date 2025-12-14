@@ -408,6 +408,18 @@ class UR10eCuroboMoveIt(Node):
         print("Manual goal saved.")
 
     def _continuous_goal_tracker(self, msg: PoseStamped):
+        # Always store latest goal pose unconditionally for immediate access
+        import time as _time
+        self.latest_goal_pose = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+        ]
+        self.latest_goal_time = _time.time()
 
         if self.goal_seed_xy is None:
             return

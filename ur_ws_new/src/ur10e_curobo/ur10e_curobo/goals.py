@@ -151,6 +151,28 @@ def subscribe_to_goal_pose(node):
     node.goal_received = False
     node.goal_poses.clear()
 
+    # Check if we already have a recent goal pose from the continuous tracker
+    # This avoids waiting for a new message when one was recently received
+    if hasattr(node, 'latest_goal_pose') and node.latest_goal_pose is not None:
+        age = time.time() - getattr(node, 'latest_goal_time', 0)
+        if age < 1.0:  # Use cached pose if less than 1 second old
+            print(f"Using cached goal pose (age={age:.2f}s)")
+            g = [
+                node.latest_goal_pose[0],
+                node.latest_goal_pose[1],
+                node.latest_goal_pose[2],
+                *current_orientation
+            ]
+            node.goal_received = True
+            node.goal_seed_xy = [g[0], g[1]]
+            node.best_goal_xyz = g[:3]
+            node.best_goal_score = float("inf")
+            node.goal_poses.append(g)
+            publish_goal_marker(node, g[:3])
+            print(f"🟢 Immediate goal from cache: {g}")
+            node.obstacles.update_pose("fruit_obstacle", g[:3])
+            return
+
     def _goal_cb(msg: PoseStamped):
 
         # ---- ALWAYS STORE LATEST GOAL POSE ----
