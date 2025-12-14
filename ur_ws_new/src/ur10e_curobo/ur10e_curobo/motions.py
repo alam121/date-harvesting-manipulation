@@ -51,23 +51,23 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     planner = node.cfg.planner
     base_dt = planner.base_dt  # usually 0.02
     # ------------------------------
-    # 2. Speed scaling
+    # 2. Speed scaling (applies global multiplier)
     # ------------------------------
     speed_map = {
         "home": planner.speed_home,
         "dropoff": planner.speed_dropoff,
         "predropoff": planner.speed_predropoff,
     }
-    scale = speed_map.get(motion_type, 1.0)
+    scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
 
     dt = base_dt / scale
-    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
+    dt = min(max(dt, planner.min_dt), planner.max_dt)   # clamp using config limits
 
     # ------------------------------
     # 6. velocity smoothing
     # ------------------------------
     base_vel = 0.10
-    vel = min(base_vel * scale, 0.25)
+    vel = min(base_vel * scale, planner.max_traj_velocity)
 
 
 
@@ -76,8 +76,11 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         interpolated_positions(res),
         vel=vel,
         dt=dt,
-        stop_flag=lambda: node.stop_requested
-)
+        stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=planner.ramp_points,
+    )
     node.trajectory_pub.publish(traj)
 
 
@@ -108,7 +111,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     )
 
     # ------------------------------
-    # 2. Speed scaling
+    # 2. Speed scaling (applies global multiplier)
     # ------------------------------
     planner = node.cfg.planner
     speed_map = {
@@ -116,7 +119,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         "dropoff": planner.speed_dropoff,
         "predropoff": planner.speed_predropoff,
     }
-    scale = speed_map.get(motion_type, 1.0)
+    scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
 
     # ------------------------------
     # 3. cuRobo plan
@@ -137,16 +140,16 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     base_dt = planner.base_dt  # usually 0.02
     dt = base_dt / scale
-    dt = min(max(dt, 0.015), 0.03)   # clamp for UR stability
+    dt = min(max(dt, planner.min_dt), planner.max_dt)   # clamp using config limits
 
     # ------------------------------
     # 6. velocity smoothing
     # ------------------------------
     base_vel = 0.10
-    vel = min(base_vel * scale, 0.25)
+    vel = min(base_vel * scale, planner.max_traj_velocity)
 
     # ------------------------------
-    # 7. Build trajectory
+    # 7. Build trajectory with smoothness params
     # ------------------------------
     traj = build_trajectory(
         node.joint_order,
@@ -154,6 +157,9 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=planner.ramp_points,
     )
 
     node.get_logger().info(f"Moving to {label} (vel={vel:.2f}, dt={dt:.3f})")
@@ -208,12 +214,16 @@ def move_backward(node, delta: float):
 
 def blend_motion(node, pause=0.2):
     # maintains smoothness, avoids jerk
+    planner = node.cfg.planner
     traj = build_trajectory(
         node.joint_order,
         [node.current_joint_positions],
         vel=0.05,
         dt=0.02,
-        stop_flag=lambda: node.stop_requested
+        stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=planner.ramp_points,
     )
     node.trajectory_pub.publish(traj)
     time.sleep(pause)

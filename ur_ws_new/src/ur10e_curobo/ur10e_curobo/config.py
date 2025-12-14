@@ -62,12 +62,30 @@ class Planner:
     interpolation_dt: float = 0.004
     speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
+
+    # === GLOBAL SPEED CONTROL ===
+    # Increase this to make ALL motions faster (0.5 = half speed, 2.0 = double speed)
+    global_speed_multiplier: float = 5.0
+
+    # Motion-specific speed factors (multiplied by global_speed_multiplier)
     speed_home: float = 4.0        # for move_to_home_position
-    speed_dropoff: float = 4.5     # for move_to_dropoff_position
+    speed_dropoff: float = 6.5    # for move_to_dropoff_position
     speed_predropoff: float = 2.5  # for pre-dropoff
     speed_approach: float = 0.5    # for approach motion
     speed_final: float = 0.5       # for precise grasp
-    
+
+    # === SMOOTHNESS PARAMETERS ===
+    # Lower values = smoother but slower transitions
+    max_joint_velocity: float = 1.5      # rad/s max velocity per joint
+    max_joint_acceleration: float = 2.0  # rad/s^2 max acceleration
+    ramp_points: int = 8                 # number of points for accel/decel ramps
+
+    # === TRAJECTORY LIMITS ===
+    # These control how fast trajectories can actually execute
+    min_dt: float = 0.005                # minimum timestep (lower = faster, but may cause instability)
+    max_dt: float = 0.05                 # maximum timestep
+    max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
+
     pre_droffoff_z_offset: float = -1.0  # m above dropoff
     pre_droffoff_y_offset: float = 1.5  # m back from dropoff
 

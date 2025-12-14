@@ -30,11 +30,6 @@ def init_gripper(node, suction: bool = True):
         dead_time_thresh_s=1.40,
         hold_time_s=0.5
     )
-    node.visualizer = grasp_viz_mod.GraspVisualizer()
-    node.visual_timer = node.create_timer(
-        0.03,  # ~30 fps
-        lambda: node.visualizer.draw()
-    )
 
 # ============================================================
 # MAIN CONTROL ENTRY

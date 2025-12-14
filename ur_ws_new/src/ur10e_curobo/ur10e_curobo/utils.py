@@ -29,22 +29,91 @@ def read_key(timeout=0.1):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float, dt: float,
-                     stop_flag: Optional[Callable[[], bool]] = None) -> JointTrajectory:
-    
+                     stop_flag: Optional[Callable[[], bool]] = None,
+                     max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8) -> JointTrajectory:
+    """
+    Build a smooth trajectory with proper velocity profiles and acceleration ramping.
+
+    Args:
+        max_vel: Maximum joint velocity (rad/s)
+        max_acc: Maximum joint acceleration (rad/s^2)
+        ramp_points: Number of points for acceleration/deceleration ramps
+    """
     msg = JointTrajectory()
     msg.joint_names = joint_names
-    
-    t = 0.0
-    for q in states:
+
+    states_list = list(states)
+    n_points = len(states_list)
+    n_joints = len(joint_names)
+
+    if n_points == 0:
+        return msg
+
+    # Compute velocity for each point based on position differences
+    velocities = []
+    for i, q in enumerate(states_list):
         if stop_flag and stop_flag():
             break
+
+        if i == 0 or i == n_points - 1:
+            # Zero velocity at start and end for smooth stops
+            joint_vels = [0.0] * n_joints
+        else:
+            # Compute velocity from position differences (central difference)
+            prev_q = states_list[i - 1]
+            next_q = states_list[i + 1]
+            joint_vels = []
+            for j in range(n_joints):
+                v = (next_q[j] - prev_q[j]) / (2 * dt)
+                # Clamp to max velocity
+                v = max(min(v, max_vel), -max_vel)
+                joint_vels.append(v)
+
+        velocities.append(joint_vels)
+
+    # Apply acceleration ramping at start and end
+    ramp_len = min(ramp_points, n_points // 2)
+
+    for i in range(ramp_len):
+        # Ramp up at start (smooth S-curve scaling)
+        scale = 0.5 * (1 - math.cos(math.pi * i / ramp_len))
+        for j in range(n_joints):
+            velocities[i][j] *= scale
+
+    for i in range(ramp_len):
+        # Ramp down at end
+        idx = n_points - 1 - i
+        if idx >= 0 and idx < len(velocities):
+            scale = 0.5 * (1 - math.cos(math.pi * i / ramp_len))
+            for j in range(n_joints):
+                velocities[idx][j] *= scale
+
+    # Build the trajectory message
+    t = 0.0
+    for i, q in enumerate(states_list):
+        if stop_flag and stop_flag():
+            break
+
         pt = JointTrajectoryPoint()
         pt.positions = list(q)
-        pt.velocities = [vel] * len(joint_names)
+        pt.velocities = velocities[i] if i < len(velocities) else [0.0] * n_joints
+
+        # Compute accelerations (derivative of velocity)
+        if i == 0 or i >= len(velocities) - 1:
+            pt.accelerations = [0.0] * n_joints
+        else:
+            accs = []
+            for j in range(n_joints):
+                a = (velocities[i + 1][j] - velocities[i - 1][j]) / (2 * dt)
+                a = max(min(a, max_acc), -max_acc)
+                accs.append(a)
+            pt.accelerations = accs
+
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)
         t += dt
+
     return msg
 
 
