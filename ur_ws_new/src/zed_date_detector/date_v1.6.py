@@ -14,8 +14,8 @@ import tf2_geometry_msgs
 import cv_viewer.tracking_viewer as cv_viewer
 
 import rclpy
-from geometry_msgs.msg import PointStamped, PoseStamped
-from std_msgs.msg import String
+from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped, Point
+from visualization_msgs.msg import Marker
 from tf2_ros import Buffer, TransformListener
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
@@ -38,6 +38,8 @@ net_fps = 0.0
 loop_fps = 0.0
 prev_axis = None
 prev_heat_point = None
+prev_direction_base = None  # smoothed 3D direction in base_link
+direction_history = deque(maxlen=10)  # sliding window for direction averaging
 yolo_masks = []
 yolo_classes = []
 yolo_scores = []
@@ -337,7 +339,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
 # Main
 # ============================================================
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point
+    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -355,7 +357,8 @@ def main_(args: argparse.Namespace):
     )
     point_pub = node.create_publisher(PointStamped, "/datefruit_3d_point", 10)
     goal_pub = node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
-    dir_pub = node.create_publisher(String, "/datefruit_direction", 10)
+    dir_pub = node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
+    dir_marker_pub = node.create_publisher(Marker, "/datefruit_direction_marker", 10)
 
     # TF listener
     tf_buffer = Buffer()
@@ -853,23 +856,75 @@ def main_(args: argparse.Namespace):
                 t_best = targets[best_idx]
                 pt_base = t_best["pt_base"]
                 q = t_best["quat"]
+                # Compute 3D direction in base_link frame (from mask center to closest point)
                 dir_msg = None
-                dir_vec = t_best.get("best_dir2d")
-                if dir_vec is not None and len(dir_vec) >= 2:
-                    vx = float(dir_vec[0])
-                    vy = float(dir_vec[1])
-                    n = math.hypot(vx, vy)
-                    if n > 1e-6:
-                        vx /= n
-                        vy /= n
-                    if abs(vx) < 0.25:
-                        direction_label = "center"
-                    elif vx > 0:
-                        direction_label = "right"
-                    else:
-                        direction_label = "left"
-                    dir_msg = String()
-                    dir_msg.data = direction_label
+                raw_pt = t_best.get("best_point2d")
+
+                if raw_pt is not None:
+                    # Compute direction from mask center to peak point
+                    x1, y1, x2, y2 = t_best["bb"]
+                    roi_w = x2 - x1
+                    roi_h = y2 - y1
+                    cx = roi_w / 2.0
+                    cy = roi_h / 2.0
+                    dx = float(raw_pt[0]) - cx
+                    dy = float(raw_pt[1]) - cy
+
+                    # Magnitude check: if peak is too close to center, direction is unreliable
+                    min_offset = 0.1 * min(roi_w, roi_h)
+                    offset_mag = math.hypot(dx, dy)
+
+                    if offset_mag > min_offset:
+                        # Normalize 2D direction
+                        dx /= offset_mag
+                        dy /= offset_mag
+
+                        # 2D direction in image plane -> 3D direction in camera frame
+                        dir_cam = np.array([dx, dy, 0.0], dtype=float)
+
+                        # Transform direction to base_link frame using TF rotation
+                        try:
+                            T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
+                            q_tf = (
+                                T.transform.rotation.w,
+                                T.transform.rotation.x,
+                                T.transform.rotation.y,
+                                T.transform.rotation.z,
+                            )
+                            dir_raw = np.array(quat_rotate_vec(q_tf, dir_cam), dtype=float)
+                        except Exception:
+                            dir_raw = dir_cam.copy()
+
+                        # Flip to be consistent with history
+                        if prev_direction_base is not None:
+                            if float(np.dot(prev_direction_base, dir_raw)) < 0:
+                                dir_raw = -dir_raw
+
+                        # Add to sliding window history
+                        direction_history.append(dir_raw.copy())
+
+                    # Compute averaged direction from history (weighted, newer = more weight)
+                    if len(direction_history) > 0:
+                        weights = np.arange(1, len(direction_history) + 1, dtype=float) ** 2
+                        stacked = np.vstack(list(direction_history))
+                        dir_avg = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
+
+                        # Normalize
+                        n_avg = np.linalg.norm(dir_avg)
+                        if n_avg > 1e-6:
+                            dir_avg /= n_avg
+                        else:
+                            dir_avg = np.array([1.0, 0.0, 0.0])
+
+                        prev_direction_base = dir_avg.copy()
+
+                        # Create Vector3Stamped message
+                        dir_msg = Vector3Stamped()
+                        dir_msg.header.frame_id = "base_link"
+                        dir_msg.header.stamp = node.get_clock().now().to_msg()
+                        dir_msg.vector.x = float(dir_avg[0])
+                        dir_msg.vector.y = float(dir_avg[1])
+                        dir_msg.vector.z = float(dir_avg[2])
 
                 # Track-by-detection smoothing: weighted avg of recent centroids
                 pt_vec = np.array(
@@ -912,6 +967,46 @@ def main_(args: argparse.Namespace):
                         point_pub.publish(pt_base_smoothed)
                         if dir_msg is not None:
                             dir_pub.publish(dir_msg)
+
+                            # Publish RViz arrow marker for direction visualization
+                            arrow = Marker()
+                            arrow.header.frame_id = "base_link"
+                            arrow.header.stamp = node.get_clock().now().to_msg()
+                            arrow.ns = "fruit_direction"
+                            arrow.id = 0
+                            arrow.type = Marker.ARROW
+                            arrow.action = Marker.ADD
+
+                            # Arrow from fruit center, pointing in direction
+                            arrow.scale.x = 0.01  # shaft diameter
+                            arrow.scale.y = 0.02  # head diameter
+                            arrow.scale.z = 0.02  # head length
+
+                            # Start point (fruit position)
+                            start = Point()
+                            start.x = float(pt_x)
+                            start.y = float(pt_y)
+                            start.z = float(pt_z)
+
+                            # End point (fruit + direction * length)
+                            arrow_len = 0.15  # 15cm arrow
+                            end = Point()
+                            end.x = float(pt_x + dir_msg.vector.x * arrow_len)
+                            end.y = float(pt_y + dir_msg.vector.y * arrow_len)
+                            end.z = float(pt_z + dir_msg.vector.z * arrow_len)
+
+                            arrow.points = [start, end]
+
+                            # Orange color
+                            arrow.color.r = 1.0
+                            arrow.color.g = 0.5
+                            arrow.color.b = 0.0
+                            arrow.color.a = 1.0
+
+                            arrow.lifetime.sec = 0
+                            arrow.lifetime.nanosec = 500000000  # 0.5s
+
+                            dir_marker_pub.publish(arrow)
 
                 except Exception as e:
                     print(f"[WARN] Publish failed: {e}")

@@ -11,7 +11,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
 from std_msgs.msg import Bool, Float32MultiArray, String, Float32
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
 
@@ -167,7 +167,16 @@ class UR10eCuroboMoveIt(Node):
             self._continuous_goal_tracker,  # callback function below
             self.goal_qos
         )
-        
+
+        # Direction subscriber for pre-grasp bias
+        self.fruit_direction = None
+        self.create_subscription(
+            Vector3Stamped,
+            '/datefruit_direction',
+            self._direction_cb,
+            10
+        )
+
         # tf
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -271,6 +280,10 @@ class UR10eCuroboMoveIt(Node):
 
     def _marker_cb(self, msg): ##Stores last clicked pose
         self.latest_marker_pose = msg.pose
+
+    def _direction_cb(self, msg: Vector3Stamped):
+        """Store fruit direction for pre-grasp bias."""
+        self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
 
     def _robot_running_cb(self, msg): ##Logs robot program state
         self.robot_running = msg.data

@@ -1,5 +1,6 @@
 # ruff: noqa
 import time, math, torch
+import numpy as np
 from geometry_msgs.msg import Pose as ROSPose, PoseStamped
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
@@ -161,6 +162,14 @@ def subscribe_to_goal_pose(node):
         node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node))
         return
 
+    # Cancel any existing idle timer first (prevents multiple timers from stacking)
+    if hasattr(node, 'idle_timer'):
+        try:
+            node.idle_timer.cancel()
+            del node.idle_timer
+        except Exception:
+            pass
+
     # Reset all tracking state for fresh cycle
     node.reset_goal_tracking()
 
@@ -289,6 +298,16 @@ def subscribe_to_goal_pose(node):
 
     def _idle_cb():
         """Perform gentle idle motions until a goal is received."""
+        # Guard against shutdown/stop - cancel timer and exit early
+        if not getattr(node, 'running', True) or getattr(node, 'stop_requested', False):
+            if hasattr(node, 'idle_timer'):
+                try:
+                    node.idle_timer.cancel()
+                    del node.idle_timer
+                except Exception:
+                    pass
+            return
+
         if node.goal_received or idx["i"] >= len(sequence):
             if hasattr(node, 'idle_timer'):
                 node.idle_timer.cancel()
@@ -312,6 +331,25 @@ def subscribe_to_goal_pose(node):
 def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
     v = getattr(node, 'current_joint_velocities', None) or []
     return any(abs(x) > velocity_threshold for x in v)
+
+def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
+    d_vis_pt = compute_visibility_approach(node, x, y, z, dist=0.05)
+    d_vis = -np.array([x - d_vis_pt[0], y - d_vis_pt[1], z - d_vis_pt[2]])
+    d_vis /= np.linalg.norm(d_vis)
+
+    if getattr(node, "fruit_direction", None) is not None:
+        d_dir = -np.array(node.fruit_direction)
+        d_dir /= np.linalg.norm(d_dir)
+        dir_conf = 0.6
+    else:
+        d_dir = d_vis
+        dir_conf = 0.0
+
+    vis_conf = np.clip(vis_ratio * np.exp(-z_std / 0.02), 0.0, 1.0)
+
+    d = dir_conf * d_dir + vis_conf * d_vis
+    return d / np.linalg.norm(d)
+
 
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
@@ -344,18 +382,25 @@ def plan_and_execute(node):
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
         yoffset = node.yoffset
-        ax, ay, az = compute_visibility_approach(node, x, y, z, dist=0.05)
+
+        # Direction-biased pre-grasp: use fruit direction if available
+        direction = getattr(node, 'fruit_direction', None)
+        standoff = 0.08  # 12cm standoff distance
+
+        d_blend = blend_approach_direction(node, x, y, z)
+        ax = x + d_blend[0] * standoff
+        ay = y + d_blend[1] * standoff
+        az = z + d_blend[2] * standoff
+
         # 1. Plan approach
-        if z > 1.30:  #high targets: top-down approach
-            orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-            approach = [x, y+0.12, z, *orientation] #top approach
-            #y -= 0.004; z -= 0.4
-        else:
-            orientation = goal[3:]
-            #approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
-            approach = [ax, ay, az-0.10, *orientation]
-            print("Going for side approach:", approach)
-            #z -= 0.055; y -= 0.003
+        # if z > 1.30:  #high targets: top-down approach
+        #     orientation = quaternion_from_approach(node, pitch_deg=-35.0)
+        #     approach = [x, y+0.12, z, *orientation] #top approach
+        # else:
+        orientation = goal[3:]
+        approach = [ax, ay, az-0.10, *orientation]
+        print("Going for side approach:", approach)
+        #z -= 0.055; y -= 0.003
             
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
             continue
@@ -416,6 +461,13 @@ def plan_and_execute(node):
         node.reset_goal_tracking()
 
         if len(node.goal_poses) == 0:
+            # Cancel idle timer when cycle completes
+            if hasattr(node, 'idle_timer'):
+                try:
+                    node.idle_timer.cancel()
+                    del node.idle_timer
+                except Exception:
+                    pass
             node.get_logger().info("All goals completed; returned HOME.")
         else:
             node.get_logger().info("Preparing for next goal...")
