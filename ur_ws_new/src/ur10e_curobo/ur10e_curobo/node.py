@@ -474,7 +474,6 @@ class UR10eCuroboMoveIt(Node):
         if score < self.best_goal_score - 0.002:
             self.best_goal_score = score
             self.best_goal_xyz = [x, y, z]
-            print(f"Updated BEST (continuous) = {self.best_goal_xyz}, score={score}")
 
 
     # goal capture (timed)
