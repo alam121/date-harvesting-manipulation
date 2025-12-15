@@ -21,6 +21,7 @@ setup(
     entry_points={
         "console_scripts": [
             "main = ur10e_curobo.main:main",   # <- REQUIRED
+            "gui = ur10e_curobo.gui:main",     # Desktop GUI control panel
             # "perception = ur10e_curobo.perception:cli",  # optional
         ],
     },

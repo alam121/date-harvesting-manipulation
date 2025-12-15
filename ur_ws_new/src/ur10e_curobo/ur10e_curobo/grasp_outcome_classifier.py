@@ -3,21 +3,34 @@
 from typing import List, Tuple, Callable, Optional
 import time
 
-# ---- Templates (your values) ----
-OPEN           = [-0.10, -0.09, -0.09]
-CLOSED_NOTHING = [-0.17, -0.21, -0.17]
-PROPER         = [-0.18, -0.21, -0.18]
-WEAK_L         = [-0.18, -0.21, -0.17]
-WEAK_R         = [-0.17, -0.21, -0.18]
+# ============================================================
+# Force Templates for Date Fruit Grasping
+# NOTE: Calibrate these values by running with DEBUG_FORCES=True
+#       and observing the force readings for each scenario
+# ============================================================
+DEBUG_FORCES = False  # Set True to log forces for calibration
+
+# ---- Templates (tune for your dates) ----
+# Forces are typically negative when gripping
+OPEN           = [-0.10, -0.09, -0.09]   # fingers open, no contact
+CLOSED_NOTHING = [-0.16, -0.19, -0.16]   # closed on air
+WEAK_L         = [-0.17, -0.20, -0.15]   # weak grip, left finger not engaged
+WEAK_R         = [-0.15, -0.20, -0.17]   # weak grip, right finger not engaged
+WEAK_C         = [-0.17, -0.17, -0.17]   # weak grip, center finger not engaged
+PROPER         = [-0.20, -0.24, -0.20]   # solid 3-finger grip on date
 
 TEMPLATES: List[Tuple[str, List[float]]] = [
     ("OPEN", OPEN),
     ("CLOSED_NOTHING", CLOSED_NOTHING),
-    ("PROPER", PROPER),
     ("WEAK", WEAK_L),
     ("WEAK", WEAK_R),
+    ("WEAK", WEAK_C),
+    ("PROPER", PROPER),
 ]
 STAGE = {"OPEN": 0, "CLOSED_NOTHING": 1, "WEAK": 2, "PROPER": 3}
+
+# Minimum force difference to distinguish templates
+MIN_TEMPLATE_DIST = 0.01
 
 def _dist2(a: List[float], b: List[float]) -> float:
     return (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2
@@ -118,4 +131,17 @@ class GraspOutcomeClassifier:
         if self.on_outcome:
             self.on_outcome(label, end_name)
 
-        print(f"[grasp] final forces={self.last_forces} → end={end_name}")
+        # Debug output for template calibration
+        if DEBUG_FORCES:
+            f = self.last_forces
+            print(f"[grasp] ═══════════════════════════════════════")
+            print(f"[grasp] FORCES: [{f[0]:.4f}, {f[1]:.4f}, {f[2]:.4f}]")
+            print(f"[grasp] RESULT: {label} ({end_name})")
+            print(f"[grasp] max_stage={self.max_stage_seen} end_stage={end_stage}")
+            print(f"[grasp] ═══════════════════════════════════════")
+            # Suggest template update if this looks like a valid grab
+            if label == "GRABBED" and end_name == "PROPER":
+                print(f"[grasp] 💡 Good grab! If grip was solid, use these as PROPER template:")
+                print(f"[grasp]    PROPER = [{f[0]:.2f}, {f[1]:.2f}, {f[2]:.2f}]")
+        else:
+            print(f"[grasp] final forces={self.last_forces} → end={end_name}")

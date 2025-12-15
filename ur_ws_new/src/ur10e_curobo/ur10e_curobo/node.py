@@ -10,7 +10,7 @@ import math
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String, Float32
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
@@ -148,7 +148,15 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
         self.create_subscription(Bool, "/emergency_stop", self._stop_cb, 10)
         self.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
-        
+
+        # GUI integration: command subscriber and info publishers
+        self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
+        self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
+        self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
+
+        # Timer to publish goal info periodically
+        self.create_timer(0.2, self._publish_goal_info)  # 5Hz
+
         self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
         #while not self.io_client.wait_for_service(timeout_sec=1.0):
             #self.get_logger().info("Waiting for /set_io service...")
@@ -228,9 +236,6 @@ class UR10eCuroboMoveIt(Node):
 
         self.last_frames = [] # last few frames for stability checking
 
-
-
-
         # gripper/classifier
         gripper_mod.init_gripper(self, suction=False)
 
@@ -238,9 +243,19 @@ class UR10eCuroboMoveIt(Node):
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
-        
+
         # # Perception: ZED + YOLO
         #self._maybe_start_perception()
+
+    def reset_goal_tracking(self):
+        """Reset all goal tracking state for a fresh cycle."""
+        self.goal_seed_xy = None
+        self.best_goal_xyz = None
+        self.best_goal_score = float("inf")
+        self.last_frames.clear()
+        self.latest_goal_pose = None
+        self.latest_goal_time = 0.0
+        self.goal_received = False
 
     # callbacks
     def _check_joint_states(self):  #Confirms joint feedback received
@@ -276,6 +291,87 @@ class UR10eCuroboMoveIt(Node):
 
     def _classifier_tick(self):   ##Runs periodic classifier update
         self.classifier.tick()
+
+    def _ui_command_cb(self, msg: String):
+        """Handle commands from the GUI."""
+        import json
+        cmd = msg.data.strip()
+        self.get_logger().info(f"UI command received: {cmd}")
+
+        if cmd == "home":
+            motions_mod.move_to_home_position(self)
+        elif cmd == "dropoff":
+            motions_mod.move_to_dropoff_position(self)
+            gripper_mod.control_gripper(self, 'OPEN')
+        elif cmd == "execute":
+            if self.goal_poses:
+                self._prep_and_execute()
+        elif cmd == "clear":
+            self.goal_poses.clear()
+            self.get_logger().info("Goals cleared")
+        elif cmd == "open":
+            gripper_mod.control_gripper(self, 'OPEN')
+        elif cmd == "close":
+            gripper_mod.control_gripper(self, 'CLOSE')
+        elif cmd == "stop":
+            self.stop_requested = True
+            motions_mod.publish_stop_trajectory(self)
+            self.goal_poses.clear()
+        elif cmd.startswith("capture "):
+            try:
+                duration = float(cmd.split()[1])
+                self.start_goal_capture(duration)
+            except (ValueError, IndexError):
+                self.start_goal_capture(10.0)
+        elif cmd == "capture_stop":
+            self.stop_goal_capture()
+        elif cmd.startswith("set_speeds "):
+            # Format: "set_speeds home dropoff approach"
+            try:
+                parts = cmd.split()
+                self.cfg.planner.speed_home = float(parts[1])
+                self.cfg.planner.speed_dropoff = float(parts[2])
+                self.cfg.planner.speed_approach = float(parts[3])
+                self.get_logger().info(f"Speeds updated: home={parts[1]}, dropoff={parts[2]}, approach={parts[3]}")
+            except (ValueError, IndexError) as e:
+                self.get_logger().warn(f"Invalid set_speeds format: {e}")
+        elif cmd.startswith("set_velocity_scale "):
+            # Format: "set_velocity_scale 1.5"
+            try:
+                scale = float(cmd.split()[1])
+                scale = max(0.1, min(scale, 10.0))  # Clamp between 0.1 and 10.0
+                self.cfg.planner.global_speed_multiplier = scale
+                self.speed_scale = scale
+                self.get_logger().info(f"Velocity scale set to {scale}")
+                # Publish updated scale
+                scale_msg = Float32()
+                scale_msg.data = scale
+                self.velocity_scale_pub.publish(scale_msg)
+            except (ValueError, IndexError) as e:
+                self.get_logger().warn(f"Invalid set_velocity_scale format: {e}")
+        elif cmd == "debug_world":
+            self.debug_print_world()
+        else:
+            self.get_logger().warn(f"Unknown UI command: {cmd}")
+
+    def _publish_goal_info(self):
+        """Publish goal information for GUI consumption."""
+        import json
+        info = {
+            "goal_count": len(self.goal_poses),
+            "goals": [[round(v, 4) for v in g[:3]] for g in self.goal_poses[:5]],  # First 5 goals, XYZ only
+            "latest_goal": [round(v, 4) for v in self.latest_goal_pose[:3]] if self.latest_goal_pose else None,
+            "best_goal_xyz": [round(v, 4) for v in self.best_goal_xyz] if self.best_goal_xyz else None,
+            "capture_active": self.goal_capture_active,
+            "capture_count": getattr(self, 'goal_capture_count', 0),
+            "velocity_scale": self.cfg.planner.global_speed_multiplier,
+            "speed_home": self.cfg.planner.speed_home,
+            "speed_dropoff": self.cfg.planner.speed_dropoff,
+            "speed_approach": self.cfg.planner.speed_approach,
+        }
+        msg = String()
+        msg.data = json.dumps(info)
+        self.goal_info_pub.publish(msg)
 
     # methods used by helpers (so helpers can call like node.get_end_effector_pose())
     def get_end_effector_pose(self):

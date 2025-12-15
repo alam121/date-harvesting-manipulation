@@ -492,9 +492,16 @@ class DeltoROSDriver(Node):
         return value if value < 32768 else value - 65536
 
     def estimate_force(self, current):
-        """ Convert motor current (mA) to estimated force (N) """
-        k = 0.01  # Scaling factor (adjust experimentally)
-        return round(k * current, 2)
+        baseline = -17.5   # measured
+        k = 0.3            # bigger scale for better resolution
+
+        raw = current - baseline
+
+        # Clamp very small noise
+        if abs(raw) < 0.3:
+            raw = 0.0
+
+        return round(k * raw, 3)
         
         
     def publish_force_data(self):

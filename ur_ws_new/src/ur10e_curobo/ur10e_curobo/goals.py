@@ -77,17 +77,22 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=3, radius=0.08):
+def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=5, radius=0.08):
+    """
+    Reacquire goal pose with improved Z-axis accuracy.
 
+    Uses median filtering and Z-specific stability checks to reduce
+    depth noise from stereo camera.
+    """
     stable_count = 0
     last_pose = None
     start = time.time()
 
-    # Track small movements
-    small_movements = []
+    # Track Z history for median filtering (reduces depth noise)
+    z_history = []
+    stable_poses = []
 
     while time.time() - start < timeout:
-
         pose = node.best_goal_xyz
         if pose is None:
             time.sleep(0.005)
@@ -95,40 +100,55 @@ def reacquire_goal_pose(node, seed_xyz, timeout=5.5, stable_needed=3, radius=0.0
 
         x, y, z = pose
 
+        # XY radius check
         if math.hypot(x - seed_xyz[0], y - seed_xyz[1]) > radius:
             time.sleep(0.005)
             continue
 
-        # Distance change between frames
+        # Track Z history for filtering
+        z_history.append(z)
+        if len(z_history) > 20:
+            z_history.pop(0)
+
+        # Z outlier rejection: skip if Z deviates >8mm from median
+        if len(z_history) >= 5:
+            z_median = sorted(z_history)[len(z_history) // 2]
+            if abs(z - z_median) > 0.008:
+                time.sleep(0.005)
+                continue
+
+        # Stability check with tighter thresholds
         if last_pose is not None:
             delta = math.dist(last_pose, pose)
+            z_delta = abs(z - last_pose[2])
 
-            # Collect last few deltas
-            small_movements.append(delta)
-            if len(small_movements) > 5:
-                small_movements.pop(0)
-
-            # Movement below 2 mm consistently
-            if len(small_movements) >= 4 and max(small_movements) < 0.002:
-                print("🍏 Fruit is static — early exit")
-                return pose
-
-            # Standard stability counter
-            if delta < 0.004:  # 4 mm
+            # Require both total delta < 2mm AND Z delta < 2mm
+            if delta < 0.002 and z_delta < 0.002:
                 stable_count += 1
-                print(f"🍏 Stable count: {stable_count}/{stable_needed} (delta={delta:.4f} m)")
+                print(f"Stable reacquire pose: {[round(v,3) for v in pose]} (stable {stable_count}/{stable_needed})")
+                stable_poses.append(pose)
             else:
                 stable_count = 0
+                stable_poses.clear()
 
         last_pose = pose
 
         if stable_count >= stable_needed:
-            print(f"🍏 Stable reacquired goal = {pose}")
-            return pose
+            # Return median-filtered Z for accuracy
+            stable_z_values = [p[2] for p in stable_poses]
+            median_z = sorted(stable_z_values)[len(stable_z_values) // 2]
+            return (x, y, median_z)
 
         time.sleep(0.005)
 
-    print("⚠️ Reacquire timeout — using best estimate.")
+    # Timeout fallback: use median Z if we have history
+    if z_history:
+        z_median = sorted(z_history)[len(z_history) // 2]
+        best = node.best_goal_xyz
+        if best:
+            return (best[0], best[1], z_median)
+        return (seed_xyz[0], seed_xyz[1], z_median)
+
     return node.best_goal_xyz or seed_xyz
 
 
@@ -141,6 +161,9 @@ def subscribe_to_goal_pose(node):
         node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node))
         return
 
+    # Reset all tracking state for fresh cycle
+    node.reset_goal_tracking()
+
     # Destroy previous subscription if it exists
     if hasattr(node, 'goal_pose_sub'):
         node.destroy_subscription(node.goal_pose_sub)
@@ -148,7 +171,6 @@ def subscribe_to_goal_pose(node):
 
     cur = node.get_end_effector_pose()
     current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
-    node.goal_received = False
     node.goal_poses.clear()
 
     # Check if we already have a recent goal pose from the continuous tracker
@@ -322,7 +344,7 @@ def plan_and_execute(node):
         goal = node.goal_poses.pop(0)
         x,y,z = goal[:3]
         yoffset = node.yoffset
-        ax, ay, az = compute_visibility_approach(node, x, y, z, dist=0.18)
+        ax, ay, az = compute_visibility_approach(node, x, y, z, dist=0.05)
         # 1. Plan approach
         if z > 1.30:  #high targets: top-down approach
             orientation = quaternion_from_approach(node, pitch_deg=-35.0)
@@ -331,7 +353,8 @@ def plan_and_execute(node):
         else:
             orientation = goal[3:]
             #approach = [x, y+node.yoffset, z-node.zoffset, *orientation] #side approch: Z negative means down, y positive means back 
-            approach = [ax, ay, az, *orientation]
+            approach = [ax, ay, az-0.10, *orientation]
+            print("Going for side approach:", approach)
             #z -= 0.055; y -= 0.003
             
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
@@ -366,10 +389,11 @@ def plan_and_execute(node):
         
         
         if node.slip_detection or node.grab_miss or node.weak_grab:
-            node.control_gripper("OPEN"); cur = node.get_end_effector_pose()
-            if cur: exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
-            node.slip_detection = node.grab_miss = False
-            node.control_gripper("CLOSE")
+            print("Re-attempting grasp due to:",)
+            # node.control_gripper("OPEN"); cur = node.get_end_effector_pose()
+            # if cur: exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
+            # node.slip_detection = node.grab_miss = False
+            # node.control_gripper("CLOSE")
             
         # 4. Drop-off and return
         rotate_wrist(node, 90); time.sleep(0.9)
@@ -387,6 +411,9 @@ def plan_and_execute(node):
         time.sleep(0.2)  # small delay to allow state update
         node.control_gripper("OPEN")
         move_to_home_position(node)
+
+        # Reset tracking state for next goal
+        node.reset_goal_tracking()
 
         if len(node.goal_poses) == 0:
             node.get_logger().info("All goals completed; returned HOME.")

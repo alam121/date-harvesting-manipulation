@@ -55,6 +55,28 @@ BEST_REUSE_THRESH = 0.05         # 5 cm positional tolerance in base_link
 # --- Track-by-detection smoothing ---
 best_history = deque(maxlen=3)   # shorter window for snappier response
 
+# ============================================================
+# Scoring System Weights (tune these for your application)
+# ============================================================
+SCORE_WEIGHTS = {
+    "distance": 0.30,       # closer is better (normalized: 0-1)
+    "visibility": 0.25,     # higher vis_ratio is better
+    "depth_quality": 0.20,  # lower z_std is better
+    "confidence": 0.15,     # YOLO detection confidence
+    "ellipse": 0.10,        # bonus for valid ellipse fit (orientation reliability)
+}
+
+# Distance scoring parameters
+DIST_MIN = 0.10  # best possible distance (m)
+DIST_MAX = 1.50  # worst acceptable distance (m)
+
+# Depth quality parameters
+Z_STD_IDEAL = 0.005   # ideal depth std (m)
+Z_STD_WORST = 0.05    # worst acceptable depth std (m)
+
+# Sticky bonus: how much to prefer the previous best fruit
+STICKY_BONUS = 0.15   # added to score if this was the previous best
+
 
 # ============================================================
 # Utility Functions
@@ -144,6 +166,74 @@ def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0)
         sleep(0.05)
     print(f"[WARN] TF {source_frame}->{target_frame} unavailable after {timeout:.1f}s")
     return False
+
+
+def compute_fruit_score(target: dict, prev_pt_base: np.ndarray = None) -> dict:
+    """
+    Compute a comprehensive score for a detected fruit.
+
+    Returns dict with:
+        - total_score: weighted sum of all factors (0-1, higher is better)
+        - components: individual score components for debugging
+    """
+    components = {}
+
+    # 1. Distance score (closer = better)
+    dist = target.get("dist", float("inf"))
+    if dist <= DIST_MIN:
+        dist_score = 1.0
+    elif dist >= DIST_MAX:
+        dist_score = 0.0
+    else:
+        dist_score = 1.0 - (dist - DIST_MIN) / (DIST_MAX - DIST_MIN)
+    components["distance"] = dist_score
+
+    # 2. Visibility score (higher vis_ratio = better)
+    vis_ratio = target.get("vis_ratio", 0.0)
+    vis_score = max(0.0, min(1.0, vis_ratio))
+    components["visibility"] = vis_score
+
+    # 3. Depth quality score (lower z_std = better)
+    z_std = target.get("z_std", Z_STD_WORST)
+    if z_std <= Z_STD_IDEAL:
+        depth_score = 1.0
+    elif z_std >= Z_STD_WORST:
+        depth_score = 0.0
+    else:
+        depth_score = 1.0 - (z_std - Z_STD_IDEAL) / (Z_STD_WORST - Z_STD_IDEAL)
+    components["depth_quality"] = depth_score
+
+    # 4. Detection confidence score
+    confidence = target.get("confidence", 0.5)
+    conf_score = max(0.0, min(1.0, confidence))
+    components["confidence"] = conf_score
+
+    # 5. Ellipse quality score (bonus for valid orientation)
+    has_ellipse = target.get("short_axis_cam") is not None
+    ellipse_score = 1.0 if has_ellipse else 0.3  # partial credit if no ellipse
+    components["ellipse"] = ellipse_score
+
+    # Weighted sum
+    total = 0.0
+    for key, weight in SCORE_WEIGHTS.items():
+        total += weight * components.get(key, 0.0)
+
+    # Sticky bonus: if this fruit matches the previous best, add bonus
+    if prev_pt_base is not None and target.get("pt_base") is not None:
+        cur_pt = np.array([
+            target["pt_base"].point.x,
+            target["pt_base"].point.y,
+            target["pt_base"].point.z,
+        ], dtype=float)
+        dist_to_prev = np.linalg.norm(cur_pt - prev_pt_base)
+        if dist_to_prev < BEST_REUSE_THRESH:
+            total += STICKY_BONUS
+            components["sticky_bonus"] = STICKY_BONUS
+
+    # Clamp final score
+    total = max(0.0, min(1.0 + STICKY_BONUS, total))
+
+    return {"total_score": total, "components": components}
 
 
 def xywh2abcd_(xywh: np.ndarray) -> np.ndarray:
@@ -617,6 +707,11 @@ def main_(args: argparse.Namespace):
                             + pt_grip.point.z ** 2
                         )
 
+                        # Get detection confidence from ZED object
+                        obj_confidence = getattr(o, "confidence", 0.5) / 100.0  # ZED uses 0-100
+                        if not (0.0 <= obj_confidence <= 1.0):
+                            obj_confidence = 0.5
+
                         targets.append(
                             {
                                 "Xc": Xc,
@@ -635,12 +730,15 @@ def main_(args: argparse.Namespace):
                                 "z_std": depth_std,
                                 "vis_ratio": vis_ratio,
                                 "vis_quality": vis_quality,
+                                "confidence": obj_confidence,
                                 "short_axis_cam": t_short_axis,
                                 "long_axis_2d": long_axis_2d,
                                 "ellipse_angle": t_angle,
                                 "heatmap": heatmap,
                                 "best_dir2d": t_best_dir2d,
                                 "best_point2d": t_best_point,
+                                "score": 0.0,  # will be computed below
+                                "score_components": {},
                             }
                         )
 
@@ -655,24 +753,13 @@ def main_(args: argparse.Namespace):
                     continue
 
             # --------------------------------------------------
-            # Hard-Sticky BEST Fruit Selection
+            # Multi-Factor BEST Fruit Selection (Scoring System)
             # --------------------------------------------------
 
-            # 1. Pick closest fruit THIS FRAME (only used if we don't reuse previous)
-            frame_best_idx = None
-            frame_best_dist = float("inf")
-
-            for i, t in enumerate(targets):
-                if t["dist"] < frame_best_dist:
-                    frame_best_dist = t["dist"]
-                    frame_best_idx = i
-
-            best_idx = frame_best_idx  # default
-
-            # 2. Strong Reuse (sticky lock-on)
-            # We ONLY switch if previous best is completely lost.
+            # Get previous best position for sticky bonus calculation
+            prev_pt_base = None
             if best_target_prev is not None:
-                prev_pt = np.array(
+                prev_pt_base = np.array(
                     [
                         best_target_prev["pt_base"].point.x,
                         best_target_prev["pt_base"].point.y,
@@ -681,32 +768,20 @@ def main_(args: argparse.Namespace):
                     dtype=float,
                 )
 
-                reuse_idx = None
-                min_dist = float("inf")
+            # Compute scores for all targets
+            best_idx = None
+            best_score = -1.0
 
-                # Try to find the *same* fruit again by proximity
-                for i, t in enumerate(targets):
-                    cur_pt = np.array(
-                        [
-                            t["pt_base"].point.x,
-                            t["pt_base"].point.y,
-                            t["pt_base"].point.z,
-                        ],
-                        dtype=float,
-                    )
-                    d = np.linalg.norm(cur_pt - prev_pt)
+            for i, t in enumerate(targets):
+                score_result = compute_fruit_score(t, prev_pt_base)
+                t["score"] = score_result["total_score"]
+                t["score_components"] = score_result["components"]
 
-                    if d < BEST_REUSE_THRESH:  # e.g. 5 cm
-                        if d < min_dist:
-                            min_dist = d
-                            reuse_idx = i
+                if score_result["total_score"] > best_score:
+                    best_score = score_result["total_score"]
+                    best_idx = i
 
-                # If we found a matching fruit → ALWAYS reuse it
-                if reuse_idx is not None:
-                    best_idx = reuse_idx
-                # else: previous best is considered LOST → we must switch to frame_best_idx
-
-            # 3. Persistent state update
+            # Persistent state update
             if best_idx is not None:
                 best_target_prev = targets[best_idx]
 
@@ -1065,14 +1140,28 @@ def main_(args: argparse.Namespace):
                             1,
                             cv2.LINE_AA,
                         )
-                        vis_quality = t.get("vis_quality", 0.0)
+                        # Display total score prominently
+                        total_score = t.get("score", 0.0)
                         cv2.putText(
                             image_left_ocv,
-                            f"VisQ:{vis_quality:.2f}",
+                            f"SCORE: {total_score:.2f}",
                             (cx + 10, cy + 68),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 200, 255, 255),
+                            0.6,
+                            (0, 255, 0, 255),  # bright green
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        # Show score breakdown
+                        sc = t.get("score_components", {})
+                        conf = t.get("confidence", 0.0)
+                        cv2.putText(
+                            image_left_ocv,
+                            f"D:{sc.get('distance', 0):.2f} V:{sc.get('visibility', 0):.2f} Z:{sc.get('depth_quality', 0):.2f} C:{conf:.2f}",
+                            (cx + 10, cy + 84),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            (180, 180, 255, 255),
                             1,
                             cv2.LINE_AA,
                         )

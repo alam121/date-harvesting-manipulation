@@ -100,11 +100,19 @@ class Perception:
     use_gpu: bool = False
 
 @dataclass
+class Gripper:
+    use_suction: bool = False
+    min_fingers_for_stop: int = 2
+    closing_steps: int = 10
+    step_delay_s: float = 0.05
+
+@dataclass
 class AppConfig:
     topics: Topics = field(default_factory=Topics)
     joints: JointsPreset = field(default_factory=JointsPreset)
     planner: Planner = field(default_factory=Planner)
     perception: Perception = field(default_factory=Perception)
+    gripper: Gripper = field(default_factory=Gripper)
 
     @staticmethod
     def from_env(cfg: "AppConfig") -> "AppConfig":

@@ -5,11 +5,15 @@ from std_msgs.msg import Float32MultiArray
 class DeltoGripperController:
     def __init__(self, node,
                  suction: bool = False,
+                 min_fingers_for_stop: int = 3,
+                 steps: int = 10,
+                 step_delay: float = 0.2,
                  force_topic='/gripper/force',
                  target_topic='/gripper/target_joint'):
 
         self.node = node
         self.suction = suction  # <-- master mode switch
+        self.min_fingers_for_stop = min_fingers_for_stop
 
         self.force_data = [0.0, 0.0, 0.0]
 
@@ -17,8 +21,8 @@ class DeltoGripperController:
         self.force_threshold = -0.15
 
         # Motion parameters
-        self.steps = 10
-        self.step_delay = 0.2
+        self.steps = steps
+        self.step_delay = step_delay
         self.current_step = 0
 
         # FSM state
@@ -37,9 +41,9 @@ class DeltoGripperController:
 
         # Positions (shared)
         self.open_position = [
-            -0.0942, -0.1500, 2.1960, -0.5062,
-            -1.6318, 0.1309, 1.7753, -0.4887,
-            0.3333, 0.2234, 2.1973, -0.4311
+            -0.0942, -0.1500, 2.2260, -0.5062,
+            -1.6318, 0.1309, 1.8753, -0.4887,
+            0.3333, 0.2234, 2.2273, -0.4311
         ]
 
         self.closed_position = self.open_position.copy()
