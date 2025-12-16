@@ -548,10 +548,12 @@ class UR10eCuroboMoveIt(Node):
 
         # ------------------------------------------------------
         # 2. Depth check with softer limit
-        # Allow 3.5–4 cm variation
+        # Reject if Z deviates too much from best (both higher AND lower)
         # ------------------------------------------------------
-        if self.best_goal_xyz and z > self.best_goal_xyz[2] + 0.01:
-            return
+        if self.best_goal_xyz:
+            z_diff = abs(z - self.best_goal_xyz[2])
+            if z_diff > 0.05:  # 5cm tolerance
+                return
 
         # ------------------------------------------------------
         # 3. Distance to EE (we want CLOSER = BETTER)

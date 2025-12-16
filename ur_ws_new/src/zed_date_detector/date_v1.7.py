@@ -28,6 +28,7 @@ import math
 # ============================================================
 lock = Lock()
 run_event = Event()
+dets_ready = Event()
 exit_signal = False
 image_net: np.ndarray = None
 detections: List[sl.CustomMaskObjectData] = None
@@ -314,7 +315,7 @@ def detections_to_custom_masks_(dets) -> List[sl.CustomMaskObjectData]:
 # YOLO Thread
 # ============================================================
 def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
-    global image_net, exit_signal, run_event, detections, net_fps
+    global image_net, exit_signal, run_event, dets_ready, detections, net_fps
     print("Initializing Network...")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for YOLO; GPU not available.")
@@ -341,13 +342,14 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
             with lock:
                 detections = detections_to_custom_masks_(det)
             run_event.clear()
+            dets_ready.set()
         sleep(0.005)
 
 # ============================================================
 # Main
 # ============================================================
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_event, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history, latest_goal_msg, latest_dir_msg
+    global image_net, exit_signal, run_event, dets_ready, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history, latest_goal_msg, latest_dir_msg
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -468,9 +470,11 @@ def main_(args: argparse.Namespace):
     display_scale = 0.6  # shrink window display without affecting computations
 
     Z_MAX = 1.34  # limit in base_link frame
+    last_viz = 0.0
 
     def perception_loop():
-        global exit_signal, run_event, image_net, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, latest_goal_msg, latest_dir_msg
+        global exit_signal, run_event, dets_ready, image_net, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, latest_goal_msg, latest_dir_msg
+        nonlocal last_viz
         t_prev = time()
         while not exit_signal:
             if zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
@@ -486,12 +490,17 @@ def main_(args: argparse.Namespace):
                 zed.retrieve_image(image_left, sl.VIEW.LEFT)
                 image_net = image_left.get_data()
                 run_event.set()
+            # Only ingest/process when YOLO thread produced new detections
+            if not dets_ready.is_set():
+                continue
+            dets_ready.clear()
 
             # Ingest YOLO detections into ZED
             with lock:
                 current_dets = detections
-            if current_dets is not None:
-                zed.ingest_custom_mask_objects(current_dets)
+            if current_dets is None:
+                continue
+            zed.ingest_custom_mask_objects(current_dets)
 
             zed.retrieve_custom_objects(objects, obj_runtime_param)
 
@@ -981,7 +990,8 @@ def main_(args: argparse.Namespace):
             # Best fruit centroid = BLUE dot + “BEST”
             # Others = RED dots
             # --------------------------------------------------
-            if not SKIP_DRAW:
+            now = time()
+            if not SKIP_DRAW and (now - last_viz) >= 0.1:
                 # Gray out filtered detections so we can see what was rejected
                 if SHOW_REJECTED:
                     for rej in rejected_targets:
@@ -1260,6 +1270,7 @@ def main_(args: argparse.Namespace):
             key = cv2.waitKey(1)
             if key in (27, ord("q"), ord("Q")):
                 exit_signal = True
+            last_viz = now
 
     perception_thread = Thread(target=perception_loop, daemon=True)
     perception_thread.start()

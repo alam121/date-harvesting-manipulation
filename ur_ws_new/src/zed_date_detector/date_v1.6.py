@@ -14,8 +14,7 @@ import tf2_geometry_msgs
 import cv_viewer.tracking_viewer as cv_viewer
 
 import rclpy
-from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped, Point
-from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
 from tf2_ros import Buffer, TransformListener
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
@@ -40,6 +39,11 @@ prev_axis = None
 prev_heat_point = None
 prev_direction_base = None  # smoothed 3D direction in base_link
 direction_history = deque(maxlen=10)  # sliding window for direction averaging
+
+# --- Timer-based publishing data ---
+latest_goal_msg = None
+latest_dir_msg = None
+pub_lock = Lock()
 yolo_masks = []
 yolo_classes = []
 yolo_scores = []
@@ -339,7 +343,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
 # Main
 # ============================================================
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history
+    global image_net, exit_signal, run_signal, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history, latest_goal_msg, latest_dir_msg
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -355,10 +359,22 @@ def main_(args: argparse.Namespace):
         depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
-    point_pub = node.create_publisher(PointStamped, "/datefruit_3d_point", 10)
     goal_pub = node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
     dir_pub = node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
-    dir_marker_pub = node.create_publisher(Marker, "/datefruit_direction_marker", 10)
+
+    # Timer-based publishing callback (50Hz)
+    def publish_timer_cb():
+        global latest_goal_msg, latest_dir_msg
+        with pub_lock:
+            if latest_goal_msg is not None:
+                # Update timestamp for fresh publish
+                latest_goal_msg.header.stamp = node.get_clock().now().to_msg()
+                goal_pub.publish(latest_goal_msg)
+            if latest_dir_msg is not None:
+                latest_dir_msg.header.stamp = node.get_clock().now().to_msg()
+                dir_pub.publish(latest_dir_msg)
+
+    pub_timer = node.create_timer(0.02, publish_timer_cb)  # 50Hz
 
     # TF listener
     tf_buffer = Buffer()
@@ -796,8 +812,19 @@ def main_(args: argparse.Namespace):
                 short_cam = t_best.get("short_axis_cam")
                 use_axis_cam = short_cam
 
+                # Cache TF lookup once for this frame (used for axis and direction)
+                cached_q_tf = None
+                try:
+                    T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
+                    cached_q_tf = (
+                        T.transform.rotation.w,
+                        T.transform.rotation.x,
+                        T.transform.rotation.y,
+                        T.transform.rotation.z,
+                    )
+                except Exception:
+                    pass
 
-                
                 # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
                 if best_pt is not None:
@@ -810,31 +837,16 @@ def main_(args: argparse.Namespace):
                 else:
                     prev_heat_point = None
 
-                if use_axis_cam is not None:
-                    try:
-                        T = tf_buffer.lookup_transform(
-                            "base_link", cam_frame, rclpyTime()
-                        )
-                        q_tf = (
-                            T.transform.rotation.w,
-                            T.transform.rotation.x,
-                            T.transform.rotation.y,
-                            T.transform.rotation.z,
-                        )
-
-                        # Rotate chosen camera-frame axis → world (base_link)
-                        axis_world = quat_rotate_vec(q_tf, use_axis_cam)
-                        n_axis = np.linalg.norm(axis_world)
-                        if n_axis > 1e-6:
-                            axis_world /= n_axis
-                        else:
-                            axis_world = np.array([1.0, 0.0, 0.0])
-
-                    except Exception as e:
-                        print("[WARN] Axis TF fail:", e)
+                if use_axis_cam is not None and cached_q_tf is not None:
+                    # Rotate chosen camera-frame axis → world (base_link)
+                    axis_world = quat_rotate_vec(cached_q_tf, use_axis_cam)
+                    n_axis = np.linalg.norm(axis_world)
+                    if n_axis > 1e-6:
+                        axis_world /= n_axis
+                    else:
                         axis_world = np.array([1.0, 0.0, 0.0])
                 else:
-                    # fallback if no ellipse
+                    # fallback if no ellipse or TF failed
                     axis_world = np.array([1.0, 0.0, 0.0])
 
                 # stabilize axis direction (avoid flips)
@@ -882,17 +894,10 @@ def main_(args: argparse.Namespace):
                         # 2D direction in image plane -> 3D direction in camera frame
                         dir_cam = np.array([dx, dy, 0.0], dtype=float)
 
-                        # Transform direction to base_link frame using TF rotation
-                        try:
-                            T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
-                            q_tf = (
-                                T.transform.rotation.w,
-                                T.transform.rotation.x,
-                                T.transform.rotation.y,
-                                T.transform.rotation.z,
-                            )
-                            dir_raw = np.array(quat_rotate_vec(q_tf, dir_cam), dtype=float)
-                        except Exception:
+                        # Transform direction to base_link frame using cached TF rotation
+                        if cached_q_tf is not None:
+                            dir_raw = np.array(quat_rotate_vec(cached_q_tf, dir_cam), dtype=float)
+                        else:
                             dir_raw = dir_cam.copy()
 
                         # Flip to be consistent with history
@@ -930,6 +935,16 @@ def main_(args: argparse.Namespace):
                 pt_vec = np.array(
                     [pt_base.point.x, pt_base.point.y, pt_base.point.z], dtype=float
                 )
+
+                # Detect large position jump → reset tracking (new fruit)
+                if len(best_history) > 0:
+                    last_pt = best_history[-1]
+                    jump_dist = np.linalg.norm(pt_vec - last_pt)
+                    if jump_dist > 0.15:  # >15cm jump = new fruit, clear history
+                        best_history.clear()
+                        best_target_prev = None  # remove sticky bonus
+                        #print(f"[VISION] Position jump {jump_dist:.2f}m - reset tracking")
+
                 best_history.append(pt_vec)
                 if len(best_history) >= 2:
                     weights = np.arange(
@@ -941,75 +956,25 @@ def main_(args: argparse.Namespace):
                     pt_smooth = pt_vec.copy()
                 pt_x, pt_y, pt_z = pt_smooth
 
-                try:
-                    if pt_z <= Z_MAX:
-                        goal = PoseStamped()
-                        goal.header = pt_base.header
+                if pt_z <= Z_MAX:
+                    goal = PoseStamped()
+                    goal.header = pt_base.header
 
-                        # direct fruit position
-                        goal.pose.position.x = float(pt_x)
-                        goal.pose.position.y = float(pt_y)
-                        goal.pose.position.z = float(pt_z)
+                    # direct fruit position
+                    goal.pose.position.x = float(pt_x)
+                    goal.pose.position.y = float(pt_y)
+                    goal.pose.position.z = float(pt_z)
 
-                        # orientation from long axis
-                        goal.pose.orientation.w = q[0]
-                        goal.pose.orientation.x = q[1]
-                        goal.pose.orientation.y = q[2]
-                        goal.pose.orientation.z = q[3]
+                    # orientation from long axis
+                    goal.pose.orientation.w = q[0]
+                    goal.pose.orientation.x = q[1]
+                    goal.pose.orientation.y = q[2]
+                    goal.pose.orientation.z = q[3]
 
-                        goal_pub.publish(goal)
-
-                        pt_base_smoothed = PointStamped()
-                        pt_base_smoothed.header = pt_base.header
-                        pt_base_smoothed.point.x = float(pt_x)
-                        pt_base_smoothed.point.y = float(pt_y)
-                        pt_base_smoothed.point.z = float(pt_z)
-                        point_pub.publish(pt_base_smoothed)
-                        if dir_msg is not None:
-                            dir_pub.publish(dir_msg)
-
-                            # Publish RViz arrow marker for direction visualization
-                            arrow = Marker()
-                            arrow.header.frame_id = "base_link"
-                            arrow.header.stamp = node.get_clock().now().to_msg()
-                            arrow.ns = "fruit_direction"
-                            arrow.id = 0
-                            arrow.type = Marker.ARROW
-                            arrow.action = Marker.ADD
-
-                            # Arrow from fruit center, pointing in direction
-                            arrow.scale.x = 0.01  # shaft diameter
-                            arrow.scale.y = 0.02  # head diameter
-                            arrow.scale.z = 0.02  # head length
-
-                            # Start point (fruit position)
-                            start = Point()
-                            start.x = float(pt_x)
-                            start.y = float(pt_y)
-                            start.z = float(pt_z)
-
-                            # End point (fruit + direction * length)
-                            arrow_len = 0.15  # 15cm arrow
-                            end = Point()
-                            end.x = float(pt_x + dir_msg.vector.x * arrow_len)
-                            end.y = float(pt_y + dir_msg.vector.y * arrow_len)
-                            end.z = float(pt_z + dir_msg.vector.z * arrow_len)
-
-                            arrow.points = [start, end]
-
-                            # Orange color
-                            arrow.color.r = 1.0
-                            arrow.color.g = 0.5
-                            arrow.color.b = 0.0
-                            arrow.color.a = 1.0
-
-                            arrow.lifetime.sec = 0
-                            arrow.lifetime.nanosec = 500000000  # 0.5s
-
-                            dir_marker_pub.publish(arrow)
-
-                except Exception as e:
-                    print(f"[WARN] Publish failed: {e}")
+                    # Update global messages for timer-based publishing
+                    with pub_lock:
+                        latest_goal_msg = goal
+                        latest_dir_msg = dir_msg
             else:
                 best_history.clear()
 
