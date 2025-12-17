@@ -8,6 +8,7 @@ log/
 *.h5
 *.onnx
 *.engine
+*.pptx
 
 # Videos / data
 *.mp4
