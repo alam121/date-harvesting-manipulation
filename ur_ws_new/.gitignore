@@ -1,0 +1,18 @@
+# ROS
+build/
+install/
+log/
+
+# ML / DL models
+*.pth
+*.h5
+*.onnx
+*.engine
+
+# Videos / data
+*.mp4
+*.bag
+
+# Generated outputs
+zed_output*
+
