@@ -9,7 +9,7 @@ log/
 *.onnx
 *.engine
 *.pptx
-
+*.pyc
 # Videos / data
 *.mp4
 *.bag
