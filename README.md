@@ -1,24 +1,35 @@
 
 # ManipulatorsDatePalm 🤖🌴
 
-An automated date palm harvesting system using UR10e robot arm with GPU-accelerated motion planning and AI-based vision detection.
+> An automated date palm harvesting system using UR10e robot arm with GPU-accelerated motion planning and AI-based vision detection.
 
-## Current Latest
-- **Branch**: `dev2`
-- **Repository**: Documents/manipulatorsdatepalm
-- **Vision Code**: `date_v1.7.py`
-- **Motion Planning**: `python3 -m ur10e_curobo.main`
+[![ROS 2 Humble](https://img.shields.io/badge/ROS_2-Humble-blue)](https://docs.ros.org/en/humble/)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green)](https://www.python.org/)
+[![CUDA 11.4](https://img.shields.io/badge/CUDA-11.4-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 
-## Overview
+## 📋 Current Latest
+| Component | Version/File |
+|-----------|-------------|
+| **Branch** | `Humble_Refactor6.1_labdatesrealbunch` |
+| **Repository** | `Documents/manipulatorsdatepalm` |
+| **Vision Code** | `date_v1.7.py` |
+| **Motion Planning** | `python3 -m ur10e_curobo.main` |
+| **Model Weights** | `lab_dates_realbunch.pt` |
 
-This system provides a complete ROS 2 Humble-based control stack for the UR10e robot arm integrated with:
+## 🎯 Overview
 
-1. **cuRobo** - GPU-accelerated motion planning and collision avoidance
-2. **MoveIt!** - Trajectory management and motion execution
-3. **Delto 3-Finger Suction Gripper** - Grasp control via Modbus TCP
-4. **ZED 2i Camera** - 3D stereo vision and depth perception
-5. **YOLOv8 Segmentation** - AI-based date detection and localization
-6. **RViz** - Live visualization and debugging
+This system provides a complete ROS 2 Humble-based control stack for autonomous date palm harvesting with the UR10e robot arm. The system integrates computer vision, motion planning, and robotic control in a seamless pipeline.
+
+### Key Components
+
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| 🧠 **cuRobo** | GPU-accelerated motion planning & collision avoidance | NVIDIA CUDA |
+| 🎮 **MoveIt!** | Trajectory management and motion execution | ROS 2 Control |
+| 🤏 **Delto 3F Gripper** | Suction-based grasping control | Modbus TCP |
+| 👁️ **ZED 2i Camera** | 3D stereo vision and depth perception | Stereo Vision |
+| 🔍 **YOLOv8 Segmentation** | AI-based date detection and localization | Deep Learning |
+| 📊 **RViz** | Live visualization and debugging | ROS 2 |
 
 ## System Architecture
 
