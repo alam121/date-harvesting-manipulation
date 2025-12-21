@@ -5,6 +5,8 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /RobotModel1/Description Topic1
+        - /TF1
+        - /TF1/Frames1
       Splitter Ratio: 0.5
     Tree Height: 784
   - Class: rviz_common/Selection
@@ -290,7 +292,7 @@ Visualization Manager:
         wrist_3_link:
           Value: false
         zed2_left_camera_frame:
-          Value: false
+          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
@@ -412,7 +414,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.4201362133026123
+      Distance: 0.8358126282691956
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -427,10 +429,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.9153982400894165
+      Pitch: -0.09960142523050308
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.0253984928131104
+      Yaw: 6.278578281402588
     Saved: ~
 Window Geometry:
   Displays:

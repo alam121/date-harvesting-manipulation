@@ -339,13 +339,15 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "capture_stop":
             self.stop_goal_capture()
         elif cmd.startswith("set_speeds "):
-            # Format: "set_speeds home dropoff approach"
+            # Format: "set_speeds home dropoff approach predropoff"
             try:
                 parts = cmd.split()
                 self.cfg.planner.speed_home = float(parts[1])
                 self.cfg.planner.speed_dropoff = float(parts[2])
                 self.cfg.planner.speed_approach = float(parts[3])
-                self.get_logger().info(f"Speeds updated: home={parts[1]}, dropoff={parts[2]}, approach={parts[3]}")
+                if len(parts) > 4:
+                    self.cfg.planner.speed_predropoff = float(parts[4])
+                self.get_logger().info(f"Speeds updated: home={parts[1]}, dropoff={parts[2]}, approach={parts[3]}, predropoff={self.cfg.planner.speed_predropoff}")
             except (ValueError, IndexError) as e:
                 self.get_logger().warn(f"Invalid set_speeds format: {e}")
         elif cmd.startswith("set_velocity_scale "):
@@ -381,6 +383,7 @@ class UR10eCuroboMoveIt(Node):
             "speed_home": self.cfg.planner.speed_home,
             "speed_dropoff": self.cfg.planner.speed_dropoff,
             "speed_approach": self.cfg.planner.speed_approach,
+            "speed_predropoff": self.cfg.planner.speed_predropoff,
         }
         msg = String()
         msg.data = json.dumps(info)
@@ -456,7 +459,7 @@ class UR10eCuroboMoveIt(Node):
                 print(f"[{ts()}] gripper → CLOSE; nudge back & rotate wrist")
                 gripper_mod.control_gripper(self, 'CLOSE')
                 #motions_mod.move_backward(self, -0.01)
-                #motions_mod.rotate_wrist(self, 120)
+                #motions_mod.rotate_wrist(self, 70, rotate_time=0.6, hold_time=0.05, return_time=0.6)
                 print(f"[{ts()}] post-close micro-motions done")
 
             elif key == 'h':

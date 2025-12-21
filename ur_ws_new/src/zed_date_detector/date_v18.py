@@ -36,6 +36,7 @@ sl_mats: List[sl.Mat] = None
 
 net_fps = 0.0
 loop_fps = 0.0
+prev_axis = None
 prev_heat_point = None
 prev_direction_base = None  # smoothed 3D direction in base_link
 direction_history = deque(maxlen=10)  # sliding window for direction averaging
@@ -348,7 +349,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
 # Main
 # ============================================================
 def main_(args: argparse.Namespace):
-    global image_net, exit_signal, run_event, dets_ready, detections, loop_fps, best_target_prev, prev_heat_point, prev_direction_base, direction_history, latest_goal_msg, latest_dir_msg
+    global image_net, exit_signal, run_event, dets_ready, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, direction_history, latest_goal_msg, latest_dir_msg
 
     # --- ROS2 setup ---
     rclpy.init()
@@ -472,7 +473,7 @@ def main_(args: argparse.Namespace):
     last_viz = 0.0
 
     def perception_loop():
-        global exit_signal, run_event, dets_ready, image_net, detections, loop_fps, best_target_prev, prev_heat_point, prev_direction_base, latest_goal_msg, latest_dir_msg
+        global exit_signal, run_event, dets_ready, image_net, detections, loop_fps, best_target_prev, prev_axis, prev_heat_point, prev_direction_base, latest_goal_msg, latest_dir_msg
         nonlocal last_viz
         t_prev = time()
         while not exit_signal:
@@ -808,12 +809,14 @@ def main_(args: argparse.Namespace):
                 best_target_prev = targets[best_idx]
 
             # --------------------------------------------------
-            # Pre-processing for best fruit (TF cache, heatmap smoothing)
+            # Use SHORT axis (minor axis) for orientation if available
             # --------------------------------------------------
             if best_idx is not None:
                 t_best = targets[best_idx]
+                short_cam = t_best.get("short_axis_cam")
+                use_axis_cam = short_cam
 
-                # Cache TF lookup once for this frame (used for direction transform)
+                # Cache TF lookup once for this frame (used for axis and direction)
                 cached_q_tf = None
                 try:
                     T = tf_buffer.lookup_transform("base_link", cam_frame, rclpyTime())
@@ -837,6 +840,31 @@ def main_(args: argparse.Namespace):
                     t_best["best_point2d_smooth"] = sm_pt
                 else:
                     prev_heat_point = None
+
+                if use_axis_cam is not None and cached_q_tf is not None:
+                    # Rotate chosen camera-frame axis → world (base_link)
+                    axis_world = quat_rotate_vec(cached_q_tf, use_axis_cam)
+                    n_axis = np.linalg.norm(axis_world)
+                    if n_axis > 1e-6:
+                        axis_world /= n_axis
+                    else:
+                        axis_world = np.array([1.0, 0.0, 0.0])
+                else:
+                    # fallback if no ellipse or TF failed
+                    axis_world = np.array([1.0, 0.0, 0.0])
+
+                # stabilize axis direction (avoid flips)
+                if prev_axis is not None and axis_world is not None:
+                    dot = float(np.dot(prev_axis, axis_world))
+                    if dot < 0:
+                        axis_world = -axis_world
+                prev_axis = axis_world.copy()
+
+                # Convert axis → quaternion
+                q = quat_align_x_to_axis(axis_world)
+
+                t_best["quat"] = q
+                t_best["approach_axis"] = axis_world
 
             # --------------------------------------------------
             # Publish goal for BEST fruit only (before rendering to minimize latency)
@@ -907,26 +935,6 @@ def main_(args: argparse.Namespace):
                         dir_msg.vector.y = float(dir_avg[1])
                         dir_msg.vector.z = float(dir_avg[2])
 
-                        # ---- UNIFIED: Derive orientation FROM direction ----
-                        # For finger gripper: orient perpendicular to approach direction
-                        # Cross with Z-up to get horizontal perpendicular axis
-                        up = np.array([0.0, 0.0, 1.0])
-                        approach_axis = np.cross(up, dir_avg)
-                        n_ax = np.linalg.norm(approach_axis)
-                        if n_ax > 1e-6:
-                            approach_axis /= n_ax
-                        else:
-                            approach_axis = np.array([1.0, 0.0, 0.0])
-
-                        q = quat_align_x_to_axis(approach_axis)
-                        t_best["quat"] = q
-                        t_best["approach_axis"] = approach_axis
-
-                # Fallback orientation if no valid direction computed
-                if t_best.get("quat") is None:
-                    t_best["quat"] = (1.0, 0.0, 0.0, 0.0)
-                    t_best["approach_axis"] = np.array([1.0, 0.0, 0.0])
-
                 # Track-by-detection smoothing: weighted avg of recent centroids
                 pt_vec = np.array(
                     [pt_base.point.x, pt_base.point.y, pt_base.point.z], dtype=float
@@ -961,7 +969,7 @@ def main_(args: argparse.Namespace):
                     goal.pose.position.y = float(pt_y)
                     goal.pose.position.z = float(pt_z)
 
-                    # orientation derived from approach direction (unified)
+                    # orientation from long axis
                     goal.pose.orientation.w = q[0]
                     goal.pose.orientation.x = q[1]
                     goal.pose.orientation.y = q[2]

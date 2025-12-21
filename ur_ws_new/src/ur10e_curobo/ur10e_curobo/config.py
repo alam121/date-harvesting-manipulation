@@ -52,7 +52,7 @@ class JointsPreset:
         2.0885677337646484, -2.6394265333758753, 4.78283166885376, 0.013545919209718704])
     
     
-    predropoff: List[float] = field(default_factory=lambda: [-1.5063117186175745, -1.512526014154293, 2.141698662434713, -4.593678136865133, 4.582080364227295, 0.047529518604278564]
+    predropoff: List[float] = field(default_factory=lambda: [-1.5009062925921839, -1.7099877796568812, 2.0609028975116175, -4.172773023644918, 4.572351932525635, 0.05295269936323166]
 
 )
 
@@ -68,9 +68,9 @@ class Planner:
     global_speed_multiplier: float = 5.0
 
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
-    speed_home: float = 4.0        # for move_to_home_position
-    speed_dropoff: float = 6.5    # for move_to_dropoff_position
-    speed_predropoff: float = 2.5  # for pre-dropoff
+    speed_home: float = 1.0        # for move_to_home_position
+    speed_dropoff: float = 3.0    # for move_to_dropoff_position
+    speed_predropoff: float = 0.08  # for pre-dropoff (slower)
     speed_approach: float = 0.5    # for approach motion
     speed_final: float = 0.5       # for precise grasp
 

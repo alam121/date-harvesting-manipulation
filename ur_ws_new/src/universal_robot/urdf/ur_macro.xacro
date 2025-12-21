@@ -476,9 +476,9 @@
     
     <link name="tool0_to_camera_mount_link">
   <visual>
-    <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
+    <origin xyz="0.0 0.0 -0.032" rpy="0 0 3.14159"/>
     <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
+      <mesh filename="package://ur_description/meshes/ur10e/visual/top_zed_homut.stl" scale="0.001 0.001 0.001"/>
 
     </geometry>
     <material name="silver">
@@ -488,7 +488,7 @@
   <collision>
     <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
     <geometry>
-      <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
+      <mesh filename="package://ur_description/meshes/ur10e/visual/top_zed_homut.stl" scale="0.001 0.001 0.001"/>
     </geometry>
   </collision>
   <inertial>
@@ -531,7 +531,7 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin xyz="-0.037 -0.131 0.038" rpy="0 0 -0.174"/>   <!-- CHANGE --> 
+    <origin xyz="-0.048 -0.156 -0.005" rpy="0 0 -0.174"/>   <!-- CHANGE --> 
   </joint>
 
     

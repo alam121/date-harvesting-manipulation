@@ -186,20 +186,45 @@ def move_to_predropoff_position(node):
     plan_execute_js(node, node.predropoff_joints, label="preDROP-OFF", motion_type="predropoff")
 
 
-def rotate_wrist(node, degrees: float, duration: float = 0.30):
+def rotate_wrist(node, degrees: float,
+                 rotate_time: float = 1.2,
+                 hold_time: float = 0.1,
+                 return_time: float = 1.2):
+
     if node.current_joint_positions is None:
-        node.get_logger().error("No joint state; cannot rotate wrist."); return
+        node.get_logger().error("No joint state; cannot rotate wrist.")
+        return
+
     rad = math.radians(degrees)
-    start = node.current_joint_positions.copy(); plus = start.copy(); plus[5] = start[5] + rad
-    traj = JointTrajectory(); traj.joint_names = node.joint_order
-    def _pt(q, t):
-        p = JointTrajectoryPoint(); p.positions = q; p.velocities = [0.0]*len(q)
-        p.time_from_start.sec = int(t); p.time_from_start.nanosec = int((t-int(t))*1e9); return p
-    traj.points = [_pt(start, 0.0), _pt(plus, duration), _pt(start, 2*duration)]
-    last = traj.points[-1]; hold_ns = last.time_from_start.nanosec + 50_000_000
-    p3 = _pt(start, float(last.time_from_start.sec)); p3.time_from_start.sec += 1 if hold_ns>=1_000_000_000 else 0
-    p3.time_from_start.nanosec = hold_ns % 1_000_000_000; traj.points.append(p3)
+
+    start = node.current_joint_positions.copy()
+    peak = start.copy()
+    peak[5] += rad  # wrist_3_joint
+
+    traj = JointTrajectory()
+    traj.joint_names = node.joint_order
+
+    def pt(q, t):
+        p = JointTrajectoryPoint()
+        p.positions = q
+        p.time_from_start.sec = int(t)
+        p.time_from_start.nanosec = int((t - int(t)) * 1e9)
+        return p
+
+    t1 = rotate_time
+    t2 = t1 + hold_time
+    t3 = t2 + return_time
+
+    traj.points = [
+        pt(start, 0.0),    # start
+        pt(peak, t1),      # rotate
+        pt(peak, t2),      # short hold
+        pt(start, t3)      # return
+    ]
+
     node.trajectory_pub.publish(traj)
+
+
 
 
 def move_backward(node, delta: float):

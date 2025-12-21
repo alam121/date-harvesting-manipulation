@@ -20,6 +20,87 @@ def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
 
 
+def quat_dot(q1, q2):
+    """Dot product of two quaternions (measures similarity)."""
+    return q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3]
+
+
+def quat_flip_z(q):
+    """Rotate quaternion by 180° around Z axis (flip gripper orientation)."""
+    # q_z180 = (0, 0, 0, 1) represents 180° rotation around Z
+    # q_new = q * q_z180
+    w, x, y, z = q
+    # Multiply by (0, 0, 0, 1):
+    return [-z, y, -x, w]
+
+
+def quat_slerp(q0, q1, t):
+    """
+    Spherical linear interpolation between quaternions.
+    t=0 returns q0, t=1 returns q1.
+    """
+    dot = quat_dot(q0, q1)
+
+    # If dot < 0, negate one quat to take shorter path
+    if dot < 0:
+        q1 = [-q1[0], -q1[1], -q1[2], -q1[3]]
+        dot = -dot
+
+    # If quaternions are very close, use linear interpolation
+    if dot > 0.9995:
+        result = [q0[i] + t * (q1[i] - q0[i]) for i in range(4)]
+        # Normalize
+        n = math.sqrt(sum(x*x for x in result))
+        return [x/n for x in result]
+
+    # Standard slerp
+    theta_0 = math.acos(dot)
+    theta = theta_0 * t
+    sin_theta = math.sin(theta)
+    sin_theta_0 = math.sin(theta_0)
+
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+
+    return [s0 * q0[i] + s1 * q1[i] for i in range(4)]
+
+
+def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.0):
+    """
+    Blend current and target orientation, prioritizing current.
+
+    Since gripper can grasp from either direction (180° apart),
+    first pick the closer one, then blend towards current.
+
+    Args:
+        current_quat: [qw, qx, qy, qz] current end-effector orientation
+        target_quat: [qw, qx, qy, qz] target orientation from vision
+        blend_weight: 0.0 = keep current, 1.0 = use target fully (default 0.3)
+
+    Returns:
+        [qw, qx, qy, qz] blended orientation
+    """
+    if current_quat is None or target_quat is None:
+        return target_quat
+
+    # Compute similarity (dot product) with target
+    dot_orig = abs(quat_dot(current_quat, target_quat))
+
+    # Compute flipped version (180° around Z)
+    flipped = quat_flip_z(target_quat)
+    dot_flip = abs(quat_dot(current_quat, flipped))
+
+    # Higher dot = more similar = less rotation needed
+    if dot_flip > dot_orig:
+        best_target = flipped
+    else:
+        best_target = list(target_quat)
+
+    # Blend: slerp from current towards best_target
+    # blend_weight=0.3 means 70% current, 30% target
+    return quat_slerp(list(current_quat), best_target, blend_weight)
+
+
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
     # 1) Plan with cuRobo
     res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
@@ -262,8 +343,12 @@ def subscribe_to_goal_pose(node):
             node.best_goal_xyz = new_xyz
             node.best_goal_score = float("inf")
 
-            g = [*new_xyz, *current_orientation]
-
+            #g = [*new_xyz, *current_orientation]
+            g = [*new_xyz, 
+                msg.pose.orientation.w, msg.pose.orientation.x,
+                msg.pose.orientation.y, msg.pose.orientation.z]
+            
+            
             if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
                 node.goal_poses.append(g)
                 publish_goal_marker(node, g[:3])
@@ -404,7 +489,13 @@ def plan_and_execute(node):
         #     orientation = quaternion_from_approach(node, pitch_deg=-35.0)
         #     approach = [x, y+0.12, z, *orientation] #top approach
         # else:
-        orientation = goal[3:]
+        # Get current orientation and minimize rotation
+        cur_pose = node.get_end_effector_pose()
+        cur_quat = cur_pose[3:] if cur_pose else None
+        target_quat = goal[3:]
+        print("Current quat:", cur_quat)
+        print("Target quat:", target_quat)
+        orientation = minimize_rotation_orientation(cur_quat, target_quat)
         approach = [ax, ay, az-0.10, *orientation]
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
@@ -448,7 +539,8 @@ def plan_and_execute(node):
             # node.control_gripper("CLOSE")
             
         # 4. Drop-off and return
-        rotate_wrist(node, 90); time.sleep(0.9)
+        #rotate_wrist(node, 90, rotate_time=0.5, hold_time=0.05, return_time=0.5)
+        time.sleep(0.1)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
 
         # #move_to_predropoff_position(node)
         # current_pose = node.get_end_effector_pose()
