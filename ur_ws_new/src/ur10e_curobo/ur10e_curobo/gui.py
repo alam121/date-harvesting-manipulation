@@ -4,15 +4,23 @@ import json
 from typing import Optional, List
 from collections import deque
 import math
+from enum import Enum
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtCore import QTimer, pyqtSignal
+from PyQt5.QtCore import QTimer, pyqtSignal, Qt
+from PyQt5.QtWidgets import QShortcut, QScrollArea
+from PyQt5.QtGui import QKeySequence
 from std_msgs.msg import Bool, String, Float32MultiArray, Float32
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
+from tf2_ros import Buffer, TransformListener
+from geometry_msgs.msg import TransformStamped, Twist
+class ControlMode(Enum):
+    NORMAL = 0
+    KEYBOARD = 1
 
 try:
     from pyqtgraph import PlotWidget, mkPen
@@ -33,7 +41,8 @@ class UiBridge(Node):
         stop_topic: str = "/emergency_stop",
     ):
         super().__init__("ur10e_desktop_ui")
-
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         # Publishers
         self.cmd_pub = self.create_publisher(String, command_topic, 10)
         goal_qos = QoSProfile(
@@ -45,6 +54,11 @@ class UiBridge(Node):
         self.goal_pub = self.create_publisher(PoseStamped, goal_topic, goal_qos)
         self.stop_pub = self.create_publisher(Bool, stop_topic, 10)
 
+        self.teleop_pub = self.create_publisher(
+            Twist,
+            "/teleop_delta",
+            10
+        )
         # Subscribers
         self.joint_state_data = None
         self.gripper_force_data = [0.0, 0.0, 0.0]
@@ -103,6 +117,32 @@ class UiBridge(Node):
         except json.JSONDecodeError:
             pass
 
+    def get_tcp_pose(self) -> Optional[TransformStamped]:
+        try:
+            return self.tf_buffer.lookup_transform(
+                "base_link",
+                "tool0",
+                rclpy.time.Time()
+            )
+        except Exception:
+            return None
+        
+    def publish_teleop_delta(self, dx, dy, dz, droll, dpitch, dyaw):
+        """Publish a geometry_msgs/Twist with linear and angular deltas.
+
+        Many teleop consumers subscribe to a plain `Twist` message. Keep the
+        values relative (deltas) and publish on `/teleop_delta`.
+        """
+        msg = Twist()
+        msg.linear.x = dx
+        msg.linear.y = dy
+        msg.linear.z = dz
+        msg.angular.x = droll
+        msg.angular.y = dpitch
+        msg.angular.z = dyaw
+
+        self.teleop_pub.publish(msg)
+
     def _velocity_scale_cb(self, msg: Float32):
         self.velocity_scale = msg.data
 
@@ -150,15 +190,364 @@ class UiBridge(Node):
         self.stop_pub.publish(msg)
 
 
+# ==================== KEYBOARD CONTROL WINDOW ====================
+
+class KeyboardControlWindow(QtWidgets.QWidget):
+    """Separate window for keyboard/mouse control of the robot."""
+
+    status_update = pyqtSignal(str, bool)
+
+    def __init__(self, ros: UiBridge, parent_geometry=None):
+        super().__init__(None)
+        self.ros = ros
+        self.setWindowTitle("Keyboard Control - UR10e")
+        self.setMinimumSize(450, 600)
+
+        # Make it a proper independent window
+        self.setWindowFlags(Qt.Window)
+
+        # Position window to the right of parent if geometry provided
+        if parent_geometry:
+            self.move(parent_geometry.right() + 20, parent_geometry.top())
+
+        # Keyboard control state - START ENABLED
+        self.keyboard_enabled = True
+        self.step_size = 0.01  # 1cm default step
+
+        # Keys currently pressed (for display only now)
+        self.keys_pressed = set()
+
+        # Mouse tracking state
+        self.mouse_tracking_active = False
+        self.last_mouse_pos = None
+
+        self._build_ui()
+        self._setup_shortcuts()
+
+        # Movement timer for continuous key press
+        self.kbd_timer = QTimer()
+        self.kbd_timer.timeout.connect(self._process_keyboard_movement)
+        self.kbd_timer.start(50)
+
+        # Connect status signal
+        self.status_update.connect(self._set_status)
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts that work when window is active."""
+        # Movement shortcuts - these set keys_pressed and are processed by timer
+        def make_press(key):
+            def handler():
+                if self.keyboard_enabled:
+                    self.keys_pressed.add(key)
+                    self._update_control_area_display()
+            return handler
+
+        # Create shortcuts for movement keys - WindowShortcut context
+        for key_char, key_code in [('W', Qt.Key_W), ('S', Qt.Key_S), ('A', Qt.Key_A),
+                                    ('D', Qt.Key_D), ('Q', Qt.Key_Q), ('E', Qt.Key_E)]:
+            shortcut = QShortcut(QKeySequence(key_char), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(make_press(key_code))
+            shortcut.setAutoRepeat(True)
+
+        # Action shortcuts (no orientation shortcuts here) - only movement keys
+        g_shortcut = QShortcut(QKeySequence('G'), self)
+        g_shortcut.setContext(Qt.WindowShortcut)
+        g_shortcut.activated.connect(lambda: self._gripper_cmd("open"))
+
+        h_shortcut = QShortcut(QKeySequence('H'), self)
+        h_shortcut.setContext(Qt.WindowShortcut)
+        h_shortcut.activated.connect(lambda: self._gripper_cmd("close"))
+
+        # Step size shortcuts
+        plus_shortcut = QShortcut(QKeySequence('+'), self)
+        plus_shortcut.setContext(Qt.WindowShortcut)
+        plus_shortcut.activated.connect(self._increase_step)
+
+        equal_shortcut = QShortcut(QKeySequence('='), self)
+        equal_shortcut.setContext(Qt.WindowShortcut)
+        equal_shortcut.activated.connect(self._increase_step)
+
+        minus_shortcut = QShortcut(QKeySequence('-'), self)
+        minus_shortcut.setContext(Qt.WindowShortcut)
+        minus_shortcut.activated.connect(self._decrease_step)
+
+        # Escape to disable
+        esc_shortcut = QShortcut(QKeySequence("Esc"), self)
+        esc_shortcut.setContext(Qt.WindowShortcut)
+        esc_shortcut.activated.connect(self._disable_keyboard)
+
+    def _gripper_cmd(self, cmd):
+        if self.keyboard_enabled:
+            self.ros.publish_cmd(cmd)
+            self.status_update.emit(f"Gripper: {cmd.upper()}", False)
+
+    def _increase_step(self):
+        if self.keyboard_enabled:
+            self.step_spin.setValue(min(self.step_size * 2, 0.1))
+
+    def _decrease_step(self):
+        if self.keyboard_enabled:
+            self.step_spin.setValue(max(self.step_size / 2, 0.001))
+
+    def _disable_keyboard(self):
+        self.enable_btn.setChecked(False)
+        self._toggle_enabled(False)
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Title
+        title = QtWidgets.QLabel("Keyboard Control Mode")
+        title.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Status - starts enabled
+        self.status_label = QtWidgets.QLabel("ACTIVE - Press WASD/QE to move robot")
+        self.status_label.setStyleSheet("padding: 10px; background: #c8e6c9; border-radius: 4px; font-weight: bold; font-size: 11pt;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+    # Note: keyboard window publishes teleop deltas only; no goal sending here
+
+        # Enable button - starts checked
+        self.enable_btn = QtWidgets.QPushButton("Disable Keyboard Control")
+        self.enable_btn.setCheckable(True)
+        self.enable_btn.setChecked(True)
+        self.enable_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607d8b;
+                color: white;
+                font-weight: bold;
+                padding: 12px;
+                font-size: 12pt;
+                border-radius: 5px;
+            }
+            QPushButton:checked {
+                background-color: #4caf50;
+            }
+        """)
+        self.enable_btn.clicked.connect(self._toggle_enabled)
+        layout.addWidget(self.enable_btn)
+
+        # Visual control area (for mouse)
+        control_group = QtWidgets.QGroupBox("Mouse Control Area (drag here)")
+        control_layout = QtWidgets.QVBoxLayout(control_group)
+
+        self.control_area = QtWidgets.QLabel()
+        self.control_area.setMinimumSize(300, 200)
+        self.control_area.setStyleSheet("""
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #e3f2fd, stop:1 #bbdefb);
+            border: 2px dashed #1976d2;
+            border-radius: 10px;
+        """)
+        self.control_area.setAlignment(Qt.AlignCenter)
+        self._update_control_area_display()
+        control_layout.addWidget(self.control_area)
+        layout.addWidget(control_group)
+
+        # Removed absolute position and orientation displays; keyboard window
+        # only emits teleop deltas (no absolute pose state)
+
+        # Step size control
+        step_group = QtWidgets.QGroupBox("Step Size")
+        step_layout = QtWidgets.QHBoxLayout(step_group)
+
+        self.step_spin = QtWidgets.QDoubleSpinBox()
+        self.step_spin.setRange(0.001, 0.1)
+        self.step_spin.setValue(0.01)
+        self.step_spin.setSingleStep(0.005)
+        self.step_spin.setDecimals(3)
+        self.step_spin.setSuffix(" m")
+        self.step_spin.valueChanged.connect(lambda v: setattr(self, 'step_size', v))
+        step_layout.addWidget(self.step_spin)
+
+        for label, val in [("1mm", 0.001), ("5mm", 0.005), ("1cm", 0.01), ("5cm", 0.05)]:
+            btn = QtWidgets.QPushButton(label)
+            btn.setMaximumWidth(50)
+            btn.clicked.connect(lambda _, v=val: self.step_spin.setValue(v))
+            step_layout.addWidget(btn)
+
+        layout.addWidget(step_group)
+
+        # Controls help
+        help_group = QtWidgets.QGroupBox("Keyboard Controls")
+        help_layout = QtWidgets.QVBoxLayout(help_group)
+        help_text = QtWidgets.QLabel(
+            "<table>"
+            "<tr><td><b>W/S</b></td><td>Y axis (forward/back) — publishes delta</td></tr>"
+            "<tr><td><b>A/D</b></td><td>X axis (left/right) — publishes delta</td></tr>"
+            "<tr><td><b>Q/E</b></td><td>Z axis (up/down) — publishes delta</td></tr>"
+            "<tr><td><b>Mouse drag</b></td><td>Publish X/Y deltas (no absolute pose)</td></tr>"
+            "<tr><td><b>Scroll wheel</b></td><td>Publish Z delta only</td></tr>"
+            "<tr><td><b>G/H</b></td><td>Open/Close gripper</td></tr>"
+            "<tr><td><b>+/-</b></td><td>Adjust step size</td></tr>"
+            "<tr><td><b>Esc</b></td><td>Disable keyboard mode</td></tr>"
+            "</table>"
+        )
+        help_text.setStyleSheet("font-size: 9pt;")
+        help_layout.addWidget(help_text)
+        layout.addWidget(help_group)
+
+    # Action buttons removed: keyboard window only sends teleop deltas
+
+        # Gripper buttons
+        gripper_layout = QtWidgets.QHBoxLayout()
+
+        open_btn = QtWidgets.QPushButton("Open Gripper (G)")
+        open_btn.clicked.connect(lambda: self.ros.publish_cmd("open"))
+        gripper_layout.addWidget(open_btn)
+
+        close_btn = QtWidgets.QPushButton("Close Gripper (H)")
+        close_btn.clicked.connect(lambda: self.ros.publish_cmd("close"))
+        gripper_layout.addWidget(close_btn)
+
+        layout.addLayout(gripper_layout)
+
+        # Emergency stop
+        stop_btn = QtWidgets.QPushButton("EMERGENCY STOP")
+        stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 12pt; padding: 12px;")
+        stop_btn.clicked.connect(self._emergency_stop)
+        layout.addWidget(stop_btn)
+
+    def _update_control_area_display(self):
+        # Show which keys are active
+        active = []
+        if Qt.Key_W in self.keys_pressed: active.append("W")
+        if Qt.Key_S in self.keys_pressed: active.append("S")
+        if Qt.Key_A in self.keys_pressed: active.append("A")
+        if Qt.Key_D in self.keys_pressed: active.append("D")
+        if Qt.Key_Q in self.keys_pressed: active.append("Q")
+        if Qt.Key_E in self.keys_pressed: active.append("E")
+        keys_text = f"<b style='color:#4caf50'>Keys: {' '.join(active)}</b>" if active else "<i>Use WASD/QE keys</i>"
+
+        # Display that the window publishes deltas rather than absolute pose
+        self.control_area.setText(
+            f"<center><h2>Teleop (deltas)</h2>"
+            f"<p style='font-size:12pt'>Use WASD/QE to publish position deltas.<br>"
+            f"Drag mouse to publish X/Y deltas. Scroll to publish Z delta.</p>"
+            f"<p>{keys_text}</p></center>"
+        )
+
+    def _update_displays(self):
+        # Keyboard window no longer keeps absolute pose/orientation; just
+        # update the control area to reflect active keys.
+        self._update_control_area_display()
+
+    def _toggle_enabled(self, checked: bool):
+        self.keyboard_enabled = checked
+        if checked:
+            self.enable_btn.setText("Disable Keyboard Control")
+            self.status_label.setText("ACTIVE - Press WASD/QE to move robot")
+            self.status_label.setStyleSheet("padding: 10px; background: #c8e6c9; border-radius: 4px; font-weight: bold; font-size: 11pt;")
+        else:
+            self.enable_btn.setText("Enable Keyboard Control")
+            self.status_label.setText("DISABLED - Click Enable to start")
+            self.status_label.setStyleSheet("padding: 10px; background: #ffcdd2; border-radius: 4px; font-size: 11pt;")
+            self.keys_pressed.clear()
+
+    def closeEvent(self, event):
+        """Clean up when closing."""
+        self.kbd_timer.stop()
+        event.accept()
+
+    def showEvent(self, event):
+        """Focus window when showing."""
+        super().showEvent(event)
+        if self.keyboard_enabled:
+            self.activateWindow()
+            self.setFocus()
+
+
+    def _set_status(self, text: str, error: bool):
+        if error:
+            self.status_label.setStyleSheet("padding: 8px; background: #ffcdd2; border-radius: 4px;")
+        else:
+            self.status_label.setStyleSheet("padding: 8px; background: #c8e6c9; border-radius: 4px;")
+        self.status_label.setText(text)
+
+    def _emergency_stop(self):
+        self.ros.publish_stop()
+        self.ros.publish_cmd("stop")
+        self.status_update.emit("EMERGENCY STOP ACTIVATED", True)
+
+    def _process_keyboard_movement(self):
+        """Process keys and clear them (shortcuts fire repeatedly with autorepeat)."""
+        if not self.keyboard_enabled or not self.keys_pressed:
+            return
+        # Process each key once then clear and publish linear deltas only
+        keys_to_process = self.keys_pressed.copy()
+        self.keys_pressed.clear()
+        dx = dy = dz = 0.0
+
+        if Qt.Key_W in keys_to_process: dy += self.step_size
+        if Qt.Key_S in keys_to_process: dy -= self.step_size
+        if Qt.Key_A in keys_to_process: dx -= self.step_size
+        if Qt.Key_D in keys_to_process: dx += self.step_size
+        if Qt.Key_Q in keys_to_process: dz += self.step_size
+        if Qt.Key_E in keys_to_process: dz -= self.step_size
+
+        if any([dx, dy, dz]):
+            # Only publish linear deltas; orientation removed from keyboard control
+            self.ros.publish_teleop_delta(dx, dy, dz, 0.0, 0.0, 0.0)
+    
+
+    def mousePressEvent(self, event):
+        # Always grab focus when clicking anywhere in the window
+        self.setFocus()
+
+        if self.keyboard_enabled and event.button() == Qt.LeftButton:
+            self.mouse_tracking_active = True
+            self.last_mouse_pos = event.pos()
+            event.accept(); return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.mouse_tracking_active = False
+            self.last_mouse_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.keyboard_enabled and self.mouse_tracking_active and self.last_mouse_pos:
+            # Publish deltas (do not update any absolute pose)
+            delta = event.pos() - self.last_mouse_pos
+            self.last_mouse_pos = event.pos()
+            scale = self.step_size * 0.001  # scale pixels->meters
+            dx = delta.x() * scale
+            dy = -delta.y() * scale
+            # publish linear deltas only
+            self.ros.publish_teleop_delta(dx, dy, 0.0, 0.0, 0.0, 0.0)
+            event.accept(); return
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event):
+        if self.keyboard_enabled:
+            delta = event.angleDelta().y()
+            if delta != 0:
+                # Publish only Z delta (linear.z), scale by step_size
+                dz = self.step_size * (0.5 if delta > 0 else -0.5)
+                self.ros.publish_teleop_delta(0.0, 0.0, dz, 0.0, 0.0, 0.0)
+                event.accept(); return
+        super().wheelEvent(event)
+
+
+# ==================== MAIN WINDOW ====================
+
 class MainWindow(QtWidgets.QWidget):
-    # Signals for thread-safe updates
     status_update = pyqtSignal(str, bool)
 
     def __init__(self, ros: UiBridge):
         super().__init__()
         self.ros = ros
-        self.setWindowTitle("UR10e Enhanced Control Panel")
-        self.setMinimumSize(1200, 800)
+        self.setWindowTitle("UR10e Control Panel")
+        self.setMinimumSize(1000, 700)
+
+        # Keyboard window reference
+        self.kbd_window = None
 
         # Data storage for graphs
         self.force_history = [deque(maxlen=200), deque(maxlen=200), deque(maxlen=200)]
@@ -169,121 +558,94 @@ class MainWindow(QtWidgets.QWidget):
         self._status: Optional[QtWidgets.QLabel] = None
         self._build_ui()
 
+        # Emergency stop shortcut
+        stop_shortcut = QShortcut(QKeySequence("Ctrl+Space"), self)
+        stop_shortcut.activated.connect(self._handle_stop)
+
         # Update timer
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._update_displays)
-        self.update_timer.start(50)  # 20Hz update
+        self.update_timer.start(50)
 
-        # Connect signals
         self.status_update.connect(self._set_status_slot)
 
     def _build_ui(self):
         main_layout = QtWidgets.QHBoxLayout(self)
+        main_layout.setSpacing(8)
 
-        # Left panel: Controls
+        # Left panel: Controls (scrollable)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(320)
+        left_scroll.setMaximumWidth(380)
+
         left_panel = self._build_control_panel()
-        main_layout.addWidget(left_panel, stretch=1)
+        left_scroll.setWidget(left_panel)
+        main_layout.addWidget(left_scroll)
 
-        # Right panel: Monitoring & Graphs
+        # Right panel: Monitoring
         right_panel = self._build_monitor_panel()
-        main_layout.addWidget(right_panel, stretch=2)
+        main_layout.addWidget(right_panel, stretch=1)
 
     def _build_control_panel(self):
-        """Build left control panel with all buttons and inputs."""
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
+        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
 
-        # Title
-        title = QtWidgets.QLabel("UR10e Control Panel")
-        title.setFont(QtGui.QFont("Helvetica", 16, QtGui.QFont.Bold))
-        title.setAlignment(QtCore.Qt.AlignCenter)
+        # Title & Status
+        title = QtWidgets.QLabel("UR10e Control")
+        title.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # Status indicator
-        self._status = QtWidgets.QLabel("Ready — ROS2 Connected")
-        self._status.setStyleSheet("color: #2d6a4f; font-weight: bold; padding: 8px; background: #e8f5e9; border-radius: 4px;")
+        self._status = QtWidgets.QLabel("Ready")
+        self._status.setStyleSheet("color: #2d6a4f; font-weight: bold; padding: 6px; background: #e8f5e9; border-radius: 4px;")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
 
-        layout.addSpacing(10)
-
-        # Robot state display
-        state_group = QtWidgets.QGroupBox("Robot State")
-        state_layout = QtWidgets.QVBoxLayout(state_group)
+        # Robot state
         self.robot_state_label = QtWidgets.QLabel("Program: Unknown")
-        self.robot_state_label.setStyleSheet("font-size: 12pt; padding: 5px;")
-        state_layout.addWidget(self.robot_state_label)
-        layout.addWidget(state_group)
+        self.robot_state_label.setStyleSheet("font-size: 11pt; padding: 4px;")
+        layout.addWidget(self.robot_state_label)
 
-        # Global Velocity Scale (with slider)
-        velocity_group = QtWidgets.QGroupBox("Global Velocity Scale")
-        velocity_layout = QtWidgets.QVBoxLayout(velocity_group)
+        # Velocity Scale
+        vel_group = QtWidgets.QGroupBox("Velocity Scale")
+        vel_layout = QtWidgets.QVBoxLayout(vel_group)
+        vel_layout.setSpacing(4)
 
-        # Slider row
         slider_row = QtWidgets.QHBoxLayout()
-        self.velocity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.velocity_slider.setRange(10, 100)  # 0.1 to 10.0 (x10 for integer slider)
-        self.velocity_slider.setValue(50)  # Default 5.0
-        self.velocity_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-        self.velocity_slider.setTickInterval(10)
+        self.velocity_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.velocity_slider.setRange(10, 100)
+        self.velocity_slider.setValue(50)
         self.velocity_slider.valueChanged.connect(self._on_velocity_slider_changed)
         slider_row.addWidget(self.velocity_slider)
 
         self.velocity_value_label = QtWidgets.QLabel("5.0x")
-        self.velocity_value_label.setFont(QtGui.QFont("Courier", 12, QtGui.QFont.Bold))
-        self.velocity_value_label.setMinimumWidth(50)
-        self.velocity_value_label.setStyleSheet("color: #1976d2; font-weight: bold;")
+        self.velocity_value_label.setFont(QtGui.QFont("Courier", 10, QtGui.QFont.Bold))
+        self.velocity_value_label.setStyleSheet("color: #1976d2;")
         slider_row.addWidget(self.velocity_value_label)
-        velocity_layout.addLayout(slider_row)
+        vel_layout.addLayout(slider_row)
 
-        # Quick preset buttons
         preset_row = QtWidgets.QHBoxLayout()
-        for label, value in [("Slow", 1.0), ("Normal", 3.0), ("Fast", 5.0), ("Max", 8.0)]:
+        for label, value in [("Slow", 1.0), ("Med", 3.0), ("Fast", 5.0), ("Max", 8.0)]:
             btn = QtWidgets.QPushButton(label)
-            btn.setStyleSheet("padding: 4px; font-size: 9pt;")
-            btn.clicked.connect(lambda checked, v=value: self._set_velocity_scale(v))
+            btn.setMaximumHeight(24)
+            btn.clicked.connect(lambda _, v=value: self._set_velocity_scale(v))
             preset_row.addWidget(btn)
-        velocity_layout.addLayout(preset_row)
+        vel_layout.addLayout(preset_row)
 
-        apply_velocity_btn = QtWidgets.QPushButton("Apply Velocity Scale")
-        apply_velocity_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 6px;")
-        apply_velocity_btn.clicked.connect(self._apply_velocity_scale)
-        velocity_layout.addWidget(apply_velocity_btn)
-        layout.addWidget(velocity_group)
+        apply_btn = QtWidgets.QPushButton("Apply")
+        apply_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
+        apply_btn.clicked.connect(self._apply_velocity_scale)
+        vel_layout.addWidget(apply_btn)
+        layout.addWidget(vel_group)
 
-        # Speed control (motion-specific)
-        speed_group = QtWidgets.QGroupBox("Motion-Specific Speeds")
-        speed_layout = QtWidgets.QGridLayout(speed_group)
-
-        speed_layout.addWidget(QtWidgets.QLabel("Home:"), 0, 0)
-        self.speed_home = QtWidgets.QDoubleSpinBox()
-        self.speed_home.setRange(1.0, 6.0)
-        self.speed_home.setValue(4.0)
-        self.speed_home.setSingleStep(0.5)
-        speed_layout.addWidget(self.speed_home, 0, 1)
-
-        speed_layout.addWidget(QtWidgets.QLabel("Dropoff:"), 1, 0)
-        self.speed_dropoff = QtWidgets.QDoubleSpinBox()
-        self.speed_dropoff.setRange(1.0, 8.0)
-        self.speed_dropoff.setValue(6.5)
-        self.speed_dropoff.setSingleStep(0.5)
-        speed_layout.addWidget(self.speed_dropoff, 1, 1)
-
-        speed_layout.addWidget(QtWidgets.QLabel("Approach:"), 2, 0)
-        self.speed_approach = QtWidgets.QDoubleSpinBox()
-        self.speed_approach.setRange(0.2, 2.0)
-        self.speed_approach.setValue(0.5)
-        self.speed_approach.setSingleStep(0.1)
-        speed_layout.addWidget(self.speed_approach, 2, 1)
-
-        apply_speed_btn = QtWidgets.QPushButton("Apply Speeds")
-        apply_speed_btn.clicked.connect(self._apply_speed_settings)
-        speed_layout.addWidget(apply_speed_btn, 3, 0, 1, 2)
-        layout.addWidget(speed_group)
-
-        # Goal input section
-        goal_box = QtWidgets.QGroupBox("Manual Goal (base frame)")
-        goal_layout = QtWidgets.QGridLayout(goal_box)
+        # Manual Goal (compact)
+        goal_group = QtWidgets.QGroupBox("Manual Goal")
+        goal_layout = QtWidgets.QGridLayout(goal_group)
+        goal_layout.setSpacing(4)
 
         self.x_in = QtWidgets.QLineEdit("0.30")
         self.y_in = QtWidgets.QLineEdit("0.00")
@@ -293,443 +655,315 @@ class MainWindow(QtWidgets.QWidget):
         self.qy_in = QtWidgets.QLineEdit("0.0")
         self.qz_in = QtWidgets.QLineEdit("0.0")
 
-        goal_layout.addWidget(QtWidgets.QLabel("X (m)"), 0, 0)
-        goal_layout.addWidget(self.x_in, 0, 1)
-        goal_layout.addWidget(QtWidgets.QLabel("Y (m)"), 1, 0)
-        goal_layout.addWidget(self.y_in, 1, 1)
-        goal_layout.addWidget(QtWidgets.QLabel("Z (m)"), 2, 0)
-        goal_layout.addWidget(self.z_in, 2, 1)
+        for i, (label, widget) in enumerate([
+            ("X", self.x_in), ("Y", self.y_in), ("Z", self.z_in)
+        ]):
+            goal_layout.addWidget(QtWidgets.QLabel(label), i, 0)
+            widget.setMaximumWidth(80)
+            goal_layout.addWidget(widget, i, 1)
 
-        goal_layout.addWidget(QtWidgets.QLabel("qw"), 3, 0)
-        goal_layout.addWidget(self.qw_in, 3, 1)
-        goal_layout.addWidget(QtWidgets.QLabel("qx"), 4, 0)
-        goal_layout.addWidget(self.qx_in, 4, 1)
-        goal_layout.addWidget(QtWidgets.QLabel("qy"), 5, 0)
-        goal_layout.addWidget(self.qy_in, 5, 1)
-        goal_layout.addWidget(QtWidgets.QLabel("qz"), 6, 0)
-        goal_layout.addWidget(self.qz_in, 6, 1)
+        for i, (label, widget) in enumerate([
+            ("qw", self.qw_in), ("qx", self.qx_in), ("qy", self.qy_in), ("qz", self.qz_in)
+        ]):
+            goal_layout.addWidget(QtWidgets.QLabel(label), i, 2)
+            widget.setMaximumWidth(60)
+            goal_layout.addWidget(widget, i, 3)
 
-        send_goal_btn = QtWidgets.QPushButton("Send Goal")
-        send_goal_btn.clicked.connect(self._handle_send_goal)
-        send_goal_btn.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold; padding: 8px;")
-        goal_layout.addWidget(send_goal_btn, 7, 0, 1, 2)
-        layout.addWidget(goal_box)
+        send_btn = QtWidgets.QPushButton("Send Goal")
+        send_btn.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
+        send_btn.clicked.connect(self._handle_send_goal)
+        goal_layout.addWidget(send_btn, 4, 0, 1, 4)
+        layout.addWidget(goal_group)
 
-        # Motion control buttons
-        motion_group = QtWidgets.QGroupBox("Motion Commands")
-        motion_layout = QtWidgets.QVBoxLayout(motion_group)
+        # Motion Commands
+        motion_group = QtWidgets.QGroupBox("Motion")
+        motion_layout = QtWidgets.QGridLayout(motion_group)
+        motion_layout.setSpacing(4)
 
-        btn_style = "padding: 10px; font-size: 11pt; font-weight: bold;"
-
-        home_btn = QtWidgets.QPushButton("🏠 Home")
-        home_btn.setStyleSheet(f"{btn_style} background-color: #4caf50; color: white;")
+        home_btn = QtWidgets.QPushButton("Home")
+        home_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold;")
         home_btn.clicked.connect(lambda: self._send_cmd("home"))
-        motion_layout.addWidget(home_btn)
+        motion_layout.addWidget(home_btn, 0, 0)
 
-        drop_btn = QtWidgets.QPushButton("📦 Dropoff")
-        drop_btn.setStyleSheet(f"{btn_style} background-color: #2196f3; color: white;")
+        drop_btn = QtWidgets.QPushButton("Dropoff")
+        drop_btn.setStyleSheet("background-color: #2196f3; color: white; font-weight: bold;")
         drop_btn.clicked.connect(lambda: self._send_cmd("dropoff"))
-        motion_layout.addWidget(drop_btn)
+        motion_layout.addWidget(drop_btn, 0, 1)
 
-        exec_btn = QtWidgets.QPushButton("▶ Execute Goals")
-        exec_btn.setStyleSheet(f"{btn_style} background-color: #ff9800; color: white;")
+        exec_btn = QtWidgets.QPushButton("Execute")
+        exec_btn.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
         exec_btn.clicked.connect(lambda: self._send_cmd("execute"))
-        motion_layout.addWidget(exec_btn)
+        motion_layout.addWidget(exec_btn, 1, 0)
 
-        clear_btn = QtWidgets.QPushButton("🗑 Clear Goals")
-        clear_btn.setStyleSheet(f"{btn_style} background-color: #9e9e9e; color: white;")
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.setStyleSheet("background-color: #9e9e9e; color: white;")
         clear_btn.clicked.connect(lambda: self._send_cmd("clear"))
-        motion_layout.addWidget(clear_btn)
-
+        motion_layout.addWidget(clear_btn, 1, 1)
         layout.addWidget(motion_group)
 
-        # Gripper & capture controls
-        aux_group = QtWidgets.QGroupBox("Gripper & Capture")
-        aux_layout = QtWidgets.QVBoxLayout(aux_group)
+        # Gripper
+        gripper_group = QtWidgets.QGroupBox("Gripper")
+        gripper_layout = QtWidgets.QHBoxLayout(gripper_group)
 
-        gripper_row = QtWidgets.QHBoxLayout()
-        open_btn = QtWidgets.QPushButton("Open Gripper")
+        open_btn = QtWidgets.QPushButton("Open")
         open_btn.clicked.connect(lambda: self._send_cmd("open"))
-        close_btn = QtWidgets.QPushButton("Close Gripper")
+        gripper_layout.addWidget(open_btn)
+
+        close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(lambda: self._send_cmd("close"))
-        gripper_row.addWidget(open_btn)
-        gripper_row.addWidget(close_btn)
-        aux_layout.addLayout(gripper_row)
+        gripper_layout.addWidget(close_btn)
+        layout.addWidget(gripper_group)
 
-        capture_row = QtWidgets.QHBoxLayout()
-        capture_btn = QtWidgets.QPushButton("Start Capture (10s)")
-        capture_btn.clicked.connect(lambda: self._send_cmd("capture 10"))
-        cap_stop_btn = QtWidgets.QPushButton("Stop Capture")
-        cap_stop_btn.clicked.connect(lambda: self._send_cmd("capture_stop"))
-        capture_row.addWidget(capture_btn)
-        capture_row.addWidget(cap_stop_btn)
-        aux_layout.addLayout(capture_row)
+        # Keyboard Mode Button (opens separate window)
+        kbd_btn = QtWidgets.QPushButton("Open Keyboard Control Window")
+        kbd_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #673ab7;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                font-size: 11pt;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #7e57c2;
+            }
+        """)
+        kbd_btn.clicked.connect(self._open_keyboard_window)
+        layout.addWidget(kbd_btn)
 
-        layout.addWidget(aux_group)
+        # Capture
+        capture_group = QtWidgets.QGroupBox("Capture")
+        capture_layout = QtWidgets.QHBoxLayout(capture_group)
 
-        # Emergency stop
-        stop_btn = QtWidgets.QPushButton("⚠ EMERGENCY STOP")
-        stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 14pt; padding: 15px;")
+        cap_btn = QtWidgets.QPushButton("Start (10s)")
+        cap_btn.clicked.connect(lambda: self._send_cmd("capture 10"))
+        capture_layout.addWidget(cap_btn)
+
+        cap_stop = QtWidgets.QPushButton("Stop")
+        cap_stop.clicked.connect(lambda: self._send_cmd("capture_stop"))
+        capture_layout.addWidget(cap_stop)
+        layout.addWidget(capture_group)
+
+        # Emergency Stop
+        stop_btn = QtWidgets.QPushButton("EMERGENCY STOP")
+        stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 12pt; padding: 12px;")
         stop_btn.clicked.connect(self._handle_stop)
         layout.addWidget(stop_btn)
 
-        # Debug
-        debug_btn = QtWidgets.QPushButton("Debug World")
-        debug_btn.clicked.connect(lambda: self._send_cmd("debug_world"))
-        layout.addWidget(debug_btn)
-
         layout.addStretch(1)
-
         return panel
 
     def _build_monitor_panel(self):
-        """Build right monitoring panel with status displays and graphs."""
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
+        layout.setSpacing(6)
 
-        # Gripper force display
-        gripper_group = QtWidgets.QGroupBox("Gripper Force Sensors")
+        # Gripper forces (compact)
+        gripper_group = QtWidgets.QGroupBox("Gripper Forces")
         gripper_layout = QtWidgets.QHBoxLayout(gripper_group)
 
         self.force_labels = []
-        finger_names = ["Left", "Center", "Right"]
-        for i, name in enumerate(finger_names):
-            finger_widget = QtWidgets.QWidget()
-            finger_layout = QtWidgets.QVBoxLayout(finger_widget)
-            finger_layout.setSpacing(5)
+        for name in ["Left", "Center", "Right"]:
+            w = QtWidgets.QWidget()
+            vl = QtWidgets.QVBoxLayout(w)
+            vl.setSpacing(2)
 
-            label = QtWidgets.QLabel(name)
-            label.setAlignment(QtCore.Qt.AlignCenter)
-            label.setFont(QtGui.QFont("Helvetica", 10, QtGui.QFont.Bold))
-            finger_layout.addWidget(label)
+            lbl = QtWidgets.QLabel(name)
+            lbl.setAlignment(Qt.AlignCenter)
+            vl.addWidget(lbl)
 
-            value_label = QtWidgets.QLabel("0.00 N")
-            value_label.setAlignment(QtCore.Qt.AlignCenter)
-            value_label.setFont(QtGui.QFont("Courier", 14, QtGui.QFont.Bold))
-            value_label.setStyleSheet("background: #263238; color: #00e676; padding: 8px; border-radius: 4px;")
-            self.force_labels.append(value_label)
-            finger_layout.addWidget(value_label)
+            val = QtWidgets.QLabel("0.00 N")
+            val.setAlignment(Qt.AlignCenter)
+            val.setFont(QtGui.QFont("Courier", 12, QtGui.QFont.Bold))
+            val.setStyleSheet("background: #263238; color: #00e676; padding: 6px; border-radius: 4px;")
+            self.force_labels.append(val)
+            vl.addWidget(val)
 
-            # Progress bar for visual feedback
-            progress = QtWidgets.QProgressBar()
-            progress.setRange(0, 50)  # 0 to -0.50 N scaled to 0-50
-            progress.setValue(0)
-            progress.setTextVisible(False)
-            progress.setStyleSheet("""
-                QProgressBar {
-                    border: 2px solid grey;
-                    border-radius: 5px;
-                    text-align: center;
-                }
-                QProgressBar::chunk {
-                    background-color: #00e676;
-                }
-            """)
-            finger_layout.addWidget(progress)
-            setattr(self, f"force_bar_{i}", progress)
-
-            gripper_layout.addWidget(finger_widget)
-
+            gripper_layout.addWidget(w)
         layout.addWidget(gripper_group)
 
-        # Joint state display
+        # Joints
         joint_group = QtWidgets.QGroupBox("Joint Positions (rad)")
         joint_layout = QtWidgets.QGridLayout(joint_group)
-        joint_layout.setSpacing(5)
+        joint_layout.setSpacing(4)
 
         self.joint_labels = []
-        joint_names = ["Shoulder Pan", "Shoulder Lift", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"]
-        for i, name in enumerate(joint_names):
-            label = QtWidgets.QLabel(f"{name}:")
-            label.setFont(QtGui.QFont("Helvetica", 9))
-            joint_layout.addWidget(label, i // 3, (i % 3) * 2)
-
-            value = QtWidgets.QLabel("0.000")
-            value.setFont(QtGui.QFont("Courier", 9, QtGui.QFont.Bold))
-            value.setStyleSheet("background: #37474f; color: #64b5f6; padding: 4px; border-radius: 3px;")
-            self.joint_labels.append(value)
-            joint_layout.addWidget(value, i // 3, (i % 3) * 2 + 1)
-
+        names = ["Pan", "Lift", "Elbow", "W1", "W2", "W3"]
+        for i, name in enumerate(names):
+            joint_layout.addWidget(QtWidgets.QLabel(name), i // 3, (i % 3) * 2)
+            val = QtWidgets.QLabel("0.000")
+            val.setFont(QtGui.QFont("Courier", 9, QtGui.QFont.Bold))
+            val.setStyleSheet("background: #37474f; color: #64b5f6; padding: 3px; border-radius: 3px;")
+            self.joint_labels.append(val)
+            joint_layout.addWidget(val, i // 3, (i % 3) * 2 + 1)
         layout.addWidget(joint_group)
 
-        # Goals Information Panel
-        goals_group = QtWidgets.QGroupBox("Goals Information")
+        # Goals info
+        goals_group = QtWidgets.QGroupBox("Goals")
         goals_layout = QtWidgets.QVBoxLayout(goals_group)
+        goals_layout.setSpacing(4)
 
-        # Goal count and capture status
-        goals_header = QtWidgets.QHBoxLayout()
+        row1 = QtWidgets.QHBoxLayout()
         self.goal_count_label = QtWidgets.QLabel("Goals: 0")
-        self.goal_count_label.setFont(QtGui.QFont("Helvetica", 11, QtGui.QFont.Bold))
-        self.goal_count_label.setStyleSheet("color: #1976d2;")
-        goals_header.addWidget(self.goal_count_label)
+        self.goal_count_label.setStyleSheet("color: #1976d2; font-weight: bold;")
+        row1.addWidget(self.goal_count_label)
+        self.capture_status_label = QtWidgets.QLabel("Capture: --")
+        row1.addWidget(self.capture_status_label)
+        row1.addStretch()
+        goals_layout.addLayout(row1)
 
-        self.capture_status_label = QtWidgets.QLabel("Capture: Inactive")
-        self.capture_status_label.setFont(QtGui.QFont("Helvetica", 10))
-        self.capture_status_label.setStyleSheet("color: #757575;")
-        goals_header.addWidget(self.capture_status_label)
-        goals_header.addStretch()
-        goals_layout.addLayout(goals_header)
+        self.latest_goal_label = QtWidgets.QLabel("Latest: --")
+        self.latest_goal_label.setFont(QtGui.QFont("Courier", 8))
+        goals_layout.addWidget(self.latest_goal_label)
 
-        # Latest goal display
-        latest_goal_row = QtWidgets.QHBoxLayout()
-        latest_goal_row.addWidget(QtWidgets.QLabel("Latest:"))
-        self.latest_goal_label = QtWidgets.QLabel("--")
-        self.latest_goal_label.setFont(QtGui.QFont("Courier", 9))
-        self.latest_goal_label.setStyleSheet("background: #e3f2fd; padding: 3px; border-radius: 3px;")
-        latest_goal_row.addWidget(self.latest_goal_label)
-        goals_layout.addLayout(latest_goal_row)
-
-        # Best goal display
-        best_goal_row = QtWidgets.QHBoxLayout()
-        best_goal_row.addWidget(QtWidgets.QLabel("Best:"))
-        self.best_goal_label = QtWidgets.QLabel("--")
-        self.best_goal_label.setFont(QtGui.QFont("Courier", 9))
-        self.best_goal_label.setStyleSheet("background: #e8f5e9; padding: 3px; border-radius: 3px;")
-        best_goal_row.addWidget(self.best_goal_label)
-        goals_layout.addLayout(best_goal_row)
-
-        # Goal queue list
         self.goal_list_widget = QtWidgets.QListWidget()
-        self.goal_list_widget.setMaximumHeight(80)
+        self.goal_list_widget.setMaximumHeight(60)
         self.goal_list_widget.setFont(QtGui.QFont("Courier", 8))
-        self.goal_list_widget.setStyleSheet("background: #fafafa;")
         goals_layout.addWidget(self.goal_list_widget)
 
-        # Current velocity scale display
-        velocity_row = QtWidgets.QHBoxLayout()
-        velocity_row.addWidget(QtWidgets.QLabel("Velocity Scale:"))
-        self.current_velocity_label = QtWidgets.QLabel("5.0x")
-        self.current_velocity_label.setFont(QtGui.QFont("Courier", 10, QtGui.QFont.Bold))
+        self.current_velocity_label = QtWidgets.QLabel("Velocity: 5.0x")
         self.current_velocity_label.setStyleSheet("color: #ff5722; font-weight: bold;")
-        velocity_row.addWidget(self.current_velocity_label)
-        velocity_row.addStretch()
-        goals_layout.addLayout(velocity_row)
-
+        goals_layout.addWidget(self.current_velocity_label)
         layout.addWidget(goals_group)
 
         # Graphs
         if PYQTGRAPH_AVAILABLE:
-            # Force graph
-            force_graph_group = QtWidgets.QGroupBox("Gripper Force History")
+            force_graph_group = QtWidgets.QGroupBox("Force History")
             force_graph_layout = QtWidgets.QVBoxLayout(force_graph_group)
 
             self.force_plot = PlotWidget()
             self.force_plot.setBackground('w')
             self.force_plot.setLabel('left', 'Force (N)')
-            self.force_plot.setLabel('bottom', 'Time (s)')
-            self.force_plot.addLegend()
             self.force_plot.showGrid(x=True, y=True, alpha=0.3)
+            self.force_plot.setMaximumHeight(150)
 
             colors = ['#f44336', '#2196f3', '#4caf50']
-            self.force_curves = []
-            for i, color in enumerate(colors):
-                curve = self.force_plot.plot(
-                    pen=mkPen(color=color, width=2),
-                    name=finger_names[i]
-                )
-                self.force_curves.append(curve)
-
+            self.force_curves = [self.force_plot.plot(pen=mkPen(color=c, width=2)) for c in colors]
             force_graph_layout.addWidget(self.force_plot)
             layout.addWidget(force_graph_group)
 
-            # Joint graph
-            joint_graph_group = QtWidgets.QGroupBox("Joint Position History")
+            joint_graph_group = QtWidgets.QGroupBox("Joint History")
             joint_graph_layout = QtWidgets.QVBoxLayout(joint_graph_group)
 
             self.joint_plot = PlotWidget()
             self.joint_plot.setBackground('w')
-            self.joint_plot.setLabel('left', 'Position (rad)')
-            self.joint_plot.setLabel('bottom', 'Time (s)')
-            self.joint_plot.addLegend()
+            self.joint_plot.setLabel('left', 'Pos (rad)')
             self.joint_plot.showGrid(x=True, y=True, alpha=0.3)
+            self.joint_plot.setMaximumHeight(150)
 
-            joint_colors = ['#e91e63', '#9c27b0', '#3f51b5', '#00bcd4', '#009688', '#ff9800']
-            self.joint_curves = []
-            for i, color in enumerate(joint_colors):
-                curve = self.joint_plot.plot(
-                    pen=mkPen(color=color, width=1.5),
-                    name=f"J{i+1}"
-                )
-                self.joint_curves.append(curve)
-
+            jcolors = ['#e91e63', '#9c27b0', '#3f51b5', '#00bcd4', '#009688', '#ff9800']
+            self.joint_curves = [self.joint_plot.plot(pen=mkPen(color=c, width=1.5)) for c in jcolors]
             joint_graph_layout.addWidget(self.joint_plot)
             layout.addWidget(joint_graph_group)
-        else:
-            no_graph_label = QtWidgets.QLabel("⚠ Install pyqtgraph for graphs:\npip install pyqtgraph")
-            no_graph_label.setStyleSheet("color: #ff6f00; font-size: 12pt; padding: 20px;")
-            no_graph_label.setAlignment(QtCore.Qt.AlignCenter)
-            layout.addWidget(no_graph_label)
 
+        layout.addStretch(1)
         return panel
 
-    def _update_displays(self):
-        """Update all displays with latest ROS data."""
-        # Update robot state
-        if self.ros.robot_running:
-            self.robot_state_label.setText("Program: RUNNING ✓")
-            self.robot_state_label.setStyleSheet("font-size: 12pt; padding: 5px; background: #c8e6c9; color: #2e7d32;")
-        else:
-            self.robot_state_label.setText("Program: STOPPED ⏸")
-            self.robot_state_label.setStyleSheet("font-size: 12pt; padding: 5px; background: #ffccbc; color: #bf360c;")
+    def _open_keyboard_window(self):
+        """Open the keyboard control window to the right of main window."""
+        if self.kbd_window is None or not self.kbd_window.isVisible():
+            # Pass geometry so keyboard window opens to the side
+            self.kbd_window = KeyboardControlWindow(self.ros, self.geometry())
+            # Keyboard window no longer accepts absolute pose from main window
+        self.kbd_window.show()
+        self.kbd_window.raise_()
+        self.kbd_window.activateWindow()
+        self.kbd_window.setFocus()
 
-        # Update gripper forces
+    def _update_displays(self):
+        # Robot state
+        if self.ros.robot_running:
+            self.robot_state_label.setText("Program: RUNNING")
+            self.robot_state_label.setStyleSheet("font-size: 11pt; padding: 4px; background: #c8e6c9; color: #2e7d32;")
+        else:
+            self.robot_state_label.setText("Program: STOPPED")
+            self.robot_state_label.setStyleSheet("font-size: 11pt; padding: 4px; background: #ffccbc; color: #bf360c;")
+
+        # Forces
         forces = self.ros.gripper_force_data
         for i, (force, label) in enumerate(zip(forces, self.force_labels)):
             label.setText(f"{force:.3f} N")
+            color = "#ff1744" if abs(force) > 0.20 else "#ffc107" if abs(force) > 0.10 else "#00e676"
+            label.setStyleSheet(f"background: #263238; color: {color}; padding: 6px; border-radius: 4px;")
 
-            # Update color based on magnitude
-            if abs(force) > 0.20:
-                color = "#ff1744"  # Red for high force
-            elif abs(force) > 0.10:
-                color = "#ffc107"  # Yellow for medium
-            else:
-                color = "#00e676"  # Green for low
-
-            label.setStyleSheet(f"background: #263238; color: {color}; padding: 8px; border-radius: 4px; font-weight: bold;")
-
-            # Update progress bar
-            bar = getattr(self, f"force_bar_{i}")
-            bar.setValue(int(abs(force) * 100))
-
-        # Update joint positions
+        # Joints
         if self.ros.joint_state_data and len(self.ros.joint_state_data.position) >= 6:
-            positions = self.ros.joint_state_data.position[:6]
-            for i, (pos, label) in enumerate(zip(positions, self.joint_labels)):
-                label.setText(f"{pos:.3f}")
+            for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
+                self.joint_labels[i].setText(f"{pos:.3f}")
 
-        # Update goals information
+        # Goals
         goal_info = self.ros.goal_info_data
         if goal_info:
-            # Goal count
-            goal_count = goal_info.get("goal_count", 0)
-            self.goal_count_label.setText(f"Goals: {goal_count}")
-            if goal_count > 0:
-                self.goal_count_label.setStyleSheet("color: #4caf50; font-weight: bold;")
-            else:
-                self.goal_count_label.setStyleSheet("color: #1976d2;")
-
-            # Capture status
-            if goal_info.get("capture_active", False):
-                cap_count = goal_info.get("capture_count", 0)
-                self.capture_status_label.setText(f"Capture: ACTIVE ({cap_count})")
+            self.goal_count_label.setText(f"Goals: {goal_info.get('goal_count', 0)}")
+            if goal_info.get("capture_active"):
+                self.capture_status_label.setText(f"Capture: ACTIVE ({goal_info.get('capture_count', 0)})")
                 self.capture_status_label.setStyleSheet("color: #ff5722; font-weight: bold;")
             else:
-                self.capture_status_label.setText("Capture: Inactive")
-                self.capture_status_label.setStyleSheet("color: #757575;")
+                self.capture_status_label.setText("Capture: --")
+                self.capture_status_label.setStyleSheet("")
 
-            # Latest goal
             latest = goal_info.get("latest_goal")
-            if latest:
-                self.latest_goal_label.setText(f"X:{latest[0]:.3f} Y:{latest[1]:.3f} Z:{latest[2]:.3f}")
-            else:
-                self.latest_goal_label.setText("--")
+            self.latest_goal_label.setText(f"Latest: {latest[0]:.3f}, {latest[1]:.3f}, {latest[2]:.3f}" if latest else "Latest: --")
 
-            # Best goal
-            best = goal_info.get("best_goal_xyz")
-            if best:
-                self.best_goal_label.setText(f"X:{best[0]:.3f} Y:{best[1]:.3f} Z:{best[2]:.3f}")
-            else:
-                self.best_goal_label.setText("--")
-
-            # Goal queue
-            goals = goal_info.get("goals", [])
             self.goal_list_widget.clear()
-            for i, g in enumerate(goals):
-                self.goal_list_widget.addItem(f"#{i+1}: X:{g[0]:.3f} Y:{g[1]:.3f} Z:{g[2]:.3f}")
+            for i, g in enumerate(goal_info.get("goals", [])):
+                self.goal_list_widget.addItem(f"#{i+1}: {g[0]:.3f}, {g[1]:.3f}, {g[2]:.3f}")
 
-            # Velocity scale
-            vel_scale = goal_info.get("velocity_scale", 5.0)
-            self.current_velocity_label.setText(f"{vel_scale:.1f}x")
+            self.current_velocity_label.setText(f"Velocity: {goal_info.get('velocity_scale', 5.0):.1f}x")
 
-        # Update graphs
+        # Graphs
         if PYQTGRAPH_AVAILABLE:
             self.elapsed_time += 0.05
             self.time_data.append(self.elapsed_time)
 
-            # Force data
             for i, force in enumerate(forces):
                 self.force_history[i].append(force)
-                if len(self.time_data) > 0 and len(self.force_history[i]) > 0:
-                    self.force_curves[i].setData(
-                        list(self.time_data)[-len(self.force_history[i]):],
-                        list(self.force_history[i])
-                    )
+                if self.time_data and self.force_history[i]:
+                    self.force_curves[i].setData(list(self.time_data)[-len(self.force_history[i]):], list(self.force_history[i]))
 
-            # Joint data
             if self.ros.joint_state_data and len(self.ros.joint_state_data.position) >= 6:
-                positions = self.ros.joint_state_data.position[:6]
-                for i, pos in enumerate(positions):
+                for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
                     self.joint_history[i].append(pos)
-                    if len(self.time_data) > 0 and len(self.joint_history[i]) > 0:
-                        self.joint_curves[i].setData(
-                            list(self.time_data)[-len(self.joint_history[i]):],
-                            list(self.joint_history[i])
-                        )
+                    if self.time_data and self.joint_history[i]:
+                        self.joint_curves[i].setData(list(self.time_data)[-len(self.joint_history[i]):], list(self.joint_history[i]))
 
     def _handle_send_goal(self):
         try:
-            x = float(self.x_in.text())
-            y = float(self.y_in.text())
-            z = float(self.z_in.text())
-            qw = float(self.qw_in.text())
-            qx = float(self.qx_in.text())
-            qy = float(self.qy_in.text())
-            qz = float(self.qz_in.text())
+            x, y, z = float(self.x_in.text()), float(self.y_in.text()), float(self.z_in.text())
+            qw, qx, qy, qz = float(self.qw_in.text()), float(self.qx_in.text()), float(self.qy_in.text()), float(self.qz_in.text())
         except ValueError:
-            self.status_update.emit("Invalid goal values.", True)
+            self.status_update.emit("Invalid goal values", True)
             return
-
         self.ros.publish_goal(x, y, z, qw, qx, qy, qz)
-        self.status_update.emit(f"Published goal ({x:.3f}, {y:.3f}, {z:.3f}).", False)
+        self.status_update.emit(f"Goal sent: ({x:.3f}, {y:.3f}, {z:.3f})", False)
 
     def _handle_stop(self):
         self.ros.publish_stop()
         self._send_cmd("stop")
-        self.status_update.emit("⚠ EMERGENCY STOP ACTIVATED", True)
+        self.status_update.emit("EMERGENCY STOP", True)
 
     def _send_cmd(self, cmd: str):
         self.ros.publish_cmd(cmd)
-        self.status_update.emit(f"Sent command: {cmd}", False)
-
-    def _apply_speed_settings(self):
-        """Send speed configuration as command."""
-        speeds = {
-            "home": self.speed_home.value(),
-            "dropoff": self.speed_dropoff.value(),
-            "approach": self.speed_approach.value()
-        }
-        cmd = f"set_speeds {speeds['home']:.2f} {speeds['dropoff']:.2f} {speeds['approach']:.2f}"
-        self._send_cmd(cmd)
-        self.status_update.emit(f"Applied speeds: Home={speeds['home']:.1f}, Drop={speeds['dropoff']:.1f}, Approach={speeds['approach']:.2f}", False)
+        self.status_update.emit(f"Cmd: {cmd}", False)
 
     def _on_velocity_slider_changed(self, value: int):
-        """Update velocity label when slider changes."""
-        scale = value / 10.0
-        self.velocity_value_label.setText(f"{scale:.1f}x")
+        self.velocity_value_label.setText(f"{value / 10.0:.1f}x")
 
     def _set_velocity_scale(self, scale: float):
-        """Set velocity scale from preset button."""
         self.velocity_slider.setValue(int(scale * 10))
-        self.velocity_value_label.setText(f"{scale:.1f}x")
 
     def _apply_velocity_scale(self):
-        """Apply the velocity scale to the robot node."""
         scale = self.velocity_slider.value() / 10.0
         self.ros.publish_velocity_scale(scale)
-        self.status_update.emit(f"Velocity scale set to {scale:.1f}x", False)
+        self.status_update.emit(f"Velocity: {scale:.1f}x", False)
 
     def _set_status_slot(self, text: str, error: bool):
-        """Slot for thread-safe status updates."""
         if not self._status:
             return
-        if error:
-            color = "#d32f2f"
-            bg = "#ffcdd2"
-        else:
-            color = "#2d6a4f"
-            bg = "#e8f5e9"
+        color, bg = ("#d32f2f", "#ffcdd2") if error else ("#2d6a4f", "#e8f5e9")
         self._status.setText(text)
-        self._status.setStyleSheet(f"color: {color}; font-weight: bold; padding: 8px; background: {bg}; border-radius: 4px;")
+        self._status.setStyleSheet(f"color: {color}; font-weight: bold; padding: 6px; background: {bg}; border-radius: 4px;")
 
 
 def main():
@@ -743,26 +977,7 @@ def main():
     spin_thread.start()
 
     app = QtWidgets.QApplication(sys.argv)
-
-    # Set application style
     app.setStyle('Fusion')
-
-    # Dark palette (optional - comment out for light theme)
-    # palette = QtGui.QPalette()
-    # palette.setColor(QtGui.QPalette.Window, QtGui.QColor(53, 53, 53))
-    # palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
-    # palette.setColor(QtGui.QPalette.Base, QtGui.QColor(25, 25, 25))
-    # palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(53, 53, 53))
-    # palette.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
-    # palette.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
-    # palette.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
-    # palette.setColor(QtGui.QPalette.Button, QtGui.QColor(53, 53, 53))
-    # palette.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
-    # palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
-    # palette.setColor(QtGui.QPalette.Link, QtGui.QColor(42, 130, 218))
-    # palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(42, 130, 218))
-    # palette.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
-    # app.setPalette(palette)
 
     win = MainWindow(ros_node)
     win.show()

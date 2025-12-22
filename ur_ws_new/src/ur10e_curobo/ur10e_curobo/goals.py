@@ -496,7 +496,7 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
         orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        approach = [ax, ay, az-0.10, *orientation]
+        approach = [ax, ay, az-0.12, *orientation]
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
             

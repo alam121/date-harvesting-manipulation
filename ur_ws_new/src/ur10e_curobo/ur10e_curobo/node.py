@@ -11,7 +11,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
 from std_msgs.msg import Bool, Float32MultiArray, String, Float32
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped, Twist
 from tf2_ros import Buffer, TransformListener
 from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
 
@@ -253,6 +253,24 @@ class UR10eCuroboMoveIt(Node):
         self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
 
+        # ---- TELEOP STATE ----
+        # Teleop: cache incoming twist deltas and servo them to the robot
+        self.teleop_enabled = True
+        self.latest_teleop_twist = None
+        self.teleop_timeout = 0.2  # seconds
+        self.last_teleop_time = 0.0
+
+        # Subscribe to teleop delta twists (published by the GUI)
+        self.create_subscription(
+            Twist,
+            "/teleop_delta",
+            self._teleop_cb,
+            10
+        )
+
+        # Servo timer (50 Hz) to convert cached teleop deltas into single-step trajectories
+        self.create_timer(0.02, self._teleop_servo_tick)  # 50 Hz
+
         # # Perception: ZED + YOLO
         #self._maybe_start_perception()
 
@@ -308,17 +326,28 @@ class UR10eCuroboMoveIt(Node):
     def _ui_command_cb(self, msg: String):
         """Handle commands from the GUI."""
         import json
+        import threading
         cmd = msg.data.strip()
         self.get_logger().info(f"UI command received: {cmd}")
 
-        if cmd == "home":
+        # Run blocking motion commands in separate thread to avoid blocking ROS callbacks
+        def run_home():
             motions_mod.move_to_home_position(self)
-        elif cmd == "dropoff":
+
+        def run_dropoff():
             motions_mod.move_to_dropoff_position(self)
             gripper_mod.control_gripper(self, 'OPEN')
-        elif cmd == "execute":
+        
+        def run_execute():
             if self.goal_poses:
                 self._prep_and_execute()
+
+        if cmd == "home":
+            threading.Thread(target=run_home, daemon=True).start()
+        elif cmd == "dropoff":
+            threading.Thread(target=run_dropoff, daemon=True).start()
+        elif cmd == "execute":
+            threading.Thread(target=run_execute, daemon=True).start()
         elif cmd == "clear":
             self.goal_poses.clear()
             self.get_logger().info("Goals cleared")
@@ -403,7 +432,7 @@ class UR10eCuroboMoveIt(Node):
             import time
             return time.strftime("%H:%M:%S")
 
-        print("[{}] Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, q=quit".format(ts()))
+        print("[{}] Keys: y=save marker, m=manual, s=subscribe, p=capture, n=execute, o=open, c=close, h=home, d=dropoff, k=stop, z=teleop-toggle, q=quit".format(ts()))
         last_key = None
         while self.running:
             key = read_key()
@@ -479,6 +508,17 @@ class UR10eCuroboMoveIt(Node):
                 motions_mod.publish_stop_trajectory(self)
                 # Clear any queued goals so execution loop can exit quickly
                 self.goal_poses.clear()
+
+            elif key == 'z':
+                # Toggle teleop enable
+                self.teleop_enabled = not getattr(self, 'teleop_enabled', False)
+                if self.teleop_enabled:
+                    # clear any cached twist so we don't immediately servo stale commands
+                    self.latest_teleop_twist = None
+                    self.last_teleop_time = 0.0
+                    print(f"[{ts()}] TELEOP enabled. Waiting for incoming teleop deltas...")
+                else:
+                    print(f"[{ts()}] TELEOP disabled.")
 
             elif key == 'q':
                 print(f"[{ts()}] quitting…")
@@ -748,3 +788,82 @@ class UR10eCuroboMoveIt(Node):
             return
         # Delay startup to avoid RAM spikes colliding with cuRobo init
         self.perception_timer: Timer = self.create_timer(5.0, self._start_perception_once)
+
+    # ---- Teleop callbacks & servoing ----
+    def _teleop_cb(self, msg: Twist):
+        """Cache latest teleop twist and timestamp (deadman handled in servo tick)."""
+        import time
+        self.latest_teleop_twist = msg
+        self.last_teleop_time = time.time()
+
+    def _teleop_servo_tick(self):
+        """Run at ~50Hz: convert cached teleop twist into a single-step IK and publish one-step trajectory.
+
+        This implements a simple, low-latency teleop by applying the twist linear deltas
+        directly in TCP frame to the current end-effector pose, solving IK fast, and
+        publishing a single JointTrajectory point covering the next 20ms.
+        """
+        import time
+        # Teleop enabled?
+        if not getattr(self, 'teleop_enabled', False):
+            return
+
+        if self.latest_teleop_twist is None:
+            return
+
+        # deadman timeout
+        if time.time() - getattr(self, 'last_teleop_time', 0.0) > getattr(self, 'teleop_timeout', 0.2):
+            return
+
+        # need current joint feedback to seed IK
+        if self.current_joint_positions is None:
+            return
+
+        # 1. current TCP pose
+        ee = self.get_end_effector_pose()
+        if ee is None:
+            return
+
+        x, y, z, qw, qx, qy, qz = ee
+
+        # 2. Apply linear deltas (TCP frame assumed)
+        dx = float(self.latest_teleop_twist.linear.x)
+        dy = float(self.latest_teleop_twist.linear.y)
+        dz = float(self.latest_teleop_twist.linear.z)
+
+        x_new = x + dx
+        y_new = y + dy
+        z_new = z + dz
+
+        # Orientation deltas omitted (UI currently doesn't send reliable orientation)
+
+        # 3. Build target pose (vec7)
+        target_pose = [x_new, y_new, z_new, qw, qx, qy, qz]
+
+        # 4. Solve IK (fast path)
+        try:
+            q_cmd = fk_mod.solve_ik_fast(
+                self,
+                target_pose,
+                seed=self.current_joint_positions
+            )
+        except Exception:
+            return
+
+        if q_cmd is None:
+            return
+
+        # 5. Publish single-step trajectory (overwrite)
+        traj = JointTrajectory()
+        traj.joint_names = self.joint_order
+        point = traj.points.add()
+        point.positions = list(q_cmd)
+        # one step ahead (20ms)
+        point.time_from_start.sec = 0
+        point.time_from_start.nanosec = int(0.02 * 1e9)
+
+        try:
+            self.trajectory_pub.publish(traj)
+        except Exception:
+            # be defensive — don't let teleop servo crash the node
+            return
