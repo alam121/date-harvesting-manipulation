@@ -542,13 +542,18 @@ def plan_and_execute(node):
         #rotate_wrist(node, 90, rotate_time=0.5, hold_time=0.05, return_time=0.5)
         time.sleep(0.1)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
 
-        # #move_to_predropoff_position(node)
-        # current_pose = node.get_end_effector_pose()
-        # execute_single_pose(node, [current_pose[0], current_pose[1]+node.cfg.planner.pre_droffoff_y_offset,
-        #                       current_pose[2]+node.cfg.planner.pre_droffoff_z_offset,
-        #                       *current_pose[3:]], motion_type="predropoff")
-
-        move_to_predropoff_position(node)
+        # #move_to_predropoff_position
+        current_pose = node.get_end_effector_pose()
+        target_pose = [current_pose[0], current_pose[1]+node.cfg.planner.pre_dropoff_y_offset,
+                       current_pose[2]+node.cfg.planner.pre_dropoff_z_offset,
+                       *current_pose[3:]]
+        print("Current pose:", current_pose)
+        print("Target pre-dropoff pose:", target_pose)
+        execute_single_pose(node, target_pose, motion_type="predropoff")
+        # Wait until robot reaches target position (with tolerance)
+        wait_until_xyz(node, target_pose[:3], tol=0.02, timeout=10.0)
+        print("Moved to pre-dropoff position.")
+        #move_to_predropoff_position(node)
         blend_motion(node)
         time.sleep(0.1)
         move_to_dropoff_position(node)

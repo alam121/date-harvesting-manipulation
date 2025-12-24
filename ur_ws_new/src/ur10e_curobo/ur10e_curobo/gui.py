@@ -212,45 +212,37 @@ class KeyboardControlWindow(QtWidgets.QWidget):
 
         # Keyboard control state - START ENABLED
         self.keyboard_enabled = True
-        self.step_size = 0.01  # 1cm default step
+        self.step_size = 0.005  # 5mm default step (smaller for smoothness)
 
-        # Keys currently pressed (for display only now)
-        self.keys_pressed = set()
+        # Keys currently held down (tracked via keyPress/keyRelease)
+        self.keys_held = set()
 
         # Mouse tracking state
         self.mouse_tracking_active = False
         self.last_mouse_pos = None
 
+        # Velocity ramping for smooth acceleration
+        self.current_velocity = [0.0, 0.0, 0.0]  # dx, dy, dz
+        self.max_velocity = 0.02  # m per tick at full speed
+        self.accel_rate = 0.3  # how fast to ramp up (0-1, higher = faster)
+        self.decel_rate = 0.5  # how fast to slow down when key released
+
         self._build_ui()
         self._setup_shortcuts()
 
-        # Movement timer for continuous key press
+        # Movement timer - run faster for smoother motion
         self.kbd_timer = QTimer()
         self.kbd_timer.timeout.connect(self._process_keyboard_movement)
-        self.kbd_timer.start(50)
+        self.kbd_timer.start(25)  # 40Hz for smoother updates
 
         # Connect status signal
         self.status_update.connect(self._set_status)
 
     def _setup_shortcuts(self):
-        """Setup keyboard shortcuts that work when window is active."""
-        # Movement shortcuts - these set keys_pressed and are processed by timer
-        def make_press(key):
-            def handler():
-                if self.keyboard_enabled:
-                    self.keys_pressed.add(key)
-                    self._update_control_area_display()
-            return handler
+        """Setup non-movement keyboard shortcuts."""
+        # Movement keys are now handled via keyPressEvent/keyReleaseEvent for smooth hold detection
 
-        # Create shortcuts for movement keys - WindowShortcut context
-        for key_char, key_code in [('W', Qt.Key_W), ('S', Qt.Key_S), ('A', Qt.Key_A),
-                                    ('D', Qt.Key_D), ('Q', Qt.Key_Q), ('E', Qt.Key_E)]:
-            shortcut = QShortcut(QKeySequence(key_char), self)
-            shortcut.setContext(Qt.WindowShortcut)
-            shortcut.activated.connect(make_press(key_code))
-            shortcut.setAutoRepeat(True)
-
-        # Action shortcuts (no orientation shortcuts here) - only movement keys
+        # Action shortcuts - gripper
         g_shortcut = QShortcut(QKeySequence('G'), self)
         g_shortcut.setContext(Qt.WindowShortcut)
         g_shortcut.activated.connect(lambda: self._gripper_cmd("open"))
@@ -276,6 +268,28 @@ class KeyboardControlWindow(QtWidgets.QWidget):
         esc_shortcut = QShortcut(QKeySequence("Esc"), self)
         esc_shortcut.setContext(Qt.WindowShortcut)
         esc_shortcut.activated.connect(self._disable_keyboard)
+
+    def keyPressEvent(self, event):
+        """Track movement keys being held down."""
+        if not event.isAutoRepeat() and self.keyboard_enabled:
+            key = event.key()
+            if key in (Qt.Key_W, Qt.Key_S, Qt.Key_A, Qt.Key_D, Qt.Key_Q, Qt.Key_E):
+                self.keys_held.add(key)
+                self._update_control_area_display()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Track movement keys being released."""
+        if not event.isAutoRepeat():
+            key = event.key()
+            if key in (Qt.Key_W, Qt.Key_S, Qt.Key_A, Qt.Key_D, Qt.Key_Q, Qt.Key_E):
+                self.keys_held.discard(key)
+                self._update_control_area_display()
+                event.accept()
+                return
+        super().keyReleaseEvent(event)
 
     def _gripper_cmd(self, cmd):
         if self.keyboard_enabled:
@@ -416,20 +430,25 @@ class KeyboardControlWindow(QtWidgets.QWidget):
     def _update_control_area_display(self):
         # Show which keys are active
         active = []
-        if Qt.Key_W in self.keys_pressed: active.append("W")
-        if Qt.Key_S in self.keys_pressed: active.append("S")
-        if Qt.Key_A in self.keys_pressed: active.append("A")
-        if Qt.Key_D in self.keys_pressed: active.append("D")
-        if Qt.Key_Q in self.keys_pressed: active.append("Q")
-        if Qt.Key_E in self.keys_pressed: active.append("E")
-        keys_text = f"<b style='color:#4caf50'>Keys: {' '.join(active)}</b>" if active else "<i>Use WASD/QE keys</i>"
+        if Qt.Key_W in self.keys_held: active.append("W")
+        if Qt.Key_S in self.keys_held: active.append("S")
+        if Qt.Key_A in self.keys_held: active.append("A")
+        if Qt.Key_D in self.keys_held: active.append("D")
+        if Qt.Key_Q in self.keys_held: active.append("Q")
+        if Qt.Key_E in self.keys_held: active.append("E")
+        keys_text = f"<b style='color:#4caf50'>Keys: {' '.join(active)}</b>" if active else "<i>Hold WASD/QE keys</i>"
+
+        # Show current velocity
+        vel_mag = sum(v*v for v in self.current_velocity) ** 0.5
+        vel_text = f"<span style='color:#1976d2'>Vel: {vel_mag*1000:.1f} mm/tick</span>"
 
         # Display that the window publishes deltas rather than absolute pose
         self.control_area.setText(
-            f"<center><h2>Teleop (deltas)</h2>"
-            f"<p style='font-size:12pt'>Use WASD/QE to publish position deltas.<br>"
-            f"Drag mouse to publish X/Y deltas. Scroll to publish Z delta.</p>"
-            f"<p>{keys_text}</p></center>"
+            f"<center><h2>Teleop (smooth)</h2>"
+            f"<p style='font-size:12pt'>Hold WASD/QE for smooth motion.<br>"
+            f"Drag mouse for X/Y. Scroll for Z.</p>"
+            f"<p>{keys_text}</p>"
+            f"<p>{vel_text}</p></center>"
         )
 
     def _update_displays(self):
@@ -441,13 +460,14 @@ class KeyboardControlWindow(QtWidgets.QWidget):
         self.keyboard_enabled = checked
         if checked:
             self.enable_btn.setText("Disable Keyboard Control")
-            self.status_label.setText("ACTIVE - Press WASD/QE to move robot")
+            self.status_label.setText("ACTIVE - Hold WASD/QE to move robot")
             self.status_label.setStyleSheet("padding: 10px; background: #c8e6c9; border-radius: 4px; font-weight: bold; font-size: 11pt;")
         else:
             self.enable_btn.setText("Enable Keyboard Control")
             self.status_label.setText("DISABLED - Click Enable to start")
             self.status_label.setStyleSheet("padding: 10px; background: #ffcdd2; border-radius: 4px; font-size: 11pt;")
-            self.keys_pressed.clear()
+            self.keys_held.clear()
+            self.current_velocity = [0.0, 0.0, 0.0]
 
     def closeEvent(self, event):
         """Clean up when closing."""
@@ -475,24 +495,42 @@ class KeyboardControlWindow(QtWidgets.QWidget):
         self.status_update.emit("EMERGENCY STOP ACTIVATED", True)
 
     def _process_keyboard_movement(self):
-        """Process keys and clear them (shortcuts fire repeatedly with autorepeat)."""
-        if not self.keyboard_enabled or not self.keys_pressed:
+        """Process held keys with smooth velocity ramping."""
+        if not self.keyboard_enabled:
             return
-        # Process each key once then clear and publish linear deltas only
-        keys_to_process = self.keys_pressed.copy()
-        self.keys_pressed.clear()
-        dx = dy = dz = 0.0
 
-        if Qt.Key_W in keys_to_process: dy += self.step_size
-        if Qt.Key_S in keys_to_process: dy -= self.step_size
-        if Qt.Key_A in keys_to_process: dx -= self.step_size
-        if Qt.Key_D in keys_to_process: dx += self.step_size
-        if Qt.Key_Q in keys_to_process: dz += self.step_size
-        if Qt.Key_E in keys_to_process: dz -= self.step_size
+        # Target velocity based on keys held
+        target = [0.0, 0.0, 0.0]  # dx, dy, dz
+        speed = self.step_size
 
-        if any([dx, dy, dz]):
-            # Only publish linear deltas; orientation removed from keyboard control
+        if Qt.Key_W in self.keys_held: target[1] += speed
+        if Qt.Key_S in self.keys_held: target[1] -= speed
+        if Qt.Key_A in self.keys_held: target[0] -= speed
+        if Qt.Key_D in self.keys_held: target[0] += speed
+        if Qt.Key_Q in self.keys_held: target[2] += speed
+        if Qt.Key_E in self.keys_held: target[2] -= speed
+
+        # Smooth velocity ramping
+        for i in range(3):
+            if abs(target[i]) > 0.0001:
+                # Accelerate towards target
+                diff = target[i] - self.current_velocity[i]
+                self.current_velocity[i] += diff * self.accel_rate
+            else:
+                # Decelerate when no key held
+                self.current_velocity[i] *= (1.0 - self.decel_rate)
+                if abs(self.current_velocity[i]) < 0.0001:
+                    self.current_velocity[i] = 0.0
+
+        # Clamp to max velocity
+        for i in range(3):
+            self.current_velocity[i] = max(-self.max_velocity, min(self.max_velocity, self.current_velocity[i]))
+
+        # Publish if there's any movement
+        dx, dy, dz = self.current_velocity
+        if abs(dx) > 0.0001 or abs(dy) > 0.0001 or abs(dz) > 0.0001:
             self.ros.publish_teleop_delta(dx, dy, dz, 0.0, 0.0, 0.0)
+            self._update_control_area_display()
     
 
     def mousePressEvent(self, event):

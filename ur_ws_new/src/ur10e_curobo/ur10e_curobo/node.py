@@ -27,7 +27,7 @@ from . import gripper as gripper_mod
 from .motions import publish_stop_trajectory
 from .dynamic_obstacle import DynamicObstacleManager
 from .perception import ZedYoloPerception
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from ur_msgs.srv import SetIO
 from .grasp_outcome_classifier import classify_triplet
 
@@ -77,8 +77,8 @@ class UR10eCuroboMoveIt(Node):
         self.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
         self.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
         
-        self.declare_parameter("planner.pre_droffoff_z_offset", self.cfg.planner.pre_droffoff_z_offset)
-        self.declare_parameter("planner.pre_droffoff_y_offset", self.cfg.planner.pre_droffoff_y_offset)
+        self.declare_parameter("planner.pre_dropoff_z_offset", self.cfg.planner.pre_dropoff_z_offset)
+        self.declare_parameter("planner.pre_dropoff_y_offset", self.cfg.planner.pre_dropoff_y_offset)
 
         # 3) read back ROS parameters
         self.cfg.planner.speed_scale = self.get_parameter("planner.speed_scale").value
@@ -105,8 +105,8 @@ class UR10eCuroboMoveIt(Node):
         self.cfg.joints.dropoff    = list(self.get_parameter("joints.dropoff").value)
         self.cfg.joints.predropoff = list(self.get_parameter("joints.predropoff").value)
         
-        self.cfg.planner.pre_droffoff_z_offset = float(self.get_parameter("planner.pre_droffoff_z_offset").value)
-        self.cfg.planner.pre_droffoff_y_offset = float(self.get_parameter("planner.pre_droffoff_y_offset").value)
+        self.cfg.planner.pre_dropoff_z_offset = float(self.get_parameter("planner.pre_dropoff_z_offset").value)
+        self.cfg.planner.pre_dropoff_y_offset = float(self.get_parameter("planner.pre_dropoff_y_offset").value)
 
         # 4) env overrides (UR10E_*), e.g. UR10E_SHOW_VIEW=1
         self.cfg = AppConfig.from_env(self.cfg)
@@ -117,8 +117,8 @@ class UR10eCuroboMoveIt(Node):
         self.dropoff_joints    = self.cfg.joints.dropoff
         self.predropoff_joints = self.cfg.joints.predropoff
         
-        self.yoffset = self.cfg.planner.pre_droffoff_y_offset
-        self.zoffset = self.cfg.planner.pre_droffoff_z_offset
+        self.yoffset = self.cfg.planner.pre_dropoff_y_offset
+        self.zoffset = self.cfg.planner.pre_dropoff_z_offset
         self.cam_frame = self.cfg.perception.cam_frame
 
         self.traj_cmd_topic    = self.cfg.topics.traj_cmd
@@ -260,6 +260,11 @@ class UR10eCuroboMoveIt(Node):
         self.teleop_timeout = 0.2  # seconds
         self.last_teleop_time = 0.0
 
+        # Smoothing state for teleop
+        self.teleop_smoothed_delta = [0.0, 0.0, 0.0]  # Exponentially smoothed dx, dy, dz
+        self.teleop_smooth_alpha = 0.4  # Smoothing factor (0-1, lower = smoother but slower response)
+        self.teleop_traj_duration = 0.08  # Trajectory duration in seconds (longer = smoother blending)
+
         # Subscribe to teleop delta twists (published by the GUI)
         self.create_subscription(
             Twist,
@@ -268,8 +273,8 @@ class UR10eCuroboMoveIt(Node):
             10
         )
 
-        # Servo timer (50 Hz) to convert cached teleop deltas into single-step trajectories
-        self.create_timer(0.02, self._teleop_servo_tick)  # 50 Hz
+        # Servo timer (40 Hz) to convert cached teleop deltas into trajectories
+        self.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
 
         # # Perception: ZED + YOLO
         #self._maybe_start_perception()
@@ -797,26 +802,45 @@ class UR10eCuroboMoveIt(Node):
         self.last_teleop_time = time.time()
 
     def _teleop_servo_tick(self):
-        """Run at ~50Hz: convert cached teleop twist into a single-step IK and publish one-step trajectory.
+        """Run at ~40Hz: convert cached teleop twist into smoothed trajectory.
 
-        This implements a simple, low-latency teleop by applying the twist linear deltas
-        directly in TCP frame to the current end-effector pose, solving IK fast, and
-        publishing a single JointTrajectory point covering the next 20ms.
+        This implements smooth teleop by:
+        1. Exponentially smoothing incoming deltas to reduce jitter
+        2. Using longer trajectory duration for better blending
+        3. Including velocity in trajectory points for smooth motion
         """
         import time
+
         # Teleop enabled?
         if not getattr(self, 'teleop_enabled', False):
             return
 
-        if self.latest_teleop_twist is None:
-            return
-
-        # deadman timeout
-        if time.time() - getattr(self, 'last_teleop_time', 0.0) > getattr(self, 'teleop_timeout', 0.2):
-            return
-
         # need current joint feedback to seed IK
         if self.current_joint_positions is None:
+            return
+
+        # Get raw deltas from latest twist (or zero if timed out)
+        raw_dx = raw_dy = raw_dz = 0.0
+        now = time.time()
+        timed_out = now - getattr(self, 'last_teleop_time', 0.0) > getattr(self, 'teleop_timeout', 0.2)
+
+        if self.latest_teleop_twist is not None and not timed_out:
+            raw_dx = float(self.latest_teleop_twist.linear.x)
+            raw_dy = float(self.latest_teleop_twist.linear.y)
+            raw_dz = float(self.latest_teleop_twist.linear.z)
+
+        # Exponential smoothing of deltas
+        alpha = getattr(self, 'teleop_smooth_alpha', 0.4)
+        smoothed = getattr(self, 'teleop_smoothed_delta', [0.0, 0.0, 0.0])
+
+        smoothed[0] = alpha * raw_dx + (1 - alpha) * smoothed[0]
+        smoothed[1] = alpha * raw_dy + (1 - alpha) * smoothed[1]
+        smoothed[2] = alpha * raw_dz + (1 - alpha) * smoothed[2]
+
+        self.teleop_smoothed_delta = smoothed
+
+        # Skip if movement is negligible
+        if abs(smoothed[0]) < 0.0001 and abs(smoothed[1]) < 0.0001 and abs(smoothed[2]) < 0.0001:
             return
 
         # 1. current TCP pose
@@ -826,16 +850,10 @@ class UR10eCuroboMoveIt(Node):
 
         x, y, z, qw, qx, qy, qz = ee
 
-        # 2. Apply linear deltas (TCP frame assumed)
-        dx = float(self.latest_teleop_twist.linear.x)
-        dy = float(self.latest_teleop_twist.linear.y)
-        dz = float(self.latest_teleop_twist.linear.z)
-
-        x_new = x + dx
-        y_new = y + dy
-        z_new = z + dz
-
-        # Orientation deltas omitted (UI currently doesn't send reliable orientation)
+        # 2. Apply smoothed deltas
+        x_new = x + smoothed[0]
+        y_new = y + smoothed[1]
+        z_new = z + smoothed[2]
 
         # 3. Build target pose (vec7)
         target_pose = [x_new, y_new, z_new, qw, qx, qy, qz]
@@ -853,14 +871,23 @@ class UR10eCuroboMoveIt(Node):
         if q_cmd is None:
             return
 
-        # 5. Publish single-step trajectory (overwrite)
+        # 5. Build smooth trajectory with velocity
         traj = JointTrajectory()
         traj.joint_names = self.joint_order
-        point = traj.points.add()
+
+        traj_duration = getattr(self, 'teleop_traj_duration', 0.08)
+
+        # Compute velocities based on position difference
+        q_current = self.current_joint_positions
+        velocities = [(q_cmd[i] - q_current[i]) / traj_duration for i in range(len(q_cmd))]
+
+        # Single point trajectory with velocity for smooth tracking
+        point = JointTrajectoryPoint()
         point.positions = list(q_cmd)
-        # one step ahead (20ms)
+        point.velocities = velocities
         point.time_from_start.sec = 0
-        point.time_from_start.nanosec = int(0.02 * 1e9)
+        point.time_from_start.nanosec = int(traj_duration * 1e9)
+        traj.points.append(point)
 
         try:
             self.trajectory_pub.publish(traj)

@@ -65,11 +65,12 @@ best_history = deque(maxlen=3)   # shorter window for snappier response
 # Scoring System Weights (tune these for your application)
 # ============================================================
 SCORE_WEIGHTS = {
-    "distance": 0.30,       # closer is better (normalized: 0-1)
-    "visibility": 0.25,     # higher vis_ratio is better
-    "depth_quality": 0.20,  # lower z_std is better
-    "confidence": 0.15,     # YOLO detection confidence
+    "distance": 0.28,       # closer is better (normalized: 0-1)
+    "visibility": 0.23,     # higher vis_ratio is better
+    "depth_quality": 0.18,  # lower z_std is better
+    "confidence": 0.13,     # YOLO detection confidence
     "ellipse": 0.10,        # bonus for valid ellipse fit (orientation reliability)
+    "center_bias": 0.08,    # prefer fruits near frame center (better depth data)
 }
 
 # Distance scoring parameters
@@ -218,6 +219,23 @@ def compute_fruit_score(target: dict, prev_pt_base: np.ndarray = None) -> dict:
     has_ellipse = target.get("short_axis_cam") is not None
     ellipse_score = 1.0 if has_ellipse else 0.3  # partial credit if no ellipse
     components["ellipse"] = ellipse_score
+
+    # 6. Center bias score (fruits near frame center have better depth data)
+    bb = target.get("bb")
+    img_w = target.get("img_width", 1280)
+    img_h = target.get("img_height", 720)
+    if bb is not None:
+        x1, y1, x2, y2 = bb
+        bbox_cx = (x1 + x2) / 2.0
+        bbox_cy = (y1 + y2) / 2.0
+        img_cx = img_w / 2.0
+        img_cy = img_h / 2.0
+        dist_from_center = math.hypot(bbox_cx - img_cx, bbox_cy - img_cy)
+        max_dist = math.hypot(img_cx, img_cy)
+        center_score = 1.0 - (dist_from_center / max_dist) if max_dist > 0 else 0.5
+    else:
+        center_score = 0.5  # neutral if no bbox
+    components["center_bias"] = center_score
 
     # Weighted sum
     total = 0.0
@@ -740,6 +758,8 @@ def main_(args: argparse.Namespace):
                                 "Yc": Yc,
                                 "Zc": Zc,
                                 "bb": (x1, y1, x2, y2),
+                                "img_width": display_resolution.width,
+                                "img_height": display_resolution.height,
                                 "mask_resized": mask_resized,
                                 "pt_base": pt_base,
                                 "pt_grip": pt_grip,
@@ -1219,6 +1239,16 @@ def main_(args: argparse.Namespace):
                             image_left_ocv,
                             f"D:{sc.get('distance', 0):.2f} V:{sc.get('visibility', 0):.2f} Z:{sc.get('depth_quality', 0):.2f} C:{conf:.2f}",
                             (cx + 10, cy + 84),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            (180, 180, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            image_left_ocv,
+                            f"E:{sc.get('ellipse', 0):.2f} Ctr:{sc.get('center_bias', 0):.2f}",
+                            (cx + 10, cy + 98),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.4,
                             (180, 180, 255, 255),

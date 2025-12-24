@@ -85,8 +85,8 @@ class Planner:
     max_dt: float = 0.05                 # maximum timestep
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
 
-    pre_droffoff_z_offset: float = -1.0  # m above dropoff
-    pre_droffoff_y_offset: float = 1.5  # m back from dropoff
+    pre_dropoff_z_offset: float = -0.1  # m above dropoff
+    pre_dropoff_y_offset: float = 0.2  # m back from dropoff
 
 @dataclass
 class Perception:
