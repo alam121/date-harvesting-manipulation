@@ -429,18 +429,65 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
     d_vis = -np.array([x - d_vis_pt[0], y - d_vis_pt[1], z - d_vis_pt[2]])
     d_vis /= np.linalg.norm(d_vis)
 
-    if getattr(node, "fruit_direction", None) is not None:
-        d_dir = -np.array(node.fruit_direction)
-        d_dir /= np.linalg.norm(d_dir)
-        dir_conf = 0.6
+    prev_dir = getattr(node, "_prev_blend_dir", None)
+    prev_dot = None
+    d_prev = None
+    fruit_dir = getattr(node, "fruit_direction", None)
+    if fruit_dir is not None:
+        d_dir = np.array(fruit_dir, dtype=float)
+        n_dir = np.linalg.norm(d_dir)
+        if n_dir > 1e-9:
+            d_dir /= n_dir
+        else:
+            d_dir = d_vis.copy()
+
+        # Align with previous blended direction to avoid 180 flips.
+        if prev_dir is not None:
+            d_prev = np.array(prev_dir, dtype=float)
+            n_prev = np.linalg.norm(d_prev)
+            if n_prev > 1e-9:
+                d_prev /= n_prev
+                prev_dot = float(np.dot(d_dir, d_prev))
+                if prev_dot < 0.0:
+                    d_dir = -d_dir
+                    prev_dot = -prev_dot
+            else:
+                d_prev = None
+
+        dir_conf = 1.0
     else:
         d_dir = d_vis
         dir_conf = 0.0
 
     vis_conf = np.clip(vis_ratio * np.exp(-z_std / 0.02), 0.0, 1.0)
+    vis_conf = min(vis_conf, 0.0)
 
     d = dir_conf * d_dir + vis_conf * d_vis
-    return d / np.linalg.norm(d)
+    n_blend = np.linalg.norm(d)
+    d_norm = d / n_blend if n_blend > 1e-9 else d_vis.copy()
+    node._prev_blend_dir = d_norm.tolist()
+
+    # Quick log to verify sign convention (throttled).
+    now = time.time()
+    last = getattr(node, "_last_dir_log", 0.0)
+    if now - last > 1.0:
+        node._last_dir_log = now
+        if fruit_dir is None:
+            fruit_repr = "None"
+            prev_repr = "None"
+            dot_repr = "n/a"
+        else:
+            fruit_repr = np.round(np.array(fruit_dir, dtype=float), 3)
+            prev_repr = "None" if d_prev is None else np.round(d_prev, 3)
+            dot_repr = "n/a" if prev_dot is None else f"{prev_dot:.3f}"
+        node.get_logger().info(
+            f"dir dbg: fruit_direction={fruit_repr} d_vis={np.round(d_vis, 3)} "
+            f"d_dir_aligned={np.round(d_dir, 3)} prev_dir={prev_repr} prev_dot={dot_repr} "
+            f"d_blend={np.round(d_norm, 3)}"
+        )
+
+    return d_norm
+
 
 
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.

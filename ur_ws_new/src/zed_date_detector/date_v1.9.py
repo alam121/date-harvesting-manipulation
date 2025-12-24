@@ -89,13 +89,6 @@ FRUIT_RADIUS = 0.035  # approximate radius of a date fruit (3.5cm)
 APPROACH_CHECK_DIST = 0.15  # how far back to check for collisions (15cm)
 NUM_CANDIDATE_DIRS = 12  # number of directions to sample
 
-# Point cloud obstacle detection parameters
-PC_OBSTACLE_ENABLED = True  # enable point cloud obstacle detection
-PC_SAMPLE_STEP = 0.01  # sample every 1cm along approach ray
-PC_SEARCH_RADIUS = 0.025  # radius to search for points (2.5cm = ~gripper width)
-PC_MIN_POINTS_BLOCKED = 5  # min points to consider blocked
-PC_SKIP_NEAR_FRUIT = 0.04  # ignore points within 4cm of target fruit
-
 
 # ============================================================
 # Utility Functions
@@ -298,154 +291,28 @@ def ray_sphere_intersection(ray_origin, ray_dir, sphere_center, sphere_radius):
     return False, float('inf')
 
 
-def check_pointcloud_obstacle(centroid, direction, pc_np, intrinsics, image_scale):
+def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap_dir=None):
     """
-    Check for obstacles along approach path using raw point cloud.
-    FAST vectorized version - checks single region around approach ray.
-
-    Args:
-        centroid: 3D position of target fruit centroid in camera frame
-        direction: Unit vector for approach direction (camera frame)
-        pc_np: Point cloud numpy array (H x W x 3) in camera frame
-        intrinsics: Camera intrinsics dict {fx, fy, cx, cy}
-        image_scale: [scale_x, scale_y] for display resolution
-
-    Returns:
-        dict with:
-            - is_blocked: True if any obstacle found
-            - obstacle_dist: Distance to nearest obstacle
-            - obstacle_point: 3D coords of obstacle (or None)
-            - num_blocking_points: Number of points in the way
-    """
-    if not PC_OBSTACLE_ENABLED or pc_np is None or intrinsics is None or image_scale is None:
-        return {
-            "is_blocked": False,
-            "obstacle_dist": float('inf'),
-            "obstacle_point": None,
-            "num_blocking_points": 0,
-        }
-
-    h, w = pc_np.shape[:2]
-    fx_scaled = intrinsics["fx"] * image_scale[0]
-    fy_scaled = intrinsics["fy"] * image_scale[1]
-    cx_scaled = intrinsics["cx"] * image_scale[0]
-    cy_scaled = intrinsics["cy"] * image_scale[1]
-
-    # Project centroid and a point along the ray to define search region
-    mid_dist = APPROACH_CHECK_DIST / 2.0
-    mid_pt = centroid + direction * mid_dist
-
-    if mid_pt[2] <= 0.01:
-        return {"is_blocked": False, "obstacle_dist": float('inf'),
-                "obstacle_point": None, "num_blocking_points": 0}
-
-    # Project to image #find where this approach ray appears in the camera image. #cylindrical corridor in image space
-    u_mid = int(fx_scaled * mid_pt[0] / mid_pt[2] + cx_scaled)
-    v_mid = int(fy_scaled * mid_pt[1] / mid_pt[2] + cy_scaled)
-
-    # Search region - larger to cover the whole approach path
-    r_pixels = max(10, int(PC_SEARCH_RADIUS * 2 * fx_scaled / mid_pt[2]))
-
-    u_min = max(0, u_mid - r_pixels)
-    u_max = min(w, u_mid + r_pixels + 1)
-    v_min = max(0, v_mid - r_pixels)
-    v_max = min(h, v_mid + r_pixels + 1)
-
-    if u_min >= u_max or v_min >= v_max:
-        return {"is_blocked": False, "obstacle_dist": float('inf'),
-                "obstacle_point": None, "num_blocking_points": 0}
-
-    # Get local point cloud region and flatten
-    region = pc_np[v_min:v_max, u_min:u_max, :].reshape(-1, 3)
-
-    # Vectorized: filter valid points
-    valid_mask = np.all(np.isfinite(region), axis=1)
-    pts = region[valid_mask]
-
-    if len(pts) == 0:
-        return {"is_blocked": False, "obstacle_dist": float('inf'),
-                "obstacle_point": None, "num_blocking_points": 0}
-
-    # Vectorized: compute projection along direction
-    to_pts = pts - centroid  # (N, 3)
-    proj_along = to_pts @ direction  # (N,) - dot product with direction
-
-    # Vectorized: filter points in valid range along approach direction
-    in_range = (proj_along > PC_SKIP_NEAR_FRUIT) & (proj_along < APPROACH_CHECK_DIST)
-
-    if not np.any(in_range):
-        return {"is_blocked": False, "obstacle_dist": float('inf'),
-                "obstacle_point": None, "num_blocking_points": 0}
-
-    # Filter to in-range points
-    pts_in_range = pts[in_range]
-    proj_in_range = proj_along[in_range]
-    to_pts_in_range = to_pts[in_range]
-
-    # Vectorized: compute perpendicular distance to ray
-    perp_vecs = to_pts_in_range - np.outer(proj_in_range, direction)
-    perp_dists = np.linalg.norm(perp_vecs, axis=1)
-
-    # Points close to the ray are blocking
-    blocking_mask = perp_dists < PC_SEARCH_RADIUS
-    num_blocking = np.sum(blocking_mask)
-
-    if num_blocking < PC_MIN_POINTS_BLOCKED:
-        return {"is_blocked": False, "obstacle_dist": float('inf'),
-                "obstacle_point": None, "num_blocking_points": int(num_blocking)}
-
-    # Find closest blocking point
-    blocking_projs = proj_in_range[blocking_mask]
-    min_idx = np.argmin(blocking_projs)
-    min_dist = float(blocking_projs[min_idx])
-    obstacle_pt = pts_in_range[blocking_mask][min_idx].copy()
-
-    return {
-        "is_blocked": True,
-        "obstacle_dist": min_dist,
-        "obstacle_point": obstacle_pt,
-        "num_blocking_points": int(num_blocking),
-    }
-
-
-def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap_dir=None,
-                                      pc_np=None, intrinsics=None, image_scale=None,
-                                      surface_normal=None):
-    """
-    Find the approach direction with most clearance from other fruits AND point cloud obstacles.
+    Find the approach direction with most clearance from other fruits.
 
     Strategy:
     1. Sample directions in a hemisphere (toward camera = -Z in camera frame)
-    2. For each direction, check clearance to other fruits (spheres)
-    3. Also check for point cloud obstacles (branches, leaves, undetected objects)
-    4. Blend best clearance direction with SURFACE NORMAL (not heatmap)
+    2. For each direction, check clearance to other fruits
+    3. Blend best clearance direction with heatmap direction for grasp accuracy
 
     Args:
         best_target: The target fruit we want to approach
         all_targets: List of all detected fruits
         best_idx: Index of best_target in all_targets
-        heatmap_dir: Heatmap-based direction (used for candidate selection/ranking only)
-        pc_np: Point cloud numpy array (H x W x 3) for obstacle detection
-        intrinsics: Camera intrinsics dict for projection
-        image_scale: Display scale factors
-        surface_normal: Geometric surface normal (centroid → camera) for blending
+        heatmap_dir: Original heatmap-based direction (optional, for blending)
 
     Returns:
         dict with:
             - direction: 3D unit vector for approach direction in camera frame
             - clearance: Distance to nearest obstacle
             - is_collision_free: Whether the chosen direction is clear
-            - pc_obstacle: Point cloud obstacle info (if any)
     """
     centroid = np.array([best_target["Xc"], best_target["Yc"], best_target["Zc"]])
-
-    # Compute surface normal if not provided (fallback)
-    if surface_normal is None:
-        centroid_norm = np.linalg.norm(centroid)
-        if centroid_norm > 1e-6:
-            surface_normal = -centroid / centroid_norm
-        else:
-            surface_normal = np.array([0.0, 0.0, -1.0])
 
     # Collect other fruits as spheres
     other_spheres = []
@@ -455,29 +322,22 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
         other_c = np.array([t["Xc"], t["Yc"], t["Zc"]])
         other_spheres.append((other_c, FRUIT_RADIUS))
 
-    # If no other fruits, still check point cloud obstacles
+    # If no other fruits, just use heatmap direction
     if len(other_spheres) == 0:
-        chosen_dir = heatmap_dir if heatmap_dir is not None else np.array([0.0, 0.0, -1.0])
-        pc_result = check_pointcloud_obstacle(centroid, chosen_dir, pc_np, intrinsics, image_scale) \
-                    if pc_np is not None and intrinsics is not None else None
-
-        if pc_result and pc_result["is_blocked"]:
-            # Try to find alternate direction without PC obstacle
-            # (simplified: just return with obstacle info for visualization)
+        if heatmap_dir is not None:
             return {
-                "direction": chosen_dir,
-                "clearance": pc_result["obstacle_dist"],
-                "is_collision_free": False,
+                "direction": heatmap_dir,
+                "clearance": float('inf'),
+                "is_collision_free": True,
                 "num_blocked": 0,
-                "pc_obstacle": pc_result,
             }
-        return {
-            "direction": chosen_dir,
-            "clearance": float('inf'),
-            "is_collision_free": True,
-            "num_blocked": 0,
-            "pc_obstacle": None,
-        }
+        else:
+            return {
+                "direction": np.array([0.0, 0.0, -1.0]),  # default: toward camera
+                "clearance": float('inf'),
+                "is_collision_free": True,
+                "num_blocked": 0,
+            }
 
     # Generate candidate directions on a hemisphere (facing camera = -Z)
     candidate_dirs = []
@@ -501,7 +361,7 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
     if heatmap_dir is not None:
         candidate_dirs.append(heatmap_dir.copy())
 
-    # Score each direction by clearance (fruit spheres only for speed)
+    # Score each direction by clearance
     best_dir = None
     best_clearance = -1.0
     best_blocked = 0
@@ -532,91 +392,34 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
                     if clearance_at_closest < min_clearance:
                         min_clearance = max(0.0, clearance_at_closest)
 
-        # NOTE: Point cloud check is expensive - only do it for final direction, not all candidates
-
-        # Prefer directions with higher clearance (based on detected fruits only)
+        # Prefer directions with higher clearance
         if min_clearance > best_clearance:
             best_clearance = min_clearance
             best_dir = d.copy()
             best_blocked = num_blocked
 
-    # Blend collision-free direction with surface normal for grasp accuracy
-    # (Heatmap is only used for candidate selection, NOT for blending)
-    if best_clearance > FRUIT_RADIUS:
-        # Check surface normal direction clearance
-        sn_clearance = float('inf')
-        sn_d = surface_normal / (np.linalg.norm(surface_normal) + 1e-9)
+    # If heatmap direction has decent clearance, blend with it for grasp accuracy
+    if heatmap_dir is not None and best_clearance > FRUIT_RADIUS:
+        # Check heatmap direction clearance
+        hm_clearance = float('inf')
+        hm_d = heatmap_dir / (np.linalg.norm(heatmap_dir) + 1e-9)
         for (sphere_c, sphere_r) in other_spheres:
-            hit, t_hit = ray_sphere_intersection(centroid, sn_d, sphere_c, sphere_r)
+            hit, t_hit = ray_sphere_intersection(centroid, hm_d, sphere_c, sphere_r)
             if hit:
-                sn_clearance = min(sn_clearance, t_hit)
+                hm_clearance = min(hm_clearance, t_hit)
 
-        # If surface normal direction is also reasonably clear, blend toward it
-        if sn_clearance > FRUIT_RADIUS * 2:
-            # Blend: 60% collision-free, 40% surface normal for perpendicular approach
-            blended = 0.6 * best_dir + 0.4 * sn_d
+        # If heatmap direction is also clear, blend toward it
+        if hm_clearance > FRUIT_RADIUS * 2:
+            # Blend: 60% collision-free, 40% heatmap for grasp accuracy
+            blended = 0.6 * best_dir + 0.4 * hm_d
             blended = blended / (np.linalg.norm(blended) + 1e-9)
             best_dir = blended
-
-    # Now check point cloud obstacle for the FINAL chosen direction only (performance optimization)
-    best_pc_obstacle = None
-    pc_steered = False  # Track if we had to steer around PC obstacle
-    if pc_np is not None and intrinsics is not None and image_scale is not None:
-        best_pc_obstacle = check_pointcloud_obstacle(centroid, best_dir, pc_np, intrinsics, image_scale)
-        if best_pc_obstacle["is_blocked"]:
-            # Try alternative directions to steer around PC obstacle
-            original_dir = best_dir.copy()
-
-            # Generate alternative directions:
-            # 1. Rotate around camera Z axis (left/right steering)
-            # 2. Blend toward camera (retreat angles)
-            alternative_dirs = []
-
-            # Helper to rotate direction around camera Z axis
-            def rotate_around_z(d, angle_deg):
-                angle = np.radians(angle_deg)
-                cos_a, sin_a = np.cos(angle), np.sin(angle)
-                rot = np.array([[cos_a, -sin_a, 0],
-                                [sin_a, cos_a, 0],
-                                [0, 0, 1]])
-                return rot @ d
-
-            # Try rotations around Z (left/right)
-            for angle in [30, -30, 60, -60, 90, -90]:
-                rotated = rotate_around_z(original_dir, angle)
-                rotated = rotated / (np.linalg.norm(rotated) + 1e-9)
-                alternative_dirs.append(rotated)
-
-            # Try blending toward camera (more retreating angles)
-            camera_dir = np.array([0.0, 0.0, -1.0])  # Toward camera
-            for blend_factor in [0.3, 0.5, 0.7]:
-                blended = (1 - blend_factor) * original_dir + blend_factor * camera_dir
-                blended = blended / (np.linalg.norm(blended) + 1e-9)
-                alternative_dirs.append(blended)
-
-            # Also try straight toward camera as last resort
-            alternative_dirs.append(camera_dir)
-
-            # Find first clear alternative
-            for alt_dir in alternative_dirs:
-                alt_pc = check_pointcloud_obstacle(centroid, alt_dir, pc_np, intrinsics, image_scale)
-                if not alt_pc["is_blocked"]:
-                    best_dir = alt_dir
-                    best_pc_obstacle = alt_pc
-                    pc_steered = True
-                    break
-
-            # If still blocked after all alternatives, keep original and update clearance
-            if best_pc_obstacle["is_blocked"]:
-                best_clearance = min(best_clearance, best_pc_obstacle["obstacle_dist"])
 
     return {
         "direction": best_dir,
         "clearance": best_clearance,
         "is_collision_free": best_clearance > FRUIT_RADIUS,
         "num_blocked": best_blocked,
-        "pc_obstacle": best_pc_obstacle,
-        "pc_steered": pc_steered,
     }
 
 
@@ -1003,9 +806,7 @@ def main_(args: argparse.Namespace):
                     valid = np.isfinite(roi_xyz[:, :, 2])
                     valid &= mask_bool
                     heatmap = None
-
                     depth_vals = roi_xyz[:, :, 2][valid]
-
                     if depth_vals.size > 0:
                         z_lo, z_hi = np.percentile(depth_vals, [5.0, 90.0])
                         if z_hi <= z_lo:
@@ -1015,8 +816,6 @@ def main_(args: argparse.Namespace):
                         score = np.clip(score, 0.0, 1.0)
                         score_u8 = (score * 255).astype(np.uint8)
                         heatmap = cv2.applyColorMap(score_u8, cv2.COLORMAP_JET)
-
-
                         # ----------------------------------------------------------
                         # Compute best point/direction from peak heatmap score
                         # ----------------------------------------------------------
@@ -1081,8 +880,7 @@ def main_(args: argparse.Namespace):
                     if Z_std > 0.05:  # >5 cm variance → unreliable
                         mark_reject("Depth variance")
                         continue
-                    
-                    #centroid of front points
+
                     Xc = float(np.mean(pts_front[:, 0]))
                     Yc = float(np.mean(pts_front[:, 1]))
                     Zc = float(np.mean(pts_front[:, 2]))
@@ -1255,63 +1053,33 @@ def main_(args: argparse.Namespace):
                     min_offset = 0.1 * min(roi_w, roi_h)
                     offset_mag = math.hypot(dx, dy)
 
-                    if offset_mag > min_offset: #10% of the fruit box size
+                    if offset_mag > min_offset:
                         # Use TRUE 3D direction from centroid to peak point
                         best_pt_3d = t_best.get("best_point_3d")
                         centroid_3d = np.array([t_best["Xc"], t_best["Yc"], t_best["Zc"]])
 
-                        # Geometric surface normal: centroid → camera origin (fallback)
-                        # Camera is at [0,0,0] in camera frame, so normal = -centroid (normalized)
-                        centroid_norm = np.linalg.norm(centroid_3d)
-                        if centroid_norm > 1e-6:
-                            geometric_normal = -centroid_3d / centroid_norm
-                        else:
-                            geometric_normal = np.array([0.0, 0.0, -1.0])  # default: toward camera
-
-                        # Primary: heatmap-based direction (centroid → peak point)
-                        # Fallback: geometric surface normal (centroid → camera)
-                        primary_dir = None
+                        # First compute heatmap-based direction
+                        heatmap_dir = None
                         if best_pt_3d is not None:
                             heatmap_dir = best_pt_3d - centroid_3d
                             n_dir_cam = np.linalg.norm(heatmap_dir)
-                            if n_dir_cam > 0.005:  # at least 5mm offset to be meaningful
-                                primary_dir = heatmap_dir / n_dir_cam
-
-                        # Use primary if available, otherwise fallback to geometric normal
-                        used_geometric_fallback = False
-                        if primary_dir is not None:
-                            approach_hint = primary_dir
+                            if n_dir_cam > 1e-6:
+                                heatmap_dir = heatmap_dir / n_dir_cam
+                            else:
+                                heatmap_dir = np.array([dx / offset_mag, dy / offset_mag, 0.0], dtype=float)
                         else:
-                            approach_hint = geometric_normal
-                            used_geometric_fallback = True
+                            heatmap_dir = np.array([dx / offset_mag, dy / offset_mag, 0.0], dtype=float)
 
-                        # Compute collision-free direction (avoids other fruits AND point cloud obstacles)
-                        # Note: heatmap direction (approach_hint) is used for candidate ranking only
-                        # Surface normal (geometric_normal) is used for blending with collision-free direction
+                        # Compute collision-free direction (avoids other fruits)
                         collision_result = compute_collision_free_direction(
-                            t_best, targets, best_idx, approach_hint,
-                            pc_np=pc_np, intrinsics=intrinsics, image_scale=image_scale,
-                            surface_normal=geometric_normal
+                            t_best, targets, best_idx, heatmap_dir
                         )
-
                         dir_cam = collision_result["direction"]
-
-                        # Detailed direction pipeline log
-                        print(f"[DIR] centroid_cam={np.round(centroid_3d, 3)}")
-                        print(f"[DIR] geom_normal={np.round(geometric_normal, 3)} (surface→camera)")
-                        if primary_dir is not None:
-                            print(f"[DIR] heatmap_dir={np.round(primary_dir, 3)} (centroid→peak)")
-                        else:
-                            print(f"[DIR] heatmap_dir=None (using geometric fallback)")
-                        print(f"[DIR] approach_hint={np.round(approach_hint, 3)} fallback={used_geometric_fallback}")
-                        print(f"[DIR] collision_dir={np.round(dir_cam, 3)} clearance={collision_result['clearance']:.3f}m")
 
                         # Store collision info for visualization
                         t_best["clearance"] = collision_result["clearance"]
                         t_best["is_collision_free"] = collision_result["is_collision_free"]
-                        t_best["approach_hint_cam"] = approach_hint.copy()  # primary or geometric fallback
-                        t_best["used_geometric_fallback"] = used_geometric_fallback
-                        t_best["pc_obstacle"] = collision_result.get("pc_obstacle")
+                        t_best["heatmap_dir_cam"] = heatmap_dir.copy()
 
                         # Store the 3D direction in camera frame for visualization
                         t_best["approach_dir_cam"] = dir_cam.copy()
@@ -1319,23 +1087,16 @@ def main_(args: argparse.Namespace):
                         # Transform direction to base_link frame using cached TF rotation
                         if cached_q_tf is not None:
                             dir_raw = np.array(quat_rotate_vec(cached_q_tf, dir_cam), dtype=float)
-                            print(f"[DIR] TF cam→base: {np.round(dir_cam, 3)} → {np.round(dir_raw, 3)}")
                         else:
                             dir_raw = dir_cam.copy()
-                            print(f"[DIR] TF unavailable, using cam frame directly")
 
                         # Flip to be consistent with history
-                        flipped = False
                         if prev_direction_base is not None:
-                            dot_prev = float(np.dot(prev_direction_base, dir_raw))
-                            if dot_prev < 0:
+                            if float(np.dot(prev_direction_base, dir_raw)) < 0:
                                 dir_raw = -dir_raw
-                                flipped = True
-                            print(f"[DIR] flip_check: dot={dot_prev:.3f} flipped={flipped}")
 
                         # Add to sliding window history
                         direction_history.append(dir_raw.copy())
-                        print(f"[DIR] dir_raw_base={np.round(dir_raw, 3)} history_len={len(direction_history)}")
 
                     # Compute averaged direction from history (weighted, newer = more weight)
                     if len(direction_history) > 0:
@@ -1355,12 +1116,6 @@ def main_(args: argparse.Namespace):
                         # Store base_link direction for visualization
                         t_best["approach_dir_base"] = dir_avg.copy()
 
-                        # Final direction log with human-readable labels
-                        bx, by, bz = dir_avg
-                        x_lbl = "FWD" if bx > 0.1 else ("BACK" if bx < -0.1 else "-")
-                        y_lbl = "L" if by > 0.1 else ("R" if by < -0.1 else "-")
-                        z_lbl = "UP" if bz > 0.1 else ("DN" if bz < -0.1 else "-")
-                        print(f"[DIR] FINAL base_link={np.round(dir_avg, 3)} => {x_lbl} {y_lbl} {z_lbl}")
                         # Create Vector3Stamped message
                         dir_msg = Vector3Stamped()
                         dir_msg.header.frame_id = "base_link"
@@ -1645,45 +1400,102 @@ def main_(args: argparse.Namespace):
                                 2,
                             )
 
-                        # VISUALIZE: Target reticle along collision-free approach direction
+                        # Also show best heatmap peak direction (orange) toward highest score
+                        peak_pt = t.get("best_point2d_smooth")
+                        if peak_pt is None:
+                            peak_pt = t.get("best_point2d")
+                        if peak_pt is not None:
+                            dest_x = int(round(x1 + peak_pt[0]))
+                            dest_y = int(round(y1 + peak_pt[1]))
+                            # keep destination in frame
+                            dest_x = max(0, min(dest_x, image_left_ocv.shape[1] - 1))
+                            dest_y = max(0, min(dest_y, image_left_ocv.shape[0] - 1))
+
+                            dx = float(dest_x - cx)
+                            dy = float(dest_y - cy)
+                            n = math.hypot(dx, dy)
+                            if n < 1e-3:
+                                dx, dy, n = 1.0, 0.0, 1.0
+                            dx /= n
+                            dy /= n
+                            # start outside the box, along the opposite direction
+                            L_out = max(w_roi, h_roi) + 10.0
+                            start_x = int(round(dest_x - dx * L_out))
+                            start_y = int(round(dest_y - dy * L_out))
+                            start_x = max(0, min(start_x, image_left_ocv.shape[1] - 1))
+                            start_y = max(0, min(start_y, image_left_ocv.shape[0] - 1))
+                            axis_color = (0, 165, 255, 255)  # orange
+                            cv2.arrowedLine(
+                                image_left_ocv,
+                                (start_x, start_y),
+                                (dest_x, dest_y),
+                                axis_color,
+                                2,
+                                tipLength=0.25,
+                            )
+
+                        # VISUALIZE TRUE 3D APPROACH DIRECTION with coordinate frame
                         approach_dir_cam = t.get("approach_dir_cam")
-                        centroid_3d = np.array([Xc, Yc, Zc])
-                        reticle_color = (0, 165, 255, 255)  # orange
-
                         if approach_dir_cam is not None:
-                            # Compute the approach arrow
-                            arrow_len_3d = 0.10  # 10cm arrow
+                            centroid_3d = np.array([Xc, Yc, Zc])
+                            axis_len = 0.05  # 5cm for coordinate axes
+                            arrow_len_3d = 0.08  # 8cm for approach arrow
+
+                            # Project centroid (origin)
                             origin_2d = project_point_to_image(centroid_3d, intrinsics, image_scale)
-                            dir_end_3d = centroid_3d + approach_dir_cam * arrow_len_3d
-                            dir_end_2d = project_point_to_image(dir_end_3d, intrinsics, image_scale)
 
-                            if origin_2d and dir_end_2d:
-                                # Compute 2D direction from projected 3D arrow
-                                dx_2d = float(dir_end_2d[0] - origin_2d[0])
-                                dy_2d = float(dir_end_2d[1] - origin_2d[1])
-                                n_2d = math.hypot(dx_2d, dy_2d)
-                                if n_2d > 1e-3:
-                                    dx_2d /= n_2d
-                                    dy_2d /= n_2d
+                            if origin_2d is not None:
+                                # Draw RGB coordinate frame at centroid
+                                # X axis (Red) - right
+                                x_end_3d = centroid_3d + np.array([axis_len, 0, 0])
+                                x_end_2d = project_point_to_image(x_end_3d, intrinsics, image_scale)
+                                if x_end_2d:
+                                    cv2.arrowedLine(image_left_ocv, origin_2d, x_end_2d,
+                                                    (0, 0, 255, 255), 2, tipLength=0.3)
+                                    cv2.putText(image_left_ocv, "X", x_end_2d,
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255, 255), 1)
 
-                                    # Place reticle at centroid (on the magenta line, inside the mask)
-                                    dest_x, dest_y = origin_2d
+                                # Y axis (Green) - down
+                                y_end_3d = centroid_3d + np.array([0, axis_len, 0])
+                                y_end_2d = project_point_to_image(y_end_3d, intrinsics, image_scale)
+                                if y_end_2d:
+                                    cv2.arrowedLine(image_left_ocv, origin_2d, y_end_2d,
+                                                    (0, 255, 0, 255), 2, tipLength=0.3)
+                                    cv2.putText(image_left_ocv, "Y", y_end_2d,
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0, 255), 1)
 
-                                    # Draw target reticle at centroid
-                                    cv2.circle(image_left_ocv, (dest_x, dest_y), 18, reticle_color, 2, cv2.LINE_AA)
-                                    cv2.circle(image_left_ocv, (dest_x, dest_y), 10, reticle_color, 2, cv2.LINE_AA)
-                                    cv2.circle(image_left_ocv, (dest_x, dest_y), 3, reticle_color, -1, cv2.LINE_AA)
+                                # Z axis (Blue) - forward/depth
+                                z_end_3d = centroid_3d + np.array([0, 0, axis_len])
+                                z_end_2d = project_point_to_image(z_end_3d, intrinsics, image_scale)
+                                if z_end_2d:
+                                    cv2.arrowedLine(image_left_ocv, origin_2d, z_end_2d,
+                                                    (255, 0, 0, 255), 2, tipLength=0.3)
+                                    cv2.putText(image_left_ocv, "Z", z_end_2d,
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0, 255), 1)
 
-                                    # Perpendicular ticks at reticle (gripper finger orientation)
-                                    perp_x, perp_y = -dy_2d, dx_2d
-                                    tick_len = 16
-                                    tick1 = (int(dest_x + perp_x * tick_len), int(dest_y + perp_y * tick_len))
-                                    tick2 = (int(dest_x - perp_x * tick_len), int(dest_y - perp_y * tick_len))
-                                    cv2.line(image_left_ocv, tick1, tick2, reticle_color, 2, cv2.LINE_AA)
+                                # Draw approach direction arrow (Magenta, thicker)
+                                dir_end_3d = centroid_3d + approach_dir_cam * arrow_len_3d
+                                dir_end_2d = project_point_to_image(dir_end_3d, intrinsics, image_scale)
 
-                                # Magenta arrow from centroid showing approach direction
-                                cv2.arrowedLine(image_left_ocv, origin_2d, dir_end_2d,
-                                                (255, 0, 255, 255), 2, tipLength=0.2)
+                                if dir_end_2d:
+                                    # Draw XY projection (dashed line) to show lateral component
+                                    dir_xy = approach_dir_cam.copy()
+                                    dir_xy[2] = 0  # zero out Z
+                                    n_xy = np.linalg.norm(dir_xy)
+                                    if n_xy > 0.01:
+                                        dir_xy_end_3d = centroid_3d + (dir_xy / n_xy) * arrow_len_3d * n_xy
+                                        dir_xy_end_2d = project_point_to_image(dir_xy_end_3d, intrinsics, image_scale)
+                                        if dir_xy_end_2d:
+                                            # Dashed line for XY projection (cyan)
+                                            cv2.line(image_left_ocv, origin_2d, dir_xy_end_2d,
+                                                     (255, 255, 0, 255), 1, cv2.LINE_AA)
+                                            # Vertical line showing Z component (white dashed)
+                                            cv2.line(image_left_ocv, dir_xy_end_2d, dir_end_2d,
+                                                     (255, 255, 255, 255), 1, cv2.LINE_AA)
+
+                                    # Main approach arrow (thick magenta)
+                                    cv2.arrowedLine(image_left_ocv, origin_2d, dir_end_2d,
+                                                    (255, 0, 255, 255), 3, tipLength=0.25)
 
                                 # Show camera frame direction (magenta)
                                 dir_x, dir_y, dir_z = approach_dir_cam
@@ -1702,7 +1514,7 @@ def main_(args: argparse.Namespace):
                                 approach_dir_base = t.get("approach_dir_base")
                                 if approach_dir_base is not None:
                                     bx, by, bz = approach_dir_base
-                                    # base_link (ROS convention): +X=forward, +Y=left, +Z=up
+                                    # base_link: X=forward, Y=left, Z=up
                                     x_lbl = "FWD" if bx > 0.1 else ("BACK" if bx < -0.1 else "")
                                     y_lbl = "L" if by > 0.1 else ("R" if by < -0.1 else "")
                                     z_lbl = "UP" if bz > 0.1 else ("DN" if bz < -0.1 else "")
@@ -1747,58 +1559,6 @@ def main_(args: argparse.Namespace):
                                         2 if not is_clear else 1,
                                         cv2.LINE_AA,
                                     )
-
-                                # Visualize point cloud obstacle status
-                                pc_obstacle = t.get("pc_obstacle")
-                                pc_steered = t.get("pc_steered", False)
-
-                                if pc_steered:
-                                    # Successfully steered around PC obstacle - show green status
-                                    cv2.putText(
-                                        image_left_ocv,
-                                        "PC STEERED",
-                                        (x1, y1 - 70),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        (0, 255, 100, 255),  # green
-                                        1,
-                                        cv2.LINE_AA,
-                                    )
-                                elif pc_obstacle is not None and pc_obstacle.get("is_blocked"):
-                                    # Still blocked after trying alternatives - show warning
-                                    obs_pt = pc_obstacle.get("obstacle_point")
-                                    num_pts = pc_obstacle.get("num_blocking_points", 0)
-
-                                    # Show PC obstacle warning text
-                                    cv2.putText(
-                                        image_left_ocv,
-                                        f"PC BLOCKED: {num_pts}pts @ {pc_obstacle['obstacle_dist']*100:.1f}cm",
-                                        (x1, y1 - 70),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        (0, 0, 255, 255),  # red (more urgent - couldn't steer around)
-                                        1,
-                                        cv2.LINE_AA,
-                                    )
-
-                                    # Draw marker at obstacle location
-                                    if obs_pt is not None:
-                                        obs_2d = project_point_to_image(obs_pt, intrinsics, image_scale)
-                                        if obs_2d:
-                                            # Red X marker for unresolvable PC obstacle
-                                            ox, oy = obs_2d
-                                            sz = 8
-                                            cv2.line(image_left_ocv, (ox-sz, oy-sz), (ox+sz, oy+sz),
-                                                     (0, 0, 255, 255), 2, cv2.LINE_AA)
-                                            cv2.line(image_left_ocv, (ox-sz, oy+sz), (ox+sz, oy-sz),
-                                                     (0, 0, 255, 255), 2, cv2.LINE_AA)
-                                            cv2.circle(image_left_ocv, obs_2d, 12,
-                                                       (0, 0, 255, 255), 1, cv2.LINE_AA)
-
-                                            # Line from centroid to obstacle
-                                            if origin_2d:
-                                                cv2.line(image_left_ocv, origin_2d, obs_2d,
-                                                         (0, 0, 255, 200), 1, cv2.LINE_AA)
 
                     # Draw 3D text near centroid
                     cv2.putText(
