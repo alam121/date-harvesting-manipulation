@@ -65,7 +65,7 @@ def quat_slerp(q0, q1, t):
     return [s0 * q0[i] + s1 * q1[i] for i in range(4)]
 
 
-def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.0):
+def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.5):
     """
     Blend current and target orientation, prioritizing current.
 
@@ -459,8 +459,9 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
         d_dir = d_vis
         dir_conf = 0.0
 
-    vis_conf = np.clip(vis_ratio * np.exp(-z_std / 0.02), 0.0, 1.0)
-    vis_conf = min(vis_conf, 0.0)
+    # vis_conf based on visibility quality (higher vis_ratio + lower z_std = more confident)
+    # Note: Currently disabled (vis_conf=0) to rely purely on fruit_direction from vision
+    vis_conf = 0.0  # np.clip(vis_ratio * np.exp(-z_std / 0.02), 0.0, 1.0)
 
     d = dir_conf * d_dir + vis_conf * d_vis
     n_blend = np.linalg.norm(d)
