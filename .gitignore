@@ -1,0 +1,12 @@
+# Build logs
+*.log
+build.log
+logs/
+build/
+
+# Install / dependency folders
+install/
+node_modules/
+vendor/
+
+
