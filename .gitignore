@@ -1,12 +1,18 @@
-# Build logs
-*.log
-build.log
-logs/
+
+# ROS
 build/
-
-# Install / dependency folders
 install/
-node_modules/
-vendor/
-
+log/
+# ML / DL models
+*.pth
+*.h5
+*.onnx
+*.engine
+*.pptx
+*.pyc
+# Videos / data
+*.mp4
+*.bag
+# Generated outputs
+zed_output*
 
