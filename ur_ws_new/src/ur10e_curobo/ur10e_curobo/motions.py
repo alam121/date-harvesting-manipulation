@@ -69,7 +69,13 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     base_vel = 0.10
     vel = min(base_vel * scale, planner.max_traj_velocity)
 
-
+    # Reduce acceleration for predropoff to avoid joint sanity check failures
+    if motion_type == "predropoff":
+        max_acc = planner.max_joint_acceleration * 0.3  # 30% of normal acceleration
+        ramp_pts = planner.ramp_points * 2  # double ramp points for smoother motion
+    else:
+        max_acc = planner.max_joint_acceleration
+        ramp_pts = planner.ramp_points
 
     traj = build_trajectory(
         node.joint_order,
@@ -78,8 +84,8 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
-        max_acc=planner.max_joint_acceleration,
-        ramp_points=planner.ramp_points,
+        max_acc=max_acc,
+        ramp_points=ramp_pts,
     )
     node.trajectory_pub.publish(traj)
 

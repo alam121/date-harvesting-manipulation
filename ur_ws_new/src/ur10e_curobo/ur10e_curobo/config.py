@@ -22,7 +22,7 @@ JOINT_ORDER = [
 WORLD_CONFIG = {
     "cuboid": {
         "table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0]},
-        "pole":  {"dims": [0.02, 0.02, 1.0], "pose": [0.0, -0.95, 0.5, 1, 0, 0, 0]},
+        "pole":  {"dims": [0.02, 0.02, 1.0], "pose": [0.25, -1.0, 0.5, 1, 0, 0, 0]},
     }
 }
 
@@ -44,7 +44,8 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.5051692167865198, -1.4695618909648438, 2.189307514821188, -4.684940954247946, 4.581248760223389, 0.04624233767390251]
+    home: List[float] = field(default_factory=lambda: [-1.5000560919391077, -1.6181756458678187, 2.1864479223834437, -4.4248088798918666, 4.572711944580078, 0.04942631721496582]
+
 
 )
     dropoff: List[float] = field(default_factory=lambda: [-2.16858417192568, -1.3347657362567347,
@@ -86,7 +87,7 @@ class Planner:
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
-    pre_dropoff_y_offset: float = 0.2  # m back from dropoff
+    pre_dropoff_y_offset: float = 0.25  # m back from dropoff
 
 @dataclass
 class Perception:

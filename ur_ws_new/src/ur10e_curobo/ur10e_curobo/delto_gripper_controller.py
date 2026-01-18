@@ -17,8 +17,9 @@ class DeltoGripperController:
 
         self.force_data = [0.0, 0.0, 0.0]
 
-        # Contact threshold (negative force on contact)
-        self.force_threshold = -0.15
+        # Contact threshold (force value indicating contact)
+        # Finger 1 shows +0.15 when grabbed, so use 0.1 to detect abs(0.15) >= 0.1
+        self.force_threshold = 0.1
 
         # Motion parameters
         self.steps = steps
@@ -41,14 +42,14 @@ class DeltoGripperController:
 
         # Positions (shared)
         self.open_position = [
-            -0.0942, -0.1500, 2.2260, -0.5062,
-            -1.6318, 0.1309, 1.7753, -0.4887,
-            0.3333, 0.2234, 2.2273, -0.4311
+            -0.0942, -0.1500, 2.1260, -0.5062,
+            -1.6318, 0.1309, 1.6753, -0.4887,
+            0.3333, 0.2234, 2.1260, -0.4311
         ]
 
         self.closed_position = self.open_position.copy()
         # Fingers
-        self.closed_position[self.finger_joint_idx[0]] = 2.5660  # left finger
+        self.closed_position[self.finger_joint_idx[0]] = 2.5673  # left finger
         self.closed_position[self.finger_joint_idx[1]] = 2.3753  # center finger
         self.closed_position[self.finger_joint_idx[2]] = 2.5673  # right finger
 

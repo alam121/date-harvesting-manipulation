@@ -39,6 +39,8 @@ loop_fps = 0.0
 prev_heat_point = None
 prev_direction_base = None  # smoothed 3D direction in base_link
 direction_history = deque(maxlen=10)  # sliding window for direction averaging
+direction_lock = Lock()  # Protects prev_heat_point, prev_direction_base, direction_history
+_last_tf_warn_time = 0.0  # Throttle TF warning messages
 
 # --- Timer-based publishing data ---
 latest_goal_msg = None
@@ -65,12 +67,12 @@ best_history = deque(maxlen=3)   # shorter window for snappier response
 # Scoring System Weights (tune these for your application)
 # ============================================================
 SCORE_WEIGHTS = {
-    "distance": 0.28,       # closer is better (normalized: 0-1)
-    "visibility": 0.23,     # higher vis_ratio is better
-    "depth_quality": 0.18,  # lower z_std is better
-    "confidence": 0.13,     # YOLO detection confidence
-    "ellipse": 0.10,        # bonus for valid ellipse fit (orientation reliability)
-    "center_bias": 0.08,    # prefer fruits near frame center (better depth data)
+    "distance": 0.35,       # closer is better (normalized: 0-1)
+    "visibility": 0.30,     # higher vis_ratio is better
+    "depth_quality": 0.14,  # lower z_std is better
+    "confidence": 0.10,     # YOLO detection confidence
+    "ellipse": 0.07,        # bonus for valid ellipse fit (orientation reliability)
+    "center_bias": 0.04,    # prefer fruits near frame center (better depth data)
 }
 
 # Distance scoring parameters
@@ -82,7 +84,11 @@ Z_STD_IDEAL = 0.005   # ideal depth std (m)
 Z_STD_WORST = 0.05    # worst acceptable depth std (m)
 
 # Sticky bonus: how much to prefer the previous best fruit
-STICKY_BONUS = 0.15   # added to score if this was the previous best
+# Higher value = more reluctant to switch targets (reduces jitter)
+STICKY_BONUS = 0.25   # added to score if this was the previous best
+
+# Hysteresis threshold: new target must beat current by this margin to switch
+SWITCH_MARGIN = 0.10  # prevents oscillation between similar-scoring targets
 
 # Collision avoidance parameters
 FRUIT_RADIUS = 0.035  # approximate radius of a date fruit (3.5cm)
@@ -266,8 +272,8 @@ def compute_fruit_score(target: dict, prev_pt_base: np.ndarray = None) -> dict:
             total += STICKY_BONUS
             components["sticky_bonus"] = STICKY_BONUS
 
-    # Clamp final score
-    total = max(0.0, min(1.0 + STICKY_BONUS, total))
+    # Clamp final score (allow up to 1.0 + sticky bonus headroom)
+    total = max(0.0, min(1.25, total))
 
     return {"total_score": total, "components": components}
 
@@ -1216,20 +1222,26 @@ def main_(args: argparse.Namespace):
                         T.transform.rotation.y,
                         T.transform.rotation.z,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Throttled warning: only print once per second
+                    global _last_tf_warn_time
+                    now = time()
+                    if now - _last_tf_warn_time > 1.0:
+                        print(f"[WARN] TF lookup failed ({cam_frame}→base_link): {e}")
+                        _last_tf_warn_time = now
 
                 # Smooth best heatmap point to reduce jitter for arrows
                 best_pt = t_best.get("best_point2d")
-                if best_pt is not None:
-                    if prev_heat_point is None:
-                        sm_pt = best_pt.copy()
+                with direction_lock:
+                    if best_pt is not None:
+                        if prev_heat_point is None:
+                            sm_pt = best_pt.copy()
+                        else:
+                            sm_pt = 0.7 * prev_heat_point + 0.3 * best_pt
+                        prev_heat_point = sm_pt.copy()
+                        t_best["best_point2d_smooth"] = sm_pt
                     else:
-                        sm_pt = 0.7 * prev_heat_point + 0.3 * best_pt
-                    prev_heat_point = sm_pt.copy()
-                    t_best["best_point2d_smooth"] = sm_pt
-                else:
-                    prev_heat_point = None
+                        prev_heat_point = None
 
             # --------------------------------------------------
             # Publish goal for BEST fruit only (before rendering to minimize latency)
@@ -1324,34 +1336,39 @@ def main_(args: argparse.Namespace):
                             dir_raw = dir_cam.copy()
                             print(f"[DIR] TF unavailable, using cam frame directly")
 
-                        # Flip to be consistent with history
+                        # Flip to be consistent with history (thread-safe access)
                         flipped = False
-                        if prev_direction_base is not None:
-                            dot_prev = float(np.dot(prev_direction_base, dir_raw))
-                            if dot_prev < 0:
-                                dir_raw = -dir_raw
-                                flipped = True
-                            print(f"[DIR] flip_check: dot={dot_prev:.3f} flipped={flipped}")
+                        with direction_lock:
+                            if prev_direction_base is not None:
+                                dot_prev = float(np.dot(prev_direction_base, dir_raw))
+                                if dot_prev < 0:
+                                    dir_raw = -dir_raw
+                                    flipped = True
+                                print(f"[DIR] flip_check: dot={dot_prev:.3f} flipped={flipped}")
 
-                        # Add to sliding window history
-                        direction_history.append(dir_raw.copy())
-                        print(f"[DIR] dir_raw_base={np.round(dir_raw, 3)} history_len={len(direction_history)}")
+                            # Add to sliding window history
+                            direction_history.append(dir_raw.copy())
+                            print(f"[DIR] dir_raw_base={np.round(dir_raw, 3)} history_len={len(direction_history)}")
 
                     # Compute averaged direction from history (weighted, newer = more weight)
-                    if len(direction_history) > 0:
-                        weights = np.arange(1, len(direction_history) + 1, dtype=float) ** 2
-                        stacked = np.vstack(list(direction_history))
-                        dir_avg = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
+                    dir_avg = None
+                    with direction_lock:
+                        if len(direction_history) > 0:
+                            weights = np.arange(1, len(direction_history) + 1, dtype=float) ** 2
+                            stacked = np.vstack(list(direction_history))
+                            dir_avg = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
 
-                        # Normalize
-                        n_avg = np.linalg.norm(dir_avg)
-                        if n_avg > 1e-6:
-                            dir_avg /= n_avg
-                        else:
-                            dir_avg = np.array([1.0, 0.0, 0.0])
+                            # Normalize
+                            n_avg = np.linalg.norm(dir_avg)
+                            if n_avg > 1e-6:
+                                dir_avg /= n_avg
+                            else:
+                                dir_avg = np.array([1.0, 0.0, 0.0])
 
-                        prev_direction_base = dir_avg.copy()
+                            prev_direction_base = dir_avg.copy()
 
+                    # Only process direction-dependent code if we have a valid direction
+                    if dir_avg is not None:
                         # Store base_link direction for visualization
                         t_best["approach_dir_base"] = dir_avg.copy()
 

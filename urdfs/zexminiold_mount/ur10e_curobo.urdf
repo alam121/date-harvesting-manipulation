@@ -988,18 +988,18 @@
   </joint>
   <link name="tool0_to_camera_mount_link">
     <visual>
-      <origin rpy="0 0 3.14159" xyz="0.0 0.0 -0.032"/>
+      <origin rpy="0 0 3.14159" xyz="0.045 0.04 -0.005"/>
       <geometry>
-        <mesh filename="package://ur_description/meshes/ur10e/visual/top_zed_homut.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="silver">
         <color rgba="0.7 0.7 0.7 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin rpy="0 0 3.14159" xyz="0.0 0.0 -0.032"/>
+      <origin rpy="0 0 3.14159" xyz="0.045 0.04 -0.005"/>
       <geometry>
-        <mesh filename="package://ur_description/meshes/ur10e/visual/top_zed_homut.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://ur_description/meshes/ur10e/visual/mount.stl" scale="0.001 0.001 0.001"/>
       </geometry>
     </collision>
     <inertial>
@@ -1011,22 +1011,22 @@
   <joint name="tool0_to_mount" type="fixed">
     <parent link="tool0"/>
     <child link="tool0_to_camera_mount_link"/>
-    <origin rpy="0 0 0" xyz="0 0 -0.174"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
   </joint>
   <link name="zed2_left_camera_frame">
     <visual>
-      <origin rpy="-3.142 0 0" xyz="0.007 0.01 -0.032"/>
+      <origin rpy="-1.5708 0 0" xyz="0.07 0.015 -0.07"/>
       <geometry>
-        <mesh filename="package://ur_description/meshes/ur10e/visual/ZEDX_Mini.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://ur_description/meshes/ur10e/visual/zed2_camera.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="gray">
         <color rgba="0.5 0.5 0.5 1.0"/>
       </material>
     </visual>
     <collision>
-      <origin rpy="-3.142 0 0" xyz="0.007 0.01 -0.032"/>
+      <origin rpy="-1.5708 0 0" xyz="0.07 0.015 -0.07"/>
       <geometry>
-        <mesh filename="package://ur_description/meshes/ur10e/visual/ZEDX_Mini.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="package://ur_description/meshes/ur10e/visual/zed2_camera.stl" scale="0.001 0.001 0.001"/>
       </geometry>
     </collision>
     <inertial>
@@ -1038,13 +1038,13 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin rpy="0 0 -0.174" xyz="-0.048 -0.156 -0.005"/>
+    <origin rpy="0 0 0" xyz="-0.06 -0.14 0.06"/>
     <!-- CHANGE -->
   </joint>
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>
     <child link="gripper_tip"/>
-    <origin rpy="0 0.014 0.0" xyz="0 0 0.1"/>
+    <origin rpy="0 0 0" xyz="0 0 0.1"/>
     <!-- Match the box length -->
   </joint>
   <!-- Gripper tip frame -->

@@ -1,35 +1,31 @@
 # ruff: noqa
+import json
 import threading
 import rclpy
 import os
 import numpy as np
+import math
 
 from rclpy.timer import Timer
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-import math
+from rclpy.qos import QoSProfile
 from rclpy.node import Node
-from sensor_msgs.msg import JointState as ROSJointState
-from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
-from std_msgs.msg import Bool, Float32MultiArray, String, Float32
-from geometry_msgs.msg import PoseStamped, Vector3Stamped, Twist
-from tf2_ros import Buffer, TransformListener
-from .config import AppConfig, DEFAULT_QOS, WORLD_CONFIG, JOINT_ORDER
+from visualization_msgs.msg import Marker
+from std_msgs.msg import Float32MultiArray, String, Float32
+from geometry_msgs.msg import PoseStamped
+from .config import AppConfig
 
-from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
-from curobo.geom.types import Sphere, Cuboid
-from .config import JOINT_ORDER, WORLD_CONFIG, DEFAULT_QOS
 from .utils import read_key
 from . import fk as fk_mod
 from . import markers as markers_mod
 from . import motions as motions_mod
 from . import goals as goals_mod
+from .goals import ThreadSafeGoalList
 from . import gripper as gripper_mod
-from .motions import publish_stop_trajectory
-from .dynamic_obstacle import DynamicObstacleManager
-from .perception import ZedYoloPerception
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from ur_msgs.srv import SetIO
 from .grasp_outcome_classifier import classify_triplet
+
+# Manager imports
+from .managers import ConfigManager, StateManager, MotionExecutor
 
 
 # Callback	Trigger	Purpose
@@ -50,104 +46,24 @@ class UR10eCuroboMoveIt(Node):
             automatically_declare_parameters_from_overrides=True
         )
 
-        # ========= PARAMS: defaults → ROS params → env overrides =========
-        self.cfg = AppConfig()  # 1) start with code defaults
+        # ========= PHASE 1: ConfigManager =========
+        self._config_mgr = ConfigManager(self)
+        self._config_mgr.initialize()
 
-        # 2) declare ROS parameters
-        self.declare_parameter("planner.speed_scale", self.cfg.planner.speed_scale)
-        self.declare_parameter("planner.urdf_config", self.cfg.planner.urdf_config)
-        self.declare_parameter("planner.interpolation_dt", self.cfg.planner.interpolation_dt)
+        # ========= PHASE 2: StateManager =========
+        self._state_mgr = StateManager(self, self._config_mgr)
+        self._state_mgr.initialize()
 
-        self.declare_parameter("perception.enabled", self.cfg.perception.enabled)
-        self.declare_parameter("perception.weights", self.cfg.perception.weights)
-        self.declare_parameter("perception.img_size", self.cfg.perception.img_size)
-        self.declare_parameter("perception.conf_thres", self.cfg.perception.conf_thres)
-        self.declare_parameter("perception.cam_frame", self.cfg.perception.cam_frame)
-        self.declare_parameter("perception.show_view", self.cfg.perception.show_view)
-        self.declare_parameter("perception.use_gpu", self.cfg.perception.use_gpu)
+        # ========= PHASE 3: MotionExecutor =========
+        self._motion_mgr = MotionExecutor(self, self._config_mgr, self._state_mgr)
+        self._motion_mgr.initialize()
 
-        #topics
-        self.declare_parameter("topics.joint_traj", self.cfg.topics.traj_cmd)
-        self.declare_parameter("topics.goal_marker", self.cfg.topics.goal_marker)
-        self.declare_parameter("topics.path_marker", self.cfg.topics.path_marker)
-        self.declare_parameter("topics.joint_states", self.cfg.topics.joint_states)
-        #joints
+        # ======== Remaining pubs/subs (not handled by managers yet) ========
 
-        self.declare_parameter("joints.home", self.cfg.joints.home)
-        self.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
-        self.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
-        
-        self.declare_parameter("planner.pre_dropoff_z_offset", self.cfg.planner.pre_dropoff_z_offset)
-        self.declare_parameter("planner.pre_dropoff_y_offset", self.cfg.planner.pre_dropoff_y_offset)
-
-        # 3) read back ROS parameters
-        self.cfg.planner.speed_scale = self.get_parameter("planner.speed_scale").value
-        self.cfg.planner.urdf_config = self.get_parameter("planner.urdf_config").value
-        self.cfg.planner.interpolation_dt = float(self.get_parameter("planner.interpolation_dt").value)
-
-        self.cfg.perception.enabled    = bool(self.get_parameter("perception.enabled").value)
-        self.cfg.perception.weights    = self.get_parameter("perception.weights").value
-        self.cfg.perception.img_size   = int(self.get_parameter("perception.img_size").value)
-        self.cfg.perception.conf_thres = float(self.get_parameter("perception.conf_thres").value)
-        self.cfg.perception.cam_frame  = self.get_parameter("perception.cam_frame").value
-        self.cfg.perception.show_view  = bool(self.get_parameter("perception.show_view").value)
-        self.cfg.perception.use_gpu    = bool(self.get_parameter("perception.use_gpu").value)
-
-        #ros topics
-        self.cfg.topics.traj_cmd      = self.get_parameter("topics.joint_traj").value
-        self.cfg.topics.goal_marker    = self.get_parameter("topics.goal_marker").value
-        self.cfg.topics.path_marker    = self.get_parameter("topics.path_marker").value
-        self.cfg.topics.joint_states   = self.get_parameter("topics.joint_states").value
-
-
-        # arrays come back as tuples in Foxy—cast to list
-        self.cfg.joints.home       = list(self.get_parameter("joints.home").value)
-        self.cfg.joints.dropoff    = list(self.get_parameter("joints.dropoff").value)
-        self.cfg.joints.predropoff = list(self.get_parameter("joints.predropoff").value)
-        
-        self.cfg.planner.pre_dropoff_z_offset = float(self.get_parameter("planner.pre_dropoff_z_offset").value)
-        self.cfg.planner.pre_dropoff_y_offset = float(self.get_parameter("planner.pre_dropoff_y_offset").value)
-
-        # 4) env overrides (UR10E_*), e.g. UR10E_SHOW_VIEW=1
-        self.cfg = AppConfig.from_env(self.cfg)
-
-        # 5) expose to the rest of the class
-        self.speed_scale       = self.cfg.planner.speed_scale
-        self.home_joints       = self.cfg.joints.home
-        self.dropoff_joints    = self.cfg.joints.dropoff
-        self.predropoff_joints = self.cfg.joints.predropoff
-        
-        self.yoffset = self.cfg.planner.pre_dropoff_y_offset
-        self.zoffset = self.cfg.planner.pre_dropoff_z_offset
-        self.cam_frame = self.cfg.perception.cam_frame
-
-        self.traj_cmd_topic    = self.cfg.topics.traj_cmd
-        self.joint_states_topic = self.cfg.topics.joint_states
-        self.goal_marker_topic  = self.cfg.topics.goal_marker
-        self.path_marker_topic  = self.cfg.topics.path_marker
-        # state: keep track of robot state, path history, and goals in memory.
-        self.qos = DEFAULT_QOS
-        self.goal_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        # ======== pubs/subs after config so QoS/params exist ========
-
-        self.trajectory_pub = self.create_publisher(JointTrajectory, self.traj_cmd_topic, 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
 
-        self.create_subscription(ROSJointState, "/joint_states", self._joint_state_cb, 10)
-        self.create_subscription(
-            InteractiveMarkerFeedback,
-            "/rviz_moveit_motion_planning_display/robot_interaction_interactive_marker_topic/feedback",
-            self._marker_cb, 10
-        )
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
-        self.create_subscription(Bool, "/emergency_stop", self._stop_cb, 10)
-        self.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
 
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
@@ -158,9 +74,7 @@ class UR10eCuroboMoveIt(Node):
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
 
         self.io_client = self.create_client(SetIO, '/io_and_status_controller/set_io')
-        #while not self.io_client.wait_for_service(timeout_sec=1.0):
-            #self.get_logger().info("Waiting for /set_io service...")
-        
+
         self.goal_tracker_sub = self.create_subscription(
             PoseStamped,
             '/external_goal_pose',        # always listen to new poses
@@ -168,76 +82,26 @@ class UR10eCuroboMoveIt(Node):
             self.goal_qos
         )
 
-        # Direction subscriber for pre-grasp bias
-        self.fruit_direction = None
-        self.create_subscription(
-            Vector3Stamped,
-            '/datefruit_direction',
-            self._direction_cb,
-            10
-        )
-
-        # tf
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
         # timers
         self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers
         self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)
-        self.timer_wait_js = self.create_timer(0.5, self._check_joint_states) #Check if joint states received
 
-       # 1. Load cuRobo config
-        self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            self.cfg.planner.urdf_config, WORLD_CONFIG,
-            interpolation_dt=self.cfg.planner.interpolation_dt
-        )
+        # Note: cuRobo, obstacles, trajectory_pub, teleop, static obstacles moved to MotionExecutor
 
-        # 2. Create MotionGen
-        self.motion_gen = MotionGen(self.motion_gen_config)
-        self.motion_gen.warmup()
-        self.get_logger().info("cuRobo warmup done")
+        self.goal_poses = ThreadSafeGoalList()  # Thread-safe for ROS callback + main thread access
+        # Note: _motion_lock moved to MotionExecutor
 
-
-        self.obstacles = DynamicObstacleManager(
-            node=self,
-            motion_gen=self.motion_gen,
-            world_model=self.motion_gen.world_model
-        )
-
-        # 4. Add a dynamic sphere
-        self.obstacles.add_sphere("dyn_sphere", radius=0.1)
-        self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
-        
-
-        self.joint_order = JOINT_ORDER
-        
-        self.current_joint_positions = None
-        self.current_joint_velocities = None
-        self.latest_marker_pose = None
-        
-        self.goal_poses = []
-        self.path_points = []
-        
-        
-        self.running = True
-        self.stop_requested = False
-        self.robot_running = False
-        
         # --- capture state ---
         self.goal_capture_active = False
         self.goal_capture_timer = None
         self.goal_pose_sub = None
         self.goal_capture_count = 0
-        
+
         self.goal_sort_ref = None
         self.goal_sort_ascending = True
-        
-        self.tf_warning_printed = False
-        self.tf_printed = False
 
         self.latest_goal_pose = None        # [x, y, z, qw, qx, qy, qz]
         self.latest_goal_time = 0.0         # timestamp of last valid pos
-
 
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")
@@ -253,31 +117,7 @@ class UR10eCuroboMoveIt(Node):
         self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
 
-        # ---- TELEOP STATE ----
-        # Teleop: cache incoming twist deltas and servo them to the robot
-        self.teleop_enabled = True
-        self.latest_teleop_twist = None
-        self.teleop_timeout = 0.2  # seconds
-        self.last_teleop_time = 0.0
-
-        # Smoothing state for teleop
-        self.teleop_smoothed_delta = [0.0, 0.0, 0.0]  # Exponentially smoothed dx, dy, dz
-        self.teleop_smooth_alpha = 0.4  # Smoothing factor (0-1, lower = smoother but slower response)
-        self.teleop_traj_duration = 0.08  # Trajectory duration in seconds (longer = smoother blending)
-
-        # Subscribe to teleop delta twists (published by the GUI)
-        self.create_subscription(
-            Twist,
-            "/teleop_delta",
-            self._teleop_cb,
-            10
-        )
-
-        # Servo timer (40 Hz) to convert cached teleop deltas into trajectories
-        self.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
-
-        # # Perception: ZED + YOLO
-        #self._maybe_start_perception()
+        # Note: Teleop state, subscription, and timer moved to MotionExecutor
 
     def reset_goal_tracking(self):
         """Reset all goal tracking state for a fresh cycle."""
@@ -290,32 +130,8 @@ class UR10eCuroboMoveIt(Node):
         self.goal_received = False
 
     # callbacks
-    def _check_joint_states(self):  #Confirms joint feedback received
-        if self.current_joint_positions is not None:
-            self.get_logger().info("Initial joints received."); self.destroy_timer(self.timer_wait_js)
-
-    def _joint_state_cb(self, msg):  #Updates position & velocity arrays
-        jm = dict(zip(msg.name, msg.position))
-        vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
-        
-        self.current_joint_positions = [jm[j] for j in self.joint_order if j in jm]
-        self.current_joint_velocities = [vm.get(j, 0.0) for j in self.joint_order]
-
-    def _marker_cb(self, msg): ##Stores last clicked pose
-        self.latest_marker_pose = msg.pose
-
-    def _direction_cb(self, msg: Vector3Stamped):
-        """Store fruit direction for pre-grasp bias."""
-        self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
-
-    def _robot_running_cb(self, msg): ##Logs robot program state
-        self.robot_running = msg.data
-        self.get_logger().info("✅ Robot program is running." if msg.data else "⚠️ Robot program is NOT running.")
-
-    def _stop_cb(self, msg): ##Stops motion immediately
-        if not msg.data: return
-        self.get_logger().warn("🛑 Emergency stop!"); self.stop_requested = True
-        publish_stop_trajectory(self)
+    # Note: _check_joint_states, _joint_state_cb, _marker_cb, _direction_cb,
+    # _robot_running_cb, _stop_cb moved to StateManager
 
     def _force_cb(self, msg): ##Sends force readings to classifier
         forces = list(msg.data)[:3]
@@ -336,16 +152,35 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info(f"UI command received: {cmd}")
 
         # Run blocking motion commands in separate thread to avoid blocking ROS callbacks
+        # Use mutex to prevent concurrent execution of motion commands
         def run_home():
-            motions_mod.move_to_home_position(self)
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn("Motion already in progress, ignoring HOME command")
+                return
+            try:
+                motions_mod.move_to_home_position(self)
+            finally:
+                self._motion_lock.release()
 
         def run_dropoff():
-            motions_mod.move_to_dropoff_position(self)
-            gripper_mod.control_gripper(self, 'OPEN')
-        
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn("Motion already in progress, ignoring DROPOFF command")
+                return
+            try:
+                motions_mod.move_to_dropoff_position(self)
+                gripper_mod.control_gripper(self, 'OPEN')
+            finally:
+                self._motion_lock.release()
+
         def run_execute():
-            if self.goal_poses:
-                self._prep_and_execute()
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn("Motion already in progress, ignoring EXECUTE command")
+                return
+            try:
+                if self.goal_poses:
+                    self._prep_and_execute()
+            finally:
+                self._motion_lock.release()
 
         if cmd == "home":
             threading.Thread(target=run_home, daemon=True).start()
@@ -405,14 +240,33 @@ class UR10eCuroboMoveIt(Node):
 
     def _publish_goal_info(self):
         """Publish goal information for GUI consumption."""
-        import json
-        info = {
-            "goal_count": len(self.goal_poses),
-            "goals": [[round(v, 4) for v in g[:3]] for g in self.goal_poses[:5]],  # First 5 goals, XYZ only
-            "latest_goal": [round(v, 4) for v in self.latest_goal_pose[:3]] if self.latest_goal_pose else None,
-            "best_goal_xyz": [round(v, 4) for v in self.best_goal_xyz] if self.best_goal_xyz else None,
+        # Convert ThreadSafeGoalList to a list safely
+        if hasattr(self.goal_poses, "data"):  # check if 'data' attribute exists
+            safe_goals = list(self.goal_poses.data)
+        elif hasattr(self.goal_poses, "_list"):  # check for '_list'
+            safe_goals = list(self.goal_poses._list)
+        elif hasattr(self.goal_poses, "get_list"):  # check for 'get_list' method
+            safe_goals = list(self.goal_poses.get_list())
+        else:
+            # Fallback for unknown implementation
+            try:
+                safe_goals = [g for g in self.goal_poses]  # if iteration works
+            except Exception:
+                safe_goals = []
+
+        msg_data = {
+            "goal_count": len(safe_goals),
+            "goals": [[round(v, 4) for v in g[:3]] for g in safe_goals[:5]],  # First 5 goals, XYZ only
+            "latest_goal": (
+                [round(v, 4) for v in self.latest_goal_pose[:3]]
+                if self.latest_goal_pose else None
+            ),
+            "best_goal_xyz": (
+                [round(v, 4) for v in self.best_goal_xyz]
+                if self.best_goal_xyz else None
+            ),
             "capture_active": self.goal_capture_active,
-            "capture_count": getattr(self, 'goal_capture_count', 0),
+            "capture_count": getattr(self, "goal_capture_count", 0),
             "velocity_scale": self.cfg.planner.global_speed_multiplier,
             "speed_home": self.cfg.planner.speed_home,
             "speed_dropoff": self.cfg.planner.speed_dropoff,
@@ -420,12 +274,14 @@ class UR10eCuroboMoveIt(Node):
             "speed_predropoff": self.cfg.planner.speed_predropoff,
         }
         msg = String()
-        msg.data = json.dumps(info)
+        msg.data = json.dumps(msg_data)
         self.goal_info_pub.publish(msg)
+
+    # Note: _publish_static_obstacles moved to MotionExecutor
 
     # methods used by helpers (so helpers can call like node.get_end_effector_pose())
     def get_end_effector_pose(self):
-        return fk_mod.get_end_effector_pose(self)
+        return self._motion_mgr.get_end_effector_pose()
     
     
 
@@ -700,59 +556,7 @@ class UR10eCuroboMoveIt(Node):
         gripper_mod.control_gripper(self, action)
 
     def debug_print_world(self):
-        wm = self.motion_gen.world_model
-
-        print("\n========== CURRENT CUROBO WORLD ==========")
-
-        # ----- SPHERES -----
-        print("SPHERES:")
-        if wm.sphere:
-            for s in wm.sphere:
-                print(f"  - name={s.name}, pose={s.pose}, radius={s.radius}")
-        else:
-            print("  (none)")
-
-        # ----- CUBOIDS -----
-        print("\nCUBOIDS:")
-        if wm.cuboid:
-            for c in wm.cuboid:
-                print(f"  - name={c.name}, dims={c.dims}, pose={c.pose}")
-        else:
-            print("  (none)")
-
-        # ----- CAPSULES -----
-        print("\nCAPSULES:")
-        if wm.capsule:
-            for cap in wm.capsule:
-                print(f"  - name={cap.name}, dims={cap.dims}, pose={cap.pose}")
-        else:
-            print("  (none)")
-
-        # ----- CYLINDERS -----
-        print("\nCYLINDERS:")
-        if wm.cylinder:
-            for cyl in wm.cylinder:
-                print(f"  - name={cyl.name}, dims={cyl.dims}, pose={cyl.pose}")
-        else:
-            print("  (none)")
-
-        # ----- MESH -----
-        print("\nMESHES:")
-        if wm.mesh:
-            for m in wm.mesh:
-                print(f"  - name={m.name}, pose={m.pose}")
-        else:
-            print("  (none)")
-
-        # ----- VOXEL -----
-        print("\nVOXEL GRIDS:")
-        if wm.voxel:
-            for v in wm.voxel:
-                print(f"  - name={v.name}, pose={v.pose}")
-        else:
-            print("  (none)")
-
-        print("============================================\n")
+        self._motion_mgr.debug_print_world()
 
     def _start_perception_once(self):
         # run exactly once
@@ -794,103 +598,206 @@ class UR10eCuroboMoveIt(Node):
         # Delay startup to avoid RAM spikes colliding with cuRobo init
         self.perception_timer: Timer = self.create_timer(5.0, self._start_perception_once)
 
-    # ---- Teleop callbacks & servoing ----
-    def _teleop_cb(self, msg: Twist):
-        """Cache latest teleop twist and timestamp (deadman handled in servo tick)."""
-        import time
-        self.latest_teleop_twist = msg
-        self.last_teleop_time = time.time()
+    # Note: _teleop_cb and _teleop_servo_tick moved to MotionExecutor
 
-    def _teleop_servo_tick(self):
-        """Run at ~40Hz: convert cached teleop twist into smoothed trajectory.
+    # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 1: ConfigManager) ============
 
-        This implements smooth teleop by:
-        1. Exponentially smoothing incoming deltas to reduce jitter
-        2. Using longer trajectory duration for better blending
-        3. Including velocity in trajectory points for smooth motion
-        """
-        import time
+    @property
+    def cfg(self) -> AppConfig:
+        return self._config_mgr.cfg
 
-        # Teleop enabled?
-        if not getattr(self, 'teleop_enabled', False):
-            return
+    @property
+    def qos(self) -> QoSProfile:
+        return self._config_mgr.qos
 
-        # need current joint feedback to seed IK
-        if self.current_joint_positions is None:
-            return
+    @property
+    def goal_qos(self) -> QoSProfile:
+        return self._config_mgr.goal_qos
 
-        # Get raw deltas from latest twist (or zero if timed out)
-        raw_dx = raw_dy = raw_dz = 0.0
-        now = time.time()
-        timed_out = now - getattr(self, 'last_teleop_time', 0.0) > getattr(self, 'teleop_timeout', 0.2)
+    @property
+    def joint_order(self) -> list:
+        return self._config_mgr.joint_order
 
-        if self.latest_teleop_twist is not None and not timed_out:
-            raw_dx = float(self.latest_teleop_twist.linear.x)
-            raw_dy = float(self.latest_teleop_twist.linear.y)
-            raw_dz = float(self.latest_teleop_twist.linear.z)
+    @property
+    def home_joints(self) -> list:
+        return self._config_mgr.home_joints
 
-        # Exponential smoothing of deltas
-        alpha = getattr(self, 'teleop_smooth_alpha', 0.4)
-        smoothed = getattr(self, 'teleop_smoothed_delta', [0.0, 0.0, 0.0])
+    @property
+    def dropoff_joints(self) -> list:
+        return self._config_mgr.dropoff_joints
 
-        smoothed[0] = alpha * raw_dx + (1 - alpha) * smoothed[0]
-        smoothed[1] = alpha * raw_dy + (1 - alpha) * smoothed[1]
-        smoothed[2] = alpha * raw_dz + (1 - alpha) * smoothed[2]
+    @property
+    def predropoff_joints(self) -> list:
+        return self._config_mgr.predropoff_joints
 
-        self.teleop_smoothed_delta = smoothed
+    @property
+    def speed_scale(self) -> float:
+        return self._config_mgr.speed_scale
 
-        # Skip if movement is negligible
-        if abs(smoothed[0]) < 0.0001 and abs(smoothed[1]) < 0.0001 and abs(smoothed[2]) < 0.0001:
-            return
+    @speed_scale.setter
+    def speed_scale(self, value: float):
+        self._config_mgr.speed_scale = value
 
-        # 1. current TCP pose
-        ee = self.get_end_effector_pose()
-        if ee is None:
-            return
+    @property
+    def yoffset(self) -> float:
+        return self._config_mgr.yoffset
 
-        x, y, z, qw, qx, qy, qz = ee
+    @property
+    def zoffset(self) -> float:
+        return self._config_mgr.zoffset
 
-        # 2. Apply smoothed deltas
-        x_new = x + smoothed[0]
-        y_new = y + smoothed[1]
-        z_new = z + smoothed[2]
+    @property
+    def cam_frame(self) -> str:
+        return self._config_mgr.cam_frame
 
-        # 3. Build target pose (vec7)
-        target_pose = [x_new, y_new, z_new, qw, qx, qy, qz]
+    @property
+    def traj_cmd_topic(self) -> str:
+        return self._config_mgr.traj_cmd_topic
 
-        # 4. Solve IK (fast path)
-        try:
-            q_cmd = fk_mod.solve_ik_fast(
-                self,
-                target_pose,
-                seed=self.current_joint_positions
-            )
-        except Exception:
-            return
+    @property
+    def joint_states_topic(self) -> str:
+        return self._config_mgr.joint_states_topic
 
-        if q_cmd is None:
-            return
+    @property
+    def goal_marker_topic(self) -> str:
+        return self._config_mgr.goal_marker_topic
 
-        # 5. Build smooth trajectory with velocity
-        traj = JointTrajectory()
-        traj.joint_names = self.joint_order
+    @property
+    def path_marker_topic(self) -> str:
+        return self._config_mgr.path_marker_topic
 
-        traj_duration = getattr(self, 'teleop_traj_duration', 0.08)
+    # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 2: StateManager) ============
 
-        # Compute velocities based on position difference
-        q_current = self.current_joint_positions
-        velocities = [(q_cmd[i] - q_current[i]) / traj_duration for i in range(len(q_cmd))]
+    @property
+    def current_joint_positions(self):
+        return self._state_mgr.current_joint_positions
 
-        # Single point trajectory with velocity for smooth tracking
-        point = JointTrajectoryPoint()
-        point.positions = list(q_cmd)
-        point.velocities = velocities
-        point.time_from_start.sec = 0
-        point.time_from_start.nanosec = int(traj_duration * 1e9)
-        traj.points.append(point)
+    @current_joint_positions.setter
+    def current_joint_positions(self, value):
+        self._state_mgr.current_joint_positions = value
 
-        try:
-            self.trajectory_pub.publish(traj)
-        except Exception:
-            # be defensive — don't let teleop servo crash the node
-            return
+    @property
+    def current_joint_velocities(self):
+        return self._state_mgr.current_joint_velocities
+
+    @current_joint_velocities.setter
+    def current_joint_velocities(self, value):
+        self._state_mgr.current_joint_velocities = value
+
+    @property
+    def tf_buffer(self):
+        return self._state_mgr.tf_buffer
+
+    @property
+    def running(self) -> bool:
+        return self._state_mgr.running
+
+    @running.setter
+    def running(self, value: bool):
+        self._state_mgr.running = value
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._state_mgr.stop_requested
+
+    @stop_requested.setter
+    def stop_requested(self, value: bool):
+        self._state_mgr.stop_requested = value
+
+    @property
+    def robot_running(self) -> bool:
+        return self._state_mgr.robot_running
+
+    @robot_running.setter
+    def robot_running(self, value: bool):
+        self._state_mgr.robot_running = value
+
+    @property
+    def path_points(self) -> list:
+        return self._state_mgr.path_points
+
+    @property
+    def latest_marker_pose(self):
+        return self._state_mgr.latest_marker_pose
+
+    @latest_marker_pose.setter
+    def latest_marker_pose(self, value):
+        self._state_mgr.latest_marker_pose = value
+
+    @property
+    def tf_warning_printed(self) -> bool:
+        return self._state_mgr.tf_warning_printed
+
+    @tf_warning_printed.setter
+    def tf_warning_printed(self, value: bool):
+        self._state_mgr.tf_warning_printed = value
+
+    @property
+    def tf_printed(self) -> bool:
+        return self._state_mgr.tf_printed
+
+    @tf_printed.setter
+    def tf_printed(self, value: bool):
+        self._state_mgr.tf_printed = value
+
+    @property
+    def fruit_direction(self):
+        return self._state_mgr.fruit_direction
+
+    @fruit_direction.setter
+    def fruit_direction(self, value):
+        self._state_mgr.fruit_direction = value
+
+    # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 3: MotionExecutor) ============
+
+    @property
+    def motion_gen(self):
+        return self._motion_mgr.motion_gen
+
+    @property
+    def motion_gen_config(self):
+        return self._motion_mgr.motion_gen_config
+
+    @property
+    def trajectory_pub(self):
+        return self._motion_mgr.trajectory_pub
+
+    @property
+    def env_marker_pub(self):
+        return self._motion_mgr.env_marker_pub
+
+    @property
+    def obstacles(self):
+        return self._motion_mgr.obstacles
+
+    @property
+    def static_obstacles(self):
+        return self._motion_mgr.static_obstacles
+
+    @property
+    def _motion_lock(self):
+        return self._motion_mgr._motion_lock
+
+    @property
+    def teleop_enabled(self) -> bool:
+        return self._motion_mgr.teleop_enabled
+
+    @teleop_enabled.setter
+    def teleop_enabled(self, value: bool):
+        self._motion_mgr.teleop_enabled = value
+
+    @property
+    def latest_teleop_twist(self):
+        return self._motion_mgr.latest_teleop_twist
+
+    @latest_teleop_twist.setter
+    def latest_teleop_twist(self, value):
+        self._motion_mgr.latest_teleop_twist = value
+
+    @property
+    def last_teleop_time(self) -> float:
+        return self._motion_mgr.last_teleop_time
+
+    @last_teleop_time.setter
+    def last_teleop_time(self, value: float):
+        self._motion_mgr.last_teleop_time = value

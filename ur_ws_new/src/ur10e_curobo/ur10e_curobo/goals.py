@@ -1,9 +1,49 @@
 # ruff: noqa
 import time, math, torch
+import threading
 import numpy as np
 from geometry_msgs.msg import Pose as ROSPose, PoseStamped
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
+
+
+class ThreadSafeGoalList:
+    """Thread-safe wrapper for goal_poses list to prevent race conditions between ROS callbacks and main thread."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._goals = []
+
+    def append(self, goal):
+        with self._lock:
+            self._goals.append(goal)
+
+    def pop(self, index=0):
+        with self._lock:
+            if self._goals:
+                return self._goals.pop(index)
+            return None
+
+    def clear(self):
+        with self._lock:
+            self._goals.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._goals)
+
+    def __bool__(self):
+        with self._lock:
+            return bool(self._goals)
+
+    def any_within_distance(self, pos, threshold):
+        """Check if any goal is within threshold distance of pos[:3]."""
+        with self._lock:
+            return any(math.dist(pos[:3], e[:3]) < threshold for e in self._goals)
+
+    def sort(self, key=None, reverse=False):
+        """Sort goals in place with optional key function."""
+        with self._lock:
+            self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT
@@ -65,7 +105,7 @@ def quat_slerp(q0, q1, t):
     return [s0 * q0[i] + s1 * q1[i] for i in range(4)]
 
 
-def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.5):
+def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
     """
     Blend current and target orientation, prioritizing current.
 
@@ -349,7 +389,7 @@ def subscribe_to_goal_pose(node):
                 msg.pose.orientation.y, msg.pose.orientation.z]
             
             
-            if not any(math.dist(g[:3], e[:3]) < 0.01 for e in node.goal_poses):
+            if not node.goal_poses.any_within_distance(g, 0.01):
                 node.goal_poses.append(g)
                 publish_goal_marker(node, g[:3])
                 print(f"🟢 Accepted goal pose: {g}")
@@ -421,7 +461,14 @@ def subscribe_to_goal_pose(node):
 
 
 def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
-    v = getattr(node, 'current_joint_velocities', None) or []
+    """Check if robot is moving based on joint velocities.
+
+    Returns True (assume moving) if velocity data is unavailable - safer default.
+    """
+    v = getattr(node, 'current_joint_velocities', None)
+    if v is None or len(v) == 0:
+        # No velocity data available - assume robot IS moving (safer default)
+        return True
     return any(abs(x) > velocity_threshold for x in v)
 
 def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
@@ -518,14 +565,16 @@ def plan_and_execute(node):
         )
         
         
-        # 0. Get next goal
+        # 0. Get next goal (thread-safe pop returns None if empty)
         goal = node.goal_poses.pop(0)
+        if goal is None:
+            node.get_logger().warn("Goal queue empty during pop; skipping.")
+            continue
         x,y,z = goal[:3]
         yoffset = node.yoffset
 
         # Direction-biased pre-grasp: use fruit direction if available
-        direction = getattr(node, 'fruit_direction', None)
-        standoff = 0.08  # 12cm standoff distance
+        standoff = 0.0  # 12cm standoff distance
 
         d_blend = blend_approach_direction(node, x, y, z)
         ax = x + d_blend[0] * standoff
@@ -544,7 +593,7 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
         orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        approach = [ax, ay, az-0.12, *orientation]
+        approach = [ax, ay+0.03, az-0.12, *orientation]
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
             
@@ -570,32 +619,78 @@ def plan_and_execute(node):
             continue
             
         # 3. Final slow precise grasp
-        final_target = [x, y, z+0.02, *orientation]
+        final_target = [x, y, z+0.01, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
         blend_motion(node)
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
-        
-        
-        if node.slip_detection or node.grab_miss or node.weak_grab:
-            print("Re-attempting grasp due to:",)
-            # node.control_gripper("OPEN"); cur = node.get_end_effector_pose()
-            # if cur: exec_pose(node, [cur[0], cur[1], cur[2]+0.015, *cur[3:]])
-            # node.slip_detection = node.grab_miss = False
-            # node.control_gripper("CLOSE")
+
+        # Verify 3-finger contact before moving
+        def check_3finger_contact():
+            forces = node.gripper_controller.force_data
+            threshold = node.gripper_controller.force_threshold
+            finger_names = ["Finger 0 (left)", "Finger 1 (center)", "Finger 2 (right)"]
+            bad_fingers = []
+            for i, f in enumerate(forces):
+                has_contact = abs(f) >= threshold or f <= -threshold
+                if not has_contact:
+                    bad_fingers.append(f"{finger_names[i]}: {f:.2f}")
+            return len(bad_fingers) == 0, forces, bad_fingers
+
+        is_proper, forces, bad_fingers = check_3finger_contact()
+        if not is_proper:
+            print(f"⚠️ Weak grip - no contact on: {bad_fingers}")
+            node.control_gripper("OPEN"); time.sleep(0.3)
+            # Move slightly closer
+            cur = node.get_end_effector_pose()
+            if cur:
+                closer_target = [cur[0], cur[1] - 0.01, cur[2] + 0.005, *cur[3:]]
+                exec_pose(node, closer_target)
+                wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
+            node.control_gripper("CLOSE"); time.sleep(0.7)
+            is_proper, forces, bad_fingers = check_3finger_contact()
+            if is_proper:
+                print(f"Re-grip result: {forces} → PROPER ✅")
+            else:
+                print(f"Re-grip result: {forces} → STILL WEAK on: {bad_fingers}")
             
         # 4. Drop-off and return
         #rotate_wrist(node, 90, rotate_time=0.5, hold_time=0.05, return_time=0.5)
-        time.sleep(0.1)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
+        time.sleep(0.5)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
 
-        # #move_to_predropoff_position
+        # #move_to_predropoff_position - retreat along approach direction
         current_pose = node.get_end_effector_pose()
-        target_pose = [current_pose[0], current_pose[1]+node.cfg.planner.pre_dropoff_y_offset,
-                       current_pose[2]+node.cfg.planner.pre_dropoff_z_offset,
-                       *current_pose[3:]]
+        if current_pose is None:
+            node.get_logger().error("Cannot get end-effector pose for pre-dropoff; using fallback.")
+            # Fallback: skip pre-dropoff and go directly to dropoff
+            move_to_dropoff_position(node)
+            time.sleep(0.2)
+            node.control_gripper("OPEN")
+            move_to_home_position(node)
+            node.reset_goal_tracking()
+            continue
+
+        # Pre-dropoff: use home position's Y to ensure safe clearance
+        from .fk import forward_kinematics
+        home_fk = forward_kinematics(node, node.home_joints)
+        if home_fk is None:
+            node.get_logger().warn("Could not compute home FK; using fallback Y")
+            home_y = current_pose[1] + 0.3  # fallback: 30cm back
+        else:
+            home_y = home_fk.y
+
+        home_z = home_fk.z if home_fk else current_pose[2]
+
+        target_pose = [
+            current_pose[0],  # keep current X
+            home_y,           # use home's Y position
+            home_z,           # use home's Z position
+            *current_pose[3:]
+        ]
         print("Current pose:", current_pose)
+        print(f"Pre-dropoff using home Y: {home_y:.3f}, Z: {home_z:.3f}")
         print("Target pre-dropoff pose:", target_pose)
         execute_single_pose(node, target_pose, motion_type="predropoff")
         # Wait until robot reaches target position (with tolerance)

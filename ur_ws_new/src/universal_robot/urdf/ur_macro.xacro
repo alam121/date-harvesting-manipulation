@@ -486,7 +486,7 @@
     </material>
   </visual>
   <collision>
-    <origin xyz="0.045 0.04 -0.005" rpy="0 0 3.14159"/>
+    <origin xyz="0.0 0.0 -0.032" rpy="0 0 3.14159"/>
     <geometry>
       <mesh filename="package://ur_description/meshes/ur10e/visual/top_zed_homut.stl" scale="0.001 0.001 0.001"/>
     </geometry>
@@ -515,7 +515,7 @@
     </material>
   </visual>
   <collision>
-    <origin xyz="0.055 -0.05 -0.055" rpy="-3.142 0 0"/>
+    <origin xyz="0.007 0.01 -0.032" rpy="-3.142 0 0"/>
     <geometry>
       <mesh filename="package://ur_description/meshes/ur10e/visual/ZEDX_Mini.stl" scale="0.001 0.001 0.001"/>
     </geometry>

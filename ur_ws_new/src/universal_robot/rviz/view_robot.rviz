@@ -5,7 +5,6 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /RobotModel1/Description Topic1
-        - /TF1
         - /TF1/Frames1
       Splitter Ratio: 0.5
     Tree Height: 784
@@ -368,6 +367,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /robot_path_marker
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        environment: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /env_marker
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -414,25 +426,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.8358126282691956
+      Distance: 2.1218161582946777
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.08119021356105804
-        Y: -0.25848305225372314
-        Z: 0.7457068562507629
+        X: -0.7648693323135376
+        Y: -0.08057291060686111
+        Z: 1.3316758871078491
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: -0.09960142523050308
+      Pitch: 0.5653982162475586
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 6.278578281402588
+      Yaw: 1.6653907299041748
     Saved: ~
 Window Geometry:
   Displays:
