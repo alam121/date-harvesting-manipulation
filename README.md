@@ -106,3 +106,4 @@ Train the nextwork
 5. ```sudo apt install xauth```
 
 
+For frequent issues please go [here](https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm/-/blob/dev2/troubleshoot.md)
