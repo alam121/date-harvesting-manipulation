@@ -16,3 +16,15 @@ log/
 # Generated outputs
 zed_output*
 
+# colcon outputs
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# archives/installers
+*.tar.gz
+*.tgz
+*.zip
