@@ -45,7 +45,6 @@ sudo ldconfig
 ```
 Verify
 ```bash
-
 ldconfig -p | grep cudss
 python3 -c "import torch; print(torch.__version__)"
 ```
