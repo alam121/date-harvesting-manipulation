@@ -48,3 +48,28 @@ Verify
 ldconfig -p | grep cudss
 python3 -c "import torch; print(torch.__version__)"
 ```
+
+## 2) cuRobo install fails: `canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'`
+
+### Symptom
+```text
+TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'
+Preparing editable metadata (pyproject.toml) ... error
+error: metadata-generation-failed
+
+
+### Cause
+
+Python packaging toolchain mismatch.
+setuptools calls canonicalize_version(..., strip_trailing_zero=...) but the installed packaging version is too old and does not support this argument.
+This typically happens when mixing Ubuntu system Python packages with user-installed pip packages.
+
+### Fix
+python3 -m pip install --user -U pip setuptools wheel packaging setuptools-scm
+
+### Verify
+
+'''bash
+python3 -c "import pip, setuptools, packaging; print(pip.__version__, setuptools.__version__, packaging.__version__)"
+python3 -m pip install -e . --no-build-isolation -v
+'''
