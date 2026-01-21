@@ -8,16 +8,16 @@ import time
 # NOTE: Calibrate these values by running with DEBUG_FORCES=True
 #       and observing the force readings for each scenario
 # ============================================================
-DEBUG_FORCES = False  # Set True to log forces for calibration
+DEBUG_FORCES = True  # Set True to log forces for calibration
 
 # ---- Templates (tune for your dates) ----
-# Forces are typically negative when gripping
-OPEN           = [-0.10, -0.09, -0.09]   # fingers open, no contact
-CLOSED_NOTHING = [-0.16, -0.19, -0.16]   # closed on air
-WEAK_L         = [-0.17, -0.20, -0.15]   # weak grip, left finger not engaged
-WEAK_R         = [-0.15, -0.20, -0.17]   # weak grip, right finger not engaged
-WEAK_C         = [-0.17, -0.17, -0.17]   # weak grip, center finger not engaged
-PROPER         = [-0.20, -0.24, -0.20]   # solid 3-finger grip on date
+# Forces are POSITIVE for Delto gripper (motor current based)
+OPEN           = [2.25, 2.55, 3.15]   # fingers open, no contact (baseline)
+CLOSED_NOTHING = [2.55, 2.85, 3.15]   # closed on air (slight increase)
+WEAK_L         = [3.5, 4.0, 3.5]      # weak grip, left finger light contact
+WEAK_R         = [3.5, 4.0, 4.5]      # weak grip, right finger light contact
+WEAK_C         = [3.0, 5.0, 3.5]      # weak grip, center finger contact
+PROPER         = [5.0, 5.5, 5.0]      # solid 3-finger grip on date
 
 TEMPLATES: List[Tuple[str, List[float]]] = [
     ("OPEN", OPEN),

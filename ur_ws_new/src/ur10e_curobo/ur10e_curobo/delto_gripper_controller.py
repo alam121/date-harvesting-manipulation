@@ -16,10 +16,11 @@ class DeltoGripperController:
         self.min_fingers_for_stop = min_fingers_for_stop
 
         self.force_data = [0.0, 0.0, 0.0]
+        self.baseline_force = [0.0, 0.0, 0.0]  # Baseline force when gripper is open
 
         # Contact threshold (force value indicating contact)
-        # Finger 1 shows +0.15 when grabbed, so use 0.1 to detect abs(0.15) >= 0.1
-        self.force_threshold = 0.1
+        # Detect contact based on CHANGE from baseline, not absolute value
+        self.force_threshold = 4.0  # Higher threshold to allow full closure (change > 4.0N)
 
         # Motion parameters
         self.steps = steps
@@ -69,19 +70,33 @@ class DeltoGripperController:
         self.subscriber = node.create_subscription(
             Float32MultiArray, force_topic, self.force_callback, 10)
 
+        # Schedule baseline capture after a short delay to allow force data to arrive
+        import threading
+        def capture_initial_baseline():
+            time.sleep(1.0)  # Wait for force data to start flowing
+            if self.force_data != [0.0, 0.0, 0.0]:
+                self.baseline_force = self.force_data.copy()
+                self.node.get_logger().info(
+                    f"✅ Gripper initialized (baseline=[{self.baseline_force[0]:.2f}, "
+                    f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+                )
+            else:
+                self.node.get_logger().warn("⚠️ No force data received - baseline will be set on first close")
+        threading.Thread(target=capture_initial_baseline, daemon=True).start()
+
     # --------------------------------------------------------
     # Utility functions
     # --------------------------------------------------------
     def set_state(self, new_state):
         if new_state != self.state:
-            self.node.get_logger().info(f"[state] {self.state} → {new_state}")
             self.state = new_state
 
     def channel_contact(self, i: int) -> bool:
+        # Detect contact based on CHANGE from baseline, not absolute force
         f = float(self.force_data[i])
-        if self.force_threshold < 0:
-            return f <= self.force_threshold
-        return abs(f) >= self.force_threshold
+        baseline = float(self.baseline_force[i])
+        delta = abs(f - baseline)
+        return delta >= self.force_threshold
 
     def all_channels_contacted(self):
         return all(self.channel_contact(i) for i in (0, 1, 2))
@@ -134,8 +149,14 @@ class DeltoGripperController:
     # CLOSING MOTION
     # --------------------------------------------------------
     def step_close(self):
-        if self.current_step >= self.steps or self.is_force_threshold_reached():
-            self.node.get_logger().info("✅ Gripper fully closed or force limit reached.")
+        force_reached = self.is_force_threshold_reached()
+        if self.current_step >= self.steps or force_reached:
+            reason = "fully closed" if self.current_step >= self.steps else "contact detected"
+            deltas = [abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            self.node.get_logger().info(
+                f"🔒 Gripper closed ({reason}): {self.current_step}/{self.steps} steps, "
+                f"force delta=[{deltas[0]:.2f}, {deltas[1]:.2f}, {deltas[2]:.2f}]N"
+            )
             self.current_step = 0
             self.set_state('IDLE')
             return False
@@ -175,6 +196,18 @@ class DeltoGripperController:
     def run_closure_loop(self):
         self.set_state('CLOSING')
         self.first_contact_index = None
+        # Clear need_rearm flag and reset ignore window when starting to close
+        self.need_rearm = False
+        self.ignore_contacts_until = 0.0  # Clear debounce window to allow immediate force detection
+
+        # ALWAYS capture baseline from current force before closing
+        # This ensures we use the actual open state, not stale values
+        self.baseline_force = self.force_data.copy()
+        self.node.get_logger().info(
+            f"🔒 Closing gripper (baseline=[{self.baseline_force[0]:.2f}, "
+            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N, "
+            f"threshold={self.force_threshold}N)"
+        )
 
         while self.step_close():
             time.sleep(self.step_delay)
@@ -191,7 +224,16 @@ class DeltoGripperController:
         msg.data = self.open_position
         self.publisher.publish(msg)
 
-        self.node.get_logger().info("🔓 Gripper OPEN")
+        # Wait a moment for gripper to open and stabilize
+        time.sleep(0.3)
+
+        # Capture baseline force when gripper is fully open
+        self.baseline_force = self.force_data.copy()
+
+        self.node.get_logger().info(
+            f"🔓 Gripper opened (baseline=[{self.baseline_force[0]:.2f}, "
+            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+        )
 
         # Debounce window after open
         self.ignore_contacts_until = time.time() + 0.25

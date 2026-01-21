@@ -2,7 +2,7 @@
 import time, math, torch
 import threading
 import numpy as np
-from geometry_msgs.msg import Pose as ROSPose, PoseStamped
+from geometry_msgs.msg import Pose as ROSPose, PoseStamped, PointStamped
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
 
@@ -58,6 +58,23 @@ from .utils import compute_visibility_approach
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
+
+
+def notify_grasp_attempt(node, position_xyz):
+    """
+    Publish grasp attempt notification to vision system for fruit tracking.
+    This increments the attempt count for the fruit at the given position.
+    """
+    if not hasattr(node, "_grasp_attempt_pub"):
+        node._grasp_attempt_pub = node.create_publisher(PointStamped, "/fruit_grasp_attempt", 10)
+
+    msg = PointStamped()
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.header.frame_id = "base_link"
+    msg.point.x = float(position_xyz[0])
+    msg.point.y = float(position_xyz[1])
+    msg.point.z = float(position_xyz[2])
+    node._grasp_attempt_pub.publish(msg)
 
 
 def quat_dot(q1, q2):
@@ -626,6 +643,9 @@ def plan_and_execute(node):
         blend_motion(node)
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
+
+        # Notify vision system about grasp attempt for fruit tracking
+        notify_grasp_attempt(node, final_target[:3])
 
         # Verify 3-finger contact before moving
         def check_3finger_contact():

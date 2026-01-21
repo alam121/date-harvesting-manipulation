@@ -61,16 +61,26 @@ BEST_REUSE_THRESH = 0.05         # 5 cm positional tolerance in base_link
 # --- Track-by-detection smoothing ---
 best_history = deque(maxlen=3)   # shorter window for snappier response
 
+# --- Fruit ID tracking (prevent re-targeting same fruit) ---
+fruit_id_registry = {}           # {fruit_id: {"last_seen": timestamp, "attempt_count": int, "position": [x,y,z]}}
+FRUIT_ID_TIMEOUT = 30.0          # seconds before forgetting a fruit ID
+MAX_FRUIT_ATTEMPTS = 3           # max grasp attempts before blacklisting
+
+# --- Temporal stabilization (reduce flickering) ---
+detection_history = {}           # {fruit_id: {"frames_seen": int, "frames_missed": int, "last_data": dict}}
+MIN_FRAMES_TO_SHOW = 2           # Fruit must appear in N consecutive frames before showing
+MAX_FRAMES_TO_KEEP = 5           # Keep fruit for N frames after last seen (persistence)
+
 # ============================================================
 # Scoring System Weights (tune these for your application)
 # ============================================================
 SCORE_WEIGHTS = {
-    "distance": 0.28,       # closer is better (normalized: 0-1)
-    "visibility": 0.23,     # higher vis_ratio is better
-    "depth_quality": 0.18,  # lower z_std is better
-    "confidence": 0.13,     # YOLO detection confidence
-    "ellipse": 0.10,        # bonus for valid ellipse fit (orientation reliability)
-    "center_bias": 0.08,    # prefer fruits near frame center (better depth data)
+    "distance": 0.60,       # HIGHEST PRIORITY: closer is always better
+    "visibility": 0.15,     # higher vis_ratio is better
+    "depth_quality": 0.12,  # lower z_std is better
+    "confidence": 0.07,     # YOLO detection confidence
+    "ellipse": 0.04,        # bonus for valid ellipse fit (orientation reliability)
+    "center_bias": 0.02,    # prefer fruits near frame center (better depth data)
 }
 
 # Distance scoring parameters
@@ -428,6 +438,105 @@ def debug_print(msg: str) -> None:
     print(f"[DEBUG] {msg}", flush=True)
 
 
+def increment_fruit_attempt(position_xyz):
+    """
+    Increment attempt count for fruit at given position.
+    Call this after a grasp attempt (success or failure).
+    """
+    global fruit_id_registry
+    fruit_id = hash((round(position_xyz[0], 2), round(position_xyz[1], 2), round(position_xyz[2], 2)))
+
+    if fruit_id in fruit_id_registry:
+        fruit_id_registry[fruit_id]["attempt_count"] += 1
+        fruit_id_registry[fruit_id]["last_seen"] = time()
+        attempt_count = fruit_id_registry[fruit_id]["attempt_count"]
+
+        if attempt_count >= MAX_FRUIT_ATTEMPTS:
+            print(f"[FRUIT_TRACK] Fruit {fruit_id} blacklisted after {attempt_count} attempts")
+        else:
+            print(f"[FRUIT_TRACK] Fruit {fruit_id} attempt count: {attempt_count}/{MAX_FRUIT_ATTEMPTS}")
+    else:
+        print(f"[FRUIT_TRACK] WARNING: Attempted to increment unknown fruit {fruit_id}")
+
+
+def cleanup_old_fruit_ids():
+    """Remove old fruit IDs from registry (call periodically)."""
+    global fruit_id_registry
+    now = time()
+    to_remove = [fid for fid, info in fruit_id_registry.items()
+                 if now - info["last_seen"] > FRUIT_ID_TIMEOUT]
+    for fid in to_remove:
+        del fruit_id_registry[fid]
+    if to_remove:
+        print(f"[FRUIT_TRACK] Cleaned up {len(to_remove)} old fruit IDs")
+
+
+def stabilize_detections(current_targets):
+    """
+    Apply temporal filtering to reduce detection flickering.
+    Only show fruits that appear consistently across multiple frames.
+
+    Returns: list of stabilized targets (with confirmed detections only)
+    """
+    global detection_history
+
+    # Build current frame fruit IDs
+    current_ids = set()
+    current_data = {}
+
+    for t in current_targets:
+        fid = t["fruit_id"]
+        current_ids.add(fid)
+        current_data[fid] = t
+
+    # Update history for all fruits
+    all_ids = set(detection_history.keys()) | current_ids
+
+    for fid in all_ids:
+        if fid not in detection_history:
+            # New detection
+            detection_history[fid] = {
+                "frames_seen": 1 if fid in current_ids else 0,
+                "frames_missed": 0,
+                "last_data": current_data.get(fid, None)
+            }
+        else:
+            if fid in current_ids:
+                # Still detected - increment seen counter, reset missed
+                detection_history[fid]["frames_seen"] += 1
+                detection_history[fid]["frames_missed"] = 0
+                detection_history[fid]["last_data"] = current_data[fid]
+            else:
+                # Not detected this frame - increment missed counter
+                detection_history[fid]["frames_missed"] += 1
+
+    # Build stabilized output (only include fruits that meet criteria)
+    stabilized = []
+    to_remove = []
+
+    for fid, hist in detection_history.items():
+        # Include fruit if:
+        # 1. Seen in enough consecutive frames (confirmed detection)
+        # 2. OR was previously confirmed and not missed for too long (persistence)
+
+        is_confirmed = hist["frames_seen"] >= MIN_FRAMES_TO_SHOW
+        is_persistent = hist["frames_missed"] > 0 and hist["frames_missed"] <= MAX_FRAMES_TO_KEEP
+
+        if is_confirmed or is_persistent:
+            if hist["last_data"] is not None:
+                stabilized.append(hist["last_data"])
+
+        # Clean up entries that are too old
+        if hist["frames_missed"] > MAX_FRAMES_TO_KEEP:
+            to_remove.append(fid)
+
+    # Remove stale entries
+    for fid in to_remove:
+        del detection_history[fid]
+
+    return stabilized
+
+
 def xywh2abcd_(xywh: np.ndarray) -> np.ndarray:
     out = np.zeros((4, 2), dtype=np.float32)
     x_min = xywh[0] - 0.5 * xywh[2]
@@ -560,6 +669,16 @@ def main_(args: argparse.Namespace):
 
     pub_timer = node.create_timer(0.02, publish_timer_cb)  # 50Hz
 
+    # Fruit tracking: subscriber to increment attempt count after grasp
+    def grasp_attempt_cb(msg):
+        # Expecting PointStamped message with fruit position
+        increment_fruit_attempt([msg.point.x, msg.point.y, msg.point.z])
+
+    node.create_subscription(PointStamped, "/fruit_grasp_attempt", grasp_attempt_cb, 10)
+
+    # Periodic cleanup of old fruit IDs (every 5 seconds)
+    node.create_timer(5.0, cleanup_old_fruit_ids)
+
     # TF listener
     tf_buffer = Buffer()
     tf_listener = TransformListener(tf_buffer, node)
@@ -593,7 +712,7 @@ def main_(args: argparse.Namespace):
     init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
     init_params.camera_resolution = sl.RESOLUTION.HD1080
     init_params.coordinate_units = sl.UNIT.METER
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+    init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
     init_params.depth_maximum_distance = 50.0
 
     print("Initializing Camera...")
@@ -922,6 +1041,31 @@ def main_(args: argparse.Namespace):
                         if not (0.0 <= obj_confidence <= 1.0):
                             obj_confidence = 0.5
 
+                        # Generate unique fruit ID based on rounded position
+                        fruit_id = hash((round(Xc, 2), round(Yc, 2), round(Zc, 2)))
+
+                        # Check if fruit is blacklisted (too many failed attempts)
+                        global fruit_id_registry
+                        now_time = time()
+                        if fruit_id in fruit_id_registry:
+                            fruit_info = fruit_id_registry[fruit_id]
+                            # Clean up old entries
+                            if now_time - fruit_info["last_seen"] > FRUIT_ID_TIMEOUT:
+                                del fruit_id_registry[fruit_id]
+                            elif fruit_info["attempt_count"] >= MAX_FRUIT_ATTEMPTS:
+                                mark_reject(f"Max attempts ({MAX_FRUIT_ATTEMPTS})")
+                                continue
+
+                        # Register or update this fruit
+                        if fruit_id not in fruit_id_registry:
+                            fruit_id_registry[fruit_id] = {
+                                "last_seen": now_time,
+                                "attempt_count": 0,
+                                "position": [Xc, Yc, Zc]
+                            }
+                        else:
+                            fruit_id_registry[fruit_id]["last_seen"] = now_time
+
                         targets.append(
                             {
                                 "Xc": Xc,
@@ -952,6 +1096,8 @@ def main_(args: argparse.Namespace):
                                 "best_point_3d": t_best_point_3d,
                                 "score": 0.0,  # will be computed below
                                 "score_components": {},
+                                "fruit_id": fruit_id,
+                                "attempt_count": fruit_id_registry[fruit_id]["attempt_count"],
                             }
                         )
 
@@ -964,6 +1110,12 @@ def main_(args: argparse.Namespace):
                     print(f"[WARN] 3D extraction failed: {e}")
                     mark_reject("3D extraction failed")
                     continue
+
+            # --------------------------------------------------
+            # Temporal Stabilization (Reduce Flickering)
+            # --------------------------------------------------
+            # Apply temporal filtering to only show stable detections
+            targets = stabilize_detections(targets)
 
             # --------------------------------------------------
             # Multi-Factor BEST Fruit Selection (Scoring System)
@@ -1434,216 +1586,80 @@ def main_(args: argparse.Namespace):
                                 tipLength=0.25,
                             )
 
-                        # VISUALIZE TRUE 3D APPROACH DIRECTION with coordinate frame
+                        # VISUALIZE APPROACH DIRECTION (simplified)
                         approach_dir_cam = t.get("approach_dir_cam")
                         if approach_dir_cam is not None:
                             centroid_3d = np.array([Xc, Yc, Zc])
-                            axis_len = 0.05  # 5cm for coordinate axes
                             arrow_len_3d = 0.08  # 8cm for approach arrow
 
                             # Project centroid (origin)
                             origin_2d = project_point_to_image(centroid_3d, intrinsics, image_scale)
 
                             if origin_2d is not None:
-                                # Draw RGB coordinate frame at centroid
-                                # X axis (Red) - right
-                                x_end_3d = centroid_3d + np.array([axis_len, 0, 0])
-                                x_end_2d = project_point_to_image(x_end_3d, intrinsics, image_scale)
-                                if x_end_2d:
-                                    cv2.arrowedLine(image_left_ocv, origin_2d, x_end_2d,
-                                                    (0, 0, 255, 255), 2, tipLength=0.3)
-                                    cv2.putText(image_left_ocv, "X", x_end_2d,
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255, 255), 1)
-
-                                # Y axis (Green) - down
-                                y_end_3d = centroid_3d + np.array([0, axis_len, 0])
-                                y_end_2d = project_point_to_image(y_end_3d, intrinsics, image_scale)
-                                if y_end_2d:
-                                    cv2.arrowedLine(image_left_ocv, origin_2d, y_end_2d,
-                                                    (0, 255, 0, 255), 2, tipLength=0.3)
-                                    cv2.putText(image_left_ocv, "Y", y_end_2d,
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0, 255), 1)
-
-                                # Z axis (Blue) - forward/depth
-                                z_end_3d = centroid_3d + np.array([0, 0, axis_len])
-                                z_end_2d = project_point_to_image(z_end_3d, intrinsics, image_scale)
-                                if z_end_2d:
-                                    cv2.arrowedLine(image_left_ocv, origin_2d, z_end_2d,
-                                                    (255, 0, 0, 255), 2, tipLength=0.3)
-                                    cv2.putText(image_left_ocv, "Z", z_end_2d,
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0, 255), 1)
-
-                                # Draw approach direction arrow (Magenta, thicker)
+                                # Draw approach direction arrow (Magenta)
                                 dir_end_3d = centroid_3d + approach_dir_cam * arrow_len_3d
                                 dir_end_2d = project_point_to_image(dir_end_3d, intrinsics, image_scale)
 
                                 if dir_end_2d:
-                                    # Draw XY projection (dashed line) to show lateral component
-                                    dir_xy = approach_dir_cam.copy()
-                                    dir_xy[2] = 0  # zero out Z
-                                    n_xy = np.linalg.norm(dir_xy)
-                                    if n_xy > 0.01:
-                                        dir_xy_end_3d = centroid_3d + (dir_xy / n_xy) * arrow_len_3d * n_xy
-                                        dir_xy_end_2d = project_point_to_image(dir_xy_end_3d, intrinsics, image_scale)
-                                        if dir_xy_end_2d:
-                                            # Dashed line for XY projection (cyan)
-                                            cv2.line(image_left_ocv, origin_2d, dir_xy_end_2d,
-                                                     (255, 255, 0, 255), 1, cv2.LINE_AA)
-                                            # Vertical line showing Z component (white dashed)
-                                            cv2.line(image_left_ocv, dir_xy_end_2d, dir_end_2d,
-                                                     (255, 255, 255, 255), 1, cv2.LINE_AA)
-
-                                    # Main approach arrow (thick magenta)
+                                    # Main approach arrow
                                     cv2.arrowedLine(image_left_ocv, origin_2d, dir_end_2d,
                                                     (255, 0, 255, 255), 3, tipLength=0.25)
-
-                                # Show camera frame direction (magenta)
-                                dir_x, dir_y, dir_z = approach_dir_cam
-                                cv2.putText(
-                                    image_left_ocv,
-                                    f"Cam: ({dir_x:.2f}, {dir_y:.2f}, {dir_z:.2f})",
-                                    (x1, y1 - 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.4,
-                                    (255, 0, 255, 255),
-                                    1,
-                                    cv2.LINE_AA,
-                                )
-
-                                # Show base_link direction - THIS IS WHAT'S SENT TO ROBOT (green)
-                                approach_dir_base = t.get("approach_dir_base")
-                                if approach_dir_base is not None:
-                                    bx, by, bz = approach_dir_base
-                                    # base_link: X=forward, Y=left, Z=up
-                                    x_lbl = "FWD" if bx > 0.1 else ("BACK" if bx < -0.1 else "")
-                                    y_lbl = "L" if by > 0.1 else ("R" if by < -0.1 else "")
-                                    z_lbl = "UP" if bz > 0.1 else ("DN" if bz < -0.1 else "")
-                                    base_labels = " ".join(filter(None, [x_lbl, y_lbl, z_lbl]))
-                                    if not base_labels:
-                                        base_labels = "CENTER"
-
-                                    cv2.putText(
-                                        image_left_ocv,
-                                        f"Robot: ({bx:.2f}, {by:.2f}, {bz:.2f})",
-                                        (x1, y1 - 25),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        (0, 255, 0, 255),  # green for robot/base_link
-                                        1,
-                                        cv2.LINE_AA,
-                                    )
-                                    cv2.putText(
-                                        image_left_ocv,
-                                        f">> {base_labels}",
-                                        (x1, y1 - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.5,
-                                        (0, 255, 0, 255),  # green
-                                        2,
-                                        cv2.LINE_AA,
-                                    )
 
                                 # Show clearance info (collision avoidance status)
                                 clearance = t.get("clearance", float('inf'))
                                 is_clear = t.get("is_collision_free", True)
                                 if clearance < float('inf'):
                                     clr_color = (0, 255, 0, 255) if is_clear else (0, 0, 255, 255)
-                                    clr_text = f"CLEAR {clearance*100:.1f}cm" if is_clear else f"BLOCKED {clearance*100:.1f}cm"
+                                    clr_text = f"CLR {clearance*100:.0f}cm" if is_clear else f"BLOCK"
                                     cv2.putText(
                                         image_left_ocv,
                                         clr_text,
-                                        (x1, y1 - 55),
+                                        (x1, y1 - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.45,
+                                        0.4,
                                         clr_color,
                                         2 if not is_clear else 1,
                                         cv2.LINE_AA,
                                     )
 
-                    # Draw 3D text near centroid
-                    cv2.putText(
-                        image_left_ocv,
-                        f"X:{Xc:.2f} Y:{Yc:.2f} Z:{Zc:.2f}",
-                        (cx + 10, cy + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 255, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-                    # BEST label + stats
+                    # BEST label + minimal stats
                     if i == best_idx:
                         cv2.putText(
                             image_left_ocv,
                             "BEST",
                             (cx + 10, cy - 10),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.7,
                             (255, 0, 0, 255),
                             2,
                             cv2.LINE_AA,
                         )
-                        # Depth quality + visibility stats
-                        z_std = t.get("z_std", 0.0)
-                        vis_ratio = t.get("vis_ratio", 0.0) * 100.0
-                        cv2.putText(
-                            image_left_ocv,
-                            f"Zstd:{z_std:.3f}m Vis:{vis_ratio:.0f}%",
-                            (cx + 10, cy + 36),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 200, 255, 255),
-                            1,
-                            cv2.LINE_AA,
-                        )
+                        # Compact single-line info
                         dist_grip = t.get("dist", 0.0)
-                        cv2.putText(
-                            image_left_ocv,
-                            f"dist_grip:{dist_grip:.3f}m",
-                            (cx + 10, cy + 52),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 200, 255, 255),
-                            1,
-                            cv2.LINE_AA,
-                        )
-                        # Display total score prominently
                         total_score = t.get("score", 0.0)
                         cv2.putText(
                             image_left_ocv,
-                            f"SCORE: {total_score:.2f}",
-                            (cx + 10, cy + 68),
+                            f"D:{dist_grip:.2f}m S:{total_score:.2f}",
+                            (cx + 10, cy + 20),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 0, 255),  # bright green
-                            2,
-                            cv2.LINE_AA,
-                        )
-                        # Show score breakdown
-                        sc = t.get("score_components", {})
-                        conf = t.get("confidence", 0.0)
-                        cv2.putText(
-                            image_left_ocv,
-                            f"D:{sc.get('distance', 0):.2f} V:{sc.get('visibility', 0):.2f} Z:{sc.get('depth_quality', 0):.2f} C:{conf:.2f}",
-                            (cx + 10, cy + 84),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
-                            (180, 180, 255, 255),
+                            0.5,
+                            (0, 255, 0, 255),
                             1,
                             cv2.LINE_AA,
                         )
+                    else:
+                        # Show distance for non-best fruits
+                        dist_grip = t.get("dist", 0.0)
                         cv2.putText(
                             image_left_ocv,
-                            f"E:{sc.get('ellipse', 0):.2f} Ctr:{sc.get('center_bias', 0):.2f}",
-                            (cx + 10, cy + 98),
+                            f"D:{dist_grip:.2f}m",
+                            (cx + 10, cy + 20),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.4,
-                            (180, 180, 255, 255),
+                            (200, 200, 200, 255),
                             1,
                             cv2.LINE_AA,
                         )
-                        # Heatmap overlay handled earlier in mask drawing
 
             # HUD
             cv2.putText(
@@ -1704,7 +1720,7 @@ if __name__ == "__main__":
         "--img_size", type=int, default=512, help="inference size (pixels)"
     )
     parser.add_argument(
-        "--conf_thres", type=float, default=0.4, help="confidence threshold"
+        "--conf_thres", type=float, default=0.35, help="YOLO confidence threshold (lower = more detections, default 0.35)"
     )
     args = parser.parse_args()
 
