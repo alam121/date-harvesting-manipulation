@@ -65,11 +65,12 @@ setuptools calls canonicalize_version(..., strip_trailing_zero=...) but the inst
 This typically happens when mixing Ubuntu system Python packages with user-installed pip packages.
 
 ### Fix
+```text
 python3 -m pip install --user -U pip setuptools wheel packaging setuptools-scm
+```
 
 ### Verify
-
-'''bash
+```text
 python3 -c "import pip, setuptools, packaging; print(pip.__version__, setuptools.__version__, packaging.__version__)"
 python3 -m pip install -e . --no-build-isolation -v
-'''
+```

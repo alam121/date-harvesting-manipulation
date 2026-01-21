@@ -1,3 +1,5 @@
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
 ur_ws_new/src/zed_date_detector/models/*.pt filter=lfs diff=lfs merge=lfs -text
 ur_ws_new/src/zed_date_detector/models/**/*.pt filter=lfs diff=lfs merge=lfs -text
 *.stl filter=lfs diff=lfs merge=lfs -text
