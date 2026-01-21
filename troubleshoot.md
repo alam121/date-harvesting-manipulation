@@ -56,7 +56,7 @@ python3 -c "import torch; print(torch.__version__)"
 TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'
 Preparing editable metadata (pyproject.toml) ... error
 error: metadata-generation-failed
-
+```
 
 ### Cause
 
