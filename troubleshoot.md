@@ -35,9 +35,7 @@ metadata-generation-failed
 ```
 
 ##Cause
-```text
 PyTorch depends on NVIDIA cuDSS. cuDSS is installed but placed in a non-standard directory that is not searched by the dynamic linker.
-```
 
 Fix
 ```bash
@@ -46,7 +44,8 @@ echo "/usr/lib/aarch64-linux-gnu/libcudss/12" | sudo tee /etc/ld.so.conf.d/libcu
 sudo ldconfig
 ```
 Verify
-Bash
+```bash
 
 ldconfig -p | grep cudss
 python3 -c "import torch; print(torch.__version__)"
+```
