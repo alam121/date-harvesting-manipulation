@@ -588,6 +588,7 @@ def plan_and_execute(node):
             node.get_logger().warn("Goal queue empty during pop; skipping.")
             continue
         x,y,z = goal[:3]
+        grasp_orientation = goal[3:]  # Store grasp orientation for pre-dropoff
         yoffset = node.yoffset
 
         # Direction-biased pre-grasp: use fruit direction if available
@@ -636,14 +637,13 @@ def plan_and_execute(node):
             continue
             
         # 3. Final slow precise grasp
-        final_target = [x, y, z+0.01, *orientation]
+        final_target = [x, y, z+0.02, *orientation]
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
             continue
         wait_until_xyz(node, final_target[:3])
         blend_motion(node)
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
-
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
@@ -660,13 +660,17 @@ def plan_and_execute(node):
             return len(bad_fingers) == 0, forces, bad_fingers
 
         is_proper, forces, bad_fingers = check_3finger_contact()
+
+
         if not is_proper:
             print(f"⚠️ Weak grip - no contact on: {bad_fingers}")
             node.control_gripper("OPEN"); time.sleep(0.3)
+
+
             # Move slightly closer
             cur = node.get_end_effector_pose()
             if cur:
-                closer_target = [cur[0], cur[1] - 0.01, cur[2] + 0.005, *cur[3:]]
+                closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
             node.control_gripper("CLOSE"); time.sleep(0.7)
@@ -692,22 +696,31 @@ def plan_and_execute(node):
             node.reset_goal_tracking()
             continue
 
-        # Pre-dropoff: use home position's Y to ensure safe clearance
-        from .fk import forward_kinematics
-        home_fk = forward_kinematics(node, node.home_joints)
-        if home_fk is None:
-            node.get_logger().warn("Could not compute home FK; using fallback Y")
+        # Pre-dropoff: use home position's Y, Z, and orientation
+        # Compute full home FK including orientation
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            home_js = JointState.from_position(
+                torch.tensor([node.home_joints], dtype=torch.float32, device=device),
+                joint_names=node.joint_order,
+            )
+            home_ee = node.motion_gen.rollout_fn.compute_kinematics(home_js)
+            home_pos = home_ee.ee_pos_seq[0].cpu().tolist()
+            home_quat = home_ee.ee_quat_seq[0].cpu().tolist()
+            home_y = home_pos[1]
+            home_z = home_pos[2]
+            home_orientation = home_quat
+        except Exception as e:
+            node.get_logger().warn(f"Could not compute home FK: {e}; using fallback")
             home_y = current_pose[1] + 0.3  # fallback: 30cm back
-        else:
-            home_y = home_fk.y
-
-        home_z = home_fk.z if home_fk else current_pose[2]
+            home_z = current_pose[2]
+            home_orientation = current_pose[3:]
 
         target_pose = [
             current_pose[0],  # keep current X
             home_y,           # use home's Y position
             home_z,           # use home's Z position
-            *current_pose[3:]
+            *home_orientation  # use home orientation
         ]
         print("Current pose:", current_pose)
         print(f"Pre-dropoff using home Y: {home_y:.3f}, Z: {home_z:.3f}")

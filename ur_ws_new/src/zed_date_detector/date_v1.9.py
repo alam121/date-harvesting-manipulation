@@ -38,7 +38,7 @@ net_fps = 0.0
 loop_fps = 0.0
 prev_heat_point = None
 prev_direction_base = None  # smoothed 3D direction in base_link
-direction_history = deque(maxlen=10)  # sliding window for direction averaging
+direction_history = deque(maxlen=15)  # sliding window for direction averaging (longer = smoother)
 
 # --- Timer-based publishing data ---
 latest_goal_msg = None
@@ -69,7 +69,7 @@ MAX_FRUIT_ATTEMPTS = 3           # max grasp attempts before blacklisting
 # --- Temporal stabilization (reduce flickering) ---
 detection_history = {}           # {fruit_id: {"frames_seen": int, "frames_missed": int, "last_data": dict}}
 MIN_FRAMES_TO_SHOW = 2           # Fruit must appear in N consecutive frames before showing
-MAX_FRAMES_TO_KEEP = 5           # Keep fruit for N frames after last seen (persistence)
+MAX_FRAMES_TO_KEEP = 1           # Keep fruit for N frames after last seen (persistence)
 
 # ============================================================
 # Scoring System Weights (tune these for your application)
@@ -95,9 +95,11 @@ Z_STD_WORST = 0.05    # worst acceptable depth std (m)
 STICKY_BONUS = 0.15   # added to score if this was the previous best
 
 # Collision avoidance parameters
-FRUIT_RADIUS = 0.035  # approximate radius of a date fruit (3.5cm)
-APPROACH_CHECK_DIST = 0.15  # how far back to check for collisions (15cm)
-NUM_CANDIDATE_DIRS = 12  # number of directions to sample
+FRUIT_RADIUS_DEFAULT = 0.035  # default radius of a date fruit (3.5cm)
+FRUIT_RADIUS_MIN = 0.020      # minimum fruit radius (2cm)
+FRUIT_RADIUS_MAX = 0.060      # maximum fruit radius (6cm)
+APPROACH_CHECK_DIST = 0.20    # how far back to check for collisions (20cm - increased from 15cm)
+NUM_CANDIDATE_DIRS = 12       # number of directions to sample
 
 
 # ============================================================
@@ -107,6 +109,42 @@ def _unit(v):
     v = np.asarray(v, float)
     n = np.linalg.norm(v)
     return v / n if n > 1e-9 else v
+
+
+def estimate_fruit_radius(target, fx=None):
+    """
+    Estimate fruit radius from bounding box and depth using camera geometry.
+
+    Args:
+        target: dict with "bb" (x1,y1,x2,y2), "Zc" (depth in meters)
+        fx: camera focal length in pixels (optional, uses default if None)
+
+    Returns:
+        Estimated radius in meters, clamped to [FRUIT_RADIUS_MIN, FRUIT_RADIUS_MAX]
+    """
+    if fx is None:
+        fx = 700.0  # typical ZED camera focal length
+
+    bb = target.get("bb")
+    Zc = target.get("Zc", 0.5)
+
+    if bb is None or Zc <= 0.1:
+        return FRUIT_RADIUS_DEFAULT
+
+    x1, y1, x2, y2 = bb
+    bbox_width_px = x2 - x1
+    bbox_height_px = y2 - y1
+
+    # Use smaller dimension (more reliable for partially visible fruits)
+    bbox_size_px = min(bbox_width_px, bbox_height_px)
+
+    # Convert pixel size to meters using similar triangles:
+    # real_size / depth = pixel_size / focal_length
+    estimated_diameter = (bbox_size_px * Zc) / fx
+    estimated_radius = estimated_diameter / 2.0
+
+    # Clamp to reasonable range
+    return max(FRUIT_RADIUS_MIN, min(FRUIT_RADIUS_MAX, estimated_radius))
 
 
 def quat_mul(q, r):
@@ -323,14 +361,16 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
             - is_collision_free: Whether the chosen direction is clear
     """
     centroid = np.array([best_target["Xc"], best_target["Yc"], best_target["Zc"]])
+    best_radius = estimate_fruit_radius(best_target)
 
-    # Collect other fruits as spheres
+    # Collect other fruits as spheres with adaptive radii
     other_spheres = []
     for i, t in enumerate(all_targets):
         if i == best_idx:
             continue
         other_c = np.array([t["Xc"], t["Yc"], t["Zc"]])
-        other_spheres.append((other_c, FRUIT_RADIUS))
+        other_r = estimate_fruit_radius(t)
+        other_spheres.append((other_c, other_r))
 
     # If no other fruits, just use heatmap direction
     if len(other_spheres) == 0:
@@ -409,7 +449,7 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
             best_blocked = num_blocked
 
     # If heatmap direction has decent clearance, blend with it for grasp accuracy
-    if heatmap_dir is not None and best_clearance > FRUIT_RADIUS:
+    if heatmap_dir is not None and best_clearance > best_radius:
         # Check heatmap direction clearance
         hm_clearance = float('inf')
         hm_d = heatmap_dir / (np.linalg.norm(heatmap_dir) + 1e-9)
@@ -419,7 +459,7 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
                 hm_clearance = min(hm_clearance, t_hit)
 
         # If heatmap direction is also clear, blend toward it
-        if hm_clearance > FRUIT_RADIUS * 2:
+        if hm_clearance > best_radius * 2:
             # Blend: 60% collision-free, 40% heatmap for grasp accuracy
             blended = 0.6 * best_dir + 0.4 * hm_d
             blended = blended / (np.linalg.norm(blended) + 1e-9)
@@ -428,8 +468,9 @@ def compute_collision_free_direction(best_target, all_targets, best_idx, heatmap
     return {
         "direction": best_dir,
         "clearance": best_clearance,
-        "is_collision_free": best_clearance > FRUIT_RADIUS,
+        "is_collision_free": best_clearance > best_radius,
         "num_blocked": best_blocked,
+        "estimated_radius": best_radius,
     }
 
 
@@ -1251,8 +1292,9 @@ def main_(args: argparse.Namespace):
                         direction_history.append(dir_raw.copy())
 
                     # Compute averaged direction from history (weighted, newer = more weight)
+                    # Using linear weights for smoother, less jittery direction
                     if len(direction_history) > 0:
-                        weights = np.arange(1, len(direction_history) + 1, dtype=float) ** 2
+                        weights = np.arange(1, len(direction_history) + 1, dtype=float)  # Linear weights (was **2)
                         stacked = np.vstack(list(direction_history))
                         dir_avg = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
 
@@ -1409,11 +1451,12 @@ def main_(args: argparse.Namespace):
 
                                 # Check if fruit is in front along approach direction
                                 if proj_dist > 0 and proj_dist < APPROACH_CHECK_DIST:
-                                    # Check perpendicular distance
+                                    # Check perpendicular distance using adaptive radius
                                     perp_vec = to_other - proj_dist * approach_dir
                                     perp_dist = np.linalg.norm(perp_vec)
+                                    other_radius = estimate_fruit_radius(t)
 
-                                    if perp_dist < FRUIT_RADIUS * 2:
+                                    if perp_dist < other_radius * 2:
                                         is_blocking = True
 
                         # Apply transparent overlay based on blocking status
