@@ -28,3 +28,10 @@ log/
 *.tar.gz
 *.tgz
 *.zip
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+*.tar.gz
