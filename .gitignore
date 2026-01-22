@@ -38,3 +38,14 @@ log/
 # Large detector weights (keep out of Git)
 ur_ws_new/src/zed_date_detector/best.pt
 ur_ws_new/src/zed_date_detector/models/yolov8m-seg.pt
+# outputs / artifacts (never commit)
+Date_detection/
+ur_ws_new/src/zed_date_detector/zed_date_detector/Date_detection/
+*.mp4
+*.h5
+*.onnx
+*.engine
+
+# keep only models weights
+*.pt
+!ur_ws_new/src/zed_date_detector/models/**/*.pt
