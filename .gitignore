@@ -49,3 +49,17 @@ ur_ws_new/src/zed_date_detector/zed_date_detector/Date_detection/
 # keep only models weights
 *.pt
 !ur_ws_new/src/zed_date_detector/models/**/*.pt
+# ROS / colcon
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# common artifacts
+*.tar.gz
+*.tgz
+*.zip
+*.bag
+*.db
