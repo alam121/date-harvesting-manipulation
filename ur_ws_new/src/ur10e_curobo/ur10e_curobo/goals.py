@@ -77,6 +77,41 @@ def notify_grasp_attempt(node, position_xyz):
     node._grasp_attempt_pub.publish(msg)
 
 
+def lock_target(node, position_xyz):
+    """
+    Lock vision system onto a specific target position.
+    Vision will track this target instead of switching to a "better" one.
+    Call this when starting approach to a date.
+    """
+    if not hasattr(node, "_target_lock_pub"):
+        node._target_lock_pub = node.create_publisher(PointStamped, "/target_lock", 10)
+
+    msg = PointStamped()
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.header.frame_id = "base_link"
+    msg.point.x = float(position_xyz[0])
+    msg.point.y = float(position_xyz[1])
+    msg.point.z = float(position_xyz[2])
+    node._target_lock_pub.publish(msg)
+    print(f"🔒 Target lock sent: [{position_xyz[0]:.3f}, {position_xyz[1]:.3f}, {position_xyz[2]:.3f}]")
+
+
+def unlock_target(node):
+    """
+    Release target lock, allowing vision to select the best target again.
+    Call this after grasp attempt completes (success or final failure).
+    """
+    if not hasattr(node, "_target_lock_pub"):
+        node._target_lock_pub = node.create_publisher(PointStamped, "/target_lock", 10)
+
+    msg = PointStamped()
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.header.frame_id = "base_link"
+    msg.point.x = msg.point.y = msg.point.z = 0.0  # Zero = unlock signal
+    node._target_lock_pub.publish(msg)
+    print("🔓 Target lock released")
+
+
 def quat_dot(q1, q2):
     """Dot product of two quaternions (measures similarity)."""
     return q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3]
@@ -595,6 +630,9 @@ def plan_and_execute(node):
         grasp_orientation = goal[3:]  # Store grasp orientation for pre-dropoff
         yoffset = node.yoffset
 
+        # Lock vision onto this target (prevents switching to different "best" during approach)
+        lock_target(node, goal[:3])
+
         # Direction-biased pre-grasp: use fruit direction if available
         standoff = 0.0  # 12cm standoff distance
 
@@ -619,7 +657,8 @@ def plan_and_execute(node):
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
             
-        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"): 
+        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"):
+            unlock_target(node)
             continue
         wait_until_xyz(node, approach[:3])
         blend_motion(node)
@@ -638,11 +677,13 @@ def plan_and_execute(node):
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
         else:
             node.get_logger().warn("No reacquire; skipping goal.")
+            unlock_target(node)
             continue
             
         # 3. Final slow precise grasp
         final_target = [x, y, z+0.02, *orientation]
-        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"): 
+        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"):
+            unlock_target(node)
             continue
         wait_until_xyz(node, final_target[:3])
         blend_motion(node)
@@ -697,6 +738,7 @@ def plan_and_execute(node):
             time.sleep(0.2)
             node.control_gripper("OPEN")
             move_to_home_position(node)
+            unlock_target(node)
             node.reset_goal_tracking()
             continue
 
@@ -711,12 +753,12 @@ def plan_and_execute(node):
             home_ee = node.motion_gen.rollout_fn.compute_kinematics(home_js)
             home_pos = home_ee.ee_pos_seq[0].cpu().tolist()
             home_quat = home_ee.ee_quat_seq[0].cpu().tolist()
-            home_y = home_pos[1]
+            home_y = home_pos[1] + 0.1  # slightly back from home
             home_z = home_pos[2]
             home_orientation = home_quat
         except Exception as e:
             node.get_logger().warn(f"Could not compute home FK: {e}; using fallback")
-            home_y = current_pose[1] + 0.3  # fallback: 30cm back
+            home_y = current_pose[1] + 0.45  # fallback: 30cm back
             home_z = current_pose[2]
             home_orientation = current_pose[3:]
 
@@ -741,7 +783,8 @@ def plan_and_execute(node):
         node.control_gripper("OPEN")
         move_to_home_position(node)
 
-        # Reset tracking state for next goal
+        # Release target lock and reset tracking state for next goal
+        unlock_target(node)
         node.reset_goal_tracking()
 
         if len(node.goal_poses) == 0:

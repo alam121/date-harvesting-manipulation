@@ -74,6 +74,11 @@ detection_history = {}           # {fruit_id: {"frames_seen": int, "frames_misse
 MIN_FRAMES_TO_SHOW = 2           # Fruit must appear in N consecutive frames before showing
 MAX_FRAMES_TO_KEEP = 1           # Keep fruit for N frames after last seen (persistence)
 
+# --- Target lock state (keeps vision locked on specific target during grasp) ---
+target_lock_position = None      # [x, y, z] of locked target in base_link
+target_lock_active = False
+TARGET_LOCK_RADIUS = 0.10        # 10cm - match locked target within this radius
+
 # ============================================================
 # Scoring System Weights (tune these for your application)
 # ============================================================
@@ -96,6 +101,9 @@ Z_STD_WORST = 0.05    # worst acceptable depth std (m)
 
 # Sticky bonus: how much to prefer the previous best fruit
 STICKY_BONUS = 0.15   # added to score if this was the previous best
+
+# Hysteresis: only switch to new target if it beats current best by this margin
+SWITCH_THRESHOLD = 0.08  # new best must be 8% better to trigger switch
 
 # Collision avoidance parameters
 FRUIT_RADIUS_DEFAULT = 0.035  # default radius of a date fruit (3.5cm)
@@ -761,6 +769,22 @@ def main_(args: argparse.Namespace):
 
     node.create_subscription(PointStamped, "/fruit_grasp_attempt", grasp_attempt_cb, 10)
 
+    # Target lock: subscriber to lock vision onto a specific target during grasp
+    def target_lock_cb(msg):
+        global target_lock_position, target_lock_active
+        if msg.point.x == 0.0 and msg.point.y == 0.0 and msg.point.z == 0.0:
+            # Unlock signal (all zeros)
+            target_lock_active = False
+            target_lock_position = None
+            print("🔓 Target lock released")
+        else:
+            # Lock onto this position
+            target_lock_position = [msg.point.x, msg.point.y, msg.point.z]
+            target_lock_active = True
+            print(f"🔒 Target locked at [{msg.point.x:.3f}, {msg.point.y:.3f}, {msg.point.z:.3f}]")
+
+    node.create_subscription(PointStamped, "/target_lock", target_lock_cb, 10)
+
     # Periodic cleanup of old fruit IDs (every 5 seconds)
     node.create_timer(5.0, cleanup_old_fruit_ids)
 
@@ -1255,6 +1279,48 @@ def main_(args: argparse.Namespace):
                 if score_result["total_score"] > best_score:
                     best_score = score_result["total_score"]
                     best_idx = i
+
+            # Hysteresis: only switch if new best significantly beats previous best
+            # This reduces flickering when scores are close
+            if best_target_prev is not None and best_idx is not None:
+                prev_score = best_target_prev.get("score", 0.0)
+                # Find index of previous best in current targets (by position proximity)
+                prev_pt = best_target_prev.get("pt_base")
+                if prev_pt is not None:
+                    prev_pos = [prev_pt.point.x, prev_pt.point.y, prev_pt.point.z]
+                    for i, t in enumerate(targets):
+                        t_pt = t["pt_base"]
+                        t_pos = [t_pt.point.x, t_pt.point.y, t_pt.point.z]
+                        if math.dist(prev_pos, t_pos) < BEST_REUSE_THRESH:
+                            # Found previous best in current frame
+                            prev_idx = i
+                            prev_current_score = targets[prev_idx]["score"]
+                            # Only switch if new best beats previous by threshold
+                            if best_idx != prev_idx and best_score < prev_current_score + SWITCH_THRESHOLD:
+                                best_idx = prev_idx
+                                best_score = prev_current_score
+                            break
+
+            # Target lock override: if locked, select closest to lock position instead of best score
+            if target_lock_active and target_lock_position is not None:
+                lock_best_idx = None
+                lock_best_dist = float('inf')
+                for i, t in enumerate(targets):
+                    pt = t["pt_base"]
+                    t_pos = [pt.point.x, pt.point.y, pt.point.z]
+                    dist = math.dist(t_pos, target_lock_position)
+                    if dist < TARGET_LOCK_RADIUS and dist < lock_best_dist:
+                        lock_best_dist = dist
+                        lock_best_idx = i
+
+                if lock_best_idx is not None:
+                    best_idx = lock_best_idx
+                    # Update lock position to track the target as it moves
+                    pt = targets[lock_best_idx]["pt_base"]
+                    target_lock_position[0] = pt.point.x
+                    target_lock_position[1] = pt.point.y
+                    target_lock_position[2] = pt.point.z
+                # If no target found within lock radius, fall back to best score (best_idx unchanged)
 
             # Persistent state update
             if best_idx is not None:

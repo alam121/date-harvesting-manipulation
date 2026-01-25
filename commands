@@ -8,10 +8,10 @@ if something unexpected source from this folder again (ros2)
 
 1)Check ip
 
-sudo ip addr flush dev eno1
-sudo ip addr add 192.168.1.101/24 dev eno1
-sudo ip addr add 169.254.186.100/24 dev eno1
-sudo ip link set eno1 up
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.1.101/24 dev eth0
+sudo ip addr add 169.254.186.100/24 dev eth0
+sudo ip link set eth0 up
 
 
 
@@ -60,7 +60,7 @@ in this case start the program again
  python3 -m ur10e_curobo.main
 
 for motion: datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src$ python3 test21.py 
-for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 date_v1.7.py --weights models/lab_dates_realbunch.pt  --conf_thres 0.5
+for vision : datepalm@ubuntu:~/Documents/v2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector$ python3 date_v1.9.py --weights models/lab_dates_realbunch.pt  --conf_thres 0.5
 
 
 *Make sure that the start button of program is pressed, otherwise: [ERROR] [1759327538.950381504] [ur10e_curobo_moveit_node]: ❌ Cannot execute goals: robot program is OFF. Please turn it ON first.

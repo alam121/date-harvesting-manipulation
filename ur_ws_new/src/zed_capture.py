@@ -10,7 +10,7 @@ def main():
 
     # Set configuration parameters
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720  # You can change resolution if needed
+    init_params.camera_resolution = sl.RESOLUTION.HD1080  # You can change resolution if needed
     init_params.camera_fps = 30
 
     # Open the camera
