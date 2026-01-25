@@ -159,6 +159,10 @@ def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
+    # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
+    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+        node.voxel_obstacles.snapshot()
+
     # 1) Plan with cuRobo
     res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
     if not res.success:

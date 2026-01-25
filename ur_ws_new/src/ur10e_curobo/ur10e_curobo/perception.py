@@ -147,6 +147,12 @@ class ZedYoloPerception:
         self._thread: Optional[Thread] = None
         self._alive = False
 
+        # Depth data for voxel obstacle updates
+        self.latest_depth: Optional[np.ndarray] = None
+        self.latest_target_mask: Optional[np.ndarray] = None
+        self._depth_lock = Lock()
+        self._frame_count = 0
+
         # publishers
         self.goal_pub = node.create_publisher(PoseStamped, "/external_goal_pose", FAST_QOS)
         self.point_pub = node.create_publisher(PointStamped, "/datefruit_3d_point", 10)
@@ -233,6 +239,11 @@ class ZedYoloPerception:
             zed.retrieve_measure(xyz_full, sl.MEASURE.XYZ, sl.MEM.CPU)
             xyz_np = xyz_full.get_data()  # (H,W,4), meters
 
+            # Store depth for voxel obstacle updates
+            self._frame_count += 1
+            with self._depth_lock:
+                self.latest_depth = xyz_np.copy()
+
             # gather masks/classes
             masks, labels, scores = [], [], []
             if det.masks is not None and det.masks.data is not None:
@@ -247,6 +258,23 @@ class ZedYoloPerception:
 
             # resolve front-visible pixels
             vis_masks, vis_ratios = zbuffer_visible_masks(masks, xyz_np, z_min=0.10, z_max=1.60, eps=0.003)
+
+            # Create combined target mask (all detected dates to exclude from obstacles)
+            combined_mask = None
+            if vis_masks:
+                H, W = xyz_np.shape[:2]
+                combined_mask = np.zeros((H, W), dtype=bool)
+                for mbin_vis in vis_masks:
+                    combined_mask |= (mbin_vis > 0)
+                with self._depth_lock:
+                    self.latest_target_mask = combined_mask
+
+            # Update voxel obstacles every 5 frames
+            if self._frame_count % 5 == 0 and hasattr(self.node, 'voxel_obstacles') and self.node.voxel_obstacles is not None:
+                try:
+                    self.node.voxel_obstacles.update_from_depth(xyz_np, mask=combined_mask)
+                except Exception as e:
+                    self.node.get_logger().debug(f"Voxel update in perception failed: {e}")
 
             # publish each visible detection
             for mbin_vis, vis_ratio, cls_i, conf_i in zip(vis_masks, vis_ratios, labels, scores):

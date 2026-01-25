@@ -13,6 +13,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 
 from ..config import WORLD_CONFIG
 from ..dynamic_obstacle import DynamicObstacleManager
+from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
 from .. import fk as fk_mod
 
@@ -35,6 +36,7 @@ class MotionExecutor:
 
         # Obstacles
         self.obstacles: Optional[DynamicObstacleManager] = None
+        self.voxel_obstacles: Optional[VoxelObstacleManager] = None
         self.static_obstacles: List = []
 
         # Publishers
@@ -92,6 +94,12 @@ class MotionExecutor:
         )
         self.obstacles.add_sphere("dyn_sphere", radius=0.1)
         self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
+
+        # Voxel obstacle manager for depth-based collision avoidance
+        self.voxel_obstacles = VoxelObstacleManager(
+            node=self._node,
+            motion_gen=self.motion_gen
+        )
 
         # Teleop subscription
         self._node.create_subscription(

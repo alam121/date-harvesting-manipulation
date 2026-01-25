@@ -112,10 +112,16 @@ class UR10eCuroboMoveIt(Node):
         # gripper/classifier
         gripper_mod.init_gripper(self, suction=False)
 
+        # perception disabled - using external date_v1.9.py instead
+        self.perception = None
+
         # keyboard
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
+
+        # Note: Perception is handled by external date_v1.9.py node
+        # Voxel obstacles subscribe to /zed_depth_pointcloud from that node
 
         # Note: Teleop state, subscription, and timer moved to MotionExecutor
 
@@ -769,6 +775,10 @@ class UR10eCuroboMoveIt(Node):
     @property
     def obstacles(self):
         return self._motion_mgr.obstacles
+
+    @property
+    def voxel_obstacles(self):
+        return self._motion_mgr.voxel_obstacles
 
     @property
     def static_obstacles(self):

@@ -15,6 +15,9 @@ import cv_viewer.tracking_viewer as cv_viewer
 
 import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
+import struct
 from tf2_ros import Buffer, TransformListener
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
@@ -479,6 +482,43 @@ def debug_print(msg: str) -> None:
     print(f"[DEBUG] {msg}", flush=True)
 
 
+def create_pointcloud2_msg(points: np.ndarray, frame_id: str, stamp) -> PointCloud2:
+    """
+    Create a PointCloud2 message from numpy array of XYZ points.
+
+    Args:
+        points: (N, 3) array of XYZ points in meters
+        frame_id: TF frame ID
+        stamp: ROS timestamp
+
+    Returns:
+        PointCloud2 message
+    """
+    msg = PointCloud2()
+    msg.header = Header()
+    msg.header.frame_id = frame_id
+    msg.header.stamp = stamp
+
+    msg.height = 1
+    msg.width = points.shape[0]
+
+    msg.fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+
+    msg.is_bigendian = False
+    msg.point_step = 12  # 3 floats * 4 bytes
+    msg.row_step = msg.point_step * msg.width
+    msg.is_dense = True
+
+    # Pack points into bytes
+    msg.data = points.astype(np.float32).tobytes()
+
+    return msg
+
+
 def increment_fruit_attempt(position_xyz):
     """
     Increment attempt count for fruit at given position.
@@ -695,6 +735,10 @@ def main_(args: argparse.Namespace):
     )
     goal_pub = node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
     dir_pub = node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
+    depth_pub = node.create_publisher(PointCloud2, "/zed_depth_pointcloud", fast_qos)
+
+    # Depth publishing state
+    depth_frame_count = [0]  # Use list to allow modification in nested function
 
     # Timer-based publishing callback (50Hz)
     def publish_timer_cb():
@@ -754,6 +798,7 @@ def main_(args: argparse.Namespace):
     init_params.camera_resolution = sl.RESOLUTION.HD1080
     init_params.coordinate_units = sl.UNIT.METER
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
+    init_params.depth_minimum_distance = 0.15 # Set the minimum depth perception distance to 15cm
     init_params.depth_maximum_distance = 50.0
 
     print("Initializing Camera...")
@@ -855,6 +900,30 @@ def main_(args: argparse.Namespace):
                 point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU, display_resolution
             )
             pc_np = point_cloud.get_data()[:, :, :3]  # H x W x 3
+
+            # Publish depth point cloud for voxel obstacle avoidance (every 5 frames)
+            depth_frame_count[0] += 1
+            if depth_frame_count[0] % 5 == 0:
+                try:
+                    # Filter valid points
+                    valid = np.isfinite(pc_np).all(axis=-1)
+                    valid &= (pc_np[:, :, 2] > 0.1) & (pc_np[:, :, 2] < 2.0)
+                    valid_points = pc_np[valid]
+
+                    if valid_points.shape[0] > 100:
+                        # Subsample for efficiency (max 50k points)
+                        if valid_points.shape[0] > 50000:
+                            indices = np.random.choice(valid_points.shape[0], 50000, replace=False)
+                            valid_points = valid_points[indices]
+
+                        pc_msg = create_pointcloud2_msg(
+                            valid_points,
+                            cam_frame,
+                            node.get_clock().now().to_msg()
+                        )
+                        depth_pub.publish(pc_msg)
+                except Exception as e:
+                    pass  # Don't let depth publishing errors affect main loop
 
             # --------------------------------------------------
             # Process detected objects → compute 3D + store

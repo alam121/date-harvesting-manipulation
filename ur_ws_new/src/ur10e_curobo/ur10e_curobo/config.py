@@ -26,6 +26,14 @@ WORLD_CONFIG = {
     }
 }
 
+# Voxel grid configuration for depth-based obstacle avoidance
+VOXEL_CONFIG = {
+    "dims": [1.5, 1.5, 1.5],           # 1.5m cube workspace
+    "pose": [0.3, -0.5, 0.8, 1, 0, 0, 0],  # Workspace center (x, y, z, qw, qx, qy, qz)
+    "voxel_size": 0.02,                # 2cm resolution
+    "max_esdf_distance": 0.3,          # Max distance to compute ESDF
+}
+
 PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
 
 # ---------- Runtime parameters (override via ROS params / env) ----------
