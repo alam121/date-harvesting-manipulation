@@ -18,7 +18,7 @@ sudo ip link set eth0 up
 , , 
 Result: 
 
-ip a show eno1
+ip a show eth0
 3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
     inet 169.254.186.100/24 scope global eth0
     inet 192.168.1.101/24 scope global eth0

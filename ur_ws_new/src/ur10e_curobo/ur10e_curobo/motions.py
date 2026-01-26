@@ -6,7 +6,7 @@ from curobo.types.robot import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from .config import PLAN_CFG_DEFAULT
+from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .fk import forward_kinematics
 
@@ -37,7 +37,11 @@ def publish_stop_trajectory(node):
 def execute_single_pose(node, pose: list, motion_type: str = "default"):
     if node.current_joint_positions is None:
         node.get_logger().warn("No joint state; cannot execute pose."); return
-    
+
+    # Take voxel snapshot before planning
+    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+        node.voxel_obstacles.snapshot()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     start = JointState.from_position(
         torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
@@ -47,7 +51,41 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT) #cuRobo Cartesian planner
     if not res.success:
         node.get_logger().warn("Plan failed for single pose."); return
-    
+
+    states = interpolated_positions(res)
+
+    # Verify trajectory against latest depth data before execution
+    if (VOXEL_CONFIG.get("verify_before_execute", True) and
+        hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None):
+
+        # Extract goal position for exclusion zone (we WANT to reach the target)
+        goal_position = pose[:3]  # [x, y, z] from input pose
+
+        max_attempts = VOXEL_CONFIG.get("max_replan_attempts", 2)
+        for attempt in range(max_attempts):
+            is_safe, collision_idx = node.voxel_obstacles.verify_trajectory_collision(
+                states,
+                exclude_position=goal_position,  # Skip collision check near target
+            )
+
+            if is_safe:
+                break
+
+            node.get_logger().warn(
+                f"Collision detected at waypoint {collision_idx}/{len(states)} "
+                f"(attempt {attempt + 1}/{max_attempts})"
+            )
+
+            # Replan with updated obstacles
+            res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+            if not res.success:
+                node.get_logger().error("Replan failed after collision detection")
+                return
+            states = interpolated_positions(res)
+        else:
+            node.get_logger().error(f"Collision persists after {max_attempts} replans")
+            return
+
     planner = node.cfg.planner
     base_dt = planner.base_dt  # usually 0.02
     # ------------------------------
@@ -79,7 +117,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
 
     traj = build_trajectory(
         node.joint_order,
-        interpolated_positions(res),
+        states,  # Use verified states (may have been updated by replan)
         vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,

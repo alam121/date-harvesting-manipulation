@@ -83,9 +83,9 @@ TARGET_LOCK_RADIUS = 0.10        # 10cm - match locked target within this radius
 # Scoring System Weights (tune these for your application)
 # ============================================================
 SCORE_WEIGHTS = {
-    "distance": 0.60,       # HIGHEST PRIORITY: closer is always better
-    "visibility": 0.15,     # higher vis_ratio is better
-    "depth_quality": 0.12,  # lower z_std is better
+    "distance": 0.90,       # HIGHEST PRIORITY: closer is always better
+    "visibility": 0.05,     # higher vis_ratio is better
+    "depth_quality": 0.02,  # lower z_std is better
     "confidence": 0.07,     # YOLO detection confidence
     "ellipse": 0.04,        # bonus for valid ellipse fit (orientation reliability)
     "center_bias": 0.02,    # prefer fruits near frame center (better depth data)

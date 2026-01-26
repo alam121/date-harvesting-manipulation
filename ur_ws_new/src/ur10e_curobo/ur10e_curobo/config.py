@@ -32,6 +32,12 @@ VOXEL_CONFIG = {
     "pose": [0.3, -0.5, 0.8, 1, 0, 0, 0],  # Workspace center (x, y, z, qw, qx, qy, qz)
     "voxel_size": 0.02,                # 2cm resolution
     "max_esdf_distance": 0.3,          # Max distance to compute ESDF
+    # Collision verification parameters
+    "collision_safety_margin": 0.03,   # 3cm safety buffer around robot
+    "collision_check_interval": 5,     # Check every Nth waypoint for speed
+    "max_replan_attempts": 2,          # Max replans if collision detected
+    "verify_before_execute": False,     # Enable/disable pre-execution verification
+    "target_exclusion_radius": 0.08,   # 8cm radius around target to skip collision check
 }
 
 PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
@@ -52,7 +58,9 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.5000560919391077, -1.6181756458678187, 2.1864479223834437, -4.4248088798918666, 4.572711944580078, 0.04942631721496582]
+    #home: List[float] = field(default_factory=lambda: [-1.5000560919391077, -1.6181756458678187, 2.1864479223834437, -4.4248088798918666, 4.572711944580078, 0.04942631721496582]
+    home: List[float] = field(default_factory=lambda: [-1.468783203755514, -1.2339450877955933, 1.8274214903460901, -4.791028877297872, 4.717813014984131, 0.25454220175743103]
+
 
 
 )
@@ -76,8 +84,8 @@ class Planner:
     global_speed_multiplier: float = 5.0
 
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
-    speed_home: float = 1.0        # for move_to_home_position
-    speed_dropoff: float = 3.0    # for move_to_dropoff_position
+    speed_home: float = 0.5        # for move_to_home_position
+    speed_dropoff: float = 2.0    # for move_to_dropoff_position
     speed_predropoff: float = 0.1  # for pre-dropoff (slower)
     speed_approach: float = 0.5    # for approach motion
     speed_final: float = 0.5       # for precise grasp

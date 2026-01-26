@@ -46,7 +46,7 @@ class ThreadSafeGoalList:
             self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
-from .config import PLAN_CFG_DEFAULT
+from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker
 from .motions import interpolated_positions, execute_single_pose
@@ -193,7 +193,7 @@ def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
     return quat_slerp(list(current_quat), best_target, blend_weight)
 
 
-def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default") -> bool:
+def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None) -> bool:
     # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
     if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
         node.voxel_obstacles.snapshot()
@@ -205,6 +205,39 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         return False
 
     states = interpolated_positions(res)
+
+    # 1b) Verify trajectory against latest depth data before execution
+    if (VOXEL_CONFIG.get("verify_before_execute", True) and
+        hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None):
+
+        # Use provided goal_xyz for exclusion zone (more reliable than extracting from Pose)
+        goal_position = goal_xyz
+
+        max_attempts = VOXEL_CONFIG.get("max_replan_attempts", 2)
+        for attempt in range(max_attempts):
+            is_safe, collision_idx = node.voxel_obstacles.verify_trajectory_collision(
+                states,
+                exclude_position=goal_position,  # Skip collision check near target
+            )
+
+            if is_safe:
+                break
+
+            node.get_logger().warn(
+                f"Collision detected at waypoint {collision_idx}/{len(states)} for {label} "
+                f"(attempt {attempt + 1}/{max_attempts})"
+            )
+
+            # Replan with updated obstacles (snapshot already taken in verify)
+            res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
+            if not res.success:
+                node.get_logger().error(f"Replan failed for {label}")
+                return False
+            states = interpolated_positions(res)
+        else:
+            # All replan attempts failed
+            node.get_logger().error(f"Collision persists after {max_attempts} replans for {label}")
+            return False
 
     # 2) Speed scaling
     #    - global scalar from node.speed_scale
@@ -653,11 +686,13 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
         orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        approach = [ax, ay+0.03, az-0.12, *orientation]
+        #approach = [ax, ay+0.03, az-0.12, *orientation]
+        approach = [ax, ay+0.01, az-0.12, *orientation]
+
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
             
-        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach"):
+        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3]):
             unlock_target(node)
             continue
         wait_until_xyz(node, approach[:3])
@@ -682,7 +717,7 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp
         final_target = [x, y, z+0.02, *orientation]
-        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final"):
+        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final", goal_xyz=final_target[:3]):
             unlock_target(node)
             continue
         wait_until_xyz(node, final_target[:3])
@@ -753,7 +788,7 @@ def plan_and_execute(node):
             home_ee = node.motion_gen.rollout_fn.compute_kinematics(home_js)
             home_pos = home_ee.ee_pos_seq[0].cpu().tolist()
             home_quat = home_ee.ee_quat_seq[0].cpu().tolist()
-            home_y = home_pos[1] + 0.1  # slightly back from home
+            home_y = home_pos[1] + 0.3  # slightly back from home
             home_z = home_pos[2]
             home_orientation = home_quat
         except Exception as e:

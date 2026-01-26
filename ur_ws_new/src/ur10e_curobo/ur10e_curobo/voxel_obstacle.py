@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from rclpy.node import Node
     from curobo.wrap.reacher.motion_gen import MotionGen
 
+from typing import Tuple
 from .config import VOXEL_CONFIG
+from curobo.types.robot import JointState
 
 
 class VoxelObstacleManager:
@@ -488,6 +490,140 @@ class VoxelObstacleManager:
 
         except Exception as e:
             self.node.get_logger().debug(f"Voxel marker publish failed: {e}")
+
+    def verify_trajectory_collision(
+        self,
+        waypoints: List[List[float]],
+        safety_margin: Optional[float] = None,
+        check_interval: Optional[int] = None,
+        exclude_position: Optional[List[float]] = None,
+        exclude_radius: Optional[float] = None,
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        Verify trajectory doesn't collide with latest depth obstacles.
+
+        Takes fresh depth snapshot and checks each waypoint's end-effector position
+        against the ESDF voxel grid.
+
+        Args:
+            waypoints: List of joint positions per waypoint
+            safety_margin: Distance buffer around robot (default from config)
+            check_interval: Check every Nth waypoint for speed (default from config)
+            exclude_position: Target position to exclude from collision checking (we WANT to reach it)
+            exclude_radius: Radius around exclude_position to skip collision checks
+
+        Returns:
+            (is_safe, first_collision_idx) - True if safe, collision index if not
+        """
+        if not self._initialized:
+            self.node.get_logger().debug("Voxel grid not initialized, skipping verification")
+            return True, None
+
+        # Use config defaults if not specified
+        if safety_margin is None:
+            safety_margin = VOXEL_CONFIG.get("collision_safety_margin", 0.03)
+        if check_interval is None:
+            check_interval = VOXEL_CONFIG.get("collision_check_interval", 5)
+        if exclude_radius is None:
+            exclude_radius = VOXEL_CONFIG.get("target_exclusion_radius", 0.08)
+
+        # Convert exclude_position to numpy array if provided
+        exclude_pos_np = np.array(exclude_position) if exclude_position is not None else None
+
+        if exclude_pos_np is not None:
+            self.node.get_logger().info(
+                f"Collision verification with exclusion zone: {exclude_position} (radius={exclude_radius}m)"
+            )
+
+        # Take fresh snapshot for verification
+        self.snapshot()
+
+        with self._lock:
+            try:
+                if self._voxel_grid is None:
+                    return True, None
+
+                # Get ESDF tensor and grid parameters
+                esdf = self._voxel_grid.feature_tensor.cpu().numpy()
+                esdf = esdf.reshape(self.grid_shape)
+
+                center = np.array(self.pose[:3])
+                half_dims = np.array(self.dims) / 2.0
+                origin = center - half_dims
+
+                # Check waypoints at specified interval
+                for i in range(0, len(waypoints), check_interval):
+                    joint_positions = waypoints[i]
+
+                    # Compute FK to get end-effector position
+                    ee_pos = self._compute_ee_position(joint_positions)
+                    if ee_pos is None:
+                        continue
+
+                    # Skip collision check if near target (we WANT to reach it)
+                    if exclude_pos_np is not None:
+                        dist_to_target = np.linalg.norm(ee_pos - exclude_pos_np)
+                        if dist_to_target < exclude_radius:
+                            self.node.get_logger().debug(
+                                f"Skipping collision check at waypoint {i}: "
+                                f"EE {ee_pos} is {dist_to_target:.3f}m from target (within {exclude_radius}m exclusion)"
+                            )
+                            continue  # Don't flag collision near target
+
+                    # Check if EE position is in collision
+                    is_collision = self._check_point_collision(
+                        ee_pos, esdf, origin, safety_margin
+                    )
+
+                    if is_collision:
+                        self.node.get_logger().warn(
+                            f"Collision detected at waypoint {i}: EE pos {ee_pos}"
+                        )
+                        return False, i
+
+                return True, None
+
+            except Exception as e:
+                self.node.get_logger().warn(f"Collision verification failed: {e}")
+                return True, None  # Fail open - allow execution on error
+
+    def _compute_ee_position(self, joint_positions: List[float]) -> Optional[np.ndarray]:
+        """Compute end-effector position for given joint configuration using cuRobo FK."""
+        try:
+            js = JointState.from_position(
+                torch.tensor([joint_positions], dtype=torch.float32, device=self.device),
+                joint_names=["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                            "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"],
+            )
+            ee = self.motion_gen.rollout_fn.compute_kinematics(js)
+            pos = ee.ee_pos_seq[0].cpu().numpy()
+            return pos
+        except Exception as e:
+            self.node.get_logger().debug(f"FK computation failed: {e}")
+            return None
+
+    def _check_point_collision(
+        self,
+        point: np.ndarray,
+        esdf: np.ndarray,
+        origin: np.ndarray,
+        safety_margin: float
+    ) -> bool:
+        """Check if a point is in collision with the ESDF grid."""
+        # Convert point to voxel indices
+        voxel_idx = ((point - origin) / self.voxel_size).astype(np.int32)
+
+        # Check bounds
+        for d in range(3):
+            if voxel_idx[d] < 0 or voxel_idx[d] >= self.grid_shape[d]:
+                return False  # Outside grid = not in collision with depth obstacles
+
+        # Get ESDF value (negative = inside obstacle)
+        esdf_value = esdf[voxel_idx[0], voxel_idx[1], voxel_idx[2]]
+
+        # Collision if ESDF value is less than safety margin
+        # (meaning we're too close to or inside an obstacle)
+        return esdf_value < safety_margin
 
     def clear(self) -> None:
         """Clear the voxel obstacle from the world."""
