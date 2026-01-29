@@ -121,6 +121,37 @@ def _unit(v):
     n = np.linalg.norm(v)
     return v / n if n > 1e-9 else v
 
+def apply_zed_camera_settings(zed: sl.Camera):
+
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 2)
+
+
+    # Optional: these exist in many SDK builds; safe-guard if not present
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.DENOISING, 100)
+    except Exception:
+        pass
+
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE_COMPENSATION, 58)
+    except Exception:
+        pass
+
+    # Verify (prints what the camera accepted)
+    try:
+        print("[CAM] sat:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SATURATION))
+        print("[CAM] sharp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS))
+        print("[CAM] gamma:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAMMA))
+        print("[CAM] wb_auto:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO))
+        print("[CAM] wb_temp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE))
+        print("[CAM] aec_agc:", zed.get_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC))
+        print("[CAM] gain:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAIN))
+        print("[CAM] exp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE))
+    except Exception:
+        pass
+
 
 def estimate_fruit_radius(target, fx=None):
     """
@@ -833,7 +864,7 @@ def main_(args: argparse.Namespace):
         rclpy.shutdown()
         return
     print("Camera Initialized")
-
+    apply_zed_camera_settings(zed)
     positional_tracking_parameters = sl.PositionalTrackingParameters()
     zed.enable_positional_tracking(positional_tracking_parameters)
 
