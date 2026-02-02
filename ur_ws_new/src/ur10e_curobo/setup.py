@@ -15,7 +15,10 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
         # optional if you have a launch file
-        (f"share/{package_name}/launch", ["launch/bringup.launch.py"]),
+        (f"share/{package_name}/launch", [
+            "launch/bringup.launch.py",
+            "launch/combined.launch.py",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

@@ -1,133 +1,190 @@
-# Demo Commands and System Launch Guide
+# UR10e cuRobo Control System
 
-This README describes the procedure to configure network settings, launch the UR10e robot and gripper, run the vision module, subscribe goals, and execute motions.
-
----
-
-## 0. Repository Location
-
-The main repository is located at: Humble_Refactor6.1_labdatesrealbunch 
-
-
-## 1. Configure Network Interface
-
-Run the following commands:
-sudo ip addr flush dev eno1
-sudo ip addr add 192.168.1.101/24 dev eno1
-sudo ip addr add 169.254.186.100/24 dev eno1
-sudo ip link set eno1 up
-
-
-Expected output includes:
-
-inet 169.254.186.100/24
-inet 192.168.1.101/24
-
-
-If these IPs do not appear, repeat the steps.
-
-**Important:**  
-Each time the terminal is closed, you must configure the IPs again.
+This README describes how to launch and operate the UR10e robot system with cuRobo motion planning, vision, teleop, and GUI.
 
 ---
 
-## 2. Launch UR10e + Gripper + RViz
-build: colcon build --cmake-args -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython3.10.so (if colcon build dosn't work)
-Run: ros2 launch ur_bringup ur_control.launch.py
-ur_type:=ur10e
-robot_ip:=192.168.1.190
-use_fake_hardware:=false
-launch_rviz:=true
+## Quick Start
 
+```bash
+# Launch with real robot (main + vision)
+launch_ur10e main vision
 
+# Launch with fake/simulated hardware for testing
+launch_ur10e fake main vision
 
-This launches:
-- UR10e ROS driver  
-- Gripper interface  
-- RViz with robot model  
-
-If something fails, re-source the workspace and re-check IP configuration.
+# Launch all nodes
+launch_ur10e main vision teleop gui
+```
 
 ---
 
-## 3. UR Tablet Instructions
+## Prerequisites
 
-On the UR tablet:
+### Build the Workspace
 
-1. Power on the robot.
-2. Release the brakes.
-3. Go to **Program**.
-4. Load the **ucra** file.
-5. Press **Start**.
+```bash
+cd ~/manipulatorsdatepalm/ur_ws_new
+colcon build --symlink-install
+source install/setup.bash
+```
 
-If you see: Connection to reverse interface dropped.
-
-
-Restart the program on the tablet and press **Start** again.
+Note: Use `--symlink-install` so Python changes take effect immediately without rebuilding.
 
 ---
 
-## 4. Run Refactor Code (Control and Vision)
+## Launch Options
 
-### 4.1 Control Node: 
-python3 -m ur10e_curobo.main
+The `launch_ur10e` command opens a terminator window with split panes for each component.
 
+### Usage
 
-### 4.2 Vision Node
+```bash
+launch_ur10e [fake] [main] [vision] [teleop] [gui]
+```
 
-Navigate to: /manipulatorsdatepalm/ur_ws_new/src/zed_date_detector
+### Options
 
+| Option   | Description                                    |
+|----------|------------------------------------------------|
+| `fake`   | Use simulated hardware (no real robot needed)  |
+| `main`   | Main control node with cuRobo motion planning  |
+| `vision` | ZED camera + YOLO detection node               |
+| `teleop` | Joystick teleop control                        |
+| `gui`    | Desktop GUI control panel                      |
 
-Run vision: python3 date_v1.2.py --weights models/lab_dates_realbunch.pt --conf_thres 0.5
+### Examples
 
+```bash
+# Real robot + main control
+launch_ur10e main
 
+# Real robot + main + vision
+launch_ur10e main vision
 
-An OpenCV window will open with detections, and external goals will be published to ROS 2 topics.
+# Real robot + all nodes
+launch_ur10e main vision teleop gui
 
-### Common Runtime Error
+# Fake hardware for testing (no robot needed)
+launch_ur10e fake main
 
-If you see: Cannot execute goals: robot program is OFF.
+# Fake hardware + main + vision
+launch_ur10e fake main vision
+```
 
+### What Happens
 
-
-Make sure the **Start** button on the tablet is pressed.
-
----
-
-## 5. Goal Subscription (Motion Window)
-
-Press the following keys:
-
-- `s` — subscribe a single goal  
-- `p` — subscribe multiple goals for 10 seconds  
-
-Check RViz to ensure:
-- Red dot is visible  
-- Goal markers are visible  
-
----
-
-## 6. Execute Motion
-
-Press: n
-
-
-This executes the planned robot motion.
-
----
-
-## 7. Gripper Manual Control
-
-- `o` — open gripper  
-- `c` — close gripper  
+1. **UR Bringup pane**: Runs network setup (`unet.sh`) and launches UR robot driver + RViz
+2. **Main pane**: Launches cuRobo motion planning node
+3. **Vision pane**: Launches ZED/YOLO vision detection
+4. **Teleop pane**: Launches joystick teleop control
+5. **GUI pane**: Launches desktop GUI
 
 ---
 
+## Manual Launch (Alternative)
 
+If you prefer running commands manually in separate terminals:
 
+### 1. Configure Network Interface
 
+```bash
+# Run the network setup script (requires sudo)
+~/manipulatorsdatepalm/bin/unet.sh
+```
 
+Or manually:
+```bash
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.1.101/24 dev eth0
+sudo ip addr add 169.254.186.100/24 dev eth0
+sudo ip link set eth0 up
+```
 
+### 2. Launch UR10e + RViz
 
+```bash
+source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+ros2 launch ur_bringup ur_control.launch.py \
+    ur_type:=ur10e \
+    robot_ip:=192.168.1.190 \
+    use_fake_hardware:=false \
+    launch_rviz:=true
+```
 
+### 3. Launch Main Control Node
 
+```bash
+source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+ros2 run ur10e_curobo main
+```
+
+### 4. Launch Vision Node
+
+```bash
+source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+ros2 run ur10e_curobo vision
+```
+
+### 5. Launch Teleop Node
+
+```bash
+source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+ros2 run ur10e_curobo teleop
+```
+
+### 6. Launch GUI Node
+
+```bash
+source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+ros2 run ur10e_curobo gui
+```
+
+---
+
+## UR Tablet Instructions
+
+On the UR teach pendant:
+
+1. Power on the robot
+2. Release the brakes
+3. Go to **Program**
+4. Load the **ucra** file
+5. Press **Start**
+
+If you see `Connection to reverse interface dropped`, restart the program and press **Start** again.
+
+---
+
+## Keyboard Controls (Main Node)
+
+| Key | Action                              |
+|-----|-------------------------------------|
+| `s` | Subscribe a single goal             |
+| `p` | Subscribe multiple goals (10 sec)   |
+| `n` | Execute planned motion              |
+| `o` | Open gripper                        |
+| `c` | Close gripper                       |
+
+---
+
+## Troubleshooting
+
+### "Cannot execute goals: robot program is OFF"
+Make sure the **Start** button on the UR tablet is pressed.
+
+### Network issues
+Re-run `unet.sh` or manually configure IPs. IPs reset when terminal closes.
+
+### ROS nodes not found
+Re-source the workspace: `source install/setup.bash`
+
+---
+
+## Static Terminator Layout
+
+For a fixed 4-pane layout (ur_bringup + main + teleop + vision):
+
+```bash
+terminator -l ur10e
+```
