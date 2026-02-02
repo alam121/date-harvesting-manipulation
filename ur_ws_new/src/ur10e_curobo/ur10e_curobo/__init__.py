@@ -1,6 +1,7 @@
 __all__ = [
-"config",
-"motion",
-"orientation",
-"viz",
+    "config",
+    "motion",
+    "orientation",
+    "viz",
+    "vision",
 ]

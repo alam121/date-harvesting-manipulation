@@ -52,10 +52,11 @@ class MotionExecutor:
         self.teleop_timeout: float = 0.2  # seconds
         self.last_teleop_time: float = 0.0
 
-        # Smoothing state for teleop
-        self.teleop_smoothed_delta: List[float] = [0.0, 0.0, 0.0]
+        # Smoothing state for teleop (x, y, z, yaw)
+        self.teleop_smoothed_delta: List[float] = [0.0, 0.0, 0.0, 0.0]
         self.teleop_smooth_alpha: float = 0.4  # Lower = smoother but slower
         self.teleop_traj_duration: float = 0.08  # seconds
+        self._teleop_was_inactive: bool = True  # Skip first frame after re-activation
 
     def initialize(self) -> None:
         """Initialize cuRobo planner, obstacles, and motion infrastructure."""
@@ -233,14 +234,32 @@ class MotionExecutor:
             return
 
         # Get raw deltas from latest twist (or zero if timed out)
-        raw_dx = raw_dy = raw_dz = 0.0
+        raw_dx = raw_dy = raw_dz = raw_dyaw = 0.0
         now = time.time()
         timed_out = now - self.last_teleop_time > self.teleop_timeout
 
         if self.latest_teleop_twist is not None and not timed_out:
+            # Skip first frame after re-activation to prevent jump
+            if self._teleop_was_inactive:
+                self._teleop_was_inactive = False
+                self.teleop_smoothed_delta = [0.0, 0.0, 0.0, 0.0]
+                return
             raw_dx = float(self.latest_teleop_twist.linear.x)
             raw_dy = float(self.latest_teleop_twist.linear.y)
             raw_dz = float(self.latest_teleop_twist.linear.z)
+            raw_dyaw = float(self.latest_teleop_twist.angular.z)
+        else:
+            # Reset smoothed delta when timed out (deadman released) to prevent jump on re-enable
+            self._teleop_was_inactive = True
+            self.teleop_smoothed_delta = [0.0, 0.0, 0.0, 0.0]
+            return
+
+        # If all inputs are effectively zero, reset and skip (prevents drift and jumps)
+        # Use 0.0001 (0.1 mm/s) threshold to filter out joystick noise/drift
+        if (abs(raw_dx) < 0.0001 and abs(raw_dy) < 0.0001 and
+            abs(raw_dz) < 0.0001 and abs(raw_dyaw) < 0.0001):
+            self.teleop_smoothed_delta = [0.0, 0.0, 0.0, 0.0]
+            return
 
         # Exponential smoothing of deltas
         alpha = self.teleop_smooth_alpha
@@ -249,11 +268,13 @@ class MotionExecutor:
         smoothed[0] = alpha * raw_dx + (1 - alpha) * smoothed[0]
         smoothed[1] = alpha * raw_dy + (1 - alpha) * smoothed[1]
         smoothed[2] = alpha * raw_dz + (1 - alpha) * smoothed[2]
+        smoothed[3] = alpha * raw_dyaw + (1 - alpha) * smoothed[3]
 
         self.teleop_smoothed_delta = smoothed
 
-        # Skip if movement is negligible
-        if abs(smoothed[0]) < 0.0001 and abs(smoothed[1]) < 0.0001 and abs(smoothed[2]) < 0.0001:
+        # Skip if movement is negligible (use larger threshold to prevent micro-movements)
+        if (abs(smoothed[0]) < 0.0005 and abs(smoothed[1]) < 0.0005 and
+            abs(smoothed[2]) < 0.0005 and abs(smoothed[3]) < 0.0005):
             return
 
         # Current TCP pose
@@ -263,13 +284,55 @@ class MotionExecutor:
 
         x, y, z, qw, qx, qy, qz = ee
 
-        # Apply smoothed deltas
-        x_new = x + smoothed[0]
-        y_new = y + smoothed[1]
-        z_new = z + smoothed[2]
+        # Rotate delta by end effector orientation (end-effector-relative control)
+        # This makes joystick forward = gripper forward, not world X
+        def _quat_rotate_vec(q, v):
+            """Rotate vector v by quaternion q (w, x, y, z format)."""
+            qw_, qx_, qy_, qz_ = q
+            vx, vy, vz = v
+            tx = 2.0 * (qy_ * vz - qz_ * vy)
+            ty = 2.0 * (qz_ * vx - qx_ * vz)
+            tz = 2.0 * (qx_ * vy - qy_ * vx)
+            return (
+                vx + qw_ * tx + qy_ * tz - qz_ * ty,
+                vy + qw_ * ty + qz_ * tx - qx_ * tz,
+                vz + qw_ * tz + qx_ * ty - qy_ * tx,
+            )
+
+        delta_local = (smoothed[0], smoothed[1], smoothed[2])
+        delta_world = _quat_rotate_vec((qw, qx, qy, qz), delta_local)
+        x_new = x + delta_world[0]
+        y_new = y + delta_world[1]
+        z_new = z + delta_world[2]
+
+        # Apply yaw rotation if non-zero
+        dyaw = smoothed[3]
+        if abs(dyaw) > 0.0001:
+            # Quaternion for yaw rotation around Z axis
+            import math
+            half_angle = dyaw / 2.0
+            dqw = math.cos(half_angle)
+            dqz = math.sin(half_angle)
+            # Multiply quaternions: q_new = q_delta * q_current
+            # q_delta = (dqw, 0, 0, dqz)
+            qw_new = dqw * qw - dqz * qz
+            qx_new = dqw * qx - dqz * qy
+            qy_new = dqw * qy + dqz * qx
+            qz_new = dqw * qz + dqz * qw
+            # Normalize
+            norm = math.sqrt(qw_new**2 + qx_new**2 + qy_new**2 + qz_new**2)
+            qw, qx, qy, qz = qw_new/norm, qx_new/norm, qy_new/norm, qz_new/norm
+            self._node.get_logger().info(f"YAW: dyaw={dyaw:.4f} rad")
 
         # Build target pose (vec7)
         target_pose = [x_new, y_new, z_new, qw, qx, qy, qz]
+
+        # Debug: log target pose when yaw is applied
+        if abs(smoothed[3]) > 0.0001:
+            self._node.get_logger().info(
+                f"TELEOP TARGET: pos=({x_new:.4f}, {y_new:.4f}, {z_new:.4f}) "
+                f"quat=({qw:.4f}, {qx:.4f}, {qy:.4f}, {qz:.4f})"
+            )
 
         # Solve IK (fast path)
         try:
@@ -278,10 +341,13 @@ class MotionExecutor:
                 target_pose,
                 seed=current_pos
             )
-        except Exception:
+        except Exception as e:
+            self._node.get_logger().warn(f"IK exception: {e}")
             return
 
         if q_cmd is None:
+            if abs(smoothed[3]) > 0.0001:
+                self._node.get_logger().warn("IK returned None for yaw rotation")
             return
 
         # Build smooth trajectory with velocity
@@ -303,8 +369,10 @@ class MotionExecutor:
 
         try:
             self.trajectory_pub.publish(traj)
-        except Exception:
-            # Be defensive - don't let teleop servo crash the node
+            if abs(smoothed[3]) > 0.0001:
+                self._node.get_logger().info(f"TELEOP: Published trajectory with yaw rotation")
+        except Exception as e:
+            self._node.get_logger().warn(f"Trajectory publish exception: {e}")
             return
 
     def _publish_static_obstacles(self) -> None:
