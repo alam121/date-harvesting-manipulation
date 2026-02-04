@@ -236,13 +236,14 @@ def update_config(nodes, fake_hardware=False):
     new_lines = []
     in_dynamic = False
     for line in lines:
-        # Check if we're entering [[dynamic]] section
-        if re.match(r'\s*\[\[dynamic\]\]', line):
+        # Check if we're entering [[dynamic]] section (double bracket, not triple)
+        if re.match(r'^\s*\[\[dynamic\]\]\s*$', line):
             in_dynamic = True
             continue
-        # Check if we're exiting to a new [[section]] or [plugins]
+        # Check if we're exiting to a new [[section]] (double bracket only) or [plugins]
         if in_dynamic:
-            if re.match(r'\s*\[\[(?!dynamic)', line) or line.strip() == '[plugins]':
+            # Match [[name]] but NOT [[[name]]] - use negative lookahead for third bracket
+            if re.match(r'^\s*\[\[(?!\[)[a-zA-Z]', line) or line.strip() == '[plugins]':
                 in_dynamic = False
             else:
                 continue  # Skip lines inside [[dynamic]]

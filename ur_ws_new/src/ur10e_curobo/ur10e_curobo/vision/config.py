@@ -12,7 +12,7 @@ DEFAULT_IMG_SIZE = 640      # inference size in pixels
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
-    "distance": 0.90,       # HIGHEST PRIORITY: closer is always better
+    "distance": 1.90,       # HIGHEST PRIORITY: closer is always better
     "visibility": 0.05,     # higher vis_ratio is better
     "depth_quality": 0.02,  # lower z_std is better
     "confidence": 0.07,     # YOLO detection confidence

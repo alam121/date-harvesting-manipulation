@@ -1,3 +1,4 @@
+sleep 6 && source /home/datepalm2/manipulatorsdatepalm/ur_ws_new/install/setup.bash && ros2 run ur10e_curobo teleop
 # launch/combined.launch.py
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
