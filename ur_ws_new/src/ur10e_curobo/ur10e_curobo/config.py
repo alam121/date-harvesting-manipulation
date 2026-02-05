@@ -105,6 +105,13 @@ class Planner:
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff
 
+    # Approach strategy parameters
+    approach_standoff: float = 0.12             # Standoff distance for below approach (m)
+    approach_dir_z_threshold: float = 0.4       # |dir.z| below this = below approach, above = lateral
+    approach_lateral_y_offset: float = 0.19     # Y offset for lateral approach (m back toward robot)
+    approach_lateral_z_offset: float = -0.1     # Z offset for lateral approach (m, negative = below fruit)
+    use_direction_based_approach: bool = True   # Enable adaptive approach (False = legacy below-only)
+
 @dataclass
 class Perception:
     enabled: bool = True

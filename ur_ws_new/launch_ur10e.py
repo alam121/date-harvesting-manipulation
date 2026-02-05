@@ -4,6 +4,7 @@ import sys
 import subprocess
 import os
 import re
+import time
 
 WS = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new"
 SOURCE = f"source {WS}/install/setup.bash"
@@ -297,6 +298,10 @@ def main():
 
     hw_mode = "FAKE hardware" if fake_hardware else "REAL robot"
     print(f"Launching {len(ordered) + 1} panes ({hw_mode}): ur_bringup + {', '.join(ordered)}")
+
+    # Kill any existing terminator instances to ensure fresh config reload
+    subprocess.run(["pkill", "-f", "terminator"], stderr=subprocess.DEVNULL)
+    time.sleep(0.5)  # Wait for terminator to fully close
 
     # Update config with dynamic layout
     update_config(ordered, fake_hardware)

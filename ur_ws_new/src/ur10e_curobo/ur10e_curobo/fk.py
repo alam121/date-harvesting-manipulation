@@ -6,6 +6,12 @@ from geometry_msgs.msg import Point
 
 
 def get_end_effector_pose(node) -> Optional[list]:
+    import time
+    # Retry briefly if joint states not yet available
+    for _ in range(3):
+        if node.current_joint_positions is not None:
+            break
+        time.sleep(0.05)  # 50ms retry
     if node.current_joint_positions is None:
         node.get_logger().warn("Joint states not yet received.")
         return None

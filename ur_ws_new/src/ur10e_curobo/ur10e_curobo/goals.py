@@ -472,16 +472,32 @@ def subscribe_to_goal_pose(node):
             node.best_goal_xyz = new_xyz
             node.best_goal_score = float("inf")
 
-            #g = [*new_xyz, *current_orientation]
-            g = [*new_xyz, 
+            # Get current direction from vision (if available) and save with goal
+            fruit_dir = getattr(node, "fruit_direction", None)
+            if fruit_dir is not None:
+                saved_dir = list(fruit_dir)
+            else:
+                saved_dir = [0.0, 0.0, -1.0]  # Default: below approach
+
+            # Goal format: [x, y, z, qw, qx, qy, qz, dx, dy, dz]
+            g = [*new_xyz,
                 msg.pose.orientation.w, msg.pose.orientation.x,
-                msg.pose.orientation.y, msg.pose.orientation.z]
-            
-            
+                msg.pose.orientation.y, msg.pose.orientation.z,
+                *saved_dir]
+
             if not node.goal_poses.any_within_distance(g, 0.01):
                 node.goal_poses.append(g)
                 publish_goal_marker(node, g[:3])
-                print(f"🟢 Accepted goal pose: {g}")
+                # Classify goal based on saved direction Z component
+                dir_z_threshold = node.cfg.planner.approach_dir_z_threshold
+                dir_z = saved_dir[2]
+                if abs(dir_z) < dir_z_threshold:
+                    goal_type = "BELOW approach"
+                else:
+                    goal_type = "LATERAL approach"
+                print(f"🟢 Accepted goal pose: {g[:7]}")
+                print(f"   Approach: {goal_type} (|dir.z|={abs(dir_z):.2f}, threshold={dir_z_threshold})")
+                print(f"   Saved direction: {[round(d,2) for d in saved_dir]}")
                 node.obstacles.update_pose("fruit_obstacle", g[:3])
 
             # Destroy subscription
@@ -626,6 +642,88 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
     return d_norm
 
 
+def compute_approach_position(node, x, y, z, orientation, saved_direction=None):
+    """
+    Compute approach position based on vision direction's Z component.
+
+    Uses |direction.z| to decide approach type:
+    - |direction.z| < threshold: below approach
+    - |direction.z| >= threshold: lateral approach
+
+    Args:
+        node: ROS node with config and direction data
+        x, y, z: Target fruit position in base_link frame
+        orientation: Gripper orientation quaternion [qw, qx, qy, qz]
+        saved_direction: Optional direction saved at goal capture time
+
+    Returns:
+        tuple: (approach_pos, final_target_pos) as [x, y, z, *orientation] lists
+    """
+    cfg = node.cfg.planner
+    standoff = cfg.approach_standoff
+
+    # Check if direction-based approach is enabled
+    if not cfg.use_direction_based_approach:
+        # Legacy behavior: always approach from below
+        approach = [x, y + 0.01, z - standoff, *orientation]
+        final_target = [x, y, z, *orientation]
+        return approach, final_target
+
+    # Use saved direction if provided, otherwise get current from vision
+    if saved_direction is not None:
+        d = np.array(saved_direction, dtype=float)
+        node.get_logger().info(f"Using SAVED direction: {np.round(d, 2)}")
+    else:
+        d = blend_approach_direction(node, x, y, z)
+        node.get_logger().info(f"Using CURRENT direction: {np.round(d, 2)}")
+
+    z_threshold = cfg.approach_dir_z_threshold
+
+    if abs(d[2]) < z_threshold:
+        # BELOW APPROACH: direction is horizontal, clearance below fruit
+        approach_type = "below"
+        approach = [
+            x,                      # Same X as fruit
+            y + 0.01,               # 1cm toward robot base
+            z - standoff,           # 12cm below fruit
+            *orientation
+        ]
+    else:
+        # LATERAL APPROACH: back + offset in Z, then move to fruit
+        approach_type = "lateral"
+        y_offset = cfg.approach_lateral_y_offset
+        z_offset = cfg.approach_lateral_z_offset
+
+        # Compute orientation from approach direction (pointing toward fruit)
+        approach_dir = [0.0, -y_offset, -z_offset]  # Direction from approach to fruit
+        raw_lateral_orientation = quaternion_from_approach(node, direction_xyz=approach_dir)
+        # Minimize rotation from current pose (pick closer of two 180° options)
+        cur_pose = node.get_end_effector_pose()
+        cur_quat = cur_pose[3:] if cur_pose else None
+        lateral_orientation = minimize_rotation_orientation(cur_quat, raw_lateral_orientation)
+
+        approach = [
+            x,                      # Same X as fruit
+            y + y_offset,           # Back toward robot base (+Y)
+            z + z_offset,           # Z offset (negative = below)
+            *lateral_orientation
+        ]
+
+    # Final grasp: at fruit position
+    # For lateral, use same computed orientation; for below, use original
+    if approach_type == "lateral":
+        final_target = [x, y, z, *lateral_orientation]
+    else:
+        final_target = [x, y, z, *orientation]
+
+    node.get_logger().info(
+        f"Fruit z={z:.2f}m: {approach_type} approach (dir.z={d[2]:.2f}), "
+        f"approach_pos={[round(approach[0],2), round(approach[1],2), round(approach[2],2)]}"
+    )
+
+    return approach, final_target
+
+
 
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
@@ -666,30 +764,20 @@ def plan_and_execute(node):
         # Lock vision onto this target (prevents switching to different "best" during approach)
         lock_target(node, goal[:3])
 
-        # Direction-biased pre-grasp: use fruit direction if available
-        standoff = 0.0  # 12cm standoff distance
-
-        d_blend = blend_approach_direction(node, x, y, z)
-        ax = x + d_blend[0] * standoff
-        ay = y + d_blend[1] * standoff
-        az = z + d_blend[2] * standoff
-
-        # 1. Plan approach
-        # if z > 1.30:  #high targets: top-down approach
-        #     orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-        #     approach = [x, y+0.12, z, *orientation] #top approach
-        # else:
-        # Get current orientation and minimize rotation
+        # 1. Plan approach - compute orientation and adaptive approach position
         cur_pose = node.get_end_effector_pose()
         cur_quat = cur_pose[3:] if cur_pose else None
-        target_quat = goal[3:]
+        target_quat = goal[3:7]  # Only quaternion, not direction
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
         orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        #approach = [ax, ay+0.03, az-0.12, *orientation]
-        approach = [ax, ay+0.01, az-0.12, *orientation]
 
-        print("Going for side approach:", approach)
+        # Get saved direction from goal (if present), otherwise use current
+        saved_direction = goal[7:10] if len(goal) >= 10 else None
+
+        # Compute approach position using adaptive strategy
+        approach, _ = compute_approach_position(node, x, y, z, orientation, saved_direction=saved_direction)
+        print(f"Adaptive approach for z={z:.2f}m: position={[round(v,3) for v in approach[:3]]}")
         #z -= 0.055; y -= 0.003
             
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3]):
@@ -715,8 +803,8 @@ def plan_and_execute(node):
             unlock_target(node)
             continue
             
-        # 3. Final slow precise grasp
-        final_target = [x, y, z+0.02, *orientation]
+        # 3. Final slow precise grasp - recompute with reacquired position (use saved direction)
+        _, final_target = compute_approach_position(node, x, y, z, orientation, saved_direction=saved_direction)
         if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final", goal_xyz=final_target[:3]):
             unlock_target(node)
             continue
@@ -788,7 +876,7 @@ def plan_and_execute(node):
             home_ee = node.motion_gen.rollout_fn.compute_kinematics(home_js)
             home_pos = home_ee.ee_pos_seq[0].cpu().tolist()
             home_quat = home_ee.ee_quat_seq[0].cpu().tolist()
-            home_y = home_pos[1] + 0.3  # slightly back from home
+            home_y = home_pos[1] + 0.1  # slightly back from home
             home_z = home_pos[2]
             home_orientation = home_quat
         except Exception as e:

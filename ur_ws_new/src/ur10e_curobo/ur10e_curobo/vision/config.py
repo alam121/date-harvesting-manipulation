@@ -12,7 +12,7 @@ DEFAULT_IMG_SIZE = 640      # inference size in pixels
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
-    "distance": 1.90,       # HIGHEST PRIORITY: closer is always better
+    "distance": 9.90,       # HIGHEST PRIORITY: closer is always better
     "visibility": 0.05,     # higher vis_ratio is better
     "depth_quality": 0.02,  # lower z_std is better
     "confidence": 0.07,     # YOLO detection confidence
@@ -29,10 +29,10 @@ Z_STD_IDEAL = 0.005   # ideal depth std (m)
 Z_STD_WORST = 0.05    # worst acceptable depth std (m)
 
 # Sticky bonus: how much to prefer the previous best fruit
-STICKY_BONUS = 0.15   # added to score if this was the previous best
+STICKY_BONUS = 0.05   # reduced: less sticky, switches to closer fruits easier
 
 # Hysteresis: only switch to new target if it beats current best by this margin
-SWITCH_THRESHOLD = 0.08  # new best must be 8% better to trigger switch
+SWITCH_THRESHOLD = 0.02  # reduced: switches more easily to better targets
 
 # Best fruit tracking
 BEST_REUSE_THRESH = 0.05  # 5 cm positional tolerance in base_link
