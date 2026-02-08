@@ -193,7 +193,7 @@ def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
     return quat_slerp(list(current_quat), best_target, blend_weight)
 
 
-def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None) -> bool:
+def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
     # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
     if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
         node.voxel_obstacles.snapshot()
@@ -284,8 +284,65 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         return False
 
     node.trajectory_pub.publish(traj)
+
+    # Store trajectory for later reversal if requested
+    if store_trajectory:
+        if not hasattr(node, 'stored_trajectory_states'):
+            node.stored_trajectory_states = []
+        node.stored_trajectory_states.extend(states)
+
     return True
 
+
+def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
+    """
+    Execute the stored trajectory in reverse order to return along the same collision-free path.
+    """
+    if not hasattr(node, 'stored_trajectory_states') or not node.stored_trajectory_states:
+        node.get_logger().warn("No stored trajectory to reverse; falling back to normal motion.")
+        return False
+
+    # Reverse the stored states
+    reversed_states = list(reversed(node.stored_trajectory_states))
+
+    # Clear stored trajectory after use
+    node.stored_trajectory_states = []
+
+    planner = node.cfg.planner
+    base_dt = getattr(planner, "base_dt", 0.02)
+
+    # Use predropoff speed settings
+    scale = getattr(planner, "speed_predropoff", 1.0) * getattr(planner, "global_speed_multiplier", 1.0)
+
+    dt = base_dt / max(scale, 1e-6)
+    dt = min(max(dt, getattr(planner, "min_dt", 0.012)), getattr(planner, "max_dt", 0.03))
+
+    base_vel = 0.08
+    vel = min(base_vel * scale, getattr(planner, "max_traj_velocity", 0.25))
+
+    # Use reduced acceleration for smooth return motion
+    max_acc = getattr(planner, "max_joint_acceleration", 1.0) * 0.3
+    ramp_pts = getattr(planner, "ramp_points", 10) * 2
+
+    traj = build_trajectory(
+        node.joint_order,
+        reversed_states,
+        vel=vel,
+        dt=dt,
+        stop_flag=lambda: node.stop_requested,
+        max_vel=getattr(planner, "max_joint_velocity", 2.0) * getattr(planner, "global_speed_multiplier", 1.0),
+        max_acc=max_acc,
+        ramp_points=ramp_pts,
+    )
+
+    if node.stop_requested:
+        node.get_logger().warn("Stop before sending reversed trajectory.")
+        node.stop_requested = False
+        return False
+
+    node.get_logger().info(f"Executing reversed trajectory with {len(reversed_states)} waypoints")
+    node.trajectory_pub.publish(traj)
+    return True
 
 
 def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=3, radius=0.08, z_tolerance=0.05):
@@ -666,6 +723,9 @@ def plan_and_execute(node):
         # Lock vision onto this target (prevents switching to different "best" during approach)
         lock_target(node, goal[:3])
 
+        # Clear stored trajectory for this new goal (will be filled during approach and final)
+        node.stored_trajectory_states = []
+
         # Direction-biased pre-grasp: use fruit direction if available
         standoff = 0.0  # 12cm standoff distance
 
@@ -692,7 +752,7 @@ def plan_and_execute(node):
         print("Going for side approach:", approach)
         #z -= 0.055; y -= 0.003
             
-        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3]):
+        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
             unlock_target(node)
             continue
         wait_until_xyz(node, approach[:3])
@@ -717,7 +777,7 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp
         final_target = [x, y, z+0.02, *orientation]
-        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final", goal_xyz=final_target[:3]):
+        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
             unlock_target(node)
             continue
         wait_until_xyz(node, final_target[:3])
@@ -764,55 +824,30 @@ def plan_and_execute(node):
         #rotate_wrist(node, 90, rotate_time=0.5, hold_time=0.05, return_time=0.5)
         time.sleep(0.5)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
 
-        # #move_to_predropoff_position - retreat along approach direction
-        current_pose = node.get_end_effector_pose()
-        if current_pose is None:
-            node.get_logger().error("Cannot get end-effector pose for pre-dropoff; using fallback.")
-            # Fallback: skip pre-dropoff and go directly to dropoff
-            move_to_dropoff_position(node)
-            time.sleep(0.2)
-            node.control_gripper("OPEN")
-            move_to_home_position(node)
-            unlock_target(node)
-            node.reset_goal_tracking()
-            continue
+        # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
+        # Flow: grasp → reverse(final) → reverse(approach) → home → dropoff → home
+        if execute_reversed_trajectory(node, motion_type="predropoff"):
+            # Wait for reversed trajectory to complete
+            time.sleep(0.5)  # Initial delay for trajectory to start
+            timeout_start = time.time()
+            while time.time() - timeout_start < 15.0:  # 15s max timeout
+                if not is_robot_moving(node, velocity_threshold=0.005):
+                    break
+                time.sleep(0.1)
+            print("Reversed trajectory completed - returned along collision-free path.")
+            blend_motion(node)
+        else:
+            # Fallback: go directly to predropoff if no stored trajectory
+            node.get_logger().warn("No stored trajectory; using predropoff position.")
+            move_to_predropoff_position(node)
+            blend_motion(node)
 
-        # Pre-dropoff: use home position's Y, Z, and orientation
-        # Compute full home FK including orientation
-        try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            home_js = JointState.from_position(
-                torch.tensor([node.home_joints], dtype=torch.float32, device=device),
-                joint_names=node.joint_order,
-            )
-            home_ee = node.motion_gen.rollout_fn.compute_kinematics(home_js)
-            home_pos = home_ee.ee_pos_seq[0].cpu().tolist()
-            home_quat = home_ee.ee_quat_seq[0].cpu().tolist()
-            home_y = home_pos[1] + 0.3  # slightly back from home
-            home_z = home_pos[2]
-            home_orientation = home_quat
-        except Exception as e:
-            node.get_logger().warn(f"Could not compute home FK: {e}; using fallback")
-            home_y = current_pose[1] + 0.45  # fallback: 30cm back
-            home_z = current_pose[2]
-            home_orientation = current_pose[3:]
-
-        target_pose = [
-            current_pose[0],  # keep current X
-            home_y,           # use home's Y position
-            home_z,           # use home's Z position
-            *home_orientation  # use home orientation
-        ]
-        print("Current pose:", current_pose)
-        print(f"Pre-dropoff using home Y: {home_y:.3f}, Z: {home_z:.3f}")
-        print("Target pre-dropoff pose:", target_pose)
-        execute_single_pose(node, target_pose, motion_type="predropoff")
-        # Wait until robot reaches target position (with tolerance)
-        wait_until_xyz(node, target_pose[:3], tol=0.02, timeout=10.0)
-        print("Moved to pre-dropoff position.")
-        #move_to_predropoff_position(node)
-        blend_motion(node)
+        # Go to home first (ensures clean position before dropoff)
         time.sleep(0.1)
+        move_to_home_position(node)
+        time.sleep(0.1)
+
+        # Now go to dropoff
         move_to_dropoff_position(node)
         time.sleep(0.2)  # small delay to allow state update
         node.control_gripper("OPEN")
