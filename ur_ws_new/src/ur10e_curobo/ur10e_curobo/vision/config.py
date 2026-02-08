@@ -6,6 +6,8 @@ import os
 MODELS_DIR = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models"
 DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
 
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_updated.engine")
+
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
 DEFAULT_IMG_SIZE = 640      # inference size in pixels

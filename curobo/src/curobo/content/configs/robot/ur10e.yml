@@ -47,7 +47,7 @@ robot_cfg:
       joint_names: ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
       retract_config: [0.0, -2.2, 1.9, -1.383, -1.57, 0.00]
       null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-      cspace_distance_weight: [8.0, 6.0, 2.5, 1.2, 0.7, 0.4] #[2.5, 1.75, 1.5, 1.25, 0.7, 0.4]
+      cspace_distance_weight: [8.0, 6.0, 2.5, 2.2, 0.7, 0.4] #[2.5, 1.75, 1.5, 1.25, 0.7, 0.4]
       max_jerk: 500.0
       max_acceleration: 12.0
       position_limit_clip: 0.1
