@@ -309,9 +309,40 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
     node.stored_trajectory_states = []
 
     planner = node.cfg.planner
-    base_dt = getattr(planner, "base_dt", 0.02)
 
-    # Use predropoff speed settings
+    # First: very slow motion from current position to first reversed waypoint
+    if node.current_joint_positions is not None:
+        current_pos = list(node.current_joint_positions)
+        first_waypoint = reversed_states[0]
+        max_diff = max(abs(c - f) for c, f in zip(current_pos, first_waypoint))
+
+        if max_diff > 0.005:  # Any significant difference - do slow initial motion
+            node.get_logger().info(f"Slow initial motion to first waypoint (max_diff={max_diff:.4f} rad)")
+
+            # Create slow trajectory from current to first waypoint
+            initial_traj = build_trajectory(
+                node.joint_order,
+                [current_pos, first_waypoint],
+                vel=0.02,   # Very slow
+                dt=0.04,    # Long time steps
+                stop_flag=lambda: node.stop_requested,
+                max_vel=0.3,   # Very low max velocity
+                max_acc=0.2,   # Very low acceleration
+                ramp_points=20,  # Many ramp points
+            )
+            node.trajectory_pub.publish(initial_traj)
+
+            # Wait for this slow motion to complete
+            time.sleep(0.3)
+            timeout_start = time.time()
+            while time.time() - timeout_start < 10.0:
+                if not is_robot_moving(node, velocity_threshold=0.005):
+                    break
+                time.sleep(0.05)
+            time.sleep(0.1)  # Small settle time
+
+    # Now execute the main reversed trajectory
+    base_dt = getattr(planner, "base_dt", 0.02)
     scale = getattr(planner, "speed_predropoff", 1.0) * getattr(planner, "global_speed_multiplier", 1.0)
 
     dt = base_dt / max(scale, 1e-6)
@@ -320,9 +351,8 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
     base_vel = 0.08
     vel = min(base_vel * scale, getattr(planner, "max_traj_velocity", 0.25))
 
-    # Use reduced acceleration for smooth return motion
-    max_acc = getattr(planner, "max_joint_acceleration", 1.0) * 0.3
-    ramp_pts = getattr(planner, "ramp_points", 10) * 2
+    max_acc = getattr(planner, "max_joint_acceleration", 1.0)
+    ramp_pts = getattr(planner, "ramp_points", 10)
 
     traj = build_trajectory(
         node.joint_order,
@@ -813,6 +843,13 @@ def plan_and_execute(node):
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
+
+                # Store current joint position so reversed trajectory includes this re-grip position
+                if node.current_joint_positions is not None:
+                    if not hasattr(node, 'stored_trajectory_states'):
+                        node.stored_trajectory_states = []
+                    node.stored_trajectory_states.append(list(node.current_joint_positions))
+
             node.control_gripper("CLOSE"); time.sleep(0.7)
             is_proper, forces, bad_fingers = check_3finger_contact()
             if is_proper:
@@ -821,8 +858,7 @@ def plan_and_execute(node):
                 print(f"Re-grip result: {forces} → STILL WEAK on: {bad_fingers}")
             
         # 4. Drop-off and return
-        #rotate_wrist(node, 90, rotate_time=0.5, hold_time=0.05, return_time=0.5)
-        time.sleep(0.5)  # Wait for wrist rotation to complete (0.5s rotate + 0.05s hold + 0.5s return + margin)
+        time.sleep(0.5)
 
         # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
         # Flow: grasp → reverse(final) → reverse(approach) → home → dropoff → home

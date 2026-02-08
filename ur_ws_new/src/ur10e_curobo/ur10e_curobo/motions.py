@@ -283,6 +283,10 @@ def move_backward(node, delta: float):
 
 def blend_motion(node, pause=0.2):
     # maintains smoothness, avoids jerk
+    if node.current_joint_positions is None:
+        time.sleep(pause)
+        return
+
     planner = node.cfg.planner
     traj = build_trajectory(
         node.joint_order,
