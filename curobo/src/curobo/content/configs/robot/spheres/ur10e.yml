@@ -59,6 +59,6 @@ collision_spheres:
   tool0:
     - center: [0, 0, 0.12]
       radius: -0.01
-  camera_mount:
-    - center: [0, 0.11, -0.01]
-      radius: 0.06
+  zed2_left_camera_frame:
+    - center: [0, 0, 0]
+      radius: 0.02
