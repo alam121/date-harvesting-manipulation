@@ -63,3 +63,7 @@ log/
 *.zip
 *.bag
 *.db
+
+# Python artifacts
+__pycache__/
+*.pyc
