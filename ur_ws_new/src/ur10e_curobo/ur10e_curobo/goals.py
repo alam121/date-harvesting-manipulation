@@ -568,7 +568,9 @@ def subscribe_to_goal_pose(node):
             if not node.goal_poses.any_within_distance(g, 0.01):
                 node.goal_poses.append(g)
                 publish_goal_marker(node, g[:3])
+                goal_type = "HIGH (back-then-forward)" if g[2] > 0.90 else "LOW (side approach)"
                 print(f"🟢 Accepted goal pose: {g}")
+                print(f"   → Goal type: {goal_type} (z={g[2]:.2f}m)")
                 node.obstacles.update_pose("fruit_obstacle", g[:3])
 
             # Destroy subscription
@@ -764,11 +766,7 @@ def plan_and_execute(node):
         ay = y + d_blend[1] * standoff
         az = z + d_blend[2] * standoff
 
-        # 1. Plan approach
-        # if z > 1.30:  #high targets: top-down approach
-        #     orientation = quaternion_from_approach(node, pitch_deg=-35.0)
-        #     approach = [x, y+0.12, z, *orientation] #top approach
-        # else:
+        # 1. Plan approach - different strategy based on height
         # Get current orientation and minimize rotation
         cur_pose = node.get_end_effector_pose()
         cur_quat = cur_pose[3:] if cur_pose else None
@@ -776,12 +774,36 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
         orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        #approach = [ax, ay+0.03, az-0.12, *orientation]
-        approach = [ax, ay+0.01, az-0.12, *orientation]
 
-        print("Going for side approach:", approach)
-        #z -= 0.055; y -= 0.003
-            
+        if z > 0.90:  # High dates: retreat back first, then approach towards
+            print(f"High date detected (z={z:.2f}m) - using back-then-forward approach")
+
+            # Phase 1: Retreat position (15cm back from fruit)
+            retreat_pos = [x, y + 0.15, z, *orientation]
+            print(f"Retreat position: {retreat_pos[:3]}")
+
+            if not plan_and_send(node, start, Pose.from_list(retreat_pos),
+                                 label="RETREAT", motion_type="approach",
+                                 goal_xyz=retreat_pos[:3], store_trajectory=True):
+                unlock_target(node)
+                continue
+            wait_until_xyz(node, retreat_pos[:3])
+            blend_motion(node)
+
+            # Update start state for approach phase
+            start = JointState.from_position(
+                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=node.joint_order,
+            )
+
+            # Phase 2: Approach towards fruit (3cm back, same height)
+            approach = [x, y + 0.03, z, *orientation]
+            print(f"Approach position (high): {approach[:3]}")
+
+        else:  # Lower dates: approach from below (existing logic)
+            approach = [ax, ay+0.01, az-0.12, *orientation]
+            print(f"Going for side approach (low): {approach[:3]}")
+
         if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
             unlock_target(node)
             continue
