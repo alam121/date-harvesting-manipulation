@@ -299,7 +299,7 @@ def blend_motion(node, pause=0.2):
         node.joint_order,
         [node.current_joint_positions],
         vel=0.05,
-        dt=0.02,
+        dt=planner.base_dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity,
         max_acc=planner.max_joint_acceleration,

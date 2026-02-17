@@ -267,18 +267,18 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
         dq = np.clip(dq, -0.1, 0.1)
         q = q + dq
 
-    # Check final error after max iterations
+    # Check final error after max iterations (allow 2x convergence tol as fallback)
     q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
     with torch.no_grad():
         ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
     final_err = np.linalg.norm(target - ee_pos[0].cpu().numpy())
-    if final_err < 0.01:
+    if final_err < tol * 2:
         return q.tolist()
     return None
 
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
-                    store_trajectory=False, num_steps=30):
+                    store_trajectory=False, num_steps=None):
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
     if node.current_joint_positions is None:
@@ -292,6 +292,16 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         node.get_logger().warn(f"[DIRECT] {label}: Jacobian IK failed"); return False
 
     best_delta = max(abs(g - c) for g, c in zip(best_js, start_js))
+
+    # Scale num_steps with Cartesian distance (1 step per 5mm, clamped 10-60)
+    if num_steps is None:
+        cur_pose = node.get_end_effector_pose()
+        if cur_pose:
+            dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
+            num_steps = max(10, min(60, int(dist / 0.005)))
+        else:
+            num_steps = 30
+
     node.get_logger().info(
         f"[DIRECT] {label}: max_joint_delta={best_delta*57.3:.1f}deg, {num_steps}-step interpolation"
     )
@@ -313,7 +323,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     global_scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
     type_scale = getattr(planner, f"speed_{motion_type}", getattr(planner, "speed_final", 1.0))
     scale = global_scale * type_scale
-    dt = min(max(base_dt / max(scale, 1e-6), 0.012), 0.05)
+    dt = min(max(base_dt / max(scale, 1e-6), planner.min_dt), planner.max_dt)
     vel = min(0.05 * scale, 0.15)
 
     traj = build_trajectory(node.joint_order, states, vel=vel, dt=dt,
@@ -329,8 +339,9 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
 
-    # Wait for motion to finish, then blend to avoid abrupt stop
-    wait_until_xyz(node, target_pose_list[:3], tol=0.015, timeout=8.0)
+    # Wait for motion to finish (with orientation + velocity checks), then blend
+    target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
+    wait_until_xyz(node, target_pose_list[:3], tol=0.015, timeout=8.0, target_quat=target_quat)
     blend_motion(node)
 
     if store_trajectory:
@@ -490,10 +501,8 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     scale = global_scale * type_scale
 
     # 3) UR10e-friendly dt and velocity
-    #    - dt too small => jerk
-    #    - keep dt in [12 ms, 30 ms]
     raw_dt = base_dt / max(scale, 1e-6)
-    dt = min(max(raw_dt, 0.012), 0.03)
+    dt = min(max(raw_dt, planner.min_dt), planner.max_dt)
 
     # Velocity: linear scaling with cap
     base_vel = 0.08        # slightly gentler than 0.1

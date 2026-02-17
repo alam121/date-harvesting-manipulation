@@ -117,9 +117,11 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
     return msg
 
 
-def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0):
+def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
+                   target_quat=None, quat_tol: float = 0.99):
     """
     Wait until the end-effector reaches the target XYZ (within tolerance).
+    Optionally checks orientation (quaternion dot > quat_tol) and velocity (~0).
     Stops gracefully if stop_requested or timeout occurs.
     """
     from .motions import publish_stop_trajectory
@@ -155,7 +157,20 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0):
 
             # Check distance to goal
             if math.dist(cur[:3], target_xyz) < tol:
-                node.get_logger().info("✅ End-effector reached target position.")
+                # Orientation check (if requested)
+                if target_quat and len(cur) >= 7:
+                    dot = abs(sum(a * b for a, b in zip(cur[3:7], target_quat[:4])))
+                    if dot < quat_tol:
+                        time.sleep(0.05)
+                        continue
+
+                # Velocity check — ensure robot is settling, not just passing through
+                vels = getattr(node, 'current_joint_velocities', None)
+                if vels and max(abs(v) for v in vels) > 0.01:
+                    time.sleep(0.05)
+                    continue
+
+                node.get_logger().info("End-effector reached target position.")
                 break
 
             time.sleep(0.05)
