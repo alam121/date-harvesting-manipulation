@@ -48,16 +48,47 @@ from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
-from .markers import publish_goal_marker
+from .markers import publish_goal_marker, publish_planned_path
 from .motions import interpolated_positions, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
 from .motions import blend_motion
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
+from .fk import forward_kinematics, forward_kinematics_batch
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
+
+
+def log_path_deviation(node, label: str):
+    """Compare actual EE position to the planned path stored by plan_and_send.
+    Logs: distance to planned endpoint + max deviation from nearest planned waypoint."""
+    planned = getattr(node, '_planned_cartesian_path', None)
+    if not planned:
+        return
+    actual_pose = node.get_end_effector_pose()
+    if not actual_pose:
+        return
+    ax, ay, az = actual_pose[0], actual_pose[1], actual_pose[2]
+
+    # Distance to planned final point
+    fp = planned[-1]
+    end_dist = math.sqrt((ax - fp.x)**2 + (ay - fp.y)**2 + (az - fp.z)**2)
+
+    # Distance to nearest planned waypoint
+    min_dist = float('inf')
+    min_idx = 0
+    for i, p in enumerate(planned):
+        d = math.sqrt((ax - p.x)**2 + (ay - p.y)**2 + (az - p.z)**2)
+        if d < min_dist:
+            min_dist = d
+            min_idx = i
+
+    node.get_logger().info(
+        f"[PATH_DEV] {label}: end_err={end_dist*100:.1f}cm | "
+        f"nearest_wp={min_idx}/{len(planned)} dist={min_dist*100:.1f}cm"
+    )
 
 
 def notify_grasp_attempt(node, position_xyz):
@@ -193,13 +224,132 @@ def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
     return quat_slerp(list(current_quat), best_target, blend_weight)
 
 
+def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
+    """Solve position-only IK via damped least-squares Jacobian.
+
+    For small displacements (~15cm), converges in 2-3 iterations.
+    Guaranteed to stay near current joint configuration.
+
+    Returns: goal joint positions (list) or None
+    """
+    from .fk import _get_kin_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    kin = _get_kin_model(node)
+    q = np.array(start_js, dtype=np.float64)
+    target = np.array(target_xyz, dtype=np.float64)
+    eps = 1e-4
+    damping = 1e-3
+
+    for iteration in range(max_iters):
+        q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
+        current_xyz = ee_pos[0].cpu().numpy()
+
+        error = target - current_xyz
+        if np.linalg.norm(error) < tol:
+            return q.tolist()
+
+        # Numerical Jacobian (3x6)
+        J = np.zeros((3, len(q)))
+        for j in range(len(q)):
+            q_pert = q.copy()
+            q_pert[j] += eps
+            q_pt = torch.tensor([q_pert.tolist()], dtype=torch.float32, device=device)
+            with torch.no_grad():
+                ee_pert, _, _, _, _, _, _ = kin.forward(q_pt)
+            J[:, j] = (ee_pert[0].cpu().numpy() - current_xyz) / eps
+
+        # Damped least-squares: dq = J^T (J J^T + λ²I)^-1 * error
+        JJT = J @ J.T + damping**2 * np.eye(3)
+        dq = J.T @ np.linalg.solve(JJT, error)
+        dq = np.clip(dq, -0.1, 0.1)
+        q = q + dq
+
+    # Check final error after max iterations
+    q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
+    final_err = np.linalg.norm(target - ee_pos[0].cpu().numpy())
+    if final_err < 0.01:
+        return q.tolist()
+    return None
+
+
+def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
+                    store_trajectory=False, num_steps=30):
+    """Use Jacobian IK to find goal joints, then interpolate directly.
+    Bypasses trajectory optimization — goes straight to the IK solution."""
+    if node.current_joint_positions is None:
+        node.get_logger().warn(f"[DIRECT] {label}: no joint state"); return False
+
+    start_js = list(node.current_joint_positions)
+
+    # 1) Jacobian IK — position-only, stays near current joints
+    best_js = _jacobian_ik(node, target_pose_list[:3], start_js)
+    if best_js is None:
+        node.get_logger().warn(f"[DIRECT] {label}: Jacobian IK failed"); return False
+
+    best_delta = max(abs(g - c) for g, c in zip(best_js, start_js))
+    node.get_logger().info(
+        f"[DIRECT] {label}: max_joint_delta={best_delta*57.3:.1f}deg, {num_steps}-step interpolation"
+    )
+
+    # Safety: if IK solution is too far, fall back
+    if best_delta > 1.05:  # ~60 degrees
+        node.get_logger().warn(f"[DIRECT] {label}: IK too far ({best_delta*57.3:.1f}deg)"); return False
+
+    # 3) Linearly interpolate in joint space
+    states = []
+    for i in range(num_steps + 1):
+        t = i / num_steps
+        wp = [s + t * (g - s) for s, g in zip(start_js, best_js)]
+        states.append(wp)
+
+    # 4) Build slow, smooth trajectory
+    planner = node.cfg.planner
+    base_dt = getattr(planner, "base_dt", 0.02)
+    global_scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+    type_scale = getattr(planner, f"speed_{motion_type}", getattr(planner, "speed_final", 1.0))
+    scale = global_scale * type_scale
+    dt = min(max(base_dt / max(scale, 1e-6), 0.012), 0.05)
+    vel = min(0.05 * scale, 0.15)
+
+    traj = build_trajectory(node.joint_order, states, vel=vel, dt=dt,
+                            stop_flag=lambda: node.stop_requested,
+                            max_vel=planner.max_joint_velocity * 0.5,
+                            max_acc=planner.max_joint_acceleration * 0.3,
+                            ramp_points=planner.ramp_points * 2)
+    if node.stop_requested:
+        node.stop_requested = False; return False
+
+    # 5) Visualize & send
+    cart_path = forward_kinematics_batch(node, states)
+    publish_planned_path(node, states, label, cartesian_points=cart_path)
+    node.trajectory_pub.publish(traj)
+
+    # Wait for motion to finish, then blend to avoid abrupt stop
+    wait_until_xyz(node, target_pose_list[:3], tol=0.015, timeout=8.0)
+    blend_motion(node)
+
+    if store_trajectory:
+        if not hasattr(node, 'stored_trajectory_states'):
+            node.stored_trajectory_states = []
+        node.stored_trajectory_states.extend(states)
+
+    return True
+
+
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
     # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
-    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-        node.voxel_obstacles.snapshot()
+    # Exclude points near goal so the fruit doesn't become an obstacle
+    # if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+    #     node.voxel_obstacles.snapshot(exclude_xyz=goal_xyz, exclude_radius=0.10)
 
     # 1) Plan with cuRobo
-    res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
+    plan_cfg = PLAN_CFG_DEFAULT
+    res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
     if not res.success:
         node.get_logger().warn(f"Plan failed for {label}.")
         return False
@@ -229,7 +379,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             )
 
             # Replan with updated obstacles (snapshot already taken in verify)
-            res = node.motion_gen.plan_single(start_state, goal_pose, PLAN_CFG_DEFAULT)
+            res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
             if not res.success:
                 node.get_logger().error(f"Replan failed for {label}")
                 return False
@@ -238,6 +388,87 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             # All replan attempts failed
             node.get_logger().error(f"Collision persists after {max_attempts} replans for {label}")
             return False
+
+    # 1c) Path-length sanity check using subsampled single-waypoint FK (batch=1, planner-safe)
+    def _sampled_path_len(waypoints, step=20):
+        """Compute approximate Cartesian path length by FK on every `step`-th waypoint."""
+        indices = list(range(0, len(waypoints), step))
+        if indices[-1] != len(waypoints) - 1:
+            indices.append(len(waypoints) - 1)
+        pts = []
+        for idx in indices:
+            p = forward_kinematics(node, waypoints[idx])
+            if p is None:
+                return None, None  # FK failed
+            pts.append(p)
+        total = 0.0
+        for i in range(1, len(pts)):
+            total += math.sqrt((pts[i].x - pts[i-1].x)**2 + (pts[i].y - pts[i-1].y)**2 + (pts[i].z - pts[i-1].z)**2)
+        straight = math.sqrt((pts[-1].x - pts[0].x)**2 + (pts[-1].y - pts[0].y)**2 + (pts[-1].z - pts[0].z)**2)
+        return total, straight
+
+    if goal_xyz is not None and len(states) >= 2:
+        path_len, straight = _sampled_path_len(states)
+        if path_len is not None and straight is not None:
+            ratio = path_len / max(straight, 0.001)
+            node.get_logger().info(
+                f"[PATH] {label}: path_len={path_len*100:.1f}cm, straight={straight*100:.1f}cm, ratio={ratio:.1f}x"
+            )
+            # If path is >3x the straight-line distance, try replanning up to 2 more times
+            if ratio > 3.0 and straight > 0.02:
+                best_states = states
+                best_path_len = path_len
+                for retry in range(2):
+                    res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+                    if not res2.success:
+                        continue
+                    s2 = interpolated_positions(res2)
+                    pl2, _ = _sampled_path_len(s2)
+                    if pl2 is None:
+                        continue
+                    node.get_logger().info(
+                        f"[PATH] {label} retry {retry+1}: path_len={pl2*100:.1f}cm ({pl2/max(straight,0.001):.1f}x)"
+                    )
+                    if pl2 < best_path_len:
+                        best_path_len = pl2
+                        best_states = s2
+                if best_path_len < path_len:
+                    node.get_logger().info(
+                        f"[PATH] {label}: picked shorter path {best_path_len*100:.1f}cm (was {path_len*100:.1f}cm)"
+                    )
+                states = best_states
+
+    # 1d) Batched FK + trim overshoot (single GPU call — done AFTER all replanning)
+    cart_path = forward_kinematics_batch(node, states)
+
+    if goal_xyz is not None and cart_path:
+        # Find closest-to-goal waypoint in the last 40% of trajectory
+        n = len(cart_path)
+        search_start = max(0, int(n * 0.6))
+        min_dist = float('inf')
+        trim_idx = n - 1
+        for i in range(search_start, n):
+            p = cart_path[i]
+            d = math.sqrt((p.x - goal_xyz[0])**2 + (p.y - goal_xyz[1])**2 + (p.z - goal_xyz[2])**2)
+            if d < min_dist:
+                min_dist = d
+                trim_idx = i
+        # Only trim if the closest point is actually near the goal (<5cm)
+        # and there are overshoot waypoints after it
+        original_len = len(states)
+        if min_dist < 0.05 and trim_idx < original_len - 2:
+            states = states[:trim_idx + 1]
+            cart_path = cart_path[:trim_idx + 1]
+            node.get_logger().info(
+                f"[TRIM] {label}: trimmed {original_len} → {len(states)} waypoints "
+                f"(removed {original_len - len(states)} overshoot, closest dist={min_dist*100:.1f}cm)"
+            )
+
+    node._planned_cartesian_path = cart_path
+    node._planned_label = label
+
+    # 1d) Visualize planned path in RViz (blue line) — reuse pre-computed points
+    publish_planned_path(node, states, label, cartesian_points=cart_path)
 
     # 2) Speed scaling
     #    - global scalar from node.speed_scale
@@ -773,14 +1004,25 @@ def plan_and_execute(node):
         target_quat = goal[3:]
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
-        orientation = minimize_rotation_orientation(cur_quat, target_quat)
 
-        if z > 0.90:  # High dates: retreat back first, then approach towards
+        if z > 1.90:  # High dates: retreat back first, then approach towards
             print(f"High date detected (z={z:.2f}m) - using back-then-forward approach")
+            # Align gripper with approach direction (pointing towards fruit)
+            approach_dir = [-d_blend[0], -d_blend[1], -d_blend[2]]  # Invert: gripper faces fruit
+            dir_quat = quaternion_from_approach(node, direction_xyz=approach_dir)
+            # Pick closer of dir_quat vs 180° flipped to minimize rotation from current
+            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=1.0)
+            print(f"High date orientation (dir={approach_dir}): {orientation}")
 
-            # Phase 1: Retreat position (15cm back from fruit)
-            retreat_pos = [x, y + 0.15, z, *orientation]
-            print(f"Retreat position: {retreat_pos[:3]}")
+            # Phase 1: Retreat position (15cm back from fruit along d_blend direction)
+            retreat_dist = 0.15
+            retreat_pos = [
+                x + d_blend[0] * retreat_dist,
+                y + d_blend[1] * retreat_dist,
+                z - 0.10,
+                *orientation
+            ]
+            print(f"Retreat position: {retreat_pos[:3]} (d_blend={d_blend})")
 
             if not plan_and_send(node, start, Pose.from_list(retreat_pos),
                                  label="RETREAT", motion_type="approach",
@@ -788,6 +1030,7 @@ def plan_and_execute(node):
                 unlock_target(node)
                 continue
             wait_until_xyz(node, retreat_pos[:3])
+            log_path_deviation(node, "RETREAT")
             blend_motion(node)
 
             # Update start state for approach phase
@@ -796,11 +1039,19 @@ def plan_and_execute(node):
                 joint_names=node.joint_order,
             )
 
-            # Phase 2: Approach towards fruit (3cm back, same height)
-            approach = [x, y + 0.03, z, *orientation]
+            # Phase 2: Approach towards fruit (3cm back along d_blend, same height)
+            approach_dist = 0.03
+            approach = [
+                x + d_blend[0] * approach_dist,
+                y + d_blend[1] * approach_dist,
+                z,
+                *orientation
+            ]
             print(f"Approach position (high): {approach[:3]}")
 
         else:  # Lower dates: approach from below (existing logic)
+            # Use blended orientation for downward approach
+            orientation = minimize_rotation_orientation(cur_quat, target_quat)
             approach = [ax, ay+0.01, az-0.12, *orientation]
             print(f"Going for side approach (low): {approach[:3]}")
 
@@ -808,6 +1059,7 @@ def plan_and_execute(node):
             unlock_target(node)
             continue
         wait_until_xyz(node, approach[:3])
+        log_path_deviation(node, "APPROACH")
         blend_motion(node)
         
         start = JointState.from_position(
@@ -827,13 +1079,24 @@ def plan_and_execute(node):
             unlock_target(node)
             continue
             
-        # 3. Final slow precise grasp
+        # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
+        #    _direct_ik_move handles wait + blend internally
         final_target = [x, y, z+0.02, *orientation]
-        if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
-            unlock_target(node)
-            continue
-        wait_until_xyz(node, final_target[:3])
-        blend_motion(node)
+        final_ok = _direct_ik_move(node, final_target, label="FINAL",
+                                   motion_type="final", store_trajectory=True)
+        if not final_ok:
+            # Fallback: cuRobo planner
+            start = JointState.from_position(
+                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=node.joint_order,
+            )
+            if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL",
+                                 motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
+                unlock_target(node)
+                continue
+            wait_until_xyz(node, final_target[:3])
+            blend_motion(node)
+        log_path_deviation(node, "FINAL")
 
         node.control_gripper("CLOSE"); time.sleep(0.7)
         # Notify vision system about grasp attempt for fruit tracking
@@ -858,19 +1121,12 @@ def plan_and_execute(node):
             print(f"⚠️ Weak grip - no contact on: {bad_fingers}")
             node.control_gripper("OPEN"); time.sleep(0.3)
 
-
-            # Move slightly closer
+            # Move slightly closer for re-grip (~2cm, use exec_pose directly)
             cur = node.get_end_effector_pose()
             if cur:
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
-
-                # Store current joint position so reversed trajectory includes this re-grip position
-                if node.current_joint_positions is not None:
-                    if not hasattr(node, 'stored_trajectory_states'):
-                        node.stored_trajectory_states = []
-                    node.stored_trajectory_states.append(list(node.current_joint_positions))
 
             node.control_gripper("CLOSE"); time.sleep(0.7)
             is_proper, forces, bad_fingers = check_3finger_contact()

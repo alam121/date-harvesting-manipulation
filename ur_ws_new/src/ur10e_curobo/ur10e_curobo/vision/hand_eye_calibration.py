@@ -1,0 +1,297 @@
+"""
+Hand-eye calibration: find the transform from camera to gripper (eye-in-hand).
+
+Usage:
+  1. Place a chessboard flat and stationary in the robot's workspace.
+  2. Run this script.
+  3. Move the robot to ~15-20 different poses (vary rotation and translation)
+     while keeping the chessboard fully visible in the camera.
+  4. Press 'c' to capture a sample at each pose.
+  5. Press 'q' when done collecting — the script computes the calibration.
+
+The result (4x4 camera-to-gripper transform) is saved to a YAML file.
+"""
+
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import yaml
+import pyzed.sl as sl
+import rclpy
+from rclpy.node import Node
+from tf2_ros import Buffer, TransformListener
+from scipy.spatial.transform import Rotation
+
+# ── Chessboard parameters ─────────────────────────────────────────────
+BOARD_ROWS = 17         # inner corners per row    (18 squares → 17 inner corners)
+BOARD_COLS = 24         # inner corners per column (25 squares → 24 inner corners)
+SQUARE_SIZE = 0.030     # square side length in metres (30 mm)
+
+# ── Output path ───────────────────────────────────────────────────────
+OUTPUT_DIR = Path(__file__).resolve().parent
+OUTPUT_FILE = OUTPUT_DIR / "hand_eye_calibration.yaml"
+
+# ── TF frames ─────────────────────────────────────────────────────────
+BASE_FRAME = "base_link"
+EE_FRAME = "tool0"  # UR driver end-effector frame
+
+
+def get_ee_pose(tf_buffer: Buffer, node: Node, timeout_sec: float = 2.0):
+    """Return (4x4 homogeneous matrix) of the end-effector in the base frame."""
+    try:
+        t = tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=timeout_sec))
+    except Exception as e:
+        node.get_logger().warn(f"TF lookup failed: {e}")
+        return None
+
+    trans = t.transform.translation
+    rot = t.transform.rotation
+    T = np.eye(4)
+    T[:3, 3] = [trans.x, trans.y, trans.z]
+    T[:3, :3] = Rotation.from_quat([rot.x, rot.y, rot.z, rot.w]).as_matrix()
+    return T
+
+
+def rotation_matrix_to_rvec(R):
+    """Convert 3x3 rotation matrix to Rodrigues vector."""
+    rvec, _ = cv2.Rodrigues(R)
+    return rvec.flatten()
+
+
+def main():
+    rclpy.init()
+    node = Node("hand_eye_calibration")
+    tf_buffer = Buffer()
+    TransformListener(tf_buffer, node)
+
+    # Spin in background so TF updates arrive
+    from threading import Thread
+    spin_thread = Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+
+    # Wait a moment for TF tree to populate
+    node.get_logger().info("Waiting for TF tree...")
+    time.sleep(2.0)
+
+    # ── ZED camera setup ──────────────────────────────────────────────
+    zed = sl.Camera()
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = sl.RESOLUTION.HD1080
+    init_params.coordinate_units = sl.UNIT.METER
+
+    status = zed.open(init_params)
+    if status != sl.ERROR_CODE.SUCCESS:
+        node.get_logger().error(f"ZED open failed: {status}")
+        return
+
+    cam_info = zed.get_camera_information()
+    left_cam = cam_info.camera_configuration.calibration_parameters.left_cam
+    camera_matrix = np.array([
+        [left_cam.fx, 0, left_cam.cx],
+        [0, left_cam.fy, left_cam.cy],
+        [0, 0, 1],
+    ], dtype=np.float64)
+    dist_coeffs = np.array(left_cam.disto[:5], dtype=np.float64)
+
+    image_mat = sl.Mat()
+    runtime = sl.RuntimeParameters()
+
+    # ── Chessboard object points ──────────────────────────────────────
+    objp = np.zeros((BOARD_ROWS * BOARD_COLS, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:BOARD_COLS, 0:BOARD_ROWS].T.reshape(-1, 2) * SQUARE_SIZE
+
+    # ── Storage for calibration data ──────────────────────────────────
+    R_gripper2base_list = []   # rotation:    gripper -> base
+    t_gripper2base_list = []   # translation: gripper -> base
+    R_target2cam_list = []     # rotation:    chessboard -> camera
+    t_target2cam_list = []     # translation: chessboard -> camera
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    sample_count = 0
+
+    node.get_logger().info(
+        f"Hand-eye calibration ready.\n"
+        f"  Chessboard: {BOARD_COLS}x{BOARD_ROWS}, square={SQUARE_SIZE*1000:.0f}mm\n"
+        f"  Move the robot, press 'c' to capture, 'q' to finish.\n"
+        f"  Aim for 15-20 diverse poses."
+    )
+
+    while True:
+        if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            continue
+
+        zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+        frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Try to find chessboard
+        found, corners = cv2.findChessboardCorners(
+            gray, (BOARD_COLS, BOARD_ROWS),
+            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK,
+        )
+
+        display = frame.copy()
+        if found:
+            corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            cv2.drawChessboardCorners(display, (BOARD_COLS, BOARD_ROWS), corners2, found)
+            cv2.putText(display, "Chessboard FOUND - press 'c' to capture",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        else:
+            cv2.putText(display, "No chessboard detected",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        cv2.putText(display, f"Samples: {sample_count}  |  'c'=capture  'q'=calibrate & quit",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Resize for display
+        h, w = display.shape[:2]
+        scale = min(1280 / w, 720 / h)
+        display = cv2.resize(display, (int(w * scale), int(h * scale)))
+        cv2.imshow("Hand-Eye Calibration", display)
+
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == ord('c') and found:
+            # Get end-effector pose
+            ee_pose = get_ee_pose(tf_buffer, node)
+            if ee_pose is None:
+                node.get_logger().warn("Could not get EE pose — skipping this sample.")
+                continue
+
+            # Solve chessboard pose in camera frame
+            ret, rvec, tvec = cv2.solvePnP(objp, corners2, camera_matrix, dist_coeffs)
+            if not ret:
+                node.get_logger().warn("solvePnP failed — skipping.")
+                continue
+
+            R_target2cam, _ = cv2.Rodrigues(rvec)
+
+            # Store poses
+            R_gripper2base_list.append(ee_pose[:3, :3])
+            t_gripper2base_list.append(ee_pose[:3, 3].reshape(3, 1))
+            R_target2cam_list.append(R_target2cam)
+            t_target2cam_list.append(tvec.reshape(3, 1))
+
+            sample_count += 1
+            node.get_logger().info(f"Sample {sample_count} captured.")
+
+        elif key == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+    zed.close()
+
+    # ── Run hand-eye calibration ──────────────────────────────────────
+    if sample_count < 3:
+        node.get_logger().error(f"Need at least 3 samples, got {sample_count}. Aborting.")
+        rclpy.shutdown()
+        return
+
+    node.get_logger().info(f"Running hand-eye calibration with {sample_count} samples...")
+
+    # ── Try all methods and pick the best ─────────────────────────────
+    methods = {
+        "TSAI": cv2.CALIB_HAND_EYE_TSAI,
+        "PARK": cv2.CALIB_HAND_EYE_PARK,
+        "HORAUD": cv2.CALIB_HAND_EYE_HORAUD,
+        "ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
+        "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
+    }
+
+    def compute_consistency_error(T_x):
+        """Mean AX=XB translation error for a candidate transform."""
+        errs = []
+        for i in range(sample_count):
+            for j in range(i + 1, sample_count):
+                A_i = np.linalg.inv(np.vstack([np.hstack([R_gripper2base_list[i], t_gripper2base_list[i]]), [0, 0, 0, 1]])) @ \
+                      np.vstack([np.hstack([R_gripper2base_list[j], t_gripper2base_list[j]]), [0, 0, 0, 1]])
+                B_i = np.vstack([np.hstack([R_target2cam_list[i], t_target2cam_list[i]]), [0, 0, 0, 1]]) @ \
+                      np.linalg.inv(np.vstack([np.hstack([R_target2cam_list[j], t_target2cam_list[j]]), [0, 0, 0, 1]]))
+                errs.append(np.linalg.norm((A_i @ T_x)[:3, 3] - (T_x @ B_i)[:3, 3]))
+        return np.mean(errs)
+
+    print("\n" + "=" * 60)
+    print("COMPARING ALL METHODS")
+    print("=" * 60)
+
+    best_method_name = None
+    best_error = float("inf")
+    best_T = None
+
+    for name, method in methods.items():
+        R_x, t_x = cv2.calibrateHandEye(
+            R_gripper2base_list, t_gripper2base_list,
+            R_target2cam_list, t_target2cam_list,
+            method=method,
+        )
+        T_x = np.eye(4)
+        T_x[:3, :3] = R_x
+        T_x[:3, 3] = t_x.flatten()
+        err = compute_consistency_error(T_x)
+        print(f"  {name:12s}  mean error: {err*1000:.2f} mm  |  t=[{t_x[0,0]:.4f}, {t_x[1,0]:.4f}, {t_x[2,0]:.4f}]")
+
+        if err < best_error:
+            best_error = err
+            best_method_name = name
+            best_T = T_x
+
+    print(f"\n  >>> Best method: {best_method_name} ({best_error*1000:.2f} mm)")
+
+    T_cam2gripper = best_T
+    R_cam2gripper = T_cam2gripper[:3, :3]
+    t_cam2gripper = T_cam2gripper[:3, 3].reshape(3, 1)
+
+    # Also express as quaternion for ROS usage
+    quat = Rotation.from_matrix(R_cam2gripper).as_quat()  # [x, y, z, w]
+
+    # ── Print results ─────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print(f"HAND-EYE CALIBRATION RESULT — {best_method_name} (camera -> gripper)")
+    print("=" * 60)
+    print(f"\nTranslation [m]:")
+    print(f"  x: {t_cam2gripper[0, 0]:.6f}")
+    print(f"  y: {t_cam2gripper[1, 0]:.6f}")
+    print(f"  z: {t_cam2gripper[2, 0]:.6f}")
+    print(f"\nQuaternion [x, y, z, w]:")
+    print(f"  x: {quat[0]:.6f}")
+    print(f"  y: {quat[1]:.6f}")
+    print(f"  z: {quat[2]:.6f}")
+    print(f"  w: {quat[3]:.6f}")
+    print(f"\n4x4 Transform Matrix:")
+    print(T_cam2gripper)
+
+    # ── Save to YAML ──────────────────────────────────────────────────
+    result = {
+        "hand_eye_calibration": {
+            "parent_frame": EE_FRAME,
+            "child_frame": "zed2_left_camera_frame",  # ZED X Mini
+            "translation": {
+                "x": float(t_cam2gripper[0, 0]),
+                "y": float(t_cam2gripper[1, 0]),
+                "z": float(t_cam2gripper[2, 0]),
+            },
+            "quaternion": {
+                "x": float(quat[0]),
+                "y": float(quat[1]),
+                "z": float(quat[2]),
+                "w": float(quat[3]),
+            },
+            "matrix": T_cam2gripper.tolist(),
+            "method": best_method_name,
+            "num_samples": sample_count,
+        }
+    }
+
+    OUTPUT_FILE.write_text(yaml.dump(result, default_flow_style=False))
+    node.get_logger().info(f"Calibration saved to {OUTPUT_FILE}")
+
+    print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
+    print("=" * 60)
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,35 @@ from geometry_msgs.msg import Point
 import rclpy
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
+from .fk import forward_kinematics_batch
+
+
+def publish_planned_path(node, joint_states, label="planned", cartesian_points=None):
+    """Publish planned trajectory as a line strip marker (blue).
+
+    If cartesian_points is provided, uses those directly (avoids recomputing FK).
+    """
+    points = cartesian_points if cartesian_points else forward_kinematics_batch(node, joint_states)
+
+    if not points:
+        return
+
+    m = Marker()
+    m.header.frame_id = "base_link"
+    m.header.stamp = node.get_clock().now().to_msg()
+    m.ns = "planned_path"
+    m.id = hash(label) % 10000  # Different ID per label
+    m.type = Marker.LINE_STRIP
+    m.action = Marker.ADD
+    m.scale.x = 0.008  # Thinner than actual path
+    m.color.a = 0.8
+    m.color.b = 1.0  # Blue for planned
+    m.color.r = 0.2
+    m.points = points
+    m.lifetime.sec = 0  # Persist until cleared
+    node.path_marker_pub.publish(m)
+    node.get_logger().info(f"Published planned path ({len(points)} points) for {label}")
+
 
 def publish_goal_marker(node, position, rank=None):
     

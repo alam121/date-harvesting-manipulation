@@ -6,7 +6,7 @@ from curobo.types.robot import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
+from .config import PLAN_CFG_DEFAULT, PLAN_CFG_JS, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .fk import forward_kinematics
 
@@ -38,9 +38,9 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     if node.current_joint_positions is None:
         node.get_logger().warn("No joint state; cannot execute pose."); return
 
-    # Take voxel snapshot before planning
+    # Take voxel snapshot before planning, excluding goal region
     if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-        node.voxel_obstacles.snapshot()
+        node.voxel_obstacles.snapshot(exclude_xyz=pose[:3], exclude_radius=0.10)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     start = JointState.from_position(
@@ -136,6 +136,12 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
 # Publishes /joint_trajectory_controller/joint_trajectory.
 def plan_execute_js(node, target_joints: List[float], label: str, motion_type: str = "default"):
     if node.current_joint_positions is None:
+        # Wait briefly for joint state callback to fire (can be delayed after blocking ops)
+        for _ in range(10):
+            time.sleep(0.1)
+            if node.current_joint_positions is not None:
+                break
+    if node.current_joint_positions is None:
         node.get_logger().warn(f"No joint state; skipping {label} move.")
         return
 
@@ -168,7 +174,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     # 3. cuRobo plan
     # ------------------------------
-    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_DEFAULT)
+    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
     if not res.success:
         node.get_logger().warn(f"Joint-space plan to {label} failed.")
         return
@@ -210,11 +216,12 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     node.trajectory_pub.publish(traj)
 
     # ------------------------------
-    # 8. Wait for the robot
+    # 8. Wait for the robot, then blend to avoid abrupt stop
     # ------------------------------
     fk = forward_kinematics(node, states[-1])
     if fk:
         wait_until_xyz(node, [fk.x, fk.y, fk.z])
+    blend_motion(node)
 
 
 

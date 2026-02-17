@@ -1038,8 +1038,8 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin rpy="0 0 -0.174" xyz="-0.048 -0.156 -0.005"/>
-    <!-- CHANGE -->
+    <origin rpy="-0.146387 -0.085132 -0.050741" xyz="-0.0326 -0.1167 0.0670"/>
+    <!-- hand-eye calibrated (DANIILIDIS, 1.64mm error) -->
   </joint>
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>

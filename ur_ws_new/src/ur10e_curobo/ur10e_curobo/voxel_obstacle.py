@@ -102,10 +102,16 @@ class VoxelObstacleManager:
         except Exception as e:
             self.node.get_logger().debug(f"Depth callback failed: {e}")
 
-    def snapshot(self) -> bool:
+    def snapshot(self, exclude_xyz=None, exclude_radius=0.10) -> bool:
         """
         Take a snapshot of current depth and update voxel obstacles.
         Call this BEFORE planning a trajectory.
+
+        Args:
+            exclude_xyz: [x,y,z] in base_link to exclude (e.g. the target fruit).
+                         Points within exclude_radius of this position are removed
+                         so cuRobo doesn't treat the fruit as an obstacle.
+            exclude_radius: radius around exclude_xyz to clear (meters).
 
         Returns:
             True if snapshot succeeded, False otherwise
@@ -118,7 +124,10 @@ class VoxelObstacleManager:
             stamp = self._latest_stamp
 
         self.node.get_logger().info("Taking voxel obstacle snapshot...")
-        success = self.update_from_points(points, msg_stamp=stamp)
+        success = self.update_from_points(
+            points, msg_stamp=stamp,
+            exclude_xyz=exclude_xyz, exclude_radius=exclude_radius,
+        )
         if success:
             self.node.get_logger().info(f"Voxel snapshot complete: {points.shape[0]} points")
         return success
@@ -143,13 +152,16 @@ class VoxelObstacleManager:
             self.node.get_logger().debug(f"PointCloud2 parsing failed: {e}")
             return None
 
-    def update_from_points(self, points_cam: np.ndarray, msg_stamp=None) -> bool:
+    def update_from_points(self, points_cam: np.ndarray, msg_stamp=None,
+                           exclude_xyz=None, exclude_radius=0.10) -> bool:
         """
         Update voxel grid from XYZ points in camera frame.
 
         Args:
             points_cam: (N, 3) array of XYZ points in camera frame (meters)
             msg_stamp: Optional ROS timestamp for TF lookup (use point cloud capture time)
+            exclude_xyz: [x,y,z] in base_link to exclude from voxel grid
+            exclude_radius: radius around exclude_xyz to clear
 
         Returns:
             True if update succeeded, False otherwise
@@ -182,6 +194,17 @@ class VoxelObstacleManager:
                     (points_base[:, 2] <= center[2] + half_dims[2])
                 )
                 points_base = points_base[in_bounds]
+
+                # Exclude points near the target (fruit) so cuRobo doesn't avoid it
+                if exclude_xyz is not None:
+                    exc = np.array(exclude_xyz, dtype=np.float32)
+                    dists = np.linalg.norm(points_base - exc, axis=1)
+                    keep = dists > exclude_radius
+                    removed = np.count_nonzero(~keep)
+                    points_base = points_base[keep]
+                    self.node.get_logger().info(
+                        f"Excluded {removed} voxel points within {exclude_radius}m of goal"
+                    )
 
                 if points_base.shape[0] < 50:
                     return False

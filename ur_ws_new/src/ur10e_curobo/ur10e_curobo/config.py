@@ -19,10 +19,28 @@ JOINT_ORDER = [
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
 ]
 
+# ---------- Static Obstacles (single source of truth) ----------
+# Define obstacles once here, used for both cuRobo planning and RViz visualization
+STATIC_OBSTACLES = [
+    {
+        "name": "table",
+        "dims": [5.0, 5.0, 0.2],
+        "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
+        "color": (1.0, 0.0, 0.0, 1.0),  # Red
+    },
+    {
+        "name": "pole",
+        "dims": [0.02, 0.02, 1.0],
+        "pose": [0.16, -0.90, 0.5, 1, 0, 0, 0],
+        "color": (0.0, 1.0, 0.0, 1.0),  # Green
+    },
+]
+
+# Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES
 WORLD_CONFIG = {
     "cuboid": {
-        "table": {"dims": [5.0, 5.0, 0.2], "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0]},
-        "pole":  {"dims": [0.02, 0.02, 1.0], "pose": [0.25, -1.0, 0.5, 1, 0, 0, 0]},
+        obs["name"]: {"dims": obs["dims"], "pose": obs["pose"]}
+        for obs in STATIC_OBSTACLES
     }
 }
 
@@ -40,7 +58,21 @@ VOXEL_CONFIG = {
     "target_exclusion_radius": 0.08,   # 8cm radius around target to skip collision check
 }
 
-PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
+PLAN_CFG_DEFAULT = MotionGenPlanConfig(
+    max_attempts=20,
+    enable_finetune_trajopt=True,
+    enable_graph=True,
+    enable_graph_attempt=None,  # graph is already enabled, no fallback needed
+)
+
+# For joint-space planning (plan_single_js): no graph search needed since start/goal joints
+# are already known. Graph search resizes internal buffers which corrupts plan_single_js state.
+PLAN_CFG_JS = MotionGenPlanConfig(
+    max_attempts=20,
+    enable_finetune_trajopt=True,
+    enable_graph=False,
+    enable_graph_attempt=None,
+)
 
 # ---------- Runtime parameters (override via ROS params / env) ----------
 @dataclass
@@ -88,7 +120,7 @@ class Planner:
     speed_dropoff: float = 2.0    # for move_to_dropoff_position
     speed_predropoff: float = 0.1  # for pre-dropoff (slower)
     speed_approach: float = 0.5    # for approach motion
-    speed_final: float = 0.5       # for precise grasp
+    speed_final: float = 0.2       # for precise grasp (slow & gentle)
 
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions

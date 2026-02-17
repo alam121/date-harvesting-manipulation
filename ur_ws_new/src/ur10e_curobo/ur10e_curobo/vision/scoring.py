@@ -136,8 +136,8 @@ def compute_fruit_score(
             total += STICKY_BONUS
             components["sticky_bonus"] = STICKY_BONUS
 
-    # Clamp final score
-    total = max(0.0, min(1.0 + STICKY_BONUS, total))
+    # Don't clamp — let high-weight components (e.g. distance) dominate
+    total = max(0.0, total)
 
     return {"total_score": total, "components": components}
 

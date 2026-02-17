@@ -43,7 +43,7 @@
     <parent link="${parent}"/>
     <child  link="${prefix}delto_base_link"/>
     <!-- tweak these if your gripper origin isn’t at tool0 -->
-    <origin xyz="0 0 0.106" rpy="0 0 0"/>
+    <origin xyz="0 0 0.106" rpy="0 0 -0.40"/>
   </joint>
 
    <link name="${prefix}F1_01">

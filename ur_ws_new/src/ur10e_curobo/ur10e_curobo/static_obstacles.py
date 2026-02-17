@@ -3,6 +3,8 @@ from typing import Iterable, Sequence
 
 from visualization_msgs.msg import Marker
 
+from .config import STATIC_OBSTACLES
+
 
 @dataclass(frozen=True)
 class StaticObstacleSpec:
@@ -15,19 +17,17 @@ class StaticObstacleSpec:
     ns: str = "environment"
 
 
-DEFAULT_STATIC_OBSTACLES: Sequence[StaticObstacleSpec] = (
+# Derive from STATIC_OBSTACLES in config.py (single source of truth)
+# Note: pose format is [x, y, z, qw, qx, qy, qz], marker expects (qx, qy, qz, qw)
+DEFAULT_STATIC_OBSTACLES: Sequence[StaticObstacleSpec] = tuple(
     StaticObstacleSpec(
-        marker_id=0,
-        position=(0.0, 0.0, -0.1),
-        scale=(5.0, 5.0, 0.2),
-        color=(1.0, 0.0, 0.0, 1.0),
-    ),
-    StaticObstacleSpec(
-        marker_id=1,
-        position=(0.25, -0.80, 0.5),
-        scale=(0.02, 0.02, 1.0),
-        color=(0.0, 1.0, 0.0, 1.0),
-    ),
+        marker_id=i,
+        position=(float(obs["pose"][0]), float(obs["pose"][1]), float(obs["pose"][2])),
+        scale=(float(obs["dims"][0]), float(obs["dims"][1]), float(obs["dims"][2])),
+        color=obs["color"],
+        orientation=(float(obs["pose"][4]), float(obs["pose"][5]), float(obs["pose"][6]), float(obs["pose"][3])),
+    )
+    for i, obs in enumerate(STATIC_OBSTACLES)
 )
 
 

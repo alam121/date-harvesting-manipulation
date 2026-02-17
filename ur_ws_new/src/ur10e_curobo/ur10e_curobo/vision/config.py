@@ -4,9 +4,9 @@ import os
 
 # Model paths
 MODELS_DIR = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models"
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_updated.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
@@ -14,27 +14,27 @@ DEFAULT_IMG_SIZE = 640      # inference size in pixels
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
-    "distance": 1.90,       # HIGHEST PRIORITY: closer is always better
-    "visibility": 0.05,     # higher vis_ratio is better
-    "depth_quality": 0.02,  # lower z_std is better
-    "confidence": 0.07,     # YOLO detection confidence
-    "ellipse": 0.04,        # bonus for valid ellipse fit (orientation reliability)
-    "center_bias": 0.02,    # prefer fruits near frame center (better depth data)
+    "distance": 0.90,       # HIGHEST PRIORITY: closer to gripper is better
+    "visibility": 0.15,     # higher vis_ratio is better
+    "depth_quality": 0.05,  # lower z_std is better
+    "confidence": 0.10,     # YOLO detection confidence
+    "ellipse": 0.05,        # bonus for valid ellipse fit (orientation reliability)
+    "center_bias": 0.05,    # prefer fruits near frame center (better depth data)
 }
 
 # Distance scoring parameters
 DIST_MIN = 0.10  # best possible distance (m)
-DIST_MAX = 1.50  # worst acceptable distance (m)
+DIST_MAX = 0.60  # tighter range so small differences (e.g. 0.28 vs 0.31) matter more
 
 # Depth quality parameters
 Z_STD_IDEAL = 0.005   # ideal depth std (m)
 Z_STD_WORST = 0.05    # worst acceptable depth std (m)
 
 # Sticky bonus: how much to prefer the previous best fruit
-STICKY_BONUS = 0.15   # added to score if this was the previous best
+STICKY_BONUS = 0.02   # small bonus — distance should override easily
 
 # Hysteresis: only switch to new target if it beats current best by this margin
-SWITCH_THRESHOLD = 0.08  # new best must be 8% better to trigger switch
+SWITCH_THRESHOLD = 0.02  # low threshold — switch quickly to closer fruit
 
 # Best fruit tracking
 BEST_REUSE_THRESH = 0.05  # 5 cm positional tolerance in base_link

@@ -5,6 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /RobotModel1/Description Topic1
+        - /TF1
         - /TF1/Frames1
       Splitter Ratio: 0.5
     Tree Height: 784
@@ -275,7 +276,7 @@ Visualization Manager:
         shoulder_link:
           Value: false
         tool0:
-          Value: true
+          Value: false
         tool0_controller:
           Value: false
         tool0_to_camera_mount_link:
@@ -380,6 +381,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /env_marker
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /voxel_obstacles
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -426,25 +439,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.1218161582946777
+      Distance: 0.6031521558761597
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.7648693323135376
-        Y: -0.08057291060686111
-        Z: 1.3316758871078491
+        X: 0.07325496524572372
+        Y: -0.44176504015922546
+        Z: 0.7529465556144714
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5653982162475586
+      Pitch: 0.6447970271110535
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.6653907299041748
+      Yaw: 0.3622073531150818
     Saved: ~
 Window Geometry:
   Displays:
