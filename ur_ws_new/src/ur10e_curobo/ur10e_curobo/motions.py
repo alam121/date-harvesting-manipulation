@@ -176,7 +176,8 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
     if not res.success:
-        node.get_logger().warn(f"Joint-space plan to {label} failed.")
+        status = getattr(res, 'status', 'unknown')
+        node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
         return
 
     # ------------------------------

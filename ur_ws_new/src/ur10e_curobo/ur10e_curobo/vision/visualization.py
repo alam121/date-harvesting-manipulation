@@ -339,6 +339,18 @@ class VisionVisualizer:
             cv2.LINE_AA,
         )
 
+    def draw_viz_only(self, image: np.ndarray, viz_only: List[Dict[str, Any]]) -> None:
+        """Draw visualization-only detections (e.g. trunk) with colored bbox + label."""
+        for v in viz_only:
+            x1, y1, x2, y2 = v["bb"]
+            cls = v.get("class", "?")
+            conf = v.get("conf", 0.0)
+            # Orange bounding box for viz-only classes
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 165, 255, 255), 2)
+            label = f"{cls} {conf:.0%}"
+            cv2.putText(image, label, (x1 + 4, y1 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255, 255), 2, cv2.LINE_AA)
+
     def render_frame(
         self,
         image: np.ndarray,
@@ -346,13 +358,16 @@ class VisionVisualizer:
         rejected_targets: List[Dict[str, Any]],
         best_idx: Optional[int],
         net_fps: float,
-        loop_fps: float
+        loop_fps: float,
+        viz_only: Optional[List[Dict[str, Any]]] = None,
     ) -> np.ndarray:
         """Render a complete frame with all visualizations."""
         if SKIP_DRAW:
             return image
 
         self.draw_rejected_targets(image, rejected_targets)
+        if viz_only:
+            self.draw_viz_only(image, viz_only)
         self.draw_blocking_fruits(image, targets, best_idx)
 
         for i, t in enumerate(targets):

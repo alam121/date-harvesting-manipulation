@@ -1,17 +1,19 @@
 # ur10e_curobo/managers/motion_executor.py
 """Motion planning and execution for UR10e cuRobo node."""
 
+import copy
 import threading
 import time
 from typing import Optional, List, TYPE_CHECKING
+import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PointStamped, Twist
 from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 
-from ..config import WORLD_CONFIG
+from ..config import WORLD_CONFIG, STATIC_OBSTACLES
 from ..dynamic_obstacle import DynamicObstacleManager
 from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
@@ -72,14 +74,27 @@ class MotionExecutor:
             10
         )
 
-        # Static obstacles
-        self.static_obstacles = list(static_obstacles.DEFAULT_STATIC_OBSTACLES)
+        # Wait for trunk detection to set pole position before cuRobo init
+        world_config = self._wait_for_trunk_and_build_world()
+
+        # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
+        from ..static_obstacles import StaticObstacleSpec
+        self.static_obstacles = [
+            StaticObstacleSpec(
+                marker_id=i,
+                position=(float(obs["pose"][0]), float(obs["pose"][1]), float(obs["pose"][2])),
+                scale=(float(obs["dims"][0]), float(obs["dims"][1]), float(obs["dims"][2])),
+                color=obs["color"],
+                orientation=(float(obs["pose"][4]), float(obs["pose"][5]), float(obs["pose"][6]), float(obs["pose"][3])),
+            )
+            for i, obs in enumerate(STATIC_OBSTACLES)
+        ]
 
         # cuRobo setup
         self._node.get_logger().info("Loading cuRobo configuration...")
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             self._config.cfg.planner.urdf_config,
-            WORLD_CONFIG,
+            world_config,
             interpolation_dt=self._config.cfg.planner.interpolation_dt
         )
 
@@ -115,6 +130,60 @@ class MotionExecutor:
         self._node.create_timer(1.0, self._publish_static_obstacles)
 
         self._node.get_logger().info("MotionExecutor initialized")
+
+    def _wait_for_trunk_and_build_world(self, timeout: float = 30.0, collect_secs: float = 5.0) -> dict:
+        """Wait for trunk position from vision, collect samples, then build WORLD_CONFIG."""
+        import numpy as np
+        self._node.get_logger().info(
+            f"Waiting up to {timeout:.0f}s for trunk detection on /trunk_position..."
+        )
+        samples = []
+
+        def _cb(msg):
+            samples.append((msg.point.x, msg.point.y))
+
+        sub = self._node.create_subscription(PointStamped, "/trunk_position", _cb, 10)
+
+        # Wait for first message
+        t0 = time.time()
+        while len(samples) == 0 and (time.time() - t0) < timeout:
+            rclpy.spin_once(self._node, timeout_sec=0.5)
+
+        # Collect more samples for averaging
+        if len(samples) > 0:
+            self._node.get_logger().info(
+                f"First trunk detection received, collecting {collect_secs:.0f}s of samples..."
+            )
+            t1 = time.time()
+            while (time.time() - t1) < collect_secs:
+                rclpy.spin_once(self._node, timeout_sec=0.1)
+
+        self._node.destroy_subscription(sub)
+
+        world_config = copy.deepcopy(WORLD_CONFIG)
+
+        if len(samples) > 0:
+            arr = np.array(samples)
+            tx = float(np.median(arr[:, 0]))
+            ty = float(np.median(arr[:, 1]))
+            self._node.get_logger().info(
+                f"Trunk detected! {len(samples)} samples → pole at x={tx:.3f}, y={ty:.3f}"
+            )
+            if "pole" in world_config["cuboid"]:
+                pole = world_config["cuboid"]["pole"]
+                pole["pose"][0] = tx
+                pole["pose"][1] = ty
+            # Also update static obstacles for RViz
+            for obs in STATIC_OBSTACLES:
+                if obs["name"] == "pole":
+                    obs["pose"][0] = tx
+                    obs["pose"][1] = ty
+        else:
+            self._node.get_logger().warn(
+                "No trunk detected — using default pole position from config"
+            )
+
+        return world_config
 
     # ============ Public Methods ============
 

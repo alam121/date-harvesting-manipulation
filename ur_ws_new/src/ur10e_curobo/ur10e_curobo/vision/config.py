@@ -5,8 +5,9 @@ import os
 # Model paths
 MODELS_DIR = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models"
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
@@ -67,3 +68,15 @@ Z_MAX = 1.34
 
 # Camera frame name
 CAM_FRAME = "zed2_left_camera_frame"
+
+# Class filtering
+# When enabled, only GOAL_CLASS_NAME is used as a grasp target.
+# Other classes (e.g. trunk) are shown in visualization but never become goals.
+# Set to False for single-class models (e.g. dates-only) where all detections are goals.
+CLASS_FILTER_ENABLED = True
+GOAL_CLASS_NAME = "date-fruits"  # class picked as grasp target (must match model.names)
+VIZ_ONLY_CLASSES = ["trunk"]     # classes shown in visualization only
+
+# Trunk depth correction: camera overestimates trunk distance (Y in base_link)
+# Positive value moves pole closer to robot. Tune per setup.
+TRUNK_Y_OFFSET = 0.0  # meters — added to detected Y (tune if camera depth is off)

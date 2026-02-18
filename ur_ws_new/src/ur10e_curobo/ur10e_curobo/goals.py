@@ -55,7 +55,7 @@ from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_
 from .motions import blend_motion
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
-from .fk import forward_kinematics, forward_kinematics_batch
+from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
@@ -286,10 +286,31 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     start_js = list(node.current_joint_positions)
 
-    # 1) Jacobian IK — position-only, stays near current joints
-    best_js = _jacobian_ik(node, target_pose_list[:3], start_js)
+    # 1) cuRobo native IK (position + orientation), fallback to Jacobian IK (position-only)
+    best_js = None
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # goal_pose: position [1,3], quaternion [1,4]
+        pos = torch.tensor([target_pose_list[:3]], dtype=torch.float32, device=device)
+        quat = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=device)
+        goal_pose = Pose(position=pos, quaternion=quat)
+        # seed_config: (n_seeds, 1, dof)
+        seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
+        # retract_config: (1, dof) — pull solution towards current joints
+        retract = torch.tensor([start_js], dtype=torch.float32, device=device)
+        ik_result = node.motion_gen.ik_solver.solve_single(
+            goal_pose, seed_config=seed, retract_config=retract
+        )
+        if ik_result.success.item():
+            best_js = ik_result.js_solution.position.squeeze().cpu().tolist()
+            node.get_logger().info(f"[DIRECT] {label}: cuRobo IK solved (pos_err={ik_result.position_error.item():.4f}, rot_err={ik_result.rotation_error.item():.4f})")
+    except Exception as e:
+        node.get_logger().info(f"[DIRECT] {label}: cuRobo IK exception: {e}")
     if best_js is None:
-        node.get_logger().warn(f"[DIRECT] {label}: Jacobian IK failed"); return False
+        node.get_logger().info(f"[DIRECT] {label}: cuRobo IK failed, trying Jacobian fallback")
+        best_js = _jacobian_ik(node, target_pose_list[:3], start_js)
+    if best_js is None:
+        node.get_logger().warn(f"[DIRECT] {label}: all IK solvers failed"); return False
 
     best_delta = max(abs(g - c) for g, c in zip(best_js, start_js))
 
@@ -362,7 +383,8 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     plan_cfg = PLAN_CFG_DEFAULT
     res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
     if not res.success:
-        node.get_logger().warn(f"Plan failed for {label}.")
+        status = getattr(res, 'status', 'unknown')
+        node.get_logger().warn(f"Plan failed for {label}. status={status}")
         return False
 
     states = interpolated_positions(res)

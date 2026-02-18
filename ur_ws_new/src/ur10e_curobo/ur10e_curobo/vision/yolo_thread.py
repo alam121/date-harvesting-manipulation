@@ -30,6 +30,7 @@ class YoloThread:
         self.net_fps = 0.0
 
         self._model: Optional[YOLO] = None
+        self.class_names: dict = {}  # {class_id: class_name} from model
 
     def run(self) -> None:
         """Main thread loop - runs YOLO inference on available images."""
@@ -39,8 +40,8 @@ class YoloThread:
 
         device = torch.device("cuda")
         self._model = YOLO(self.weights)
-        #self._model.to(device).eval()
-        print("Network Initialized...")
+        self.class_names = getattr(self._model, 'names', {})
+        print(f"Network Initialized... classes: {self.class_names}")
 
         while not self.exit_signal:
             if self.run_event.is_set():
