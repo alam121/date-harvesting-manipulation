@@ -112,6 +112,11 @@ class UR10eCuroboMoveIt(Node):
         # gripper/classifier
         gripper_mod.init_gripper(self, suction=False)
 
+        # grasp learning
+        from .grasp_learner import GraspLearner
+        self.grasp_learner = GraspLearner()
+        self.pending_grasp_record = None
+
         # perception disabled - using external date_v1.9.py instead
         self.perception = None
 

@@ -1,6 +1,7 @@
 # main.py
 import signal, sys, termios, atexit
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from ur10e_curobo.node import UR10eCuroboMoveIt
 
 # restore TTY on exit (even on crashes)
@@ -26,19 +27,16 @@ signal.signal(signal.SIGTERM, _handle_signal)  # kill
 def main():
     rclpy.init()
     node = UR10eCuroboMoveIt()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        # This loop (line 27) will now work because 'exit_signal' exists
         while rclpy.ok() and not exit_signal:
-            rclpy.spin_once(node, timeout_sec=0.1)
-
-        # IMPORTANT: Add your thread cleanup logic here before the 'finally' block
-        # (This is the next step to stop Thread-1 from crashing)
-        # e.g., node.wait_for_threads() 
+            executor.spin_once(timeout_sec=0.1)
 
     finally:
-        # This block runs when the 'while' loop exits (or if an error occurs)
         node.stop_requested = True
         try:
+            executor.shutdown()
             node.destroy_node()
         except Exception:
             pass

@@ -143,7 +143,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
                 break
     if node.current_joint_positions is None:
         node.get_logger().warn(f"No joint state; skipping {label} move.")
-        return
+        return False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -178,7 +178,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
-        return
+        return False
 
     # ------------------------------
     # 4. Interpolate (older cuRobo API)
@@ -223,15 +223,16 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     if fk:
         wait_until_xyz(node, [fk.x, fk.y, fk.z])
     blend_motion(node)
+    return True
 
 
 
 def move_to_home_position(node):
-    plan_execute_js(node, node.home_joints, label="HOME", motion_type="home")
+    return plan_execute_js(node, node.home_joints, label="HOME", motion_type="home")
 
 
 def move_to_dropoff_position(node):
-    plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", motion_type="dropoff")
+    return plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", motion_type="dropoff")
  
 
 def move_to_predropoff_position(node):

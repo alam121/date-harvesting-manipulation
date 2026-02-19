@@ -32,7 +32,7 @@ setup(
             "gui = ur10e_curobo.gui:main",     # Desktop GUI control panel
             "vision = ur10e_curobo.vision:main",  # ZED/YOLO vision node
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control
-            # "perception = ur10e_curobo.perception:cli",  # optional
+            "calibrate = ur10e_curobo.grasp_calibrate:main",  # Grasp force calibration
         ],
     },
 )

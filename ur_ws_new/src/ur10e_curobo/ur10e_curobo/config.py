@@ -119,7 +119,7 @@ class Planner:
     speed_home: float = 0.5        # for move_to_home_position
     speed_dropoff: float = 2.0    # for move_to_dropoff_position
     speed_predropoff: float = 0.1  # for pre-dropoff (slower)
-    speed_approach: float = 0.5    # for approach motion
+    speed_approach: float = 1.0    # for approach motion
     speed_final: float = 0.2       # for precise grasp (slow & gentle)
 
     # === SMOOTHNESS PARAMETERS ===

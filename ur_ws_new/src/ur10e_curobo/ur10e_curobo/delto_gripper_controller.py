@@ -151,8 +151,14 @@ class DeltoGripperController:
     def step_close(self):
         force_reached = self.is_force_threshold_reached()
         if self.current_step >= self.steps or force_reached:
-            reason = "fully closed" if self.current_step >= self.steps else "contact detected"
+            stopped_early = force_reached and self.current_step < self.steps
+            reason = "contact detected" if stopped_early else "fully closed"
             deltas = [abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            self.closure_stopped_early = stopped_early
+            self.closure_step_stopped = self.current_step
+            # Snapshot forces at closure moment (before motors settle at mechanical stop)
+            self.closure_forces = list(self.force_data)
+            self.closure_deltas = list(deltas)
             self.node.get_logger().info(
                 f"🔒 Gripper closed ({reason}): {self.current_step}/{self.steps} steps, "
                 f"force delta=[{deltas[0]:.2f}, {deltas[1]:.2f}, {deltas[2]:.2f}]N"
@@ -209,8 +215,33 @@ class DeltoGripperController:
             f"threshold={self.force_threshold}N)"
         )
 
+        # Track closure result for learning
+        self.closure_stopped_early = False
+        self.closure_step_stopped = self.steps  # default: fully closed
+        self.closure_force_profile = []  # force deltas at each step
+
         while self.step_close():
+            # Record force profile at each step (before the delay)
+            deltas = [abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            self.closure_force_profile.append(deltas)
             time.sleep(self.step_delay)
+
+        # Compute early contact step: first step where any finger delta > 0.5N
+        self.closure_first_contact_step = len(self.closure_force_profile)  # default: no early contact
+        for i, deltas in enumerate(self.closure_force_profile):
+            if any(d > 0.5 for d in deltas):
+                self.closure_first_contact_step = i
+                break
+
+        # Log the profile summary
+        profile_str = " | ".join(
+            f"s{i}:[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}]"
+            for i, d in enumerate(self.closure_force_profile)
+        )
+        self.node.get_logger().info(f"🔒 Force profile: {profile_str}")
+        self.node.get_logger().info(
+            f"🔒 First contact at step {self.closure_first_contact_step}/{len(self.closure_force_profile)}"
+        )
 
     # --------------------------------------------------------
     # OPENING

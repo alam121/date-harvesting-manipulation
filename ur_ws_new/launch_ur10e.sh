@@ -17,23 +17,27 @@ RUN_TELEOP=false
 RUN_VISION=false
 RUN_GUI=false
 
+RUN_CALIBRATE=false
+
 for arg in "$@"; do
     case $arg in
-        main)   RUN_MAIN=true ;;
-        teleop) RUN_TELEOP=true ;;
-        vision) RUN_VISION=true ;;
-        gui)    RUN_GUI=true ;;
-        *)      echo "Unknown argument: $arg"; exit 1 ;;
+        main)      RUN_MAIN=true ;;
+        teleop)    RUN_TELEOP=true ;;
+        vision)    RUN_VISION=true ;;
+        gui)       RUN_GUI=true ;;
+        calibrate) RUN_CALIBRATE=true ;;
+        *)         echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
 
-if ! $RUN_MAIN && ! $RUN_TELEOP && ! $RUN_VISION && ! $RUN_GUI; then
-    echo "Usage: launch_ur10e [main] [teleop] [vision] [gui]"
+if ! $RUN_MAIN && ! $RUN_TELEOP && ! $RUN_VISION && ! $RUN_GUI && ! $RUN_CALIBRATE; then
+    echo "Usage: launch_ur10e [main] [teleop] [vision] [gui] [calibrate]"
     echo ""
     echo "Examples:"
     echo "  launch_ur10e main"
     echo "  launch_ur10e main teleop"
     echo "  launch_ur10e main vision gui"
+    echo "  launch_ur10e calibrate          # grasp force calibration only"
     exit 1
 fi
 
@@ -43,6 +47,7 @@ CMD_MAIN="sleep 5 && $SOURCE_CMD && ros2 run ur10e_curobo main"
 CMD_VISION="sleep 7 && $SOURCE_CMD && ros2 run ur10e_curobo vision"
 CMD_TELEOP="sleep 6 && $SOURCE_CMD && ros2 run ur10e_curobo teleop"
 CMD_GUI="sleep 8 && $SOURCE_CMD && ros2 run ur10e_curobo gui"
+CMD_CALIBRATE="sleep 6 && $SOURCE_CMD && ros2 run ur10e_curobo calibrate"
 
 # Count panes needed
 NUM_PANES=1
@@ -50,6 +55,7 @@ $RUN_MAIN && ((NUM_PANES++))
 $RUN_VISION && ((NUM_PANES++))
 $RUN_TELEOP && ((NUM_PANES++))
 $RUN_GUI && ((NUM_PANES++))
+$RUN_CALIBRATE && ((NUM_PANES++))
 
 echo "Launching $NUM_PANES panes..."
 
@@ -125,6 +131,12 @@ fi
 if $RUN_GUI; then
     split_v  # split right
     type_cmd "$CMD_GUI"
+fi
+
+# Pane 6: Calibrate (if requested)
+if $RUN_CALIBRATE; then
+    split_v  # split right
+    type_cmd "$CMD_CALIBRATE"
 fi
 
 echo "Done. Launched $NUM_PANES panes in single window."

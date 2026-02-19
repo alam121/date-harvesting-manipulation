@@ -56,6 +56,7 @@ from .motions import blend_motion
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
+from .grasp_learner import GraspRecord
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
@@ -389,6 +390,15 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
     states = interpolated_positions(res)
 
+    # Early return if trajectory is trivial (already at goal)
+    if len(states) <= 2:
+        node.get_logger().info(f"{label}: already at goal ({len(states)} waypoints), skipping motion")
+        if store_trajectory:
+            if not hasattr(node, 'stored_trajectory_states'):
+                node.stored_trajectory_states = []
+            node.stored_trajectory_states.extend(states)
+        return True
+
     # 1b) Verify trajectory against latest depth data before execution
     if (VOXEL_CONFIG.get("verify_before_execute", True) and
         hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None):
@@ -694,6 +704,11 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=3, radius=0.0
             if abs(z - z_median) > 0.008:
                 time.sleep(0.001)
                 continue
+
+        # Fast path: if first valid reading is very close to seed, skip stability wait
+        if last_pose is None and math.dist(pose, seed_xyz) < 0.01:
+            print(f"Reacquire fast: pose matches seed within 1cm, skipping stability wait")
+            return tuple(pose)
 
         # Stability check with tighter thresholds
         if last_pose is not None:
@@ -1112,7 +1127,8 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
-        final_target = [x, y, z+0.02, *orientation]
+        z_offset = 0.02
+        final_target = [x, y, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
@@ -1133,39 +1149,59 @@ def plan_and_execute(node):
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
-        # Verify 3-finger contact before moving
-        def check_3finger_contact():
-            forces = node.gripper_controller.force_data
-            threshold = node.gripper_controller.force_threshold
-            finger_names = ["Finger 0 (left)", "Finger 1 (center)", "Finger 2 (right)"]
-            bad_fingers = []
-            for i, f in enumerate(forces):
-                has_contact = abs(f) >= threshold or f <= -threshold
-                if not has_contact:
-                    bad_fingers.append(f"{finger_names[i]}: {f:.2f}")
-            return len(bad_fingers) == 0, forces, bad_fingers
+        # Evaluate grasp using force profile (when did contact start during closure)
+        gc = node.gripper_controller
+        first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
+        stopped_early = getattr(gc, 'closure_stopped_early', False)
+        closure_step = getattr(gc, 'closure_step_stopped', gc.steps)
+        deltas = getattr(gc, 'closure_deltas', [0.0, 0.0, 0.0])
 
-        is_proper, forces, bad_fingers = check_3finger_contact()
+        learner = getattr(node, 'grasp_learner', None)
+        if learner and learner.enabled and learner.has_enough_data():
+            prediction = learner.predict_grasp_success(first_contact, gc.steps, stopped_early)
+            action = learner.suggest_action(first_contact, gc.steps, stopped_early)
+            print(f"[LEARNER] prediction={prediction}, action={action}, "
+                  f"first_contact={first_contact}/{gc.steps}")
+        else:
+            # Fallback: early contact or stopped_early = PROCEED
+            if stopped_early or first_contact < gc.steps - 2:
+                prediction = "PROPER"
+                action = "PROCEED"
+            else:
+                prediction = "NO_CONTACT"
+                action = "REGRIP"
 
-
-        if not is_proper:
-            print(f"⚠️ Weak grip - no contact on: {bad_fingers}")
+        if action == "REGRIP":
+            print(f"Weak grip ({prediction}) - re-gripping...")
             node.control_gripper("OPEN"); time.sleep(0.3)
-
-            # Move slightly closer for re-grip (~2cm, use exec_pose directly)
             cur = node.get_end_effector_pose()
             if cur:
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
-
             node.control_gripper("CLOSE"); time.sleep(0.7)
-            is_proper, forces, bad_fingers = check_3finger_contact()
-            if is_proper:
-                print(f"Re-grip result: {forces} → PROPER ✅")
+            # Re-read after re-grip
+            first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
+            stopped_early = getattr(gc, 'closure_stopped_early', False)
+            closure_step = getattr(gc, 'closure_step_stopped', gc.steps)
+            deltas = getattr(gc, 'closure_deltas', [0.0, 0.0, 0.0])
+            if learner and learner.enabled and learner.has_enough_data():
+                prediction = learner.predict_grasp_success(first_contact, gc.steps, stopped_early)
             else:
-                print(f"Re-grip result: {forces} → STILL WEAK on: {bad_fingers}")
-            
+                prediction = "PROPER" if (stopped_early or first_contact < gc.steps - 2) else "NO_CONTACT"
+            print(f"Re-grip result: {prediction}, first_contact={first_contact}/{gc.steps}")
+
+        # Log grasp attempt for learning (success filled in by user feedback later)
+        if learner:
+            node.pending_grasp_record = GraspRecord(
+                fruit_x=x, fruit_y=y, fruit_z=z,
+                first_contact_step=first_contact,
+                stopped_early=stopped_early,
+                closure_step=closure_step,
+                total_steps=gc.steps,
+                delta_f0=deltas[0], delta_f1=deltas[1], delta_f2=deltas[2],
+            )
+
         # 4. Drop-off and return
         time.sleep(0.5)
 
@@ -1187,16 +1223,34 @@ def plan_and_execute(node):
             move_to_predropoff_position(node)
             blend_motion(node)
 
-        # Go to home first (ensures clean position before dropoff)
+        # Try dropoff directly (skip HOME if possible)
         time.sleep(0.1)
-        move_to_home_position(node)
-        time.sleep(0.1)
-
-        # Now go to dropoff
-        move_to_dropoff_position(node)
-        time.sleep(0.2)  # small delay to allow state update
+        if not move_to_dropoff_position(node):
+            # Dropoff plan failed (trunk in the way) — go HOME first to clear
+            node.get_logger().info("Direct dropoff failed, going HOME first")
+            move_to_home_position(node)
+            move_to_dropoff_position(node)
+        time.sleep(0.2)
         node.control_gripper("OPEN")
         move_to_home_position(node)
+
+        # Ask user for grasp outcome and log for learning
+        if hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
+            print("Grasp outcome? [y=success / n=fail] ", end="", flush=True)
+            try:
+                import select, sys
+                # Wait up to 10s for user input (non-blocking on the keyboard thread)
+                ready, _, _ = select.select([sys.stdin], [], [], 10.0)
+                if ready:
+                    key = sys.stdin.read(1).strip().lower()
+                    record = node.pending_grasp_record
+                    record.success = (key == 'y')
+                    node.grasp_learner.log_attempt(record)
+                else:
+                    print("\n(timeout — skipping feedback)")
+            except Exception:
+                print("\n(feedback skipped)")
+            node.pending_grasp_record = None
 
         # Release target lock and reset tracking state for next goal
         unlock_target(node)

@@ -20,6 +20,7 @@ def get_commands(fake_hardware=False):
         "vision": f'sleep 7 && {SOURCE} && ros2 run ur10e_curobo vision',
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
+        "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
     }
 
 TITLES = {
@@ -28,6 +29,7 @@ TITLES = {
     "vision": "Vision",
     "teleop": "Teleop",
     "gui": "GUI",
+    "calibrate": "Calibrate",
 }
 
 def make_command(cmd):
@@ -263,7 +265,7 @@ def update_config(nodes, fake_hardware=False):
         f.writelines(final_lines)
 
 def main():
-    valid = ["main", "vision", "teleop", "gui"]
+    valid = ["main", "vision", "teleop", "gui", "calibrate"]
     args = sys.argv[1:]
 
     # Check for fake hardware flag
@@ -273,25 +275,27 @@ def main():
     nodes = [arg for arg in args if arg in valid]
 
     if not nodes:
-        print("Usage: launch_ur10e [fake] [main] [vision] [teleop] [gui]")
+        print("Usage: launch_ur10e [fake] [main] [vision] [teleop] [gui] [calibrate]")
         print()
         print("Options:")
-        print("  fake   - Use fake/simulated hardware (no real robot)")
-        print("  main   - Main control node")
-        print("  vision - Vision node")
-        print("  teleop - Teleop node")
-        print("  gui    - GUI node")
+        print("  fake      - Use fake/simulated hardware (no real robot)")
+        print("  main      - Main control node")
+        print("  vision    - Vision node")
+        print("  teleop    - Teleop node")
+        print("  gui       - GUI node")
+        print("  calibrate - Grasp force calibration tool")
         print()
         print("Examples:")
         print("  launch_ur10e main              # Real robot + main")
         print("  launch_ur10e fake main         # Fake hardware + main")
         print("  launch_ur10e main teleop       # Real robot + main + teleop")
-        print("  launch_ur10e fake main vision  # Fake hardware + main + vision")
+        print("  launch_ur10e calibrate         # Grasp force calibration only")
+        print("  launch_ur10e calibrate teleop  # Calibrate + teleop (jog robot)")
         sys.exit(1)
 
     # Reorder to: main, vision, teleop, gui
     ordered = []
-    for n in ["main", "vision", "teleop", "gui"]:
+    for n in ["main", "vision", "teleop", "gui", "calibrate"]:
         if n in nodes:
             ordered.append(n)
 
