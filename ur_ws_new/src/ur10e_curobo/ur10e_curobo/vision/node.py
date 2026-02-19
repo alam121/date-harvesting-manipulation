@@ -22,7 +22,6 @@ import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 from .config import (
     CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
-    CLASS_FILTER_ENABLED, GOAL_CLASS_NAME, VIZ_ONLY_CLASSES,
     TRUNK_Y_OFFSET,
 )
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
@@ -228,16 +227,11 @@ class VisionNode:
                     continue
                 self.yolo_thread.dets_ready.clear()
 
-                # Ingest YOLO detections into ZED
+                # Ingest YOLO fruit detections into ZED (trunk handled separately)
                 current_dets = self.yolo_thread.get_detections()
                 if current_dets is None:
                     continue
-                # Build bbox→YOLO class ID map before ZED overwrites labels
-                yolo_class_map = {}
-                for d in current_dets:
-                    bb = d.bounding_box_2d
-                    key = (int(bb[0][0]), int(bb[0][1]), int(bb[2][0]), int(bb[2][1]))
-                    yolo_class_map[key] = getattr(d, 'label', -1)
+                trunk_boxes = self.yolo_thread.get_trunk_boxes()
 
                 zed.ingest_custom_mask_objects(current_dets)
                 zed.retrieve_custom_objects(objects, obj_runtime_param)
@@ -257,15 +251,14 @@ class VisionNode:
 
                 # Process detected objects
                 targets, rejected_targets, viz_only = self._process_objects(
-                    objects, pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
-                    yolo_class_map=yolo_class_map
+                    objects, pc_np, image_left_ocv, image_scale, display_resolution, intrinsics
                 )
 
                 # Temporal stabilization
                 targets = self.tracker.stabilize_detections(targets)
 
-                # Publish trunk position for pole obstacle (after stabilization so targets have pt_base)
-                self._publish_trunk_position(viz_only, trunk_pub)
+                # Publish trunk position for pole obstacle (uses YOLO trunk boxes directly)
+                self._publish_trunk_position(trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub)
 
                 # Select best fruit
                 best_idx = self._select_best_fruit(targets)
@@ -274,13 +267,22 @@ class VisionNode:
                 if best_idx is not None:
                     self._process_best_target(targets, best_idx, intrinsics)
 
+                # Build viz entries for trunk bboxes (display only)
+                trunk_viz = []
+                for bx1, by1, bx2, by2 in trunk_boxes:
+                    tx1 = max(0, min(int(bx1 * image_scale[0]), image_left_ocv.shape[1] - 1))
+                    ty1 = max(0, min(int(by1 * image_scale[1]), image_left_ocv.shape[0] - 1))
+                    tx2 = max(0, min(int(bx2 * image_scale[0]), image_left_ocv.shape[1]))
+                    ty2 = max(0, min(int(by2 * image_scale[1]), image_left_ocv.shape[0]))
+                    trunk_viz.append({"bb": (tx1, ty1, tx2, ty2), "class": "trunk", "conf": 1.0})
+
                 # Visualization
                 now = time()
                 if (now - last_viz) >= 0.1:
                     display_image = self.visualizer.render_frame(
                         image_left_ocv, targets, rejected_targets,
                         best_idx, self.yolo_thread.net_fps, loop_fps,
-                        viz_only=viz_only,
+                        viz_only=trunk_viz,
                     )
                     cv2.imshow("ZED | Dense-bunch 3D Position", display_image)
                     key = cv2.waitKey(1)
@@ -321,26 +323,47 @@ class VisionNode:
         except Exception:
             pass
 
-    def _publish_trunk_position(self, viz_only: List[Dict[str, Any]], trunk_pub) -> None:
-        """Publish detected trunk position in base_link for pole obstacle update."""
-        for v in viz_only:
-            if v.get("class") != "trunk" or "Xc" not in v:
-                continue
-            point_msg = PointStamped()
-            point_msg.header.frame_id = CAM_FRAME
-            point_msg.header.stamp = rclpyTime().to_msg()
-            point_msg.point.x = v["Xc"]
-            point_msg.point.y = v["Yc"]
-            point_msg.point.z = v["Zc"]
-            try:
-                pt_base = self.tf_buffer.transform(
-                    point_msg, "base_link", timeout=rclpyDuration(seconds=0.1)
-                )
-                pt_base.point.y += TRUNK_Y_OFFSET
-                trunk_pub.publish(pt_base)
-            except Exception:
-                pass
-            break
+    def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub) -> None:
+        """Publish detected trunk position in base_link for pole obstacle update.
+        Uses only the first (largest/most confident) trunk detection."""
+        if not trunk_boxes:
+            return
+        # Use first trunk box only
+        bx1, by1, bx2, by2 = trunk_boxes[0]
+        # Scale to display resolution
+        x1 = int(bx1 * image_scale[0])
+        y1 = int(by1 * image_scale[1])
+        x2 = int(bx2 * image_scale[0])
+        y2 = int(by2 * image_scale[1])
+        x1 = max(0, min(x1, image_left_ocv.shape[1] - 1))
+        x2 = max(0, min(x2, image_left_ocv.shape[1]))
+        y1 = max(0, min(y1, image_left_ocv.shape[0] - 1))
+        y2 = max(0, min(y2, image_left_ocv.shape[0]))
+        if x2 <= x1 or y2 <= y1:
+            return
+        roi_xyz = pc_np[y1:y2, x1:x2, :]
+        valid_z = np.isfinite(roi_xyz[:, :, 2]) & (roi_xyz[:, :, 2] > 0.1)
+        if np.count_nonzero(valid_z) < 10:
+            return
+        pts = roi_xyz[valid_z]
+        zs = pts[:, 2]
+        idx = np.argsort(zs)
+        k = max(10, int(0.2 * len(idx)))
+        pts_front = pts[idx[:k]]
+        point_msg = PointStamped()
+        point_msg.header.frame_id = CAM_FRAME
+        point_msg.header.stamp = rclpyTime().to_msg()
+        point_msg.point.x = float(np.mean(pts_front[:, 0]))
+        point_msg.point.y = float(np.mean(pts_front[:, 1]))
+        point_msg.point.z = float(np.mean(pts_front[:, 2]))
+        try:
+            pt_base = self.tf_buffer.transform(
+                point_msg, "base_link", timeout=rclpyDuration(seconds=0.1)
+            )
+            pt_base.point.y += TRUNK_Y_OFFSET
+            trunk_pub.publish(pt_base)
+        except Exception:
+            pass
 
     def _process_objects(
         self,
@@ -350,21 +373,16 @@ class VisionNode:
         image_scale: List[float],
         display_resolution,
         intrinsics: Dict[str, float],
-        yolo_class_map: Dict[tuple, int] = None
     ) -> tuple:
         """Process detected objects and extract 3D information.
+        All objects from ZED are fruit (trunk is filtered at YOLO level).
         Returns (targets, rejected_targets, viz_only)."""
         targets = []
         rejected_targets = []
-        viz_only = []
-        class_names = self.yolo_thread.class_names
-        if yolo_class_map is None:
-            yolo_class_map = {}
+        viz_only = []  # kept for API compat but always empty now
 
         for o in objects.object_list:
             bb = o.bounding_box_2d
-            # Raw bbox coords (before scaling) for matching with yolo_class_map
-            raw_key = (int(bb[0][0]), int(bb[0][1]), int(bb[2][0]), int(bb[2][1]))
             x1 = int(bb[0][0] * image_scale[0])
             y1 = int(bb[0][1] * image_scale[1])
             x2 = int(bb[2][0] * image_scale[0])
@@ -377,35 +395,6 @@ class VisionNode:
 
             def mark_reject(reason: str):
                 rejected_targets.append({"bb": (x1, y1, x2, y2), "reason": reason})
-
-            # Class filtering: skip non-goal classes (e.g. trunk → visualization only)
-            if CLASS_FILTER_ENABLED:
-                if not class_names:
-                    mark_reject("class_names not loaded")
-                    continue
-                label_id = yolo_class_map.get(raw_key, getattr(o, 'raw_label', getattr(o, 'label', -1)))
-                cls_name = class_names.get(label_id, "unknown")
-                if cls_name in VIZ_ONLY_CLASSES:
-                    conf = getattr(o, 'confidence', 0.0) / 100.0
-                    viz_entry = {"bb": (x1, y1, x2, y2), "class": cls_name, "conf": conf}
-                    # Take closest (front) depth points in trunk bbox
-                    if x2 > x1 and y2 > y1:
-                        roi_xyz = pc_np[y1:y2, x1:x2, :]
-                        valid_z = np.isfinite(roi_xyz[:, :, 2]) & (roi_xyz[:, :, 2] > 0.1)
-                        if np.count_nonzero(valid_z) > 10:
-                            pts = roi_xyz[valid_z]
-                            zs = pts[:, 2]
-                            idx = np.argsort(zs)
-                            k = max(10, int(0.2 * len(idx)))
-                            pts_front = pts[idx[:k]]  # closest points
-                            viz_entry["Xc"] = float(np.mean(pts_front[:, 0]))
-                            viz_entry["Yc"] = float(np.mean(pts_front[:, 1]))
-                            viz_entry["Zc"] = float(np.mean(pts_front[:, 2]))
-                    viz_only.append(viz_entry)
-                    continue
-                if cls_name != GOAL_CLASS_NAME and GOAL_CLASS_NAME in class_names.values():
-                    mark_reject(f"not goal: {cls_name}")
-                    continue
 
             # Choose mask source
             mask_mat = None

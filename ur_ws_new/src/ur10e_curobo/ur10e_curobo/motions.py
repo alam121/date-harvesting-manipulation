@@ -290,7 +290,7 @@ def move_backward(node, delta: float):
     p = JointTrajectoryPoint(); p.positions = q; p.time_from_start.sec = 1
     traj.points.append(p); node.trajectory_pub.publish(traj)
 
-def blend_motion(node, pause=0.2):
+def blend_motion(node, pause=0.1):
     # maintains smoothness, avoids jerk
     if node.current_joint_positions is None:
         time.sleep(pause)

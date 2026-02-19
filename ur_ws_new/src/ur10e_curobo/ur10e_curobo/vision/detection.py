@@ -24,21 +24,40 @@ def xywh2abcd(xywh: np.ndarray) -> np.ndarray:
     return out
 
 
-def detections_to_custom_masks(dets) -> List[sl.CustomMaskObjectData]:
-    """Convert YOLO detections to ZED CustomMaskObjectData format."""
+def detections_to_custom_masks(dets, trunk_class_ids=None):
+    """Convert YOLO detections to ZED CustomMaskObjectData format.
+
+    Returns (fruit_dets, trunk_boxes) where:
+      - fruit_dets: list of sl.CustomMaskObjectData for non-trunk classes
+      - trunk_boxes: list of (x1, y1, x2, y2) int tuples for trunk detections
+    """
     global _sl_mats
-    output = []
+    fruit_output = []
+    trunk_boxes = []
     _sl_mats = []
+    if trunk_class_ids is None:
+        trunk_class_ids = set()
     H, W = dets.orig_shape
 
     for di in range(len(dets.boxes)):
-        obj = sl.CustomMaskObjectData()
+        cls_id = int(dets.boxes.cls[di].item())
         xywh = dets.boxes.xywh[di].cpu().numpy().astype(np.float32)
         abcd = xywh2abcd(xywh)
         abcd[:, 0] = np.clip(abcd[:, 0], 0, W - 1)
         abcd[:, 1] = np.clip(abcd[:, 1], 0, H - 1)
+
+        # Trunk → just save bbox, don't create ZED object
+        if cls_id in trunk_class_ids:
+            x1 = int(abcd[0, 0])
+            y1 = int(abcd[0, 1])
+            x2 = int(abcd[2, 0])
+            y2 = int(abcd[2, 1])
+            trunk_boxes.append((x1, y1, x2, y2))
+            continue
+
+        obj = sl.CustomMaskObjectData()
         obj.bounding_box_2d = abcd
-        obj.label = int(dets.boxes.cls[di].item())
+        obj.label = cls_id
         obj.probability = float(dets.boxes.conf[di].item())
         obj.is_grounded = False
 
@@ -62,5 +81,5 @@ def detections_to_custom_masks(dets) -> List[sl.CustomMaskObjectData]:
             _sl_mats.append(sl_mat)
             obj.box_mask = sl_mat
 
-        output.append(obj)
-    return output
+        fruit_output.append(obj)
+    return fruit_output, trunk_boxes

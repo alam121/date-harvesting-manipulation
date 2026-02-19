@@ -1145,7 +1145,7 @@ def plan_and_execute(node):
             blend_motion(node)
         log_path_deviation(node, "FINAL")
 
-        node.control_gripper("CLOSE"); time.sleep(0.7)
+        node.control_gripper("CLOSE"); time.sleep(0.5)
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
@@ -1179,7 +1179,7 @@ def plan_and_execute(node):
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
-            node.control_gripper("CLOSE"); time.sleep(0.7)
+            node.control_gripper("CLOSE"); time.sleep(0.5)
             # Re-read after re-grip
             first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
             stopped_early = getattr(gc, 'closure_stopped_early', False)
@@ -1203,28 +1203,25 @@ def plan_and_execute(node):
             )
 
         # 4. Drop-off and return
-        time.sleep(0.5)
+        time.sleep(0.2)
 
         # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
         # Flow: grasp → reverse(final) → reverse(approach) → home → dropoff → home
         if execute_reversed_trajectory(node, motion_type="predropoff"):
             # Wait for reversed trajectory to complete
-            time.sleep(0.5)  # Initial delay for trajectory to start
+            time.sleep(0.2)  # Initial delay for trajectory to start
             timeout_start = time.time()
             while time.time() - timeout_start < 15.0:  # 15s max timeout
                 if not is_robot_moving(node, velocity_threshold=0.005):
                     break
                 time.sleep(0.1)
             print("Reversed trajectory completed - returned along collision-free path.")
-            blend_motion(node)
         else:
             # Fallback: go directly to predropoff if no stored trajectory
             node.get_logger().warn("No stored trajectory; using predropoff position.")
             move_to_predropoff_position(node)
-            blend_motion(node)
 
         # Try dropoff directly (skip HOME if possible)
-        time.sleep(0.1)
         if not move_to_dropoff_position(node):
             # Dropoff plan failed (trunk in the way) — go HOME first to clear
             node.get_logger().info("Direct dropoff failed, going HOME first")
@@ -1239,8 +1236,8 @@ def plan_and_execute(node):
             print("Grasp outcome? [y=success / n=fail] ", end="", flush=True)
             try:
                 import select, sys
-                # Wait up to 10s for user input (non-blocking on the keyboard thread)
-                ready, _, _ = select.select([sys.stdin], [], [], 10.0)
+                # Wait for user input (blocks ROS callbacks during this time)
+                ready, _, _ = select.select([sys.stdin], [], [], 5.0)
                 if ready:
                     key = sys.stdin.read(1).strip().lower()
                     record = node.pending_grasp_record

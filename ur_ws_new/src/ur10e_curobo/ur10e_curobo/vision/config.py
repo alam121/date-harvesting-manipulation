@@ -74,7 +74,7 @@ CAM_FRAME = "zed2_left_camera_frame"
 # Other classes (e.g. trunk) are shown in visualization but never become goals.
 # Set to False for single-class models (e.g. dates-only) where all detections are goals.
 CLASS_FILTER_ENABLED = True
-GOAL_CLASS_NAME = "date-fruits"  # class picked as grasp target (must match model.names)
+GOAL_CLASS_NAME = "datefruit"  # class picked as grasp target (must match model.names)
 VIZ_ONLY_CLASSES = ["trunk"]     # classes shown in visualization only
 
 # Trunk depth correction: camera overestimates trunk distance (Y in base_link)

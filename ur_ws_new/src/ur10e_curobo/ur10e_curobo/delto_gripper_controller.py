@@ -153,11 +153,10 @@ class DeltoGripperController:
         if self.current_step >= self.steps or force_reached:
             stopped_early = force_reached and self.current_step < self.steps
             reason = "contact detected" if stopped_early else "fully closed"
-            deltas = [abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            current_force = list(self.force_data)  # atomic snapshot
+            deltas = [abs(current_force[i] - self.baseline_force[i]) for i in range(3)]
             self.closure_stopped_early = stopped_early
             self.closure_step_stopped = self.current_step
-            # Snapshot forces at closure moment (before motors settle at mechanical stop)
-            self.closure_forces = list(self.force_data)
             self.closure_deltas = list(deltas)
             self.node.get_logger().info(
                 f"🔒 Gripper closed ({reason}): {self.current_step}/{self.steps} steps, "
@@ -218,11 +217,13 @@ class DeltoGripperController:
         # Track closure result for learning
         self.closure_stopped_early = False
         self.closure_step_stopped = self.steps  # default: fully closed
+        self.closure_first_contact_step = self.steps  # default: no early contact
         self.closure_force_profile = []  # force deltas at each step
 
         while self.step_close():
-            # Record force profile at each step (before the delay)
-            deltas = [abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            # Record force profile at each step (atomic snapshot before the delay)
+            current_force = list(self.force_data)
+            deltas = [abs(current_force[i] - self.baseline_force[i]) for i in range(3)]
             self.closure_force_profile.append(deltas)
             time.sleep(self.step_delay)
 

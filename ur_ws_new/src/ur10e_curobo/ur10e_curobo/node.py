@@ -91,6 +91,8 @@ class UR10eCuroboMoveIt(Node):
         self.goal_poses = ThreadSafeGoalList()  # Thread-safe for ROS callback + main thread access
         # Note: _motion_lock moved to MotionExecutor
 
+        self.goal_received = False
+
         # --- capture state ---
         self.goal_capture_active = False
         self.goal_capture_timer = None
@@ -110,7 +112,7 @@ class UR10eCuroboMoveIt(Node):
         self.last_frames = [] # last few frames for stability checking
 
         # gripper/classifier
-        gripper_mod.init_gripper(self, suction=False)
+        gripper_mod.init_gripper(self, suction=None)  # uses config value
 
         # grasp learning
         from .grasp_learner import GraspLearner
@@ -145,6 +147,8 @@ class UR10eCuroboMoveIt(Node):
     # _robot_running_cb, _stop_cb moved to StateManager
 
     def _force_cb(self, msg): ##Sends force readings to classifier
+        if not hasattr(self, 'classifier'):
+            return
         forces = list(msg.data)[:3]
         self.classifier.on_force(forces)
         if hasattr(self, "visualizer"):
@@ -153,7 +157,8 @@ class UR10eCuroboMoveIt(Node):
             self.visualizer.update_classifier(self.classifier.phase, tpl)
 
     def _classifier_tick(self):   ##Runs periodic classifier update
-        self.classifier.tick()
+        if hasattr(self, 'classifier'):
+            self.classifier.tick()
 
     def _ui_command_cb(self, msg: String):
         """Handle commands from the GUI."""

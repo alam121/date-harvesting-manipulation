@@ -355,6 +355,7 @@ class VoxelObstacleManager:
                 lookup_time = rclpy.time.Time()  # Latest available
 
             # Get transform at the time the point cloud was captured
+            from tf2_ros import ExtrapolationException
             try:
                 tf_stamped = self.node.tf_buffer.lookup_transform(
                     "base_link",
@@ -362,7 +363,7 @@ class VoxelObstacleManager:
                     lookup_time,
                     timeout=rclpyDuration(seconds=0.1),
                 )
-            except Exception:
+            except ExtrapolationException:
                 # Timestamp not yet in TF buffer — fall back to latest available
                 tf_stamped = self.node.tf_buffer.lookup_transform(
                     "base_link",

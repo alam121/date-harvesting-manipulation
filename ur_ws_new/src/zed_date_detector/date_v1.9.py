@@ -731,6 +731,7 @@ def torch_thread_(weights: str, img_size: int, conf_thres: float = 0.2) -> None:
     device = torch.device("cuda")
     model = YOLO(weights)
     model.to(device).eval()
+
     print("Network Initialized...")
     while not exit_signal:
         if run_event.is_set():
