@@ -118,15 +118,15 @@ class Planner:
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
     speed_home: float = 0.5        # for move_to_home_position
     speed_dropoff: float = 2.0    # for move_to_dropoff_position
-    speed_predropoff: float = 0.5  # for pre-dropoff reverse
-    speed_approach: float = 1.5    # for approach motion
+    speed_predropoff: float = 0.2  # for pre-dropoff reverse
+    speed_approach: float = 1.0    # for approach motion
     speed_final: float = 0.2       # for precise grasp (slow & gentle)
 
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions
     max_joint_velocity: float = 1.5      # rad/s max velocity per joint
-    max_joint_acceleration: float = 2.0  # rad/s^2 max acceleration
-    ramp_points: int = 8                 # number of points for accel/decel ramps
+    max_joint_acceleration: float = 1.5  # rad/s^2 max acceleration (lower = less jerk at end)
+    ramp_points: int = 15                # number of points for accel/decel ramps
 
     # === TRAJECTORY LIMITS ===
     # These control how fast trajectories can actually execute
@@ -155,12 +155,22 @@ class Gripper:
     step_delay_s: float = 0.05
 
 @dataclass
+class Grasp:
+    learning_enabled: bool = False
+    contact_delta_threshold: float = 0.5
+    late_step_margin: int = 2
+    min_samples_to_learn: int = 3
+    learning_rate: float = 0.3
+    default_contact_step_threshold: int = 7
+
+@dataclass
 class AppConfig:
     topics: Topics = field(default_factory=Topics)
     joints: JointsPreset = field(default_factory=JointsPreset)
     planner: Planner = field(default_factory=Planner)
     perception: Perception = field(default_factory=Perception)
     gripper: Gripper = field(default_factory=Gripper)
+    grasp: Grasp = field(default_factory=Grasp)
 
     @staticmethod
     def from_env(cfg: "AppConfig") -> "AppConfig":

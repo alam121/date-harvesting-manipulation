@@ -17,6 +17,18 @@ launch_ur10e fake main vision
 launch_ur10e main vision teleop gui
 ```
 
+## Command Setup (One-Time Per Machine)
+
+Use repo-managed commands from `<repo_root>/bin`:
+
+```bash
+cd <repo_root>
+./bin/install_shell.sh
+source ~/.bashrc
+```
+
+This keeps repo commands ahead of older `~/bin` wrappers if both exist.
+
 ---
 
 ## Prerequisites
@@ -24,7 +36,7 @@ launch_ur10e main vision teleop gui
 ### Build the Workspace
 
 ```bash
-cd ~/manipulatorsdatepalm/ur_ws_new
+cd <repo_root>/ur_ws_new
 colcon build --symlink-install
 source install/setup.bash
 ```
@@ -90,7 +102,7 @@ If you prefer running commands manually in separate terminals:
 
 ```bash
 # Run the network setup script (requires sudo)
-~/manipulatorsdatepalm/bin/unet.sh
+<repo_root>/bin/unet.sh
 ```
 
 Or manually:
@@ -104,7 +116,7 @@ sudo ip link set eth0 up
 ### 2. Launch UR10e + RViz
 
 ```bash
-source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+source <repo_root>/ur_ws_new/install/setup.bash
 ros2 launch ur_bringup ur_control.launch.py \
     ur_type:=ur10e \
     robot_ip:=192.168.1.190 \
@@ -115,28 +127,28 @@ ros2 launch ur_bringup ur_control.launch.py \
 ### 3. Launch Main Control Node
 
 ```bash
-source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+source <repo_root>/ur_ws_new/install/setup.bash
 ros2 run ur10e_curobo main
 ```
 
 ### 4. Launch Vision Node
 
 ```bash
-source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+source <repo_root>/ur_ws_new/install/setup.bash
 ros2 run ur10e_curobo vision
 ```
 
 ### 5. Launch Teleop Node
 
 ```bash
-source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+source <repo_root>/ur_ws_new/install/setup.bash
 ros2 run ur10e_curobo teleop
 ```
 
 ### 6. Launch GUI Node
 
 ```bash
-source ~/manipulatorsdatepalm/ur_ws_new/install/setup.bash
+source <repo_root>/ur_ws_new/install/setup.bash
 ros2 run ur10e_curobo gui
 ```
 

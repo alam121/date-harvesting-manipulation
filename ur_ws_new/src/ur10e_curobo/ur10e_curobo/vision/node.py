@@ -47,6 +47,11 @@ class VisionNode:
         self.direction_history = deque(maxlen=15)
         self.best_history = deque(maxlen=3)
 
+        # Heatmap throttling — only recompute every N frames
+        self._heatmap_frame_count = 0
+        self._heatmap_interval = 3  # recompute every 3rd frame
+        self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
+
         # Target lock
         self.target_lock_position: Optional[List[float]] = None
         self.target_lock_active = False
@@ -250,6 +255,9 @@ class VisionNode:
                     self._publish_depth_cloud(pc_np, depth_pub)
 
                 # Process detected objects
+                self._heatmap_frame_count += 1
+                if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
+                    self._cached_heatmaps.clear()  # prevent stale cache buildup
                 targets, rejected_targets, viz_only = self._process_objects(
                     objects, pc_np, image_left_ocv, image_scale, display_resolution, intrinsics
                 )
@@ -452,9 +460,22 @@ class VisionNode:
         roi_xyz = pc_np[y1:y2, x1:x2, :]
         valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
 
-        heatmap, t_best_point, t_best_dir2d, t_best_point_3d = self._compute_heatmap(
-            roi_xyz, valid, mask_clean
-        )
+        # Throttle heatmap computation — reuse cached on non-compute frames
+        target_key = (x1, y1, x2, y2)
+        if self._heatmap_frame_count % self._heatmap_interval == 0:
+            heatmap, t_best_point, t_best_dir2d, t_best_point_3d = self._compute_heatmap(
+                roi_xyz, valid, mask_clean
+            )
+            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d)
+        else:
+            cached = self._cached_heatmaps.get(target_key)
+            if cached is not None:
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d = cached
+            else:
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d = self._compute_heatmap(
+                    roi_xyz, valid, mask_clean
+                )
+                self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d)
 
         # Visibility ratio
         vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0

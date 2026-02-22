@@ -1,9 +1,11 @@
 """Vision module configuration constants."""
 
 import os
+from pathlib import Path
 
 # Model paths
-MODELS_DIR = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models"
+DEFAULT_MODELS_DIR = Path(__file__).resolve().parents[3] / "zed_date_detector" / "models"
+MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
 

@@ -52,7 +52,7 @@ from .markers import publish_goal_marker, publish_planned_path
 from .motions import interpolated_positions, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
-from .motions import blend_motion
+from .motions import blend_motion, preplan_js
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
@@ -576,6 +576,9 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
 
     # Reverse the stored states
     reversed_states = list(reversed(node.stored_trajectory_states))
+
+    # Save for pre-planning dropoff from the end position
+    node._last_reversed_states = reversed_states
 
     # Clear stored trajectory after use
     node.stored_trajectory_states = []
@@ -1206,23 +1209,50 @@ def plan_and_execute(node):
         time.sleep(0.2)
 
         # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
-        # Flow: grasp → reverse(final) → reverse(approach) → home → dropoff → home
+        # Flow: grasp → reverse(final) → reverse(approach) → dropoff → home
+        dropoff_preplan = [None]  # mutable container for thread result
+
         if execute_reversed_trajectory(node, motion_type="predropoff"):
+            # Pre-plan dropoff in background while reverse executes
+            reverse_end_joints = node._last_reversed_states[-1] if hasattr(node, '_last_reversed_states') and node._last_reversed_states else None
+            if reverse_end_joints:
+                def _preplan():
+                    try:
+                        dropoff_preplan[0] = preplan_js(
+                            node, node.dropoff_joints, reverse_end_joints,
+                            label="DROP-OFF", motion_type="dropoff"
+                        )
+                    except Exception:
+                        dropoff_preplan[0] = None
+                plan_thread = threading.Thread(target=_preplan, daemon=True)
+                plan_thread.start()
+
             # Wait for reversed trajectory to complete
-            time.sleep(0.2)  # Initial delay for trajectory to start
+            time.sleep(0.2)
             timeout_start = time.time()
-            while time.time() - timeout_start < 15.0:  # 15s max timeout
+            while time.time() - timeout_start < 15.0:
                 if not is_robot_moving(node, velocity_threshold=0.005):
                     break
                 time.sleep(0.1)
             print("Reversed trajectory completed - returned along collision-free path.")
+            blend_motion(node)
         else:
             # Fallback: go directly to predropoff if no stored trajectory
             node.get_logger().warn("No stored trajectory; using predropoff position.")
             move_to_predropoff_position(node)
+            blend_motion(node)
 
-        # Try dropoff directly (skip HOME if possible)
-        if not move_to_dropoff_position(node):
+        # Execute dropoff — use pre-planned trajectory if available
+        if dropoff_preplan[0] is not None:
+            traj, states = dropoff_preplan[0]
+            node.get_logger().info("Using pre-planned dropoff trajectory")
+            node.trajectory_pub.publish(traj)
+            from .fk import forward_kinematics
+            fk = forward_kinematics(node, states[-1])
+            if fk:
+                wait_until_xyz(node, [fk.x, fk.y, fk.z])
+            blend_motion(node)
+        elif not move_to_dropoff_position(node):
             # Dropoff plan failed (trunk in the way) — go HOME first to clear
             node.get_logger().info("Direct dropoff failed, going HOME first")
             move_to_home_position(node)
@@ -1232,7 +1262,7 @@ def plan_and_execute(node):
         move_to_home_position(node)
 
         # Ask user for grasp outcome and log for learning
-        if hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
+        if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
             print("Grasp outcome? [y=success / n=fail] ", end="", flush=True)
             try:
                 import select, sys

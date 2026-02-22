@@ -2,7 +2,7 @@
 
 import os
 
-GRASP_LEARNING_ENABLED = True
+GRASP_LEARNING_ENABLED = False
 
 # Data storage
 DATA_DIR = os.path.expanduser("~/grasp_learning_data")

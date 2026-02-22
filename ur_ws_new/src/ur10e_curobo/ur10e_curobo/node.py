@@ -116,7 +116,7 @@ class UR10eCuroboMoveIt(Node):
 
         # grasp learning
         from .grasp_learner import GraspLearner
-        self.grasp_learner = GraspLearner()
+        self.grasp_learner = GraspLearner(grasp_cfg=self.cfg.grasp)
         self.pending_grasp_record = None
 
         # perception disabled - using external date_v1.9.py instead

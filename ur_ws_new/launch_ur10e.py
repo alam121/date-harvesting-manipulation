@@ -4,11 +4,13 @@ import sys
 import subprocess
 import os
 import re
+from pathlib import Path
 
-WS = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new"
+WS = str(Path(__file__).resolve().parent)
+REPO_ROOT = str(Path(WS).parent)
 SOURCE = f"source {WS}/install/setup.bash"
 CONFIG_PATH = os.path.expanduser("~/.config/terminator/config")
-UNET_SCRIPT = "/home/datepalm2/manipulatorsdatepalm/bin/unet.sh"
+UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
 
 def get_commands(fake_hardware=False):
     hw = "true" if fake_hardware else "false"
@@ -17,7 +19,7 @@ def get_commands(fake_hardware=False):
     return {
         "ur": f'{ur_prefix}{SOURCE} && ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:={hw} launch_rviz:=true',
         "main": f'sleep 5 && {SOURCE} && ros2 run ur10e_curobo main',
-        "vision": f'sleep 7 && {SOURCE} && ros2 run ur10e_curobo vision',
+        "vision": f'sleep 2 && {SOURCE} && ros2 run ur10e_curobo vision',
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',

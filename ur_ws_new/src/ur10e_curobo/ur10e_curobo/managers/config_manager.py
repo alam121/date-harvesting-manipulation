@@ -2,6 +2,7 @@
 """Configuration management for UR10e cuRobo node."""
 
 from typing import List, TYPE_CHECKING
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
@@ -53,6 +54,7 @@ class ConfigManager:
         self._load_parameters()
         self._apply_env_overrides()
         self._expose_shortcuts()
+        self._node.add_on_set_parameters_callback(self._on_parameter_change)
         self._node.get_logger().info("ConfigManager initialized")
 
     def _declare_parameters(self) -> None:
@@ -63,6 +65,29 @@ class ConfigManager:
         self._node.declare_parameter("planner.interpolation_dt", self.cfg.planner.interpolation_dt)
         self._node.declare_parameter("planner.pre_dropoff_z_offset", self.cfg.planner.pre_dropoff_z_offset)
         self._node.declare_parameter("planner.pre_dropoff_y_offset", self.cfg.planner.pre_dropoff_y_offset)
+
+        # Planner speed & smoothness params
+        self._node.declare_parameter("planner.base_dt", self.cfg.planner.base_dt)
+        self._node.declare_parameter("planner.global_speed_multiplier", self.cfg.planner.global_speed_multiplier)
+        self._node.declare_parameter("planner.speed_home", self.cfg.planner.speed_home)
+        self._node.declare_parameter("planner.speed_dropoff", self.cfg.planner.speed_dropoff)
+        self._node.declare_parameter("planner.speed_predropoff", self.cfg.planner.speed_predropoff)
+        self._node.declare_parameter("planner.speed_approach", self.cfg.planner.speed_approach)
+        self._node.declare_parameter("planner.speed_final", self.cfg.planner.speed_final)
+        self._node.declare_parameter("planner.max_joint_velocity", self.cfg.planner.max_joint_velocity)
+        self._node.declare_parameter("planner.max_joint_acceleration", self.cfg.planner.max_joint_acceleration)
+        self._node.declare_parameter("planner.ramp_points", self.cfg.planner.ramp_points)
+        self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
+        self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
+        self._node.declare_parameter("planner.max_traj_velocity", self.cfg.planner.max_traj_velocity)
+
+        # Grasp learning params
+        self._node.declare_parameter("grasp.learning_enabled", self.cfg.grasp.learning_enabled)
+        self._node.declare_parameter("grasp.contact_delta_threshold", self.cfg.grasp.contact_delta_threshold)
+        self._node.declare_parameter("grasp.late_step_margin", self.cfg.grasp.late_step_margin)
+        self._node.declare_parameter("grasp.min_samples_to_learn", self.cfg.grasp.min_samples_to_learn)
+        self._node.declare_parameter("grasp.learning_rate", self.cfg.grasp.learning_rate)
+        self._node.declare_parameter("grasp.default_contact_step_threshold", self.cfg.grasp.default_contact_step_threshold)
 
         # Perception params
         self._node.declare_parameter("perception.enabled", self.cfg.perception.enabled)
@@ -92,6 +117,29 @@ class ConfigManager:
         self.cfg.planner.interpolation_dt = float(self._node.get_parameter("planner.interpolation_dt").value)
         self.cfg.planner.pre_dropoff_z_offset = float(self._node.get_parameter("planner.pre_dropoff_z_offset").value)
         self.cfg.planner.pre_dropoff_y_offset = float(self._node.get_parameter("planner.pre_dropoff_y_offset").value)
+
+        # Planner speed & smoothness
+        self.cfg.planner.base_dt = float(self._node.get_parameter("planner.base_dt").value)
+        self.cfg.planner.global_speed_multiplier = float(self._node.get_parameter("planner.global_speed_multiplier").value)
+        self.cfg.planner.speed_home = float(self._node.get_parameter("planner.speed_home").value)
+        self.cfg.planner.speed_dropoff = float(self._node.get_parameter("planner.speed_dropoff").value)
+        self.cfg.planner.speed_predropoff = float(self._node.get_parameter("planner.speed_predropoff").value)
+        self.cfg.planner.speed_approach = float(self._node.get_parameter("planner.speed_approach").value)
+        self.cfg.planner.speed_final = float(self._node.get_parameter("planner.speed_final").value)
+        self.cfg.planner.max_joint_velocity = float(self._node.get_parameter("planner.max_joint_velocity").value)
+        self.cfg.planner.max_joint_acceleration = float(self._node.get_parameter("planner.max_joint_acceleration").value)
+        self.cfg.planner.ramp_points = int(self._node.get_parameter("planner.ramp_points").value)
+        self.cfg.planner.min_dt = float(self._node.get_parameter("planner.min_dt").value)
+        self.cfg.planner.max_dt = float(self._node.get_parameter("planner.max_dt").value)
+        self.cfg.planner.max_traj_velocity = float(self._node.get_parameter("planner.max_traj_velocity").value)
+
+        # Grasp learning
+        self.cfg.grasp.learning_enabled = bool(self._node.get_parameter("grasp.learning_enabled").value)
+        self.cfg.grasp.contact_delta_threshold = float(self._node.get_parameter("grasp.contact_delta_threshold").value)
+        self.cfg.grasp.late_step_margin = int(self._node.get_parameter("grasp.late_step_margin").value)
+        self.cfg.grasp.min_samples_to_learn = int(self._node.get_parameter("grasp.min_samples_to_learn").value)
+        self.cfg.grasp.learning_rate = float(self._node.get_parameter("grasp.learning_rate").value)
+        self.cfg.grasp.default_contact_step_threshold = int(self._node.get_parameter("grasp.default_contact_step_threshold").value)
 
         # Perception
         self.cfg.perception.enabled = bool(self._node.get_parameter("perception.enabled").value)
@@ -131,3 +179,39 @@ class ConfigManager:
         self.joint_states_topic = self.cfg.topics.joint_states
         self.goal_marker_topic = self.cfg.topics.goal_marker
         self.path_marker_topic = self.cfg.topics.path_marker
+
+    def _on_parameter_change(self, params) -> SetParametersResult:
+        """Handle runtime parameter changes via ros2 param set."""
+        # Map ROS param names to (config_obj, attr_name, type_cast)
+        param_map = {
+            # Planner speed & smoothness
+            "planner.base_dt": (self.cfg.planner, "base_dt", float),
+            "planner.global_speed_multiplier": (self.cfg.planner, "global_speed_multiplier", float),
+            "planner.speed_home": (self.cfg.planner, "speed_home", float),
+            "planner.speed_dropoff": (self.cfg.planner, "speed_dropoff", float),
+            "planner.speed_predropoff": (self.cfg.planner, "speed_predropoff", float),
+            "planner.speed_approach": (self.cfg.planner, "speed_approach", float),
+            "planner.speed_final": (self.cfg.planner, "speed_final", float),
+            "planner.max_joint_velocity": (self.cfg.planner, "max_joint_velocity", float),
+            "planner.max_joint_acceleration": (self.cfg.planner, "max_joint_acceleration", float),
+            "planner.ramp_points": (self.cfg.planner, "ramp_points", int),
+            "planner.min_dt": (self.cfg.planner, "min_dt", float),
+            "planner.max_dt": (self.cfg.planner, "max_dt", float),
+            "planner.max_traj_velocity": (self.cfg.planner, "max_traj_velocity", float),
+            "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
+            "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
+            "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),
+            # Grasp learning
+            "grasp.learning_enabled": (self.cfg.grasp, "learning_enabled", bool),
+            "grasp.contact_delta_threshold": (self.cfg.grasp, "contact_delta_threshold", float),
+            "grasp.late_step_margin": (self.cfg.grasp, "late_step_margin", int),
+            "grasp.min_samples_to_learn": (self.cfg.grasp, "min_samples_to_learn", int),
+            "grasp.learning_rate": (self.cfg.grasp, "learning_rate", float),
+            "grasp.default_contact_step_threshold": (self.cfg.grasp, "default_contact_step_threshold", int),
+        }
+        for p in params:
+            if p.name in param_map:
+                obj, attr, cast = param_map[p.name]
+                setattr(obj, attr, cast(p.value))
+                self._node.get_logger().info(f"Parameter updated: {p.name} = {p.value}")
+        return SetParametersResult(successful=True)

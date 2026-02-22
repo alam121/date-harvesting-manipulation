@@ -8,7 +8,8 @@
 #   |Vision|Teleop| GUI  |      |
 #   +------+------+------+------+
 
-WS="/home/datepalm2/manipulatorsdatepalm/ur_ws_new"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS="$SCRIPT_DIR"
 SOURCE_CMD="source $WS/install/setup.bash"
 
 # Parse arguments

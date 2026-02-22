@@ -17,6 +17,19 @@ ROS 2 Humble control stack for UR10e robot arm for autonomous date palm harvesti
 5. **Voxel Obstacles** — depth-based collision avoidance using ZED point clouds
 6. **Grasp Learning** — learns grasp success from force profile during closure
 
+## Command Setup (One-Time Per Machine)
+
+Use repo-managed commands from `<repo>/bin` so cloning on another machine keeps the same command names.
+
+```bash
+cd <repo_root>
+./bin/install_shell.sh
+source ~/.bashrc
+```
+
+This adds `<repo_root>/bin` to `PATH` and sets `MANIPULATOR_REPO`.
+It also keeps repo commands ahead of older `~/bin` wrappers if both exist.
+
 ## Quick Start
 
 ### Launch everything (real robot)
@@ -85,7 +98,7 @@ pip install warp-lang==1.0.0
 
 ## Build
 ```bash
-cd ~/manipulatorsdatepalm/ur_ws_new
+cd <repo_root>/ur_ws_new
 colcon build --symlink-install --packages-select ur10e_curobo
 source install/setup.bash
 ```

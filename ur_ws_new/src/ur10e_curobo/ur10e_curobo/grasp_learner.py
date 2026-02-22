@@ -51,14 +51,23 @@ class GraspLearner:
     - Failure: push threshold earlier (more strict)
     """
 
-    def __init__(self):
-        self.enabled = cfg.GRASP_LEARNING_ENABLED
+    def __init__(self, grasp_cfg=None):
+        """Initialize grasp learner.
+
+        Args:
+            grasp_cfg: Optional config object (e.g. node.cfg.grasp) with fields like
+                       learning_enabled, contact_delta_threshold, etc.
+                       Falls back to grasp_learning_config module constants if None.
+        """
+        self._cfg = grasp_cfg
+        self.enabled = grasp_cfg.learning_enabled if grasp_cfg else cfg.GRASP_LEARNING_ENABLED
         self._ensure_data_dir()
 
+        default_threshold = grasp_cfg.default_contact_step_threshold if grasp_cfg else cfg.DEFAULT_CONTACT_STEP_THRESHOLD
         self._stats = {
             "count": 0,
             "successes": 0,
-            "contact_step_threshold": cfg.DEFAULT_CONTACT_STEP_THRESHOLD,
+            "contact_step_threshold": default_threshold,
         }
         self._load_model()
 
@@ -144,7 +153,7 @@ class GraspLearner:
         if record.success:
             self._stats["successes"] += 1
 
-        alpha = cfg.LEARNING_RATE
+        alpha = self._cfg.learning_rate if self._cfg else cfg.LEARNING_RATE
         current = self._stats["contact_step_threshold"]
 
         if record.success:

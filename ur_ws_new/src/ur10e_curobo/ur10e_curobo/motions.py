@@ -233,6 +233,43 @@ def move_to_home_position(node):
 
 def move_to_dropoff_position(node):
     return plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", motion_type="dropoff")
+
+
+def preplan_js(node, target_joints: List[float], start_joints: List[float],
+               label: str = "PREPLAN", motion_type: str = "default"):
+    """Plan a joint-space trajectory without executing it.
+    Returns the built JointTrajectory message, or None on failure."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    start = JointState.from_position(
+        torch.tensor([start_joints], dtype=torch.float32, device=device),
+        joint_names=node.joint_order,
+    )
+    goal_js = JointState.from_position(
+        torch.tensor([target_joints], dtype=torch.float32, device=device),
+        joint_names=node.joint_order,
+    )
+    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    if not res.success:
+        return None
+    states = interpolated_positions(res)
+    planner = node.cfg.planner
+    speed_map = {
+        "home": planner.speed_home,
+        "dropoff": planner.speed_dropoff,
+        "predropoff": planner.speed_predropoff,
+    }
+    scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
+    dt = planner.base_dt / scale
+    dt = min(max(dt, planner.min_dt), planner.max_dt)
+    vel = min(0.10 * scale, planner.max_traj_velocity)
+    traj = build_trajectory(
+        node.joint_order, states, vel=vel, dt=dt,
+        stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=planner.ramp_points,
+    )
+    return traj, states
  
 
 def move_to_predropoff_position(node):
