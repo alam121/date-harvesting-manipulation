@@ -71,17 +71,28 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
 
         velocities.append(joint_vels)
 
-    # Apply acceleration ramping at start and end
+    # Compute per-point dt with ramp scaling (slower at start and end)
     ramp_len = min(ramp_points, n_points // 2)
+    dt_list = [dt] * n_points
 
     for i in range(ramp_len):
-        # Ramp up at start (smooth S-curve scaling)
+        # S-curve: scale goes 0→1 over the ramp
+        scale = 0.5 * (1 - math.cos(math.pi * i / ramp_len))
+        scale = max(scale, 0.15)  # floor so we don't stall completely
+        # Slow dt = dt / scale (smaller scale → longer time between points)
+        dt_list[i] = dt / scale
+        # Mirror for end ramp
+        end_idx = n_points - 1 - i
+        if end_idx > i:  # avoid double-setting middle points
+            dt_list[end_idx] = dt / scale
+
+    # Apply velocity scaling to match the dt ramp
+    for i in range(ramp_len):
         scale = 0.5 * (1 - math.cos(math.pi * i / ramp_len))
         for j in range(n_joints):
             velocities[i][j] *= scale
 
     for i in range(ramp_len):
-        # Ramp down at end
         idx = n_points - 1 - i
         if idx >= 0 and idx < len(velocities):
             scale = 0.5 * (1 - math.cos(math.pi * i / ramp_len))
@@ -104,7 +115,7 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         else:
             accs = []
             for j in range(n_joints):
-                a = (velocities[i + 1][j] - velocities[i - 1][j]) / (2 * dt)
+                a = (velocities[i + 1][j] - velocities[i - 1][j]) / (2 * dt_list[i])
                 a = max(min(a, max_acc), -max_acc)
                 accs.append(a)
             pt.accelerations = accs
@@ -112,7 +123,22 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)
-        t += dt
+        t += dt_list[i]
+
+    # Append settle points at the final position so the controller can decelerate smoothly
+    if n_points > 1:
+        final_pos = list(states_list[-1])
+        zero_vel = [0.0] * n_joints
+        for s in range(1, 6):  # 5 extra hold points over ~250ms
+            settle_dt = 0.05
+            t += settle_dt
+            pt = JointTrajectoryPoint()
+            pt.positions = final_pos
+            pt.velocities = zero_vel
+            pt.accelerations = zero_vel
+            pt.time_from_start.sec = int(t)
+            pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            msg.points.append(pt)
 
     return msg
 

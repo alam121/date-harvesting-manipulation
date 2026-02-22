@@ -352,7 +352,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             stop_flag=lambda: node.stop_requested,
                             max_vel=planner.max_joint_velocity * 0.5,
                             max_acc=planner.max_joint_acceleration * 0.3,
-                            ramp_points=planner.ramp_points * 2)
+                            ramp_points=0)
     if node.stop_requested:
         node.stop_requested = False; return False
 
@@ -496,10 +496,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             if d < min_dist:
                 min_dist = d
                 trim_idx = i
-        # Only trim if the closest point is actually near the goal (<5cm)
-        # and there are overshoot waypoints after it
+        # Only trim if the closest point is actually near the goal (<5cm),
+        # there are overshoot waypoints after it, and we retain enough waypoints
         original_len = len(states)
-        if min_dist < 0.05 and trim_idx < original_len - 2:
+        min_keep = max(10, int(original_len * 0.2))  # keep at least 20% or 10 waypoints
+        if min_dist < 0.05 and trim_idx < original_len - 2 and (trim_idx + 1) >= min_keep:
             states = states[:trim_idx + 1]
             cart_path = cart_path[:trim_idx + 1]
             node.get_logger().info(
@@ -541,13 +542,16 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     vel = base_vel * scale
     vel = min(vel, 0.25)   # hard cap for safety
 
-    # 4) Build trajectory
+    # 4) Build trajectory — constant speed, no ramping
     traj = build_trajectory(
         node.joint_order,
         states,
         vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=0,
     )
 
     if node.stop_requested:
@@ -603,7 +607,7 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
                 stop_flag=lambda: node.stop_requested,
                 max_vel=0.3,   # Very low max velocity
                 max_acc=0.2,   # Very low acceleration
-                ramp_points=20,  # Many ramp points
+                ramp_points=0,
             )
             node.trajectory_pub.publish(initial_traj)
 
@@ -626,9 +630,6 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
     base_vel = 0.08
     vel = min(base_vel * scale, getattr(planner, "max_traj_velocity", 0.25))
 
-    max_acc = getattr(planner, "max_joint_acceleration", 1.0)
-    ramp_pts = getattr(planner, "ramp_points", 10)
-
     traj = build_trajectory(
         node.joint_order,
         reversed_states,
@@ -636,8 +637,8 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=getattr(planner, "max_joint_velocity", 2.0) * getattr(planner, "global_speed_multiplier", 1.0),
-        max_acc=max_acc,
-        ramp_points=ramp_pts,
+        max_acc=getattr(planner, "max_joint_acceleration", 1.0),
+        ramp_points=0,
     )
 
     if node.stop_requested:
@@ -1054,7 +1055,19 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
 
-        if z > 1.90:  # High dates: retreat back first, then approach towards
+        # Skip approach if EE is already close to the goal
+        skip_approach = False
+        if cur_pose is not None:
+            ee_dist = math.sqrt((cur_pose[0] - x)**2 + (cur_pose[1] - y)**2 + (cur_pose[2] - z)**2)
+            node.get_logger().info(f"EE-to-goal distance: {ee_dist*100:.1f}cm")
+            if ee_dist < 0.1:  # within 15cm — skip approach, go straight to final
+                node.get_logger().info("EE already close to goal — skipping approach, going direct to final.")
+                orientation = minimize_rotation_orientation(cur_quat, target_quat)
+                skip_approach = True
+
+        if skip_approach:
+            pass  # jump straight to reacquire + final below
+        elif z > 1.90:  # High dates: retreat back first, then approach towards
             print(f"High date detected (z={z:.2f}m) - using back-then-forward approach")
             # Align gripper with approach direction (pointing towards fruit)
             approach_dir = [-d_blend[0], -d_blend[1], -d_blend[2]]  # Invert: gripper faces fruit
@@ -1104,18 +1117,29 @@ def plan_and_execute(node):
             approach = [ax, ay+0.01, az-0.12, *orientation]
             print(f"Going for side approach (low): {approach[:3]}")
 
-        if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
-            unlock_target(node)
-            continue
-        wait_until_xyz(node, approach[:3])
-        log_path_deviation(node, "APPROACH")
-        blend_motion(node)
-        
-        start = JointState.from_position(
-            torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
-            joint_names=node.joint_order,
-        )
-        
+        if not skip_approach:
+            if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
+                unlock_target(node)
+                continue
+            wait_until_xyz(node, approach[:3])
+            log_path_deviation(node, "APPROACH")
+            blend_motion(node)
+
+            # Wait for joint state to be available after approach
+            for _ in range(20):
+                if node.current_joint_positions is not None:
+                    break
+                time.sleep(0.05)
+            if node.current_joint_positions is None:
+                node.get_logger().warn("No joint state after approach; skipping goal.")
+                unlock_target(node)
+                continue
+
+            start = JointState.from_position(
+                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                joint_names=node.joint_order,
+            )
+
         # 2. Reacquire
         seed = [x,y,z]
         print("Reacquiring goal pose near:", seed)
@@ -1243,8 +1267,19 @@ def plan_and_execute(node):
             blend_motion(node)
 
         # Execute dropoff — use pre-planned trajectory if available
+        # Validate that actual joints are close to the planned start
+        preplan_valid = False
         if dropoff_preplan[0] is not None:
             traj, states = dropoff_preplan[0]
+            if node.current_joint_positions is not None and reverse_end_joints is not None:
+                max_diff = max(abs(a - b) for a, b in zip(node.current_joint_positions, reverse_end_joints))
+                node.get_logger().info(f"Pre-plan joint deviation: {math.degrees(max_diff):.1f}deg")
+                if max_diff < 0.15:  # < ~8.5 degrees — safe to use pre-planned
+                    preplan_valid = True
+                else:
+                    node.get_logger().warn(f"Pre-planned trajectory start too far from actual ({math.degrees(max_diff):.1f}deg); re-planning.")
+
+        if preplan_valid:
             node.get_logger().info("Using pre-planned dropoff trajectory")
             node.trajectory_pub.publish(traj)
             from .fk import forward_kinematics

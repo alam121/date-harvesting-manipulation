@@ -107,23 +107,15 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     base_vel = 0.10
     vel = min(base_vel * scale, planner.max_traj_velocity)
 
-    # Reduce acceleration for predropoff to avoid joint sanity check failures
-    if motion_type == "predropoff":
-        max_acc = planner.max_joint_acceleration * 0.3  # 30% of normal acceleration
-        ramp_pts = planner.ramp_points * 2  # double ramp points for smoother motion
-    else:
-        max_acc = planner.max_joint_acceleration
-        ramp_pts = planner.ramp_points
-
     traj = build_trajectory(
         node.joint_order,
-        states,  # Use verified states (may have been updated by replan)
+        states,
         vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
-        max_acc=max_acc,
-        ramp_points=ramp_pts,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=0,
     )
     node.trajectory_pub.publish(traj)
 
@@ -210,7 +202,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
         max_acc=planner.max_joint_acceleration,
-        ramp_points=planner.ramp_points,
+        ramp_points=0,
     )
 
     node.get_logger().info(f"Moving to {label} (vel={vel:.2f}, dt={dt:.3f})")
@@ -267,7 +259,7 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
         max_acc=planner.max_joint_acceleration,
-        ramp_points=planner.ramp_points,
+        ramp_points=0,
     )
     return traj, states
  
@@ -342,7 +334,7 @@ def blend_motion(node, pause=0.1):
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity,
         max_acc=planner.max_joint_acceleration,
-        ramp_points=planner.ramp_points,
+        ramp_points=0,
     )
     node.trajectory_pub.publish(traj)
     time.sleep(pause)

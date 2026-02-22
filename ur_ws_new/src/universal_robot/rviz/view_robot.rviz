@@ -5,7 +5,6 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /RobotModel1/Description Topic1
-        - /TF1
         - /TF1/Frames1
       Splitter Ratio: 0.5
     Tree Height: 784
@@ -359,7 +358,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        robot_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -372,7 +371,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        environment: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -439,7 +438,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.6031521558761597
+      Distance: 0.8202869296073914
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

@@ -26,7 +26,7 @@ def _get_kin_model(node):
 
 def get_end_effector_pose(node) -> Optional[list]:
     if node.current_joint_positions is None:
-        node.get_logger().warn("Joint states not yet received.")
+        node.get_logger().debug("Joint states not yet received.")
         return None
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
