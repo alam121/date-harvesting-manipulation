@@ -7,6 +7,27 @@ from curobo.types.math import Pose
 from curobo.types.robot import JointState
 
 
+def try_cuda_recovery(node) -> bool:
+    """Attempt to recover from a CUDA fault by resetting the device state.
+    Returns True if CUDA is usable again, False if still broken."""
+    if not getattr(node, "_cuda_faulted", False):
+        return True
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        # Test with a small tensor operation
+        t = torch.tensor([1.0], device="cuda")
+        _ = t + t
+        del t
+        torch.cuda.empty_cache()
+        node._cuda_faulted = False
+        node.get_logger().info("CUDA recovery successful — GPU planning re-enabled")
+        return True
+    except Exception as e:
+        node.get_logger().warn(f"CUDA recovery failed: {e}")
+        return False
+
+
 class ThreadSafeGoalList:
     """Thread-safe wrapper for goal_poses list to prevent race conditions between ROS callbacks and main thread."""
     def __init__(self):
@@ -235,47 +256,56 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
     """
     from .fk import _get_kin_model
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    kin = _get_kin_model(node)
-    q = np.array(start_js, dtype=np.float64)
-    target = np.array(target_xyz, dtype=np.float64)
-    eps = 1e-4
-    damping = 1e-3
+    try:
+        use_cuda = torch.cuda.is_available() and not getattr(node, "_cuda_faulted", False)
+        device = torch.device("cuda" if use_cuda else "cpu")
+        kin = _get_kin_model(node)
+        q = np.array(start_js, dtype=np.float64)
+        target = np.array(target_xyz, dtype=np.float64)
+        eps = 1e-4
+        damping = 1e-3
 
-    for iteration in range(max_iters):
+        for iteration in range(max_iters):
+            q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
+            with torch.no_grad():
+                ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
+            current_xyz = ee_pos[0].cpu().numpy()
+
+            error = target - current_xyz
+            if np.linalg.norm(error) < tol:
+                return q.tolist()
+
+            # Numerical Jacobian (3x6)
+            J = np.zeros((3, len(q)))
+            for j in range(len(q)):
+                q_pert = q.copy()
+                q_pert[j] += eps
+                q_pt = torch.tensor([q_pert.tolist()], dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    ee_pert, _, _, _, _, _, _ = kin.forward(q_pt)
+                J[:, j] = (ee_pert[0].cpu().numpy() - current_xyz) / eps
+
+            # Damped least-squares: dq = J^T (J J^T + λ²I)^-1 * error
+            JJT = J @ J.T + damping**2 * np.eye(3)
+            dq = J.T @ np.linalg.solve(JJT, error)
+            dq = np.clip(dq, -0.1, 0.1)
+            q = q + dq
+
+        # Check final error after max iterations (allow 2x convergence tol as fallback)
         q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
         with torch.no_grad():
             ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
-        current_xyz = ee_pos[0].cpu().numpy()
-
-        error = target - current_xyz
-        if np.linalg.norm(error) < tol:
+        final_err = np.linalg.norm(target - ee_pos[0].cpu().numpy())
+        if final_err < tol * 2:
             return q.tolist()
-
-        # Numerical Jacobian (3x6)
-        J = np.zeros((3, len(q)))
-        for j in range(len(q)):
-            q_pert = q.copy()
-            q_pert[j] += eps
-            q_pt = torch.tensor([q_pert.tolist()], dtype=torch.float32, device=device)
-            with torch.no_grad():
-                ee_pert, _, _, _, _, _, _ = kin.forward(q_pt)
-            J[:, j] = (ee_pert[0].cpu().numpy() - current_xyz) / eps
-
-        # Damped least-squares: dq = J^T (J J^T + λ²I)^-1 * error
-        JJT = J @ J.T + damping**2 * np.eye(3)
-        dq = J.T @ np.linalg.solve(JJT, error)
-        dq = np.clip(dq, -0.1, 0.1)
-        q = q + dq
-
-    # Check final error after max iterations (allow 2x convergence tol as fallback)
-    q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
-    with torch.no_grad():
-        ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
-    final_err = np.linalg.norm(target - ee_pos[0].cpu().numpy())
-    if final_err < tol * 2:
-        return q.tolist()
-    return None
+        return None
+    except Exception as e:
+        msg = str(e)
+        if "CUDA error" in msg or "illegal memory access" in msg:
+            node._cuda_faulted = True
+            try_cuda_recovery(node)
+        node.get_logger().warn(f"[DIRECT] Jacobian IK failed: {e}")
+        return None
 
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
@@ -289,27 +319,38 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     # 1) cuRobo native IK (position + orientation), fallback to Jacobian IK (position-only)
     best_js = None
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # goal_pose: position [1,3], quaternion [1,4]
-        pos = torch.tensor([target_pose_list[:3]], dtype=torch.float32, device=device)
-        quat = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=device)
-        goal_pose = Pose(position=pos, quaternion=quat)
-        # seed_config: (n_seeds, 1, dof)
-        seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
-        # retract_config: (1, dof) — pull solution towards current joints
-        retract = torch.tensor([start_js], dtype=torch.float32, device=device)
-        ik_result = node.motion_gen.ik_solver.solve_single(
-            goal_pose, seed_config=seed, retract_config=retract
-        )
-        if ik_result.success.item():
-            best_js = ik_result.js_solution.position.squeeze().cpu().tolist()
-            node.get_logger().info(f"[DIRECT] {label}: cuRobo IK solved (pos_err={ik_result.position_error.item():.4f}, rot_err={ik_result.rotation_error.item():.4f})")
-    except Exception as e:
-        node.get_logger().info(f"[DIRECT] {label}: cuRobo IK exception: {e}")
+    if getattr(node, "_cuda_faulted", False):
+        node.get_logger().warn(f"[DIRECT] {label}: skipping cuRobo IK (CUDA previously faulted)")
+    else:
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # goal_pose: position [1,3], quaternion [1,4]
+            pos = torch.tensor([target_pose_list[:3]], dtype=torch.float32, device=device)
+            quat = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=device)
+            goal_pose = Pose(position=pos, quaternion=quat)
+            # seed_config: (n_seeds, 1, dof)
+            seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
+            # retract_config: (1, dof) — pull solution towards current joints
+            retract = torch.tensor([start_js], dtype=torch.float32, device=device)
+            ik_result = node.motion_gen.ik_solver.solve_single(
+                goal_pose, seed_config=seed, retract_config=retract
+            )
+            if ik_result.success.item():
+                best_js = ik_result.js_solution.position.squeeze().cpu().tolist()
+                node.get_logger().info(f"[DIRECT] {label}: cuRobo IK solved (pos_err={ik_result.position_error.item():.4f}, rot_err={ik_result.rotation_error.item():.4f})")
+        except Exception as e:
+            msg = str(e)
+            if "CUDA error" in msg or "illegal memory access" in msg:
+                node._cuda_faulted = True
+                try_cuda_recovery(node)
+            node.get_logger().info(f"[DIRECT] {label}: cuRobo IK exception: {e}")
     if best_js is None:
         node.get_logger().info(f"[DIRECT] {label}: cuRobo IK failed, trying Jacobian fallback")
-        best_js = _jacobian_ik(node, target_pose_list[:3], start_js)
+        try:
+            best_js = _jacobian_ik(node, target_pose_list[:3], start_js)
+        except Exception as e:
+            node.get_logger().warn(f"[DIRECT] {label}: Jacobian fallback exception: {e}")
+            best_js = None
     if best_js is None:
         node.get_logger().warn(f"[DIRECT] {label}: all IK solvers failed"); return False
 
@@ -1143,7 +1184,7 @@ def plan_and_execute(node):
         else:  # Lower dates: approach from below (existing logic)
             # Use blended orientation for downward approach
             orientation = minimize_rotation_orientation(cur_quat, target_quat)
-            approach = [ax, ay+0.01, az-0.12, *orientation]
+            approach = [ax, ay-0.01, az-0.12, *orientation]
             print(f"Going for side approach (low): {approach[:3]}")
 
         if not skip_approach:
@@ -1183,18 +1224,27 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
-        z_offset = 0.02
-        final_target = [x, y, z + z_offset, *orientation]
+        z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
+        final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
             # Fallback: cuRobo planner
-            start = JointState.from_position(
-                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
-                joint_names=node.joint_order,
-            )
-            if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL",
-                                 motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
+            try:
+                start = JointState.from_position(
+                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                    joint_names=node.joint_order,
+                )
+                if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL",
+                                     motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
+                    unlock_target(node)
+                    continue
+            except Exception as e:
+                msg = str(e)
+                if "CUDA error" in msg or "illegal memory access" in msg:
+                    node._cuda_faulted = True
+                    try_cuda_recovery(node)
+                node.get_logger().warn(f"[FINAL] Planner fallback exception: {e}")
                 unlock_target(node)
                 continue
             wait_until_xyz(node, final_target[:3])
@@ -1229,13 +1279,13 @@ def plan_and_execute(node):
 
         if action == "REGRIP":
             print(f"Weak grip ({prediction}) - re-gripping...")
-            node.control_gripper("OPEN"); time.sleep(0.3)
+            node.control_gripper("OPEN"); time.sleep(0.1)
             cur = node.get_end_effector_pose()
             if cur:
-                closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.02, *cur[3:]]
+                closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.015, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
-            node.control_gripper("CLOSE"); time.sleep(0.5)
+            node.control_gripper("CLOSE"); time.sleep(0.1)
             # Re-read after re-grip
             first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
             stopped_early = getattr(gc, 'closure_stopped_early', False)
@@ -1260,6 +1310,10 @@ def plan_and_execute(node):
 
         # 4. Drop-off and return
         time.sleep(0.2)
+
+        # Attempt CUDA recovery before dropoff/home planning
+        if getattr(node, "_cuda_faulted", False):
+            try_cuda_recovery(node)
 
         # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
         # Flow: grasp → reverse(final) → reverse(approach) → dropoff → home

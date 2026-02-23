@@ -1,0 +1,7 @@
+<library path="rviz_ur10e_panel">
+  <class name="rviz_ur10e_panel/UR10ePanel"
+         type="rviz_ur10e_panel::UR10ePanel"
+         base_class_type="rviz_common::Panel">
+    <description>UR10e robot control panel</description>
+  </class>
+</library>

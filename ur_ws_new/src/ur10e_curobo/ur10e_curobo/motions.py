@@ -132,20 +132,32 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         node.get_logger().warn(f"No joint state; skipping {label} move.")
         return False
 
+    # Attempt CUDA recovery if previously faulted
+    if getattr(node, "_cuda_faulted", False):
+        from .goals import try_cuda_recovery
+        try_cuda_recovery(node)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ------------------------------
     # 1. Build joint states
     # ------------------------------
-    start = JointState.from_position(
-        torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
-        joint_names=node.joint_order,
-    )
+    try:
+        start = JointState.from_position(
+            torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+            joint_names=node.joint_order,
+        )
 
-    goal_js = JointState.from_position(
-        torch.tensor([target_joints], dtype=torch.float32, device=device),
-        joint_names=node.joint_order,
-    )
+        goal_js = JointState.from_position(
+            torch.tensor([target_joints], dtype=torch.float32, device=device),
+            joint_names=node.joint_order,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "CUDA error" in msg or "illegal memory access" in msg:
+            node._cuda_faulted = True
+        node.get_logger().warn(f"Failed to create tensors for {label}: {e}")
+        return False
 
     # ------------------------------
     # 2. Speed scaling (applies global multiplier)
@@ -161,7 +173,14 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     # 3. cuRobo plan
     # ------------------------------
-    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    try:
+        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    except Exception as e:
+        msg = str(e)
+        if "CUDA error" in msg or "illegal memory access" in msg:
+            node._cuda_faulted = True
+        node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
+        return False
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")

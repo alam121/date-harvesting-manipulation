@@ -3,8 +3,14 @@
 import os
 from pathlib import Path
 
-# Model paths
-DEFAULT_MODELS_DIR = Path(__file__).resolve().parents[3] / "zed_date_detector" / "models"
+# Model paths — resolve from source tree (works from both src and install)
+_SRC_MODELS = Path(__file__).resolve().parents[3] / "zed_date_detector" / "models"
+if not _SRC_MODELS.exists():
+    # Fallback: resolve from workspace src directory
+    _SRC_MODELS = Path(os.getenv("COLCON_PREFIX_PATH", "")).parent / "src" / "zed_date_detector" / "models"
+if not _SRC_MODELS.exists():
+    _SRC_MODELS = Path("/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models")
+DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
