@@ -49,7 +49,7 @@ from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker, publish_planned_path
-from .motions import interpolated_positions, execute_single_pose
+from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
 from .motions import blend_motion, preplan_js
@@ -389,6 +389,31 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         return False
 
     states = interpolated_positions(res)
+    curobo_dt = get_curobo_dt(res)
+
+    # Safety: reject trajectories with joint wraparound (>300 deg on any joint), retry up to 3x
+    for _plan_attempt in range(3):
+        wraparound = False
+        if len(states) > 1:
+            for j in range(len(states[0])):
+                total_rot = sum(abs(states[i+1][j] - states[i][j]) for i in range(len(states)-1))
+                if total_rot > math.radians(300):
+                    node.get_logger().warn(
+                        f"Joint {j} wraparound: {math.degrees(total_rot):.0f}deg for {label} — replanning ({_plan_attempt+1}/3)"
+                    )
+                    wraparound = True
+                    break
+        if not wraparound:
+            break
+        res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+        if not res.success:
+            node.get_logger().warn(f"Replan failed for {label}")
+            return False
+        states = interpolated_positions(res)
+        curobo_dt = get_curobo_dt(res)
+    else:
+        node.get_logger().warn(f"All replans had joint wraparound for {label} — rejecting")
+        return False
 
     # Early return if trajectory is trivial (already at goal)
     if len(states) <= 2:
@@ -457,29 +482,33 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             node.get_logger().info(
                 f"[PATH] {label}: path_len={path_len*100:.1f}cm, straight={straight*100:.1f}cm, ratio={ratio:.1f}x"
             )
-            # If path is >3x the straight-line distance, try replanning up to 2 more times
-            if ratio > 3.0 and straight > 0.02:
-                best_states = states
-                best_path_len = path_len
-                for retry in range(2):
-                    res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
-                    if not res2.success:
-                        continue
+            # If path is roundabout (>1.8x straight line), try 1 more plan and pick shorter
+            best_states = states
+            best_path_len = path_len
+            if ratio > 1.8 and straight > 0.02:
+                res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+                if res2.success:
                     s2 = interpolated_positions(res2)
-                    pl2, _ = _sampled_path_len(s2)
-                    if pl2 is None:
-                        continue
-                    node.get_logger().info(
-                        f"[PATH] {label} retry {retry+1}: path_len={pl2*100:.1f}cm ({pl2/max(straight,0.001):.1f}x)"
-                    )
-                    if pl2 < best_path_len:
-                        best_path_len = pl2
-                        best_states = s2
+                    skip = False
+                    for j in range(len(s2[0])):
+                        tot = sum(abs(s2[i+1][j] - s2[i][j]) for i in range(len(s2)-1))
+                        if tot > math.radians(300):
+                            skip = True
+                            break
+                    if not skip:
+                        pl2, _ = _sampled_path_len(s2)
+                        if pl2 is not None:
+                            node.get_logger().info(
+                                f"[PATH] {label} replan: path_len={pl2*100:.1f}cm ({pl2/max(straight,0.001):.1f}x)"
+                            )
+                            if pl2 < best_path_len:
+                                best_path_len = pl2
+                                best_states = s2
                 if best_path_len < path_len:
                     node.get_logger().info(
                         f"[PATH] {label}: picked shorter path {best_path_len*100:.1f}cm (was {path_len*100:.1f}cm)"
                     )
-                states = best_states
+            states = best_states
 
     # 1d) Batched FK + trim overshoot (single GPU call — done AFTER all replanning)
     cart_path = forward_kinematics_batch(node, states)

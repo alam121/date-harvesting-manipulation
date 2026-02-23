@@ -20,6 +20,11 @@ def interpolated_positions(result):
     return interp.to("cpu").tolist()
 
 
+def get_curobo_dt(result) -> float:
+    """Get cuRobo's interpolation dt from a MotionGenResult."""
+    return getattr(result, 'interpolation_dt', 0.02)
+
+
 def publish_stop_trajectory(node):
     if node.current_joint_positions is None:
         return

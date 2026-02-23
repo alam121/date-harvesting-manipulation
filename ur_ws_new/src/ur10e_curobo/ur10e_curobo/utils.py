@@ -44,12 +44,15 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
     if n_points == 0:
         return msg
 
+    n_joints = len(joint_names)
     t = 0.0
     for i, q in enumerate(states_list):
         if stop_flag and stop_flag():
             break
         pt = JointTrajectoryPoint()
         pt.positions = list(q)
+        if i == 0 or i == n_points - 1:
+            pt.velocities = [0.0] * n_joints
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)
