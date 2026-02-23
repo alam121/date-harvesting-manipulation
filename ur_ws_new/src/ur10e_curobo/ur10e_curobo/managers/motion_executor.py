@@ -131,7 +131,7 @@ class MotionExecutor:
 
         self._node.get_logger().info("MotionExecutor initialized")
 
-    def _wait_for_trunk_and_build_world(self, timeout: float = 30.0, collect_secs: float = 5.0) -> dict:
+    def _wait_for_trunk_and_build_world(self, timeout: float = 15.0, collect_secs: float = 2.0) -> dict:
         """Wait for trunk position from vision, collect samples, then build WORLD_CONFIG."""
         import numpy as np
         self._node.get_logger().info(

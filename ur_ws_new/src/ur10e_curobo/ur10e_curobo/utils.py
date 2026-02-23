@@ -28,7 +28,7 @@ def read_key(timeout=0.1):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
-def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float, dt: float,
+def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float = 0.1, dt: float = 0.02,
                      stop_flag: Optional[Callable[[], bool]] = None,
                      max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8) -> JointTrajectory:
     """

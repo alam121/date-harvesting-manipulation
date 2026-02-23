@@ -58,6 +58,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         node.get_logger().warn("Plan failed for single pose."); return
 
     states = interpolated_positions(res)
+    curobo_dt = get_curobo_dt(res)
 
     # Verify trajectory against latest depth data before execution
     if (VOXEL_CONFIG.get("verify_before_execute", True) and
@@ -92,10 +93,6 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
             return
 
     planner = node.cfg.planner
-    base_dt = planner.base_dt  # usually 0.02
-    # ------------------------------
-    # 2. Speed scaling (applies global multiplier)
-    # ------------------------------
     speed_map = {
         "home": planner.speed_home,
         "dropoff": planner.speed_dropoff,
@@ -103,19 +100,12 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     }
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
 
-    dt = base_dt / scale
-    dt = min(max(dt, planner.min_dt), planner.max_dt)   # clamp using config limits
-
-    # ------------------------------
-    # 6. velocity smoothing
-    # ------------------------------
-    base_vel = 0.10
-    vel = min(base_vel * scale, planner.max_traj_velocity)
+    dt = curobo_dt / max(scale, 1e-6)
+    dt = min(max(dt, planner.min_dt), planner.max_dt)
 
     traj = build_trajectory(
         node.joint_order,
         states,
-        vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
@@ -182,35 +172,19 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     # ------------------------------
     # No args allowed
     states = interpolated_positions(res)
+    curobo_dt = get_curobo_dt(res)
 
-    # ------------------------------
-    # 5. dt smoothing (critical)
-    # ------------------------------
-    base_dt = planner.base_dt  # usually 0.02
-    dt = base_dt / scale
-    dt = min(max(dt, planner.min_dt), planner.max_dt)   # clamp using config limits
+    dt = curobo_dt / max(scale, 1e-6)
+    dt = min(max(dt, planner.min_dt), planner.max_dt)
 
-    # ------------------------------
-    # 6. velocity smoothing
-    # ------------------------------
-    base_vel = 0.10
-    vel = min(base_vel * scale, planner.max_traj_velocity)
-
-    # ------------------------------
-    # 7. Build trajectory with smoothness params
-    # ------------------------------
     traj = build_trajectory(
         node.joint_order,
         states,
-        vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
-        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
-        max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
     )
 
-    node.get_logger().info(f"Moving to {label} (vel={vel:.2f}, dt={dt:.3f})")
+    node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
     node.trajectory_pub.publish(traj)
 
     # ------------------------------
@@ -249,6 +223,7 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
     if not res.success:
         return None
     states = interpolated_positions(res)
+    curobo_dt = get_curobo_dt(res)
     planner = node.cfg.planner
     speed_map = {
         "home": planner.speed_home,
@@ -256,15 +231,11 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         "predropoff": planner.speed_predropoff,
     }
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
-    dt = planner.base_dt / scale
+    dt = curobo_dt / max(scale, 1e-6)
     dt = min(max(dt, planner.min_dt), planner.max_dt)
-    vel = min(0.10 * scale, planner.max_traj_velocity)
     traj = build_trajectory(
-        node.joint_order, states, vel=vel, dt=dt,
+        node.joint_order, states, dt=dt,
         stop_flag=lambda: node.stop_requested,
-        max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
-        max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
     )
     return traj, states
  
@@ -334,12 +305,8 @@ def blend_motion(node, pause=0.1):
     traj = build_trajectory(
         node.joint_order,
         [node.current_joint_positions],
-        vel=0.05,
-        dt=planner.base_dt,
+        dt=0.02,
         stop_flag=lambda: node.stop_requested,
-        max_vel=planner.max_joint_velocity,
-        max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
     )
     node.trajectory_pub.publish(traj)
     time.sleep(pause)
