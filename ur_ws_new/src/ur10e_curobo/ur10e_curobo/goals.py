@@ -420,10 +420,11 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
+    
     # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
     # Exclude points near goal so the fruit doesn't become an obstacle
-    # if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-    #     node.voxel_obstacles.snapshot(exclude_xyz=goal_xyz, exclude_radius=0.10)
+    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+        node.voxel_obstacles.snapshot(exclude_xyz=goal_xyz, exclude_radius=0.10)
 
     # 1) Plan with cuRobo
     plan_cfg = PLAN_CFG_DEFAULT
