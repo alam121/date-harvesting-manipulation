@@ -56,6 +56,10 @@ class ThreadSafeGoalList:
         with self._lock:
             return bool(self._goals)
 
+    def __iter__(self):
+        with self._lock:
+            return iter(list(self._goals))
+
     def any_within_distance(self, pos, threshold):
         """Check if any goal is within threshold distance of pos[:3]."""
         with self._lock:

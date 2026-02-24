@@ -11,12 +11,15 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 
 add_library(${PROJECT_NAME} SHARED
   src/ur10e_panel.cpp
+  src/log_panel.cpp
   include/rviz_ur10e_panel/ur10e_panel.hpp
+  include/rviz_ur10e_panel/log_panel.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -35,6 +38,7 @@ ament_target_dependencies(${PROJECT_NAME}
   sensor_msgs
   geometry_msgs
   pluginlib
+  rcl_interfaces
 )
 
 pluginlib_export_plugin_description_file(rviz_common plugin_description.xml)

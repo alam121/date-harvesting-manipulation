@@ -135,6 +135,10 @@ class UIManager:
             self._handle_set_speeds(cmd)
         elif cmd.startswith("set_velocity_scale "):
             self._handle_set_velocity_scale(cmd)
+        elif cmd == "subscribe":
+            goals_mod.subscribe_to_goal_pose(self._node)
+            self._node.goal_capture_active = False
+            self._node.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
         elif cmd == "debug_world":
             self._motion.debug_print_world()
         else:

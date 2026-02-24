@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QScrollArea>
 #include <QFont>
+#include <QApplication>
 
 #include <cmath>
 #include <sstream>
@@ -252,6 +253,31 @@ UR10ePanel::~UR10ePanel()
 void UR10ePanel::onInitialize()
 {
   setupRos();
+  // Install keyboard event filter on top-level RViz window
+  if (window()) {
+    window()->installEventFilter(this);
+  }
+}
+
+bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
+{
+  if (event->type() == QEvent::KeyPress) {
+    // Don't intercept keys when typing in text fields
+    auto * focus = QApplication::focusWidget();
+    if (qobject_cast<QLineEdit *>(focus)) {
+      return false;
+    }
+    auto * ke = static_cast<QKeyEvent *>(event);
+    switch (ke->key()) {
+      case Qt::Key_H: onHome(); return true;
+      case Qt::Key_D: onDropoff(); return true;
+      case Qt::Key_S: onSubscribe(); return true;
+      case Qt::Key_N: onExecute(); return true;
+      case Qt::Key_O: onGripperOpen(); return true;
+      case Qt::Key_C: onGripperClose(); return true;
+    }
+  }
+  return rviz_common::Panel::eventFilter(obj, event);
 }
 
 void UR10ePanel::setupRos()
@@ -386,6 +412,7 @@ void UR10ePanel::onGripperOpen() { publishCmd("open"); }
 void UR10ePanel::onGripperClose() { publishCmd("close"); }
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
+void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
 
 void UR10ePanel::onSendGoal()
 {

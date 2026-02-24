@@ -4,4 +4,9 @@
          base_class_type="rviz_common::Panel">
     <description>UR10e robot control panel</description>
   </class>
+  <class name="rviz_ur10e_panel/LogPanel"
+         type="rviz_ur10e_panel::LogPanel"
+         base_class_type="rviz_common::Panel">
+    <description>ROS log output panel (filtered)</description>
+  </class>
 </library>

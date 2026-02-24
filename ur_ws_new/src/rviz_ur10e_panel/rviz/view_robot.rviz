@@ -5,14 +5,13 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Global Options1
+        - /TF1
       Splitter Ratio: 0.4957627058029175
-    Tree Height: 573
+    Tree Height: 111
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
-    Expanded:
-      - /2D Goal Pose1
-      - /Publish Point1
+    Expanded: ~
     Name: Tool Properties
     Splitter Ratio: 0.5886790156364441
   - Class: rviz_common/Views
@@ -22,6 +21,9 @@ Panels:
     Splitter Ratio: 0.5
   - Class: rviz_ur10e_panel/UR10ePanel
     Name: UR10e Control
+    velocity_slider: 50
+  - Class: rviz_ur10e_panel/LogPanel
+    Name: Log Output
 Visualization Manager:
   Class: ""
   Displays:
@@ -60,7 +62,160 @@ Visualization Manager:
         Expand Joint Details: false
         Expand Link Details: false
         Expand Tree: false
+        F1_01:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F1_02:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F1_03:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F1_04:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F1_TIP:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F2_01:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F2_02:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F2_03:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F2_04:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F2_TIP:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F3_01:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F3_02:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F3_03:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F3_04:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        F3_TIP:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         Link Tree Style: Links in Alphabetic Order
+        base:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        base_link_inertia:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        delto_base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        flange:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        forearm_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        ft_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        gripper_tip:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        shoulder_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        tool0:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        tool0_to_camera_mount_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        upper_arm_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        world:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        wrist_1_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        wrist_2_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        wrist_3_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        zed2_left_camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
       Mass Properties:
         Inertia: false
         Mass: false
@@ -74,18 +229,194 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        base_link:
+        F1_01:
+          Value: false
+        F1_02:
+          Value: false
+        F1_03:
+          Value: false
+        F1_04:
+          Value: false
+        F1_TIP:
+          Value: false
+        F2_01:
+          Value: false
+        F2_02:
+          Value: false
+        F2_03:
+          Value: false
+        F2_04:
+          Value: false
+        F2_TIP:
+          Value: false
+        F3_01:
+          Value: false
+        F3_02:
+          Value: false
+        F3_03:
+          Value: false
+        F3_04:
+          Value: false
+        F3_TIP:
+          Value: false
+        UR20255201028_base:
           Value: true
+        UR20255201028_flange:
+          Value: true
+        UR20255201028_tcp:
+          Value: true
+        UR20255201028_world:
+          Value: true
+        base:
+          Value: false
+        base_link:
+          Value: false
+        base_link_inertia:
+          Value: false
+        delto_base_link:
+          Value: false
+        flange:
+          Value: false
+        forearm_link:
+          Value: false
+        ft_frame:
+          Value: false
+        gripper_tip:
+          Value: true
+        shoulder_link:
+          Value: false
         tool0:
+          Value: false
+        tool0_controller:
+          Value: false
+        tool0_to_camera_mount_link:
+          Value: false
+        upper_arm_link:
+          Value: false
+        world:
+          Value: false
+        wrist_1_link:
+          Value: false
+        wrist_2_link:
+          Value: false
+        wrist_3_link:
+          Value: false
+        zed2_left_camera_frame:
           Value: true
       Marker Scale: 0.5
       Name: TF
       Show Arrows: true
       Show Axes: true
-      Show Names: true
+      Show Names: false
       Tree:
-        {}
+        world:
+          base_link:
+            base:
+              tool0_controller:
+                {}
+            base_link_inertia:
+              shoulder_link:
+                upper_arm_link:
+                  forearm_link:
+                    wrist_1_link:
+                      wrist_2_link:
+                        wrist_3_link:
+                          flange:
+                            tool0:
+                              delto_base_link:
+                                F1_01:
+                                  F1_02:
+                                    F1_03:
+                                      F1_04:
+                                        F1_TIP:
+                                          {}
+                                F2_01:
+                                  F2_02:
+                                    F2_03:
+                                      F2_04:
+                                        F2_TIP:
+                                          {}
+                                F3_01:
+                                  F3_02:
+                                    F3_03:
+                                      F3_04:
+                                        F3_TIP:
+                                          {}
+                                gripper_tip:
+                                  {}
+                              tool0_to_camera_mount_link:
+                                {}
+                              zed2_left_camera_frame:
+                                {}
+                          ft_frame:
+                            {}
       Update Interval: 0
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Vision Camera
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /vision/display
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        voxel_obstacles: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /voxel_obstacles
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        environment: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /env_marker
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        planned_path: true
+        robot_path: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_path_marker
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        goal_positions: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_positions_marker
       Value: true
   Enabled: true
   Global Options:
@@ -108,33 +439,35 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.0
+      Distance: 2.1931228637695312
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.0
-        Y: 0.0
-        Z: 0.5
+        X: 0.264443576335907
+        Y: -0.40696007013320923
+        Z: 0.8653027415275574
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5
+      Pitch: 0.29000017046928406
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.0
+      Yaw: 0.9949995279312134
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1080
+  Height: 1016
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000004000000000000015a00000396fc0200000008fb0000001200530065006c0065006300740069006f006e00000001e10000009b0000005c01000003fb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c006100790073010000003d00000396000000c901000003fb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e00650063740200000186000001060000030c00000261000000010000015a00000396fc0200000002fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb0000002400550052003100300065002000430068006e00740072006f006c00100000003d00000396000000a701000003000000020000073f000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e1000001970000000300000a000000003efc0100000002fb0000000800540069006d00650100000000000004420000000000000000fb0000000800540069006d00650100000000000004500000000000000000000005df0000039600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Log Output:
+    collapsed: false
+  QMainWindow State: 000000ff00000000fd00000002000000000000029a000003a2fc0200000006fb0000001a0056006900730069006f006e002000430061006d006500720061010000003b000002050000002800fffffffb000000100044006900730070006c00610079007300000001fa00000101000000c700fffffffb0000001200530065006c0065006300740069006f006e00000001b60000006f0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007300000001ec000000810000005c00fffffffb0000000a00560069006500770073000000023500000106000000a000fffffffb00000014004c006f00670020004f007500740070007500740100000246000001970000006000ffffff00000001000001da000003a2fc0200000001fb0000001a0055005200310030006500200043006f006e00740072006f006c010000003b000003a20000005c00ffffff000002ba000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
     collapsed: false
   Tool Properties:
@@ -143,6 +476,8 @@ Window Geometry:
     collapsed: false
   Views:
     collapsed: false
-  Width: 1920
-  X: 0
-  Y: 0
+  Vision Camera:
+    collapsed: false
+  Width: 1850
+  X: 70
+  Y: 27

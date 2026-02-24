@@ -15,7 +15,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, Image as ROSImage
+from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 
@@ -96,6 +97,8 @@ class VisionNode:
         dir_pub = self.node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
         depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", fast_qos)
         trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
+        self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
+        self.cv_bridge = CvBridge()
 
         depth_frame_count = [0]
 
@@ -292,10 +295,20 @@ class VisionNode:
                         best_idx, self.yolo_thread.net_fps, loop_fps,
                         viz_only=trunk_viz,
                     )
-                    cv2.imshow("ZED | Dense-bunch 3D Position", display_image)
-                    key = cv2.waitKey(1)
-                    if key in (27, ord("q"), ord("Q")):
-                        self.exit_signal = True
+                    # Publish to RViz Image display
+                    try:
+                        # ZED produces BGRA (4-channel); convert to BGR for ROS
+                        if len(display_image.shape) == 3 and display_image.shape[2] == 4:
+                            pub_image = cv2.cvtColor(display_image, cv2.COLOR_BGRA2BGR)
+                        else:
+                            pub_image = display_image
+                        img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
+                        img_msg.header.stamp = self.node.get_clock().now().to_msg()
+                        self.image_pub.publish(img_msg)
+                    except Exception as e:
+                        if not getattr(self, '_img_pub_err_logged', False):
+                            print(f"[WARN] Failed to publish vision image: {e}")
+                            self._img_pub_err_logged = True
                     last_viz = now
 
         perception_thread = Thread(target=perception_loop, daemon=True)

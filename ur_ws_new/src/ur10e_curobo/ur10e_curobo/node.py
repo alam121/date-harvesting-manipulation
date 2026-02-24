@@ -249,6 +249,10 @@ class UR10eCuroboMoveIt(Node):
                 self.velocity_scale_pub.publish(scale_msg)
             except (ValueError, IndexError) as e:
                 self.get_logger().warn(f"Invalid set_velocity_scale format: {e}")
+        elif cmd == "subscribe":
+            goals_mod.subscribe_to_goal_pose(self)
+            self.goal_capture_active = False
+            self.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
         elif cmd == "debug_world":
             self.debug_print_world()
         else:
@@ -547,7 +551,7 @@ class UR10eCuroboMoveIt(Node):
         cur = self.get_end_effector_pose()
         qw,qx,qy,qz = (cur[3:] if cur else [1.0,0.0,0.0,0.0])
         
-        if any(math.dist([gx,gy,gz], g[:3]) < 0.01 for g in (self.goal_poses or [])): 
+        if self.goal_poses.any_within_distance([gx,gy,gz], 0.01):
             return
         goal = [gx,gy,gz,qw,qx,qy,qz]
         self.goal_poses.append(goal)

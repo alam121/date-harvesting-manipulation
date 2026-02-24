@@ -17,6 +17,8 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg.engine")
 
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg_v2.engine")
+
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
 DEFAULT_IMG_SIZE = 640      # inference size in pixels

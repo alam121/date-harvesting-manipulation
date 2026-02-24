@@ -8,6 +8,7 @@
 #include <QLineEdit>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QKeyEvent>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/panel.hpp>
@@ -31,6 +32,7 @@ public:
   void onInitialize() override;
   void save(rviz_common::Config config) const override;
   void load(const rviz_common::Config & config) override;
+  bool eventFilter(QObject * obj, QEvent * event) override;
 
 private Q_SLOTS:
   void onStop();
@@ -46,6 +48,7 @@ private Q_SLOTS:
   void onVelocityPreset();
   void onCapture();
   void onCaptureStop();
+  void onSubscribe();
   void updateDisplay();
 
 private:
