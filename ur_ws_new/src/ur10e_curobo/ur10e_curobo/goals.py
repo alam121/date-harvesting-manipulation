@@ -82,6 +82,7 @@ from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
 from .grasp_learner import GraspRecord
+from . import gripper as gripper_mod
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
@@ -1114,6 +1115,10 @@ def plan_and_execute(node):
         # Clear stored trajectory for this new goal (will be filled during approach and final)
         node.stored_trajectory_states = []
 
+        # Adaptive gripper open: deferred until approach motion starts (opens during arm travel)
+        fruit_radius = getattr(node, 'latest_fruit_radius', None)
+        gripper_opened = False
+
         # Direction-biased pre-grasp: use fruit direction if available
         standoff = 0.0  # 12cm standoff distance
 
@@ -1142,60 +1147,20 @@ def plan_and_execute(node):
 
         if skip_approach:
             pass  # jump straight to reacquire + final below
-        elif z > 1.90:  # High dates: retreat back first, then approach towards
-            print(f"High date detected (z={z:.2f}m) - using back-then-forward approach")
-            # Align gripper with approach direction (pointing towards fruit)
-            approach_dir = [-d_blend[0], -d_blend[1], -d_blend[2]]  # Invert: gripper faces fruit
-            dir_quat = quaternion_from_approach(node, direction_xyz=approach_dir)
-            # Pick closer of dir_quat vs 180° flipped to minimize rotation from current
-            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=1.0)
-            print(f"High date orientation (dir={approach_dir}): {orientation}")
-
-            # Phase 1: Retreat position (15cm back from fruit along d_blend direction)
-            retreat_dist = 0.15
-            retreat_pos = [
-                x + d_blend[0] * retreat_dist,
-                y + d_blend[1] * retreat_dist,
-                z - 0.10,
-                *orientation
-            ]
-            print(f"Retreat position: {retreat_pos[:3]} (d_blend={d_blend})")
-
-            if not plan_and_send(node, start, Pose.from_list(retreat_pos),
-                                 label="RETREAT", motion_type="approach",
-                                 goal_xyz=retreat_pos[:3], store_trajectory=True):
-                unlock_target(node)
-                continue
-            wait_until_xyz(node, retreat_pos[:3])
-            log_path_deviation(node, "RETREAT")
-            blend_motion(node)
-
-            # Update start state for approach phase
-            start = JointState.from_position(
-                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
-                joint_names=node.joint_order,
-            )
-
-            # Phase 2: Approach towards fruit (3cm back along d_blend, same height)
-            approach_dist = 0.03
-            approach = [
-                x + d_blend[0] * approach_dist,
-                y + d_blend[1] * approach_dist,
-                z,
-                *orientation
-            ]
-            print(f"Approach position (high): {approach[:3]}")
-
-        else:  # Lower dates: approach from below (existing logic)
-            # Use blended orientation for downward approach
+        else:
+            # Use blended orientation for approach
             orientation = minimize_rotation_orientation(cur_quat, target_quat)
             approach = [ax, ay-0.01, az-0.12, *orientation]
-            print(f"Going for side approach (low): {approach[:3]}")
+            print(f"Going for side approach: {approach[:3]}")
 
         if not skip_approach:
             if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
                 unlock_target(node)
                 continue
+            # Open gripper during approach motion (arm is already moving)
+            if not gripper_opened:
+                gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
+                gripper_opened = True
             wait_until_xyz(node, approach[:3])
             log_path_deviation(node, "APPROACH")
             blend_motion(node)
@@ -1214,6 +1179,11 @@ def plan_and_execute(node):
                 torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
                 joint_names=node.joint_order,
             )
+
+        # Ensure gripper is open before final approach (fallback for skip_approach case)
+        if not gripper_opened:
+            gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
+            gripper_opened = True
 
         # 2. Reacquire
         seed = [x,y,z]
@@ -1284,7 +1254,7 @@ def plan_and_execute(node):
 
         if action == "REGRIP":
             print(f"Weak grip ({prediction}) - re-gripping...")
-            node.control_gripper("OPEN"); time.sleep(0.1)
+            gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius); time.sleep(0.1)
             cur = node.get_end_effector_pose()
             if cur:
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.015, *cur[3:]]

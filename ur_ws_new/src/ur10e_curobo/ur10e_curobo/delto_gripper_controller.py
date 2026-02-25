@@ -186,8 +186,9 @@ class DeltoGripperController:
             if ch in self.frozen_fingers:
                 continue
             j_idx = self.finger_joint_idx[ch]
+            start = getattr(self, 'close_start_position', self.open_position)
             self.current_position[j_idx] = (
-                (1 - alpha) * self.open_position[j_idx] +
+                (1 - alpha) * start[j_idx] +
                 alpha * self.closed_position[j_idx]
             )
 
@@ -251,6 +252,7 @@ class DeltoGripperController:
         self.set_state('OPENING')
         self.current_step = 0
         self.current_position = self.open_position.copy()
+        self.close_start_position = self.open_position.copy()
 
         msg = Float32MultiArray()
         msg.data = self.open_position
@@ -263,11 +265,47 @@ class DeltoGripperController:
         self.baseline_force = self.force_data.copy()
 
         self.node.get_logger().info(
-            f"🔓 Gripper opened (baseline=[{self.baseline_force[0]:.2f}, "
+            f"Gripper opened fully (baseline=[{self.baseline_force[0]:.2f}, "
             f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
         )
 
         # Debounce window after open
+        self.ignore_contacts_until = time.time() + 0.25
+        self.need_rearm = True
+
+        self.unfreeze_all()
+        self.set_state('IDLE')
+
+    def open_gripper_to(self, alpha: float = 0.0):
+        """Open gripper to a partial position. alpha=0.0 is fully open, alpha=1.0 is fully closed."""
+        alpha = max(0.0, min(1.0, alpha))
+        self.set_state('OPENING')
+        self.current_step = 0
+
+        # Compute partial open position
+        position = self.open_position.copy()
+        for ch in [0, 1, 2]:
+            j_idx = self.finger_joint_idx[ch]
+            position[j_idx] = (
+                (1 - alpha) * self.open_position[j_idx] +
+                alpha * self.closed_position[j_idx]
+            )
+
+        self.current_position = position
+        self.close_start_position = position.copy()
+
+        msg = Float32MultiArray()
+        msg.data = position
+        self.publisher.publish(msg)
+
+        time.sleep(0.3)
+        self.baseline_force = self.force_data.copy()
+
+        self.node.get_logger().info(
+            f"Gripper opened to alpha={alpha:.2f} (baseline=[{self.baseline_force[0]:.2f}, "
+            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+        )
+
         self.ignore_contacts_until = time.time() + 0.25
         self.need_rearm = True
 

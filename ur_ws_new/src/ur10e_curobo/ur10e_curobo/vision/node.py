@@ -15,6 +15,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
+from std_msgs.msg import Float32
 from sensor_msgs.msg import PointCloud2, Image as ROSImage
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
@@ -97,6 +98,7 @@ class VisionNode:
         dir_pub = self.node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
         depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", fast_qos)
         trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
+        self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.cv_bridge = CvBridge()
 
@@ -877,5 +879,12 @@ class VisionNode:
             with self.pub_lock:
                 self.latest_goal_msg = goal
                 self.latest_dir_msg = dir_msg
+
+            # Publish estimated fruit radius for adaptive gripper
+            from .scoring import estimate_fruit_radius
+            radius = estimate_fruit_radius(t_best)
+            radius_msg = Float32()
+            radius_msg.data = float(radius)
+            self.radius_pub.publish(radius_msg)
         else:
             self.best_history.clear()

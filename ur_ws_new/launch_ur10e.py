@@ -8,7 +8,8 @@ from pathlib import Path
 
 WS = str(Path(__file__).resolve().parent)
 REPO_ROOT = str(Path(WS).parent)
-SOURCE = f"source {WS}/install/setup.bash"
+FASTDDS_CFG = f"export FASTRTPS_DEFAULT_PROFILES_FILE={WS}/fastdds_config.xml"
+SOURCE = f"{FASTDDS_CFG} && source {WS}/install/setup.bash"
 CONFIG_PATH = os.path.expanduser("~/.config/terminator/config")
 UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
 

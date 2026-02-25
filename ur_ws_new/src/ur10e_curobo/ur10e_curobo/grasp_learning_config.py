@@ -2,7 +2,7 @@
 
 import os
 
-GRASP_LEARNING_ENABLED = False
+GRASP_LEARNING_ENABLED = True  # master switch to enable/disable grasp learning features
 
 # Data storage
 DATA_DIR = os.path.expanduser("~/grasp_learning_data")

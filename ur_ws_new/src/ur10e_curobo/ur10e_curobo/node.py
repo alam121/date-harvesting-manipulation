@@ -82,6 +82,13 @@ class UR10eCuroboMoveIt(Node):
             self.goal_qos
         )
 
+        # Subscribe to fruit radius from vision for adaptive gripper
+        self.create_subscription(
+            Float32, '/fruit_radius',
+            lambda msg: setattr(self, 'latest_fruit_radius', msg.data),
+            10
+        )
+
         # timers
         self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers
         self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)
@@ -104,6 +111,7 @@ class UR10eCuroboMoveIt(Node):
 
         self.latest_goal_pose = None        # [x, y, z, qw, qx, qy, qz]
         self.latest_goal_time = 0.0         # timestamp of last valid pos
+        self.latest_fruit_radius = None     # estimated fruit radius from vision (meters)
 
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")
@@ -572,8 +580,8 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info("Done.")
 
     # expose some helpers for external callers
-    def control_gripper(self, action: str):
-        gripper_mod.control_gripper(self, action)
+    def control_gripper(self, action: str, fruit_radius: float = None):
+        gripper_mod.control_gripper(self, action, fruit_radius=fruit_radius)
 
     def debug_print_world(self):
         self._motion_mgr.debug_print_world()

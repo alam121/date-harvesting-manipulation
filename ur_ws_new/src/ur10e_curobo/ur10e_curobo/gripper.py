@@ -6,6 +6,10 @@ from . import grasp_visualizer as grasp_viz_mod
 from ur_msgs.srv import SetIO
 import time
 
+# Gripper aperture constants (meters)
+GRIPPER_MAX_APERTURE = 0.080   # 80mm total opening at full open
+APERTURE_MARGIN = 0.015        # 15mm extra clearance beyond fruit diameter
+
 
 # ============================================================
 # INITIALIZATION
@@ -45,9 +49,10 @@ def init_gripper(node, suction: bool = None):
 # ============================================================
 # MAIN CONTROL ENTRY
 # ============================================================
-def control_gripper(node, action: str):
+def control_gripper(node, action: str, fruit_radius: float = None):
     """
     Unified logic for OPEN / CLOSE based on selected mode.
+    fruit_radius: optional fruit radius in meters (from vision) for adaptive aperture.
     """
 
     act = action.upper()
@@ -61,7 +66,17 @@ def control_gripper(node, action: str):
         if node.gripper_controller.suction:
             activate_suction(node, False)
 
-        node.gripper_controller.open_gripper()
+        if fruit_radius is not None and fruit_radius > 0:
+            # Adaptive aperture: open only enough for this fruit
+            desired_aperture = (fruit_radius * 2) + APERTURE_MARGIN
+            open_alpha = max(0.0, 1.0 - desired_aperture / GRIPPER_MAX_APERTURE)
+            node.get_logger().info(
+                f"Adaptive gripper: radius={fruit_radius*1000:.0f}mm, "
+                f"aperture={desired_aperture*1000:.0f}mm, alpha={open_alpha:.2f}")
+            node.gripper_controller.open_gripper_to(open_alpha)
+        else:
+            node.gripper_controller.open_gripper()
+
         node.gripper_closed = False
         node.slip_detection = False
         node.grab_miss = False
