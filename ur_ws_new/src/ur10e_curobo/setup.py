@@ -33,6 +33,7 @@ setup(
             "vision = ur10e_curobo.vision:main",  # ZED/YOLO vision node
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control
             "calibrate = ur10e_curobo.grasp_calibrate:main",  # Grasp force calibration
+            "hand_eye = ur10e_curobo.vision.hand_eye_calibration:main",  # Hand-eye calibration
         ],
     },
 )

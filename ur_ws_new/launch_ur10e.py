@@ -28,6 +28,7 @@ def get_commands(fake_hardware=False, use_panel=False):
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
+        "hand_eye": f'sleep 3 && {SOURCE} && ros2 run ur10e_curobo hand_eye',
     }
     if use_panel:
         cmds["rviz_panel"] = f'sleep 5 && {SOURCE} && rviz2 -d {RVIZ_CONFIG}'
@@ -41,6 +42,7 @@ TITLES = {
     "gui": "GUI",
     "rviz_panel": "RViz+Panel",
     "calibrate": "Calibrate",
+    "hand_eye": "Hand-Eye Cal",
 }
 
 def make_command(cmd):

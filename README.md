@@ -50,6 +50,17 @@ launch_ur10e fake main
 | `teleop` | Joystick teleop control |
 | `gui` | Desktop GUI control panel |
 | `calibrate` | Standalone grasp force calibration tool |
+| `hand_eye` | Hand-eye (camera-to-gripper) calibration |
+
+### Hand-Eye Calibration
+Calibrate the ZED camera-to-gripper transform using a chessboard:
+```bash
+launch_ur10e hand_eye teleop
+```
+1. Place a chessboard flat in the workspace
+2. Move the robot to 15-20 different poses (vary rotation and translation)
+3. Press `c` to capture at each pose, `q` when done
+4. Result saved to `vision/hand_eye_calibration.yaml`
 
 ### Grasp Calibration
 Train the force-profile grasp learner without running the full pipeline:
@@ -60,18 +71,33 @@ Keys: `c`=close, `o`=open, `y`=success, `n`=fail, `s`=stats, `q`=quit
 
 Data stored in `~/grasp_learning_data/` (CSV log + pickle model).
 
+## RViz Keyboard Shortcuts
+When the RViz window is focused:
+
+| Key | Action |
+|-----|--------|
+| H | Home position |
+| D | Dropoff position |
+| E | Execute stored goals |
+| S | Subscribe to vision goals |
+| O | Open gripper |
+| C | Close gripper |
+| U | Update voxel obstacles |
+| Y | Grasp feedback: success |
+| N | Grasp feedback: fail |
+
 ## Harvesting Pipeline
 
 ```
-HOME → APPROACH → REACQUIRE → FINAL GRASP → CLOSE → REVERSE → DROPOFF → HOME
+HOME → APPROACH → REACQUIRE → FINAL GRASP → CLOSE → PARTIAL REVERSE → DROPOFF → HOME
 ```
 
 1. **Approach** — cuRobo plans collision-free path to detected fruit
 2. **Reacquire** — vision re-locks fruit position with stability check
 3. **Final Grasp** — slow IK-based precision move to fruit
 4. **Close & Evaluate** — gripper closes, force profile analyzed (early contact = grabbed)
-5. **Reverse** — replay approach trajectory in reverse (collision-free return)
-6. **Dropoff** — move to dropoff position, release
+5. **Partial Reverse** — pull back ~12cm to clear the date bunch
+6. **Dropoff** — cuRobo plans collision-free path to dropoff, release
 
 ### Grasp Force Profile Detection
 During the 10-step gripper closure, force deltas are recorded at each step:
