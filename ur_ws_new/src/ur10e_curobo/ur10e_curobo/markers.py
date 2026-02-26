@@ -34,6 +34,24 @@ def publish_planned_path(node, joint_states, label="planned", cartesian_points=N
     node.get_logger().info(f"Published planned path ({len(points)} points) for {label}")
 
 
+def clear_path_markers(node):
+    """Delete all planned path markers in RViz."""
+    m = Marker()
+    m.header.frame_id = "base_link"
+    m.header.stamp = node.get_clock().now().to_msg()
+    m.ns = "planned_path"
+    m.action = Marker.DELETEALL
+    node.path_marker_pub.publish(m)
+    # Also clear the live robot path trail
+    node.path_points.clear()
+    m2 = Marker()
+    m2.header.frame_id = "base_link"
+    m2.header.stamp = node.get_clock().now().to_msg()
+    m2.ns = "robot_path"
+    m2.action = Marker.DELETEALL
+    node.path_marker_pub.publish(m2)
+
+
 def publish_goal_marker(node, position, rank=None):
     
     m = Marker(); m.header.frame_id = "base_link"; m.header.stamp = node.get_clock().now().to_msg()

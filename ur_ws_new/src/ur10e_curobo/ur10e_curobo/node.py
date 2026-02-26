@@ -126,6 +126,10 @@ class UR10eCuroboMoveIt(Node):
         from .grasp_learner import GraspLearner
         self.grasp_learner = GraspLearner(grasp_cfg=self.cfg.grasp)
         self.pending_grasp_record = None
+        self._grasp_feedback = None  # set by GUI: True=success, False=fail, None=pending
+
+        # System control publishers
+        self._refresh_camera_pub = self.create_publisher(String, "/camera_command", 10)
 
         # perception disabled - using external date_v1.9.py instead
         self.perception = None
@@ -261,10 +265,53 @@ class UR10eCuroboMoveIt(Node):
             goals_mod.subscribe_to_goal_pose(self)
             self.goal_capture_active = False
             self.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
+        elif cmd == "update_voxel":
+            self._update_voxel_snapshot()
+        elif cmd == "grasp_success":
+            self._grasp_feedback = True
+            self.get_logger().info("Grasp feedback: SUCCESS")
+        elif cmd == "grasp_fail":
+            self._grasp_feedback = False
+            self.get_logger().info("Grasp feedback: FAIL")
+        elif cmd == "exit":
+            self.get_logger().info("Exit requested from GUI — killing all nodes")
+            import os, signal, subprocess
+            # Kill the entire launch process group (all terminator panes)
+            subprocess.Popen(["pkill", "-f", "ros2"])
+            subprocess.Popen(["pkill", "-f", "rviz2"])
+            time.sleep(0.5)
+            os.kill(os.getpid(), signal.SIGKILL)
+        elif cmd == "refresh_main":
+            self.get_logger().info("Refresh requested — restarting main node")
+            import os, sys
+            os.execvp(sys.executable, [sys.executable] + sys.argv)
+        elif cmd == "refresh_camera":
+            self._refresh_camera_pub.publish(String(data="refresh"))
+            self.get_logger().info("Camera refresh requested")
         elif cmd == "debug_world":
             self.debug_print_world()
         else:
             self.get_logger().warn(f"Unknown UI command: {cmd}")
+
+    def _update_voxel_snapshot(self):
+        """Update voxel obstacles from latest depth data (triggered by 'u' key).
+        VoxelObstacleManager subscribes to /zed_depth_pointcloud and caches points
+        in _latest_points. snapshot() reads from that cache."""
+        if not hasattr(self, 'voxel_obstacles') or self.voxel_obstacles is None:
+            self.get_logger().warn("No voxel obstacle manager available.")
+            return
+        vo = self.voxel_obstacles
+        if vo._latest_points is None:
+            self.get_logger().warn("No depth data available yet for voxel update. Is /zed_depth_pointcloud publishing?")
+            return
+        try:
+            if vo.snapshot():
+                self.get_logger().info("Voxel obstacles updated from latest depth.")
+            else:
+                self.get_logger().warn("Voxel snapshot returned False.")
+        except Exception as e:
+            self.get_logger().warn(f"Voxel update failed: {e}")
+
 
     def _publish_goal_info(self):
         """Publish goal information for GUI consumption."""

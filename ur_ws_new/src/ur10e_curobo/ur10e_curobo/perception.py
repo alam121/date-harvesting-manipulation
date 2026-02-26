@@ -269,12 +269,8 @@ class ZedYoloPerception:
                 with self._depth_lock:
                     self.latest_target_mask = combined_mask
 
-            # Update voxel obstacles every 5 frames
-            if self._frame_count % 5 == 0 and hasattr(self.node, 'voxel_obstacles') and self.node.voxel_obstacles is not None:
-                try:
-                    self.node.voxel_obstacles.update_from_depth(xyz_np, mask=combined_mask)
-                except Exception as e:
-                    self.node.get_logger().debug(f"Voxel update in perception failed: {e}")
+            # (Voxel updates are on-demand via 'u' key — VoxelObstacleManager
+            #  subscribes to /zed_depth_pointcloud directly on the main node)
 
             # publish each visible detection
             for mbin_vis, vis_ratio, cls_i, conf_i in zip(vis_masks, vis_ratios, labels, scores):

@@ -49,6 +49,12 @@ private Q_SLOTS:
   void onCapture();
   void onCaptureStop();
   void onSubscribe();
+  void onUpdateVoxel();
+  void onExit();
+  void onRefreshMain();
+  void onRefreshCamera();
+  void onGraspSuccess();
+  void onGraspFail();
   void updateDisplay();
 
 private:

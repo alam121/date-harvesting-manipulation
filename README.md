@@ -103,6 +103,19 @@ colcon build --symlink-install --packages-select ur10e_curobo
 source install/setup.bash
 ```
 
+## FastDDS Buffer Configuration
+The system uses a custom FastDDS config (`ur_ws_new/fastdds_config.xml`) to increase UDP buffer sizes and suppress startup warnings. This is set automatically by `launch_ur10e.py` via `FASTRTPS_DEFAULT_PROFILES_FILE`.
+
+If you see `sequence size exceeds remaining buffer` warnings, increase the kernel UDP buffer limits:
+```bash
+sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608 net.core.rmem_default=8388608 net.core.wmem_default=8388608
+```
+
+To make it permanent:
+```bash
+echo -e "net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\nnet.core.rmem_default=8388608\nnet.core.wmem_default=8388608" | sudo tee /etc/sysctl.d/10-fastdds.conf && sudo sysctl --system
+```
+
 ## Setup UR10e Connection
 ```bash
 sudo ip addr flush dev eth0

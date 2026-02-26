@@ -19,6 +19,13 @@ def main():
         print(f"Failed to open ZED camera: {status}")
         exit(1)
 
+    # Set video settings after opening the camera
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 2)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.DENOISING, 100)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE_COMPENSATION, 58)
+
     # Prepare image container
     image = sl.Mat()
 

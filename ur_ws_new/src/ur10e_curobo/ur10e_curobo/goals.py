@@ -73,7 +73,7 @@ from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
-from .markers import publish_goal_marker, publish_planned_path
+from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
@@ -314,7 +314,7 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
 
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
-                    store_trajectory=False, num_steps=None):
+                    store_trajectory=True, num_steps=None):
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
     if node.current_joint_positions is None:
@@ -422,11 +422,6 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
     
-    # Take voxel obstacle snapshot before planning (uses latest depth from date_v1.9.py)
-    # Exclude points near goal so the fruit doesn't become an obstacle
-    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-        node.voxel_obstacles.snapshot(exclude_xyz=goal_xyz, exclude_radius=0.10)
-
     # 1) Plan with cuRobo
     plan_cfg = PLAN_CFG_DEFAULT
     res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
@@ -724,6 +719,73 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
 
     node.get_logger().info(f"Executing reversed trajectory with {len(reversed_states)} waypoints")
     node.trajectory_pub.publish(traj)
+    return True
+
+
+def execute_partial_reverse(node, clearance_m: float = 0.12):
+    """
+    Reverse only enough of the stored trajectory to pull back `clearance_m` from
+    the grasp position, then stop. This clears the date bunch so cuRobo can plan
+    directly to dropoff without hitting fruit.
+    """
+    if not hasattr(node, 'stored_trajectory_states') or not node.stored_trajectory_states:
+        node.get_logger().warn("No stored trajectory for partial reverse.")
+        return False
+
+    stored = node.stored_trajectory_states
+    reversed_states = list(reversed(stored))
+    node.stored_trajectory_states = []
+
+    # Use FK to find how many waypoints = clearance_m of Cartesian distance
+    grasp_fk = forward_kinematics(node, reversed_states[0])
+    if not grasp_fk:
+        node.get_logger().warn("FK failed for partial reverse; using full reverse.")
+        partial = reversed_states
+    else:
+        gx, gy, gz = grasp_fk.x, grasp_fk.y, grasp_fk.z
+        partial = [reversed_states[0]]
+        for wp in reversed_states[1:]:
+            partial.append(wp)
+            fk = forward_kinematics(node, wp)
+            if fk:
+                dist = math.sqrt((fk.x - gx)**2 + (fk.y - gy)**2 + (fk.z - gz)**2)
+                if dist >= clearance_m:
+                    break
+
+    node.get_logger().info(
+        f"Partial reverse: {len(partial)}/{len(reversed_states)} waypoints "
+        f"({clearance_m*100:.0f}cm clearance)"
+    )
+
+    planner = node.cfg.planner
+    base_dt = getattr(planner, "base_dt", 0.02)
+    scale = getattr(planner, "speed_predropoff", 1.0) * getattr(planner, "global_speed_multiplier", 1.0)
+    dt = base_dt / max(scale, 1e-6)
+    dt = min(max(dt, getattr(planner, "min_dt", 0.012)), getattr(planner, "max_dt", 0.03))
+    base_vel = 0.08
+    vel = min(base_vel * scale, getattr(planner, "max_traj_velocity", 0.25))
+
+    traj = build_trajectory(
+        node.joint_order,
+        partial,
+        vel=vel,
+        dt=dt,
+        stop_flag=lambda: node.stop_requested,
+        max_vel=getattr(planner, "max_joint_velocity", 2.0) * getattr(planner, "global_speed_multiplier", 1.0),
+        max_acc=getattr(planner, "max_joint_acceleration", 1.0),
+        ramp_points=0,
+    )
+
+    node.trajectory_pub.publish(traj)
+
+    # Wait for partial reverse to complete
+    time.sleep(0.3)
+    timeout_start = time.time()
+    while time.time() - timeout_start < 10.0:
+        if not is_robot_moving(node, velocity_threshold=0.005):
+            break
+        time.sleep(0.1)
+    blend_motion(node)
     return True
 
 
@@ -1109,10 +1171,13 @@ def plan_and_execute(node):
         grasp_orientation = goal[3:]  # Store grasp orientation for pre-dropoff
         yoffset = node.yoffset
 
+        # Clear previous trajectory markers from RViz
+        clear_path_markers(node)
+
         # Lock vision onto this target (prevents switching to different "best" during approach)
         lock_target(node, goal[:3])
 
-        # Clear stored trajectory for this new goal (will be filled during approach and final)
+        # Clear stored trajectory for partial reverse after grasp
         node.stored_trajectory_states = []
 
         # Adaptive gripper open: deferred until approach motion starts (opens during arm travel)
@@ -1204,26 +1269,23 @@ def plan_and_execute(node):
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
-            # Fallback: cuRobo planner
-            try:
-                start = JointState.from_position(
-                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
-                    joint_names=node.joint_order,
-                )
-                if not plan_and_send(node, start, Pose.from_list(final_target), label="FINAL",
-                                     motion_type="final", goal_xyz=final_target[:3], store_trajectory=True):
-                    unlock_target(node)
-                    continue
-            except Exception as e:
-                msg = str(e)
-                if "CUDA error" in msg or "illegal memory access" in msg:
-                    node._cuda_faulted = True
-                    try_cuda_recovery(node)
-                node.get_logger().warn(f"[FINAL] Planner fallback exception: {e}")
-                unlock_target(node)
-                continue
-            wait_until_xyz(node, final_target[:3])
-            blend_motion(node)
+            # IK too far — pull back a few cm and retry from a different config
+            node.get_logger().warn("FINAL IK failed — pulling back and retrying...")
+            cur = node.get_end_effector_pose()
+            if cur:
+                # Move 5cm back (away from fruit, along -Y in base frame)
+                retreat = [cur[0], cur[1] + 0.05, cur[2], *cur[3:]]
+                _direct_ik_move(node, retreat, label="FINAL_RETREAT",
+                                motion_type="final", store_trajectory=True)
+
+            # Retry FINAL from new position
+            final_ok = _direct_ik_move(node, final_target, label="FINAL_RETRY",
+                                       motion_type="final", store_trajectory=True)
+        if not final_ok:
+            # Both attempts failed — skip this goal
+            node.get_logger().warn("FINAL IK retry also failed — skipping goal.")
+            unlock_target(node)
+            continue
         log_path_deviation(node, "FINAL")
 
         node.control_gripper("CLOSE"); time.sleep(0.5)
@@ -1290,62 +1352,11 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # Pre-dropoff: reverse the approach trajectory (reuses the collision-free path)
-        # Flow: grasp → reverse(final) → reverse(approach) → dropoff → home
-        dropoff_preplan = [None]  # mutable container for thread result
+        # Partial reverse: pull back ~12cm to clear the date bunch, then plan to dropoff
+        execute_partial_reverse(node, clearance_m=0.12)
 
-        if execute_reversed_trajectory(node, motion_type="predropoff"):
-            # Pre-plan dropoff in background while reverse executes
-            reverse_end_joints = node._last_reversed_states[-1] if hasattr(node, '_last_reversed_states') and node._last_reversed_states else None
-            if reverse_end_joints:
-                def _preplan():
-                    try:
-                        dropoff_preplan[0] = preplan_js(
-                            node, node.dropoff_joints, reverse_end_joints,
-                            label="DROP-OFF", motion_type="dropoff"
-                        )
-                    except Exception:
-                        dropoff_preplan[0] = None
-                plan_thread = threading.Thread(target=_preplan, daemon=True)
-                plan_thread.start()
-
-            # Wait for reversed trajectory to complete
-            time.sleep(0.2)
-            timeout_start = time.time()
-            while time.time() - timeout_start < 15.0:
-                if not is_robot_moving(node, velocity_threshold=0.005):
-                    break
-                time.sleep(0.1)
-            print("Reversed trajectory completed - returned along collision-free path.")
-            blend_motion(node)
-        else:
-            # Fallback: go directly to predropoff if no stored trajectory
-            node.get_logger().warn("No stored trajectory; using predropoff position.")
-            move_to_predropoff_position(node)
-            blend_motion(node)
-
-        # Execute dropoff — use pre-planned trajectory if available
-        # Validate that actual joints are close to the planned start
-        preplan_valid = False
-        if dropoff_preplan[0] is not None:
-            traj, states = dropoff_preplan[0]
-            if node.current_joint_positions is not None and reverse_end_joints is not None:
-                max_diff = max(abs(a - b) for a, b in zip(node.current_joint_positions, reverse_end_joints))
-                node.get_logger().info(f"Pre-plan joint deviation: {math.degrees(max_diff):.1f}deg")
-                if max_diff < 0.15:  # < ~8.5 degrees — safe to use pre-planned
-                    preplan_valid = True
-                else:
-                    node.get_logger().warn(f"Pre-planned trajectory start too far from actual ({math.degrees(max_diff):.1f}deg); re-planning.")
-
-        if preplan_valid:
-            node.get_logger().info("Using pre-planned dropoff trajectory")
-            node.trajectory_pub.publish(traj)
-            from .fk import forward_kinematics
-            fk = forward_kinematics(node, states[-1])
-            if fk:
-                wait_until_xyz(node, [fk.x, fk.y, fk.z])
-            blend_motion(node)
-        elif not move_to_dropoff_position(node):
+        # Plan directly to dropoff — cuRobo avoids trunk via voxel obstacles
+        if not move_to_dropoff_position(node):
             # Dropoff plan failed (trunk in the way) — go HOME first to clear
             node.get_logger().info("Direct dropoff failed, going HOME first")
             move_to_home_position(node)
@@ -1354,22 +1365,21 @@ def plan_and_execute(node):
         node.control_gripper("OPEN")
         move_to_home_position(node)
 
-        # Ask user for grasp outcome and log for learning
+        # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
         if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
-            print("Grasp outcome? [y=success / n=fail] ", end="", flush=True)
-            try:
-                import select, sys
-                # Wait for user input (blocks ROS callbacks during this time)
-                ready, _, _ = select.select([sys.stdin], [], [], 5.0)
-                if ready:
-                    key = sys.stdin.read(1).strip().lower()
-                    record = node.pending_grasp_record
-                    record.success = (key == 'y')
-                    node.grasp_learner.log_attempt(record)
-                else:
-                    print("\n(timeout — skipping feedback)")
-            except Exception:
-                print("\n(feedback skipped)")
+            node._grasp_feedback = None  # reset
+            node.get_logger().info("Waiting for grasp feedback (Y=success / N=fail)...")
+            t0 = time.time()
+            while node._grasp_feedback is None and (time.time() - t0) < 10.0:
+                time.sleep(0.1)
+            if node._grasp_feedback is not None:
+                record = node.pending_grasp_record
+                record.success = node._grasp_feedback
+                node.grasp_learner.log_attempt(record)
+                node.get_logger().info(f"Grasp logged: {'SUCCESS' if record.success else 'FAIL'}")
+            else:
+                node.get_logger().info("Grasp feedback timeout — skipping.")
+            node._grasp_feedback = None
             node.pending_grasp_record = None
 
         # Release target lock and reset tracking state for next goal

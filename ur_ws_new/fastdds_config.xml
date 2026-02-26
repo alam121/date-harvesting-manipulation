@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <dds>
+    <log>
+        <use_default>false</use_default>
+        <consumer>
+            <class>StdoutErrConsumer</class>
+            <property>
+                <name>stderr_threshold</name>
+                <value>Log::Kind::Error</value>
+            </property>
+        </consumer>
+    </log>
     <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
         <transport_descriptors>
             <transport_descriptor>

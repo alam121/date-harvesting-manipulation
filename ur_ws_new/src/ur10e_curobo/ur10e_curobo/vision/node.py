@@ -135,6 +135,16 @@ class VisionNode:
         self.node.create_subscription(PointStamped, "/target_lock", target_lock_cb, 10)
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
+        # Camera refresh command
+        def camera_cmd_cb(msg):
+            cmd = msg.data.strip()
+            if cmd == "refresh":
+                self.node.get_logger().info("Camera refresh requested — reinitializing ZED...")
+                self.exit_signal = True  # will restart the main loop
+
+        from std_msgs.msg import String as StdString
+        self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
+
         # TF listener
         self.tf_buffer = Buffer()
         TransformListener(self.tf_buffer, self.node)

@@ -170,6 +170,44 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   layout->addWidget(capture_group);
 
+  // Grasp Feedback
+  auto * grasp_group = new QGroupBox("Grasp Feedback");
+  auto * grasp_layout = new QHBoxLayout(grasp_group);
+
+  auto * success_btn = new QPushButton("Success (Y)");
+  success_btn->setStyleSheet("background-color: #4caf50; color: white; font-weight: bold;");
+  connect(success_btn, &QPushButton::clicked, this, &UR10ePanel::onGraspSuccess);
+  grasp_layout->addWidget(success_btn);
+
+  auto * fail_btn = new QPushButton("Fail (N)");
+  fail_btn->setStyleSheet("background-color: #f44336; color: white; font-weight: bold;");
+  connect(fail_btn, &QPushButton::clicked, this, &UR10ePanel::onGraspFail);
+  grasp_layout->addWidget(fail_btn);
+
+  layout->addWidget(grasp_group);
+
+  // System
+  auto * sys_group = new QGroupBox("System");
+  auto * sys_layout = new QGridLayout(sys_group);
+  sys_layout->setSpacing(4);
+
+  auto * refresh_main_btn = new QPushButton("Refresh Main");
+  refresh_main_btn->setStyleSheet("background-color: #0288d1; color: white;");
+  connect(refresh_main_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshMain);
+  sys_layout->addWidget(refresh_main_btn, 0, 0);
+
+  auto * refresh_cam_btn = new QPushButton("Refresh Camera");
+  refresh_cam_btn->setStyleSheet("background-color: #0288d1; color: white;");
+  connect(refresh_cam_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshCamera);
+  sys_layout->addWidget(refresh_cam_btn, 0, 1);
+
+  auto * exit_btn = new QPushButton("Exit");
+  exit_btn->setStyleSheet("background-color: #b71c1c; color: white; font-weight: bold;");
+  connect(exit_btn, &QPushButton::clicked, this, &UR10ePanel::onExit);
+  sys_layout->addWidget(exit_btn, 1, 0, 1, 2);
+
+  layout->addWidget(sys_group);
+
   // Joint Positions
   auto * joint_group = new QGroupBox("Joint Positions (rad)");
   auto * joint_layout = new QGridLayout(joint_group);
@@ -272,9 +310,12 @@ bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
       case Qt::Key_H: onHome(); return true;
       case Qt::Key_D: onDropoff(); return true;
       case Qt::Key_S: onSubscribe(); return true;
-      case Qt::Key_N: onExecute(); return true;
+      case Qt::Key_E: onExecute(); return true;
       case Qt::Key_O: onGripperOpen(); return true;
       case Qt::Key_C: onGripperClose(); return true;
+      case Qt::Key_U: onUpdateVoxel(); return true;
+      case Qt::Key_Y: onGraspSuccess(); return true;
+      case Qt::Key_N: onGraspFail(); return true;
     }
   }
   return rviz_common::Panel::eventFilter(obj, event);
@@ -413,6 +454,12 @@ void UR10ePanel::onGripperClose() { publishCmd("close"); }
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
+void UR10ePanel::onUpdateVoxel() { publishCmd("update_voxel"); }
+void UR10ePanel::onExit() { publishCmd("exit"); }
+void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
+void UR10ePanel::onRefreshCamera() { publishCmd("refresh_camera"); }
+void UR10ePanel::onGraspSuccess() { publishCmd("grasp_success"); }
+void UR10ePanel::onGraspFail() { publishCmd("grasp_fail"); }
 
 void UR10ePanel::onSendGoal()
 {

@@ -129,6 +129,9 @@ class MotionExecutor:
         self._node.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
         self._node.create_timer(1.0, self._publish_static_obstacles)
 
+        # One-shot timer to take initial voxel snapshot once depth data is available
+        self._initial_voxel_timer = self._node.create_timer(2.0, self._initial_voxel_snapshot)
+
         self._node.get_logger().info("MotionExecutor initialized")
 
     def _wait_for_trunk_and_build_world(self, timeout: float = 15.0, collect_secs: float = 2.0) -> dict:
@@ -443,6 +446,17 @@ class MotionExecutor:
         except Exception as e:
             self._node.get_logger().warn(f"Trajectory publish exception: {e}")
             return
+
+    def _initial_voxel_snapshot(self) -> None:
+        """Take initial voxel snapshot once depth data arrives, then cancel timer."""
+        vo = self.voxel_obstacles
+        if vo._latest_points is not None:
+            try:
+                vo.snapshot()
+                self._node.get_logger().info("Initial voxel snapshot taken from depth data.")
+            except Exception as e:
+                self._node.get_logger().warn(f"Initial voxel snapshot failed: {e}")
+            self._initial_voxel_timer.cancel()
 
     def _publish_static_obstacles(self) -> None:
         """Publish static obstacles for visualization."""

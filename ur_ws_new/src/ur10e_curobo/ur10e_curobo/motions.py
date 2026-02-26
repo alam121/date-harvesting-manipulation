@@ -43,10 +43,6 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     if node.current_joint_positions is None:
         node.get_logger().warn("No joint state; cannot execute pose."); return
 
-    # Take voxel snapshot before planning, excluding goal region
-    if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-        node.voxel_obstacles.snapshot(exclude_xyz=pose[:3], exclude_radius=0.10)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     start = JointState.from_position(
         torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),

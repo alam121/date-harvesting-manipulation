@@ -139,6 +139,10 @@ class UIManager:
             goals_mod.subscribe_to_goal_pose(self._node)
             self._node.goal_capture_active = False
             self._node.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
+        elif cmd == "update_voxel":
+            self._node._update_voxel_snapshot()
+        elif cmd in ("grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera"):
+            pass  # handled by node.py's _ui_command_cb
         elif cmd == "debug_world":
             self._motion.debug_print_world()
         else:
