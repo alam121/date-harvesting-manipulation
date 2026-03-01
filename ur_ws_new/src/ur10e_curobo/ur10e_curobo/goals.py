@@ -170,6 +170,18 @@ def unlock_target(node):
     print("🔓 Target lock released")
 
 
+def quat_multiply(a, b):
+    """Multiply two quaternions [w, x, y, z]."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return [
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+    ]
+
+
 def quat_dot(q1, q2):
     """Dot product of two quaternions (measures similarity)."""
     return q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3]
@@ -1210,13 +1222,39 @@ def plan_and_execute(node):
                 orientation = minimize_rotation_orientation(cur_quat, target_quat)
                 skip_approach = True
 
+        # 2-finger mode: detect between-branches scenario from vision depth analysis
+        between_branches = getattr(node, 'fruit_between_branches', False)
+        gap_angle = getattr(node, 'fruit_gap_angle', 0.0)
+
+        if between_branches:
+            node.get_logger().info(
+                f"Between-branches detected! gap_angle={math.degrees(gap_angle):.1f} deg — using 2-finger mode")
+            # Apply roll correction so left+right fingers align with gap
+            half = gap_angle / 2.0
+            q_roll = [math.cos(half), 0.0, 0.0, math.sin(half)]
+            target_quat = quat_multiply(list(target_quat), q_roll)
+            node.gripper_controller.frozen_fingers = {1}  # freeze center finger
+        else:
+            node.gripper_controller.frozen_fingers = set()  # all 3 fingers active
+
         if skip_approach:
             pass  # jump straight to reacquire + final below
         else:
-            # Use blended orientation for approach
-            orientation = minimize_rotation_orientation(cur_quat, target_quat)
-            approach = [ax, ay-0.01, az-0.12, *orientation]
-            print(f"Going for side approach: {approach[:3]}")
+            # Height-adaptive approach: vary offset and orientation blend by fruit height
+            if z < 0.9:
+                y_off, z_off, blend_w = -0.01, -0.12, 0.25   # low: from below
+                node.get_logger().info(f"Low fruit detected (z={z:.2f}m) — using bottom-up approach with moderate orientation blend")
+            elif z < 1.05:
+                y_off, z_off, blend_w = 0.08, -0.08, 0.15   # mid: angled side
+                node.get_logger().info(f"Mid-height fruit detected (z={z:.2f}m) — using angled approach with higher orientation blend")
+            else:
+                y_off, z_off, blend_w = -0.12, -0.02, 0.65   # high: horizontal
+                node.get_logger().info(f"High fruit detected (z={z:.2f}m) — using horizontal approach with strong orientation blend")
+
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=blend_w)
+            approach = [ax, ay + y_off, az + z_off, *orientation]
+            node.get_logger().info(f"Height-adaptive: z={z:.2f} -> y_off={y_off}, z_off={z_off}, blend={blend_w}")
+            print(f"Going for approach: {approach[:3]}")
 
         if not skip_approach:
             if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
@@ -1362,6 +1400,8 @@ def plan_and_execute(node):
             move_to_home_position(node)
             move_to_dropoff_position(node)
         time.sleep(0.2)
+        # Reset 2-finger mode before dropoff open (all fingers active for release)
+        node.gripper_controller.frozen_fingers = set()
         node.control_gripper("OPEN")
         move_to_home_position(node)
 

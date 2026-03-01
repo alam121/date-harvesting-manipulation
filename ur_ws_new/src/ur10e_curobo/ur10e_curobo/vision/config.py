@@ -15,9 +15,11 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg_v2.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg_v2.engine")
+
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_improved_exposure_data.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)

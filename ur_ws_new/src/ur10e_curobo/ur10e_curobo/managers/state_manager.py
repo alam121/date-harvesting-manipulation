@@ -7,6 +7,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import InteractiveMarkerFeedback
 from tf2_ros import Buffer, TransformListener
 
@@ -47,6 +48,10 @@ class StateManager:
 
         # Direction tracking (for pre-grasp bias)
         self.fruit_direction: Optional[Tuple[float, float, float]] = None
+
+        # Branch gap detection (for 2-finger mode)
+        self.fruit_between_branches: bool = False
+        self.fruit_gap_angle: float = 0.0
 
         # Timer reference for cleanup
         self._timer_wait_js = None
@@ -93,6 +98,14 @@ class StateManager:
             Vector3Stamped,
             "/datefruit_direction",
             self._direction_cb,
+            10
+        )
+
+        # Branch gap info for 2-finger mode
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/datefruit_gap_info",
+            self._gap_info_cb,
             10
         )
 
@@ -185,6 +198,12 @@ class StateManager:
     def _direction_cb(self, msg: Vector3Stamped) -> None:
         """Store fruit direction for pre-grasp bias."""
         self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
+
+    def _gap_info_cb(self, msg: Float32MultiArray) -> None:
+        """Store branch gap detection results for 2-finger mode."""
+        if len(msg.data) >= 2:
+            self.fruit_between_branches = msg.data[0] > 0.5
+            self.fruit_gap_angle = float(msg.data[1])
 
     def _check_joint_states(self) -> None:
         """Check if initial joint states have been received."""

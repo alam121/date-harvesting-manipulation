@@ -15,7 +15,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray
 from sensor_msgs.msg import PointCloud2, Image as ROSImage
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
@@ -99,6 +99,7 @@ class VisionNode:
         depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", fast_qos)
         trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
+        self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.cv_bridge = CvBridge()
 
@@ -538,6 +539,10 @@ class VisionNode:
             mark_reject("Z out of range")
             return None
 
+        # Branch gap detection (depth ring sampling around fruit)
+        gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
+        self._detect_branch_gap(pc_np, gap_target)
+
         # Transform to base_link
         point_msg = PointStamped()
         point_msg.header.frame_id = CAM_FRAME
@@ -593,11 +598,88 @@ class VisionNode:
                 "score_components": {},
                 "fruit_id": fruit_id,
                 "attempt_count": attempt_count,
+                "between_branches": gap_target.get("between_branches", False),
+                "gap_angle_cam": gap_target.get("gap_angle_cam", 0.0),
             }
         except Exception as e:
             print(f"[WARN] TF transform failed: {e}")
             mark_reject("TF transform failed")
             return None
+
+    def _detect_branch_gap(self, pc_np: np.ndarray, target: dict) -> None:
+        """Sample depth in a ring around the fruit to detect branch gaps.
+
+        Sets target["between_branches"] (bool) and target["gap_angle_cam"] (radians).
+        The gap angle is in image space (0 = right, pi/2 = down).
+        """
+        x1, y1, x2, y2 = target["bb"]
+        cx_img = (x1 + x2) / 2.0
+        cy_img = (y1 + y2) / 2.0
+        fruit_z = target["Zc"]
+
+        bbox_r = max(x2 - x1, y2 - y1) / 2.0
+        ring_r = bbox_r * 1.5
+
+        H, W = pc_np.shape[:2]
+        n_samples = 24
+        branch_threshold = 0.03  # within 3cm of fruit depth = branch
+
+        blocked = []
+        for i in range(n_samples):
+            angle = i * (2 * math.pi / n_samples)
+            u = int(cx_img + ring_r * math.cos(angle))
+            v = int(cy_img + ring_r * math.sin(angle))
+
+            if 0 <= u < W and 0 <= v < H:
+                z = pc_np[v, u, 2]
+                if np.isfinite(z) and z <= fruit_z + branch_threshold:
+                    blocked.append(True)
+                else:
+                    blocked.append(False)
+            else:
+                blocked.append(False)
+
+        # Count blocked sectors and find widest clear gap (circular scan)
+        n_blocked = sum(blocked)
+        if n_blocked < 3 or n_blocked > n_samples - 3:
+            # Too few or too many blocked = not a between-branches pattern
+            target["between_branches"] = False
+            target["gap_angle_cam"] = 0.0
+            return
+
+        # Find longest run of consecutive clear (False) sectors
+        best_start = 0
+        best_len = 0
+        cur_start = 0
+        cur_len = 0
+        # Double the array for circular wrap-around
+        doubled = blocked + blocked
+        for i in range(len(doubled)):
+            if not doubled[i]:
+                if cur_len == 0:
+                    cur_start = i
+                cur_len += 1
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+            else:
+                cur_len = 0
+
+        # Cap best_len to n_samples (circular wrap)
+        best_len = min(best_len, n_samples)
+
+        if best_len < 3:
+            # No significant clear gap
+            target["between_branches"] = False
+            target["gap_angle_cam"] = 0.0
+            return
+
+        # Gap midpoint angle
+        mid_idx = (best_start + best_len // 2) % n_samples
+        gap_angle = mid_idx * (2 * math.pi / n_samples)
+
+        target["between_branches"] = True
+        target["gap_angle_cam"] = float(gap_angle)
 
     def _fit_ellipse(self, mask_clean: np.ndarray) -> tuple:
         """Fit ellipse to mask and extract short axis."""
@@ -896,5 +978,22 @@ class VisionNode:
             radius_msg = Float32()
             radius_msg.data = float(radius)
             self.radius_pub.publish(radius_msg)
+
+            # Publish branch gap info for 2-finger mode
+            between_branches = t_best.get("between_branches", False)
+            gap_angle_cam = t_best.get("gap_angle_cam", 0.0)
+            gap_angle_base = gap_angle_cam
+            if between_branches and cached_q_tf is not None:
+                gap_dir_cam = np.array([
+                    math.cos(gap_angle_cam),
+                    math.sin(gap_angle_cam),
+                    0.0
+                ], dtype=float)
+                gap_dir_base = np.array(quat_rotate_vec(cached_q_tf, gap_dir_cam), dtype=float)
+                gap_angle_base = float(math.atan2(gap_dir_base[2], gap_dir_base[0]))
+
+            gap_msg = Float32MultiArray()
+            gap_msg.data = [1.0 if between_branches else 0.0, float(gap_angle_base)]
+            self.gap_info_pub.publish(gap_msg)
         else:
             self.best_history.clear()
