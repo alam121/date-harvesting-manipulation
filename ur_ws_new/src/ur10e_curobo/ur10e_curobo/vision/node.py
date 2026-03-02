@@ -101,6 +101,7 @@ class VisionNode:
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
+        self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
         self.cv_bridge = CvBridge()
 
         depth_frame_count = [0]
@@ -489,19 +490,19 @@ class VisionNode:
         # Throttle heatmap computation — reuse cached on non-compute frames
         target_key = (x1, y1, x2, y2)
         if self._heatmap_frame_count % self._heatmap_interval == 0:
-            heatmap, t_best_point, t_best_dir2d, t_best_point_3d = self._compute_heatmap(
+            heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = self._compute_heatmap(
                 roi_xyz, valid, mask_clean
             )
-            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d)
+            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts)
         else:
             cached = self._cached_heatmaps.get(target_key)
             if cached is not None:
-                heatmap, t_best_point, t_best_dir2d, t_best_point_3d = cached
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = cached
             else:
-                heatmap, t_best_point, t_best_dir2d, t_best_point_3d = self._compute_heatmap(
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
                 )
-                self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d)
+                self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts)
 
         # Visibility ratio
         vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
@@ -594,6 +595,7 @@ class VisionNode:
                 "best_dir2d": t_best_dir2d,
                 "best_point2d": t_best_point,
                 "best_point_3d": t_best_point_3d,
+                "scored_3d_points": scored_3d_pts,
                 "score": 0.0,
                 "score_components": {},
                 "fruit_id": fruit_id,
@@ -716,6 +718,7 @@ class VisionNode:
         t_best_point = None
         t_best_dir2d = None
         t_best_point_3d = None
+        scored_3d_points = None  # (N, 4) array: x, y, z, score
 
         depth_vals = roi_xyz[:, :, 2][valid]
         if depth_vals.size > 0:
@@ -751,7 +754,24 @@ class VisionNode:
                         dir_vec = np.array([1.0, 0.0], dtype=float)
                     t_best_dir2d = dir_vec
 
-        return heatmap, t_best_point, t_best_dir2d, t_best_point_3d
+                    # Collect scored 3D points for RViz marker (downsample to ~100)
+                    valid_in_mask = np.zeros_like(valid)
+                    valid_in_mask[ys, xs] = valid[ys, xs]
+                    mask_ys, mask_xs = np.nonzero(valid_in_mask)
+                    if len(mask_ys) > 0:
+                        pts_3d = roi_xyz[mask_ys, mask_xs, :]
+                        pts_scores = score[mask_ys, mask_xs]
+                        finite_mask = np.all(np.isfinite(pts_3d), axis=1)
+                        pts_3d = pts_3d[finite_mask]
+                        pts_scores = pts_scores[finite_mask]
+                        if len(pts_3d) > 100:
+                            indices = np.linspace(0, len(pts_3d) - 1, 100, dtype=int)
+                            pts_3d = pts_3d[indices]
+                            pts_scores = pts_scores[indices]
+                        if len(pts_3d) > 0:
+                            scored_3d_points = np.column_stack([pts_3d, pts_scores])
+
+        return heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_points
 
     def _select_best_fruit(self, targets: List[Dict[str, Any]]) -> Optional[int]:
         """Select the best fruit based on scoring system."""
@@ -995,5 +1015,30 @@ class VisionNode:
             gap_msg = Float32MultiArray()
             gap_msg.data = [1.0 if between_branches else 0.0, float(gap_angle_base)]
             self.gap_info_pub.publish(gap_msg)
+
+            # Publish heatmap 3D data for goal marker (consumed on subscribe)
+            scored_pts = t_best.get("scored_3d_points")
+            if scored_pts is not None and cached_q_tf is not None:
+                try:
+                    T = self.tf_buffer.lookup_transform("base_link", CAM_FRAME, rclpyTime())
+                    t_vec = np.array([
+                        T.transform.translation.x,
+                        T.transform.translation.y,
+                        T.transform.translation.z,
+                    ])
+                except Exception:
+                    t_vec = None
+
+                if t_vec is not None:
+                    # Transform all points to base_link, store as flat array
+                    # Format: [x0,y0,z0,s0, x1,y1,z1,s1, ...]
+                    flat = []
+                    for row in scored_pts:
+                        pt_cam = row[:3]
+                        pt_base = np.array(quat_rotate_vec(cached_q_tf, pt_cam), dtype=float) + t_vec
+                        flat.extend([float(pt_base[0]), float(pt_base[1]), float(pt_base[2]), float(row[3])])
+                    hm_msg = Float32MultiArray()
+                    hm_msg.data = flat
+                    self.heatmap_data_pub.publish(hm_msg)
         else:
             self.best_history.clear()

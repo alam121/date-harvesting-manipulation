@@ -77,7 +77,7 @@ from .markers import publish_goal_marker, publish_planned_path, clear_path_marke
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
-from .motions import blend_motion, preplan_js
+from .motions import blend_motion, preplan_js, plan_execute_js
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
@@ -1196,21 +1196,49 @@ def plan_and_execute(node):
         fruit_radius = getattr(node, 'latest_fruit_radius', None)
         gripper_opened = False
 
-        # Direction-biased pre-grasp: use fruit direction if available
-        standoff = 0.0  # 12cm standoff distance
+        # Direction-biased pre-grasp: use vision-computed approach direction
+        # d_blend points FROM fruit TOWARD the most accessible surface (heatmap peak)
+        # The standoff (approach waypoint) must be OPPOSITE to d_blend — the gripper
+        # comes from behind and moves along d_blend toward the accessible face
+        standoff = 0.12  # 12cm standoff distance
 
         d_blend = blend_approach_direction(node, x, y, z)
-        ax = x + d_blend[0] * standoff
-        ay = y + d_blend[1] * standoff
-        az = z + d_blend[2] * standoff
+        ax = x - d_blend[0] * standoff
+        ay = y - d_blend[1] * standoff
+        az = z - d_blend[2] * standoff
 
-        # 1. Plan approach - different strategy based on height
+        # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
         cur_pose = node.get_end_effector_pose()
         cur_quat = cur_pose[3:] if cur_pose else None
         target_quat = goal[3:]
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
+
+        # Dynamic side HOME: adjust shoulder pan for laterally distant fruits
+        TRUNK_X = 0.16
+        if cur_pose is not None:
+            dx_ee_to_fruit = abs(x - cur_pose[0])
+            print(f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m")
+            node.get_logger().info(f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m")
+            if dx_ee_to_fruit > 0.20:
+                dx_from_trunk = x - TRUNK_X
+                pan_offset = max(-0.52, min(0.52, dx_from_trunk * 1.0))  # ±30° max
+                side_home = list(node.home_joints)
+                side_home[0] = node.home_joints[0] + pan_offset
+                node.get_logger().info(
+                    f"Side HOME: fruit x={x:.2f}, pan_offset={math.degrees(pan_offset):.1f}deg")
+                plan_execute_js(node, side_home, label="SIDE_HOME", motion_type="home")
+                # Update start state and cur_pose after side HOME
+                cur_pose = node.get_end_effector_pose()
+                cur_quat = cur_pose[3:] if cur_pose else cur_quat
+                start = JointState.from_position(
+                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                    joint_names=node.joint_order,
+                )
+            else:
+                print("Fruit near center; using default HOME without pan offset.")
+                node.get_logger().info("Fruit near center; using default HOME without pan offset.")
 
         # Skip approach if EE is already close to the goal
         skip_approach = False
@@ -1240,20 +1268,27 @@ def plan_and_execute(node):
         if skip_approach:
             pass  # jump straight to reacquire + final below
         else:
-            # Height-adaptive approach: vary offset and orientation blend by fruit height
-            if z < 0.9:
-                y_off, z_off, blend_w = -0.01, -0.12, 0.25   # low: from below
-                node.get_logger().info(f"Low fruit detected (z={z:.2f}m) — using bottom-up approach with moderate orientation blend")
-            elif z < 1.05:
-                y_off, z_off, blend_w = 0.08, -0.08, 0.15   # mid: angled side
-                node.get_logger().info(f"Mid-height fruit detected (z={z:.2f}m) — using angled approach with higher orientation blend")
-            else:
-                y_off, z_off, blend_w = -0.12, -0.02, 0.65   # high: horizontal
-                node.get_logger().info(f"High fruit detected (z={z:.2f}m) — using horizontal approach with strong orientation blend")
+            # Compute orientation: gripper Z-axis points along d_blend (toward accessible face)
+            # Standoff is at fruit - d_blend*standoff, gripper moves along +d_blend toward fruit
+            dir_quat = quaternion_from_approach(node, direction_xyz=d_blend.tolist())
 
-            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=blend_w)
-            approach = [ax, ay + y_off, az + z_off, *orientation]
-            node.get_logger().info(f"Height-adaptive: z={z:.2f} -> y_off={y_off}, z_off={z_off}, blend={blend_w}")
+            # Blend with current orientation to avoid extreme rotations IK can't handle
+            if z < 0.9:
+                blend_w = 0.60   # low: mostly direction-driven
+            elif z < 1.05:
+                blend_w = 0.75   # mid: strongly direction-driven
+            else:
+                blend_w = 0.90   # high: almost fully direction-driven
+
+            # Pick closer of dir_quat or 180°-flipped, then blend
+            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=blend_w)
+
+            # ax/ay/az already offset by standoff * d_blend (12cm along best approach direction)
+            approach = [ax, ay, az, *orientation]
+            node.get_logger().info(
+                f"Vision-directed approach: z={z:.2f}, blend={blend_w}, "
+                f"d_blend=[{d_blend[0]:.2f},{d_blend[1]:.2f},{d_blend[2]:.2f}], "
+                f"approach=[{ax:.3f},{ay:.3f},{az:.3f}]")
             print(f"Going for approach: {approach[:3]}")
 
         if not skip_approach:

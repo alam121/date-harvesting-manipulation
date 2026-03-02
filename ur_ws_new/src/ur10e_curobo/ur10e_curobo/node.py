@@ -65,6 +65,13 @@ class UR10eCuroboMoveIt(Node):
 
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
 
+        # Cache latest heatmap 3D data from vision (for goal marker rendering)
+        self._latest_heatmap_data = None
+        self.create_subscription(
+            Float32MultiArray, "/vision/heatmap_3d_data",
+            self._heatmap_data_cb, 10
+        )
+
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
@@ -157,6 +164,10 @@ class UR10eCuroboMoveIt(Node):
     # callbacks
     # Note: _check_joint_states, _joint_state_cb, _marker_cb, _direction_cb,
     # _robot_running_cb, _stop_cb moved to StateManager
+
+    def _heatmap_data_cb(self, msg):
+        """Cache latest heatmap 3D points from vision node."""
+        self._latest_heatmap_data = list(msg.data)
 
     def _force_cb(self, msg): ##Sends force readings to classifier
         if not hasattr(self, 'classifier'):

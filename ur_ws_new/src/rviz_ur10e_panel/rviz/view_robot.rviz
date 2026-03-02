@@ -279,8 +279,6 @@ Visualization Manager:
           Value: false
         tool0:
           Value: false
-        tool0_controller:
-          Value: false
         tool0_to_camera_mount_link:
           Value: false
         upper_arm_link:
@@ -304,8 +302,7 @@ Visualization Manager:
         world:
           base_link:
             base:
-              tool0_controller:
-                {}
+              {}
             base_link_inertia:
               shoulder_link:
                 upper_arm_link:
@@ -362,7 +359,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        voxel_obstacles: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -430,7 +427,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.385160207748413
+      Distance: 5.905569076538086
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
