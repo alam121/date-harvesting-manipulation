@@ -227,7 +227,7 @@ def quat_slerp(q0, q1, t):
     return [s0 * q0[i] + s1 * q1[i] for i in range(4)]
 
 
-def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.25):
+def minimize_rotation_orientation(current_quat, target_quat, blend_weight=0.50):
     """
     Blend current and target orientation, prioritizing current.
 
@@ -1122,6 +1122,7 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
     d = dir_conf * d_dir + vis_conf * d_vis
     n_blend = np.linalg.norm(d)
     d_norm = d / n_blend if n_blend > 1e-9 else d_vis.copy()
+
     node._prev_blend_dir = d_norm.tolist()
 
     # Quick log to verify sign convention (throttled).
@@ -1196,16 +1197,22 @@ def plan_and_execute(node):
         fruit_radius = getattr(node, 'latest_fruit_radius', None)
         gripper_opened = False
 
-        # Direction-biased pre-grasp: use vision-computed approach direction
-        # d_blend points FROM fruit TOWARD the most accessible surface (heatmap peak)
-        # The standoff (approach waypoint) must be OPPOSITE to d_blend — the gripper
-        # comes from behind and moves along d_blend toward the accessible face
+        # Direction-biased pre-grasp: standoff is ALWAYS in front of fruit (toward robot)
+        # d_blend adds lateral (X) and vertical (Z) bias from vision heatmap
+        # Y offset is always positive (toward robot) regardless of d_blend
         standoff = 0.12  # 12cm standoff distance
 
         d_blend = blend_approach_direction(node, x, y, z)
-        ax = x - d_blend[0] * standoff
-        ay = y - d_blend[1] * standoff
-        az = z - d_blend[2] * standoff
+        # Standoff is offset OPPOSITE to d_blend so robot approaches TOWARD the heatmap peak
+        # d_blend points toward accessible face; standoff is on the opposite side
+        # Y: always toward robot (+) regardless of d_blend sign
+        ax = x - d_blend[0] * standoff  # opposite to lateral bias
+        ay = y + abs(d_blend[1]) * standoff  # ALWAYS toward robot (positive Y)
+        az = z - d_blend[2] * standoff  # opposite to vertical bias
+        node.get_logger().info(
+            f"Standoff: fruit=[{x:.3f},{y:.3f},{z:.3f}] "
+            f"approach=[{ax:.3f},{ay:.3f},{az:.3f}] "
+            f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
 
         # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
@@ -1268,25 +1275,22 @@ def plan_and_execute(node):
         if skip_approach:
             pass  # jump straight to reacquire + final below
         else:
-            # Compute orientation: gripper Z-axis points along d_blend (toward accessible face)
-            # Standoff is at fruit - d_blend*standoff, gripper moves along +d_blend toward fruit
-            dir_quat = quaternion_from_approach(node, direction_xyz=d_blend.tolist())
+            # Orientation: compute from actual standoff→fruit direction vector
+            approach_dir = [x - ax, y - ay, z - az]
+            # Gripper must face toward tree (-Y), never away
+            if approach_dir[1] > 0:
+                approach_dir = [-d for d in approach_dir]
+            dir_quat = quaternion_from_approach(node, direction_xyz=approach_dir)
+            # Use minimize_rotation to pick the closer roll (handles 180° flip around Z)
+            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=1.0)
+            node.get_logger().info(
+                f"Approach orientation from direction: dir=[{approach_dir[0]:.3f},{approach_dir[1]:.3f},{approach_dir[2]:.3f}] "
+                f"quat=[{dir_quat[0]:.3f},{dir_quat[1]:.3f},{dir_quat[2]:.3f},{dir_quat[3]:.3f}]")
 
-            # Blend with current orientation to avoid extreme rotations IK can't handle
-            if z < 0.9:
-                blend_w = 0.60   # low: mostly direction-driven
-            elif z < 1.05:
-                blend_w = 0.75   # mid: strongly direction-driven
-            else:
-                blend_w = 0.90   # high: almost fully direction-driven
-
-            # Pick closer of dir_quat or 180°-flipped, then blend
-            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=blend_w)
-
-            # ax/ay/az already offset by standoff * d_blend (12cm along best approach direction)
+            # Position: purely d_blend driven (no hardcoded offsets)
             approach = [ax, ay, az, *orientation]
             node.get_logger().info(
-                f"Vision-directed approach: z={z:.2f}, blend={blend_w}, "
+                f"Vision-directed approach: z={z:.2f}, blend={approach}, "
                 f"d_blend=[{d_blend[0]:.2f},{d_blend[1]:.2f},{d_blend[2]:.2f}], "
                 f"approach=[{ax:.3f},{ay:.3f},{az:.3f}]")
             print(f"Going for approach: {approach[:3]}")
