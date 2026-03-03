@@ -1,0 +1,8 @@
+[console_scripts]
+calibrate = ur10e_curobo.grasp_calibrate:main
+gui = ur10e_curobo.gui:main
+hand_eye = ur10e_curobo.vision.hand_eye_calibration:main
+main = ur10e_curobo.main:main
+teleop = ur10e_curobo.teleop:main
+vision = ur10e_curobo.vision:main
+

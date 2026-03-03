@@ -69,17 +69,13 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     Stops gracefully if stop_requested or timeout occurs.
     """
     from .motions import publish_stop_trajectory
-    start_time = time.time()
+    last_dist = None
+    stall_start = None
+    STALL_TIMEOUT = 2.0  # only timeout if robot not moving for 2s
 
     try:
         node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
         while getattr(node, "running", True):
-            # Safety exit: timeout
-            if time.time() - start_time > timeout:
-                node.get_logger().warn("Timeout waiting for EE to reach target.")
-                publish_stop_trajectory(node)
-                break
-
             # Safety exit: stop signal
             if getattr(node, "stop_requested", False):
                 node.get_logger().warn("Stop requested during wait; holding.")
@@ -99,8 +95,10 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 time.sleep(0.05)
                 continue
 
+            dist = math.dist(cur[:3], target_xyz)
+
             # Check distance to goal
-            if math.dist(cur[:3], target_xyz) < tol:
+            if dist < tol:
                 # Orientation check (if requested)
                 if target_quat and len(cur) >= 7:
                     dot = abs(sum(a * b for a, b in zip(cur[3:7], target_quat[:4])))
@@ -114,8 +112,22 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                     time.sleep(0.05)
                     continue
 
-                node.get_logger().info("End-effector reached target position.")
+                node.get_logger().info(f"End-effector reached target. dist={dist*100:.1f}cm")
                 break
+
+            # Stall detection: only timeout if robot has stopped moving
+            if last_dist is not None and abs(dist - last_dist) < 0.001:
+                if stall_start is None:
+                    stall_start = time.time()
+                elif time.time() - stall_start > STALL_TIMEOUT:
+                    node.get_logger().warn(
+                        f"Robot not moving (dist={dist*100:.1f}cm from target, stalled {STALL_TIMEOUT}s) — accepting.")
+                    break
+            else:
+                stall_start = None
+            last_dist = dist
+
+            time.sleep(0.05)
 
             time.sleep(0.05)
 

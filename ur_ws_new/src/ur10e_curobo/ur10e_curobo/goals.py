@@ -1197,22 +1197,30 @@ def plan_and_execute(node):
         fruit_radius = getattr(node, 'latest_fruit_radius', None)
         gripper_opened = False
 
-        # Direction-biased pre-grasp: standoff is ALWAYS in front of fruit (toward robot)
-        # d_blend adds lateral (X) and vertical (Z) bias from vision heatmap
-        # Y offset is always positive (toward robot) regardless of d_blend
-        standoff = 0.12  # 12cm standoff distance
+        # Height-based approach strategy
+        LOW_Z_THRESH = 1.0  # below 0.9m = low-hanging
+        is_low = z < LOW_Z_THRESH
 
+        standoff = 0.12  # 12cm standoff distance
         d_blend = blend_approach_direction(node, x, y, z)
-        # Standoff is offset OPPOSITE to d_blend so robot approaches TOWARD the heatmap peak
-        # d_blend points toward accessible face; standoff is on the opposite side
-        # Y: always toward robot (+) regardless of d_blend sign
-        ax = x - d_blend[0] * standoff  # opposite to lateral bias
-        ay = y + abs(d_blend[1]) * standoff  # ALWAYS toward robot (positive Y)
-        az = z - d_blend[2] * standoff  # opposite to vertical bias
-        node.get_logger().info(
-            f"Standoff: fruit=[{x:.3f},{y:.3f},{z:.3f}] "
-            f"approach=[{ax:.3f},{ay:.3f},{az:.3f}] "
-            f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+
+        if is_low:
+            # Low-hanging: original master_new approach (no d_blend for position)
+            ax = x
+            ay = y
+            az = z
+            node.get_logger().info(
+                f"LOW approach (z={z:.2f} < {LOW_Z_THRESH}): "
+                f"fruit=[{x:.3f},{y:.3f},{z:.3f}]")
+        else:
+            # Mid/high: d_blend direction-driven approach from front
+            ax = x - d_blend[0] * standoff
+            ay = y + abs(d_blend[1]) * standoff  # ALWAYS toward robot
+            az = z - d_blend[2] * standoff
+            node.get_logger().info(
+                f"MID/HIGH approach (z={z:.2f} >= {LOW_Z_THRESH}): "
+                f"fruit=[{x:.3f},{y:.3f},{z:.3f}] standoff=[{ax:.3f},{ay:.3f},{az:.3f}] "
+                f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
 
         # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
@@ -1274,26 +1282,24 @@ def plan_and_execute(node):
 
         if skip_approach:
             pass  # jump straight to reacquire + final below
+        elif is_low:
+            # Low-hanging: blend 25% toward goal orientation, hardcoded offsets (master_new style)
+            orientation = minimize_rotation_orientation(cur_quat, target_quat)
+            approach = [ax, ay - 0.01, az - 0.12, *orientation]
+            node.get_logger().info(f"LOW approach pose: {approach[:3]}")
+            print(f"Going for LOW approach: {approach[:3]}")
         else:
-            # Orientation: compute from actual standoff→fruit direction vector
+            # Mid/high: direction-driven orientation from standoff→fruit vector
             approach_dir = [x - ax, y - ay, z - az]
-            # Gripper must face toward tree (-Y), never away
             if approach_dir[1] > 0:
                 approach_dir = [-d for d in approach_dir]
             dir_quat = quaternion_from_approach(node, direction_xyz=approach_dir)
-            # Use minimize_rotation to pick the closer roll (handles 180° flip around Z)
             orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=1.0)
-            node.get_logger().info(
-                f"Approach orientation from direction: dir=[{approach_dir[0]:.3f},{approach_dir[1]:.3f},{approach_dir[2]:.3f}] "
-                f"quat=[{dir_quat[0]:.3f},{dir_quat[1]:.3f},{dir_quat[2]:.3f},{dir_quat[3]:.3f}]")
-
-            # Position: purely d_blend driven (no hardcoded offsets)
             approach = [ax, ay, az, *orientation]
             node.get_logger().info(
-                f"Vision-directed approach: z={z:.2f}, blend={approach}, "
-                f"d_blend=[{d_blend[0]:.2f},{d_blend[1]:.2f},{d_blend[2]:.2f}], "
-                f"approach=[{ax:.3f},{ay:.3f},{az:.3f}]")
-            print(f"Going for approach: {approach[:3]}")
+                f"MID/HIGH approach pose: {approach[:3]} "
+                f"dir=[{approach_dir[0]:.3f},{approach_dir[1]:.3f},{approach_dir[2]:.3f}]")
+            print(f"Going for MID/HIGH approach: {approach[:3]}")
 
         if not skip_approach:
             if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
@@ -1341,6 +1347,11 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
+        # Always recompute orientation from CURRENT EE (post-approach) to avoid 180° flip
+        cur_pose = node.get_end_effector_pose()
+        cur_quat = cur_pose[3:] if cur_pose else cur_quat
+        orientation = minimize_rotation_orientation(cur_quat, target_quat)
+        node.get_logger().info(f"FINAL orientation: recomputed from current EE (is_low={is_low})")
         z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
