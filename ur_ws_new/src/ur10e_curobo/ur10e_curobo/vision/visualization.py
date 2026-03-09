@@ -239,7 +239,19 @@ class VisionVisualizer:
             axis_color = (0, 165, 255, 255)  # orange
             cv2.arrowedLine(image, (start_x, start_y), (dest_x, dest_y), axis_color, 2, tipLength=0.25)
 
-        # Draw 3D approach direction arrow (magenta)
+        # Draw raw surface normal arrow (cyan, thin)
+        surface_normal = target.get("surface_normal")
+        if surface_normal is not None:
+            Xc, Yc, Zc = target["Xc"], target["Yc"], target["Zc"]
+            centroid_3d = np.array([Xc, Yc, Zc])
+            origin_2d = project_point_to_image(centroid_3d, self.intrinsics, self.image_scale)
+            if origin_2d is not None:
+                sn_end_3d = centroid_3d + surface_normal * 0.06
+                sn_end_2d = project_point_to_image(sn_end_3d, self.intrinsics, self.image_scale)
+                if sn_end_2d:
+                    cv2.arrowedLine(image, origin_2d, sn_end_2d, (255, 255, 0, 255), 1, tipLength=0.3)
+
+        # Draw 3D approach direction arrow (magenta, thick)
         approach_dir_cam = target.get("approach_dir_cam")
         if approach_dir_cam is not None:
             Xc, Yc, Zc = target["Xc"], target["Yc"], target["Zc"]

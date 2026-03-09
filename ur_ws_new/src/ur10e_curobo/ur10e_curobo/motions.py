@@ -49,7 +49,12 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         joint_names=node.joint_order,
     )
     goal = Pose.from_list(pose)
-    res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT) #cuRobo Cartesian planner
+    lock = getattr(node, '_planning_lock', None)
+    if lock: lock.acquire()
+    try:
+        res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+    finally:
+        if lock: lock.release()
     if not res.success:
         node.get_logger().warn("Plan failed for single pose."); return
 
@@ -79,7 +84,11 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
             )
 
             # Replan with updated obstacles
-            res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+            if lock: lock.acquire()
+            try:
+                res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+            finally:
+                if lock: lock.release()
             if not res.success:
                 node.get_logger().error("Replan failed after collision detection")
                 return
@@ -167,8 +176,10 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
 
     # ------------------------------
-    # 3. cuRobo plan
+    # 3. cuRobo plan (hold lock to prevent concurrent CUDA ops)
     # ------------------------------
+    lock = getattr(node, '_planning_lock', None)
+    if lock: lock.acquire()
     try:
         res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
     except Exception as e:
@@ -177,6 +188,8 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
             node._cuda_faulted = True
         node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
         return False
+    finally:
+        if lock: lock.release()
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
@@ -234,7 +247,12 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         torch.tensor([target_joints], dtype=torch.float32, device=device),
         joint_names=node.joint_order,
     )
-    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    lock = getattr(node, '_planning_lock', None)
+    if lock: lock.acquire()
+    try:
+        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    finally:
+        if lock: lock.release()
     if not res.success:
         return None
     states = interpolated_positions(res)

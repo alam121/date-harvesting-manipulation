@@ -99,6 +99,11 @@ class MotionExecutor:
         )
 
         self.motion_gen = MotionGen(self.motion_gen_config)
+
+        # Initialize isolated FK model BEFORE warmup so its GPU allocation
+        # is included in CUDA graph capture (avoids 20s+ delay on first plan)
+        fk_mod.init_fk_model(self._create_fk_facade())
+
         self.motion_gen.warmup()
         self._node.get_logger().info("cuRobo warmup done")
 
@@ -287,6 +292,7 @@ class MotionExecutor:
         facade.joint_order = self._config.joint_order
         facade.motion_gen = self.motion_gen
         facade.get_logger = self._node.get_logger
+        facade._planning_lock = getattr(self._node, '_planning_lock', None)
         return facade
 
     def _teleop_cb(self, msg: Twist) -> None:

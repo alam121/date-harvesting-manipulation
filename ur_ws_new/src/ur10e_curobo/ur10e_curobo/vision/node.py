@@ -490,19 +490,19 @@ class VisionNode:
         # Throttle heatmap computation — reuse cached on non-compute frames
         target_key = (x1, y1, x2, y2)
         if self._heatmap_frame_count % self._heatmap_interval == 0:
-            heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = self._compute_heatmap(
+            heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                 roi_xyz, valid, mask_clean
             )
-            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts)
+            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
         else:
             cached = self._cached_heatmaps.get(target_key)
             if cached is not None:
-                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = cached
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
             else:
-                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts = self._compute_heatmap(
+                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
                 )
-                self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts)
+                self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
 
         # Visibility ratio
         vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
@@ -596,6 +596,7 @@ class VisionNode:
                 "best_point2d": t_best_point,
                 "best_point_3d": t_best_point_3d,
                 "scored_3d_points": scored_3d_pts,
+                "surface_normal": surface_normal,
                 "score": 0.0,
                 "score_components": {},
                 "fruit_id": fruit_id,
@@ -771,7 +772,48 @@ class VisionNode:
                         if len(pts_3d) > 0:
                             scored_3d_points = np.column_stack([pts_3d, pts_scores])
 
-        return heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_points
+        # Compute surface normal from depth gradients (Sobel)
+        surface_normal = None
+        if valid.any() and mask_clean is not None:
+            combined = valid & mask_clean.astype(bool)
+            if combined.any():
+                x_ch = roi_xyz[:, :, 0].astype(np.float32)
+                y_ch = roi_xyz[:, :, 1].astype(np.float32)
+                z_ch = roi_xyz[:, :, 2].astype(np.float32)
+
+                dx_du = cv2.Sobel(x_ch, cv2.CV_32F, 1, 0, ksize=5)
+                dy_du = cv2.Sobel(y_ch, cv2.CV_32F, 1, 0, ksize=5)
+                dz_du = cv2.Sobel(z_ch, cv2.CV_32F, 1, 0, ksize=5)
+
+                dx_dv = cv2.Sobel(x_ch, cv2.CV_32F, 0, 1, ksize=5)
+                dy_dv = cv2.Sobel(y_ch, cv2.CV_32F, 0, 1, ksize=5)
+                dz_dv = cv2.Sobel(z_ch, cv2.CV_32F, 0, 1, ksize=5)
+
+                # Cross product dP/du x dP/dv = surface normal per pixel
+                nx = dy_du * dz_dv - dz_du * dy_dv
+                ny = dz_du * dx_dv - dx_du * dz_dv
+                nz = dx_du * dy_dv - dy_du * dx_dv
+
+                norms = np.sqrt(nx**2 + ny**2 + nz**2)
+                good = combined & (norms > 1e-6)
+
+                if good.any():
+                    nx_g = nx[good] / norms[good]
+                    ny_g = ny[good] / norms[good]
+                    nz_g = nz[good] / norms[good]
+
+                    # Flip normals to point toward camera (negative Z)
+                    flip = nz_g > 0
+                    nx_g[flip] *= -1
+                    ny_g[flip] *= -1
+                    nz_g[flip] *= -1
+
+                    avg_normal = np.array([nx_g.mean(), ny_g.mean(), nz_g.mean()])
+                    n_len = np.linalg.norm(avg_normal)
+                    if n_len > 1e-6:
+                        surface_normal = avg_normal / n_len
+
+        return heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_points, surface_normal
 
     def _select_best_fruit(self, targets: List[Dict[str, Any]]) -> Optional[int]:
         """Select the best fruit based on scoring system."""
@@ -888,14 +930,30 @@ class VisionNode:
             if offset_mag > min_offset:
                 best_pt_3d = t_best.get("best_point_3d")
                 centroid_3d = np.array([t_best["Xc"], t_best["Yc"], t_best["Zc"]])
+                sn = t_best.get("surface_normal")
 
+                # Compute peak direction (heatmap closest point - centroid)
+                peak_dir = None
                 if best_pt_3d is not None:
-                    heatmap_dir = best_pt_3d - centroid_3d
-                    n_dir_cam = np.linalg.norm(heatmap_dir)
-                    if n_dir_cam > 1e-6:
-                        heatmap_dir = heatmap_dir / n_dir_cam
+                    peak_dir = best_pt_3d - centroid_3d
+                    n_peak = np.linalg.norm(peak_dir)
+                    if n_peak > 1e-6:
+                        peak_dir = peak_dir / n_peak
                     else:
-                        heatmap_dir = np.array([dx / offset_mag, dy / offset_mag, 0.0], dtype=float)
+                        peak_dir = None
+
+                # Blend: 70% surface normal + 30% heatmap peak
+                if sn is not None and peak_dir is not None:
+                    heatmap_dir = 0.7 * sn + 0.3 * peak_dir
+                    n_blend = np.linalg.norm(heatmap_dir)
+                    if n_blend > 1e-6:
+                        heatmap_dir = heatmap_dir / n_blend
+                    else:
+                        heatmap_dir = sn.copy()
+                elif sn is not None:
+                    heatmap_dir = sn.copy()
+                elif peak_dir is not None:
+                    heatmap_dir = peak_dir
                 else:
                     heatmap_dir = np.array([dx / offset_mag, dy / offset_mag, 0.0], dtype=float)
 

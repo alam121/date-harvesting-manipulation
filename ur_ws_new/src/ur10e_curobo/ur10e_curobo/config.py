@@ -58,12 +58,7 @@ VOXEL_CONFIG = {
     "target_exclusion_radius": 0.08,   # 8cm radius around target to skip collision check
 }
 
-PLAN_CFG_DEFAULT = MotionGenPlanConfig(
-    max_attempts=20,
-    enable_finetune_trajopt=True,
-    enable_graph=True,
-    enable_graph_attempt=None,  # graph is already enabled, no fallback needed
-)
+PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
 
 # For joint-space planning (plan_single_js): no graph search needed since start/goal joints
 # are already known. Graph search resizes internal buffers which corrupts plan_single_js state.

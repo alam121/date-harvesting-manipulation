@@ -46,6 +46,10 @@ class UR10eCuroboMoveIt(Node):
             automatically_declare_parameters_from_overrides=True
         )
 
+        # Thread-safety: lock held during plan_single / plan_single_js
+        # FK checks this (non-blocking) to skip CUDA ops during graph capture
+        self._planning_lock = threading.Lock()
+
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
         self._config_mgr.initialize()

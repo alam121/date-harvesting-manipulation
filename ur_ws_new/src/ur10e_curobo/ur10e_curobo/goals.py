@@ -433,10 +433,15 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
-    
+
     # 1) Plan with cuRobo
     plan_cfg = PLAN_CFG_DEFAULT
-    res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+    lock = getattr(node, '_planning_lock', None)
+    if lock: lock.acquire()
+    try:
+        res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+    finally:
+        if lock: lock.release()
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
@@ -459,7 +464,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                     break
         if not wraparound:
             break
-        res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+        if lock: lock.acquire()
+        try:
+            res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+        finally:
+            if lock: lock.release()
         if not res.success:
             node.get_logger().warn(f"Replan failed for {label}")
             return False
@@ -501,7 +510,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             )
 
             # Replan with updated obstacles (snapshot already taken in verify)
-            res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+            if lock: lock.acquire()
+            try:
+                res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+            finally:
+                if lock: lock.release()
             if not res.success:
                 node.get_logger().error(f"Replan failed for {label}")
                 return False
@@ -540,7 +553,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             best_states = states
             best_path_len = path_len
             if ratio > 1.8 and straight > 0.02:
-                res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+                if lock: lock.acquire()
+                try:
+                    res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+                finally:
+                    if lock: lock.release()
                 if res2.success:
                     s2 = interpolated_positions(res2)
                     skip = False
@@ -801,7 +818,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.12):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=3, radius=0.08, z_tolerance=0.05):
+def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=2, radius=0.08, z_tolerance=0.05):
     """
     Reacquire goal pose with improved Z-axis accuracy.
 
@@ -999,9 +1016,12 @@ def subscribe_to_goal_pose(node):
             if not node.goal_poses.any_within_distance(g, 0.01):
                 node.goal_poses.append(g)
                 publish_goal_marker(node, g[:3])
-                goal_type = "HIGH (back-then-forward)" if g[2] > 0.90 else "LOW (side approach)"
-                print(f"🟢 Accepted goal pose: {g}")
-                print(f"   → Goal type: {goal_type} (z={g[2]:.2f}m)")
+                LOW_Z_THRESH = 1.0
+                is_low = g[2] < LOW_Z_THRESH
+                goal_type = "LOW" if is_low else "MID/HIGH"
+                print(f"Accepted goal pose: {g}")
+                print(f"   Goal type: {goal_type} (z={g[2]:.2f}m, thresh={LOW_Z_THRESH})")
+                node.get_logger().info(f"Goal accepted: {goal_type} (z={g[2]:.2f}m)")
                 node.obstacles.update_pose("fruit_obstacle", g[:3])
 
             # Destroy subscription
@@ -1283,22 +1303,18 @@ def plan_and_execute(node):
         if skip_approach:
             pass  # jump straight to reacquire + final below
         elif is_low:
-            # Low-hanging: blend 25% toward goal orientation, hardcoded offsets (master_new style)
-            orientation = minimize_rotation_orientation(cur_quat, target_quat)
+            # Low-hanging: blend 25% toward vision orientation
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=0.25)
             approach = [ax, ay - 0.01, az - 0.12, *orientation]
             node.get_logger().info(f"LOW approach pose: {approach[:3]}")
             print(f"Going for LOW approach: {approach[:3]}")
         else:
-            # Mid/high: direction-driven orientation from standoff→fruit vector
-            approach_dir = [x - ax, y - ay, z - az]
-            if approach_dir[1] > 0:
-                approach_dir = [-d for d in approach_dir]
-            dir_quat = quaternion_from_approach(node, direction_xyz=approach_dir)
-            orientation = minimize_rotation_orientation(cur_quat, dir_quat, blend_weight=1.0)
+            # Mid/high: use vision direction (surface normal + collision avoidance) for orientation
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=1.0)
             approach = [ax, ay, az, *orientation]
             node.get_logger().info(
                 f"MID/HIGH approach pose: {approach[:3]} "
-                f"dir=[{approach_dir[0]:.3f},{approach_dir[1]:.3f},{approach_dir[2]:.3f}]")
+                f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
             print(f"Going for MID/HIGH approach: {approach[:3]}")
 
         if not skip_approach:
@@ -1347,11 +1363,8 @@ def plan_and_execute(node):
             
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
-        # Always recompute orientation from CURRENT EE (post-approach) to avoid 180° flip
-        cur_pose = node.get_end_effector_pose()
-        cur_quat = cur_pose[3:] if cur_pose else cur_quat
-        orientation = minimize_rotation_orientation(cur_quat, target_quat)
-        node.get_logger().info(f"FINAL orientation: recomputed from current EE (is_low={is_low})")
+        # Reuse orientation from APPROACH step — all orientation changes happen during approach only
+        node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
         z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",

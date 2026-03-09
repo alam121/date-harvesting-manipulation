@@ -10,6 +10,35 @@ from geometry_msgs.msg import Point
 _fk_kin_model: Optional[CudaRobotModel] = None
 
 
+def init_fk_model(node):
+    """Eagerly create the isolated FK model BEFORE warmup().
+
+    This ensures GPU memory allocation happens before CUDA graph capture,
+    so the pre-captured graphs remain valid.  Must be called after
+    MotionGen is constructed but before motion_gen.warmup().
+    """
+    global _fk_kin_model
+    if _fk_kin_model is None:
+        _fk_kin_model = CudaRobotModel(node.motion_gen.robot_cfg.kinematics)
+        try:
+            node.get_logger().info("FK model initialized (pre-warmup)")
+        except Exception:
+            pass
+    return _fk_kin_model
+
+
+def _is_planning_active(node) -> bool:
+    """Non-blocking check: is a planning operation currently holding the lock?
+
+    Returns True if we should skip CUDA FK to avoid corrupting
+    CUDA graph capture in plan_single().
+    """
+    lock = getattr(node, '_planning_lock', None)
+    if lock is None:
+        return False
+    return lock.locked()
+
+
 def _get_kin_model(node):
     """Get an isolated CudaRobotModel for pure FK.
 
@@ -28,6 +57,9 @@ def get_end_effector_pose(node) -> Optional[list]:
     if node.current_joint_positions is None:
         node.get_logger().debug("Joint states not yet received.")
         return None
+    # Skip CUDA FK while planning is active to avoid corrupting CUDA graph capture
+    if _is_planning_active(node):
+        return getattr(node, '_last_ee_pose', None)
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         q = torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device)
@@ -36,7 +68,9 @@ def get_end_effector_pose(node) -> Optional[list]:
             ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
         pos = ee_pos[0].cpu().tolist()
         quat = ee_quat[0].cpu().tolist()
-        return pos + quat
+        result = pos + quat
+        node._last_ee_pose = result  # cache for use during planning
+        return result
     except Exception as e:
         node.get_logger().warn(f"FK failed: {e}")
         return None
