@@ -58,6 +58,10 @@ class VisionNode:
         self.target_lock_position: Optional[List[float]] = None
         self.target_lock_active = False
 
+        # Exclusion zones (for multi-subscribe: skip already-accepted fruits)
+        self.excluded_positions: List[List[float]] = []
+        self._prev_excluded_count = 0  # track changes to clear hysteresis
+
         # Publishing state
         self.latest_goal_msg: Optional[PoseStamped] = None
         self.latest_dir_msg: Optional[Vector3Stamped] = None
@@ -135,6 +139,22 @@ class VisionNode:
                 print(f"Target locked at [{msg.point.x:.3f}, {msg.point.y:.3f}, {msg.point.z:.3f}]")
 
         self.node.create_subscription(PointStamped, "/target_lock", target_lock_cb, 10)
+
+        # Exclusion zones for multi-subscribe
+        def exclude_cb(msg):
+            # Float32MultiArray: data = [x1,y1,z1, x2,y2,z2, ...] or empty to clear
+            data = list(msg.data)
+            positions = []
+            for i in range(0, len(data) - 2, 3):
+                positions.append([data[i], data[i+1], data[i+2]])
+            self.excluded_positions = positions
+            if positions:
+                print(f"Exclusion zones set: {len(positions)} position(s)")
+            else:
+                print("Exclusion zones cleared")
+
+        self.node.create_subscription(Float32MultiArray, "/exclude_fruit_positions", exclude_cb, 10)
+
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
         # Camera refresh command
@@ -291,6 +311,10 @@ class VisionNode:
                 # Compute approach direction and publish
                 if best_idx is not None:
                     self._process_best_target(targets, best_idx, intrinsics)
+                elif self.excluded_positions:
+                    # All visible targets are excluded — stop publishing stale position
+                    with self.pub_lock:
+                        self.latest_goal_msg = None
 
                 # Build viz entries for trunk bboxes (display only)
                 trunk_viz = []
@@ -817,6 +841,17 @@ class VisionNode:
 
     def _select_best_fruit(self, targets: List[Dict[str, Any]]) -> Optional[int]:
         """Select the best fruit based on scoring system."""
+        # Clear hysteresis when exclusion list changes (forces fresh best selection)
+        cur_excl_count = len(self.excluded_positions)
+        if cur_excl_count != self._prev_excluded_count:
+            self._prev_excluded_count = cur_excl_count
+            if cur_excl_count > 0 and self.best_target_prev is not None:
+                prev_pt = self.best_target_prev.get("pt_base")
+                if prev_pt is not None:
+                    prev_pos = [prev_pt.point.x, prev_pt.point.y, prev_pt.point.z]
+                    if any(math.dist(prev_pos, ep) < 0.08 for ep in self.excluded_positions):
+                        self.best_target_prev = None
+
         prev_pt_base = None
         if self.best_target_prev is not None:
             prev_pt_base = np.array([
@@ -833,16 +868,28 @@ class VisionNode:
             t["score"] = score_result["total_score"]
             t["score_components"] = score_result["components"]
 
+            # Skip targets near excluded positions (multi-subscribe)
+            if self.excluded_positions:
+                pt = t.get("pt_base")
+                if pt is not None:
+                    t_pos = [pt.point.x, pt.point.y, pt.point.z]
+                    dists = [math.dist(t_pos, ep) for ep in self.excluded_positions]
+                    if any(d < 0.08 for d in dists):
+                        t["excluded"] = True
+                        continue
+
             if score_result["total_score"] > best_score:
                 best_score = score_result["total_score"]
                 best_idx = i
 
-        # Hysteresis
+        # Hysteresis (skip excluded targets)
         if self.best_target_prev is not None and best_idx is not None:
             prev_pt = self.best_target_prev.get("pt_base")
             if prev_pt is not None:
                 prev_pos = [prev_pt.point.x, prev_pt.point.y, prev_pt.point.z]
                 for i, t in enumerate(targets):
+                    if t.get("excluded"):
+                        continue
                     t_pt = t["pt_base"]
                     t_pos = [t_pt.point.x, t_pt.point.y, t_pt.point.z]
                     if math.dist(prev_pos, t_pos) < BEST_REUSE_THRESH:
@@ -871,8 +918,23 @@ class VisionNode:
                 self.target_lock_position[1] = pt.point.y
                 self.target_lock_position[2] = pt.point.z
 
+        if self.excluded_positions:
+            n_excl = sum(1 for t in targets if t.get("excluded"))
+            print(f"[EXCL] {n_excl}/{len(targets)} excluded, best_idx={best_idx}")
+
         if best_idx is not None:
             self.best_target_prev = targets[best_idx]
+
+        # Build top-3 candidate indices by score (skip excluded targets)
+        scored = [(i, targets[i].get("score", 0.0)) for i in range(len(targets))
+                  if not targets[i].get("excluded")]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top3 = [idx for idx, _ in scored[:3]]
+        # Store on each target its rank (1-based) if in top 3
+        for t in targets:
+            t.pop("candidate_rank", None)
+        for rank, idx in enumerate(top3):
+            targets[idx]["candidate_rank"] = rank + 1
 
         return best_idx
 

@@ -75,6 +75,16 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(clear_btn, &QPushButton::clicked, this, &UR10ePanel::onClear);
   motion_layout->addWidget(clear_btn, 1, 1);
 
+  auto * sub_btn = new QPushButton("Subscribe (S)");
+  sub_btn->setStyleSheet("background-color: #7b1fa2; color: white; font-weight: bold;");
+  connect(sub_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribe);
+  motion_layout->addWidget(sub_btn, 2, 0);
+
+  auto * sub_multi_btn = new QPushButton("Sub Multi (M)");
+  sub_multi_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
+  connect(sub_multi_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribeMulti);
+  motion_layout->addWidget(sub_multi_btn, 2, 1);
+
   layout->addWidget(motion_group);
 
   // Gripper
@@ -266,6 +276,12 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   latest_goal_label_->setWordWrap(true);
   goals_layout->addWidget(latest_goal_label_);
 
+  goal_coords_label_ = new QLabel("");
+  goal_coords_label_->setFont(QFont("Courier", 8));
+  goal_coords_label_->setWordWrap(true);
+  goal_coords_label_->setStyleSheet("color: #7b1fa2;");
+  goals_layout->addWidget(goal_coords_label_);
+
   layout->addWidget(goals_group);
 
   layout->addStretch(1);
@@ -310,6 +326,7 @@ bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
       case Qt::Key_H: onHome(); return true;
       case Qt::Key_D: onDropoff(); return true;
       case Qt::Key_S: onSubscribe(); return true;
+      case Qt::Key_M: onSubscribeMulti(); return true;
       case Qt::Key_E: onExecute(); return true;
       case Qt::Key_O: onGripperOpen(); return true;
       case Qt::Key_C: onGripperClose(); return true;
@@ -392,6 +409,24 @@ void UR10ePanel::setupRos()
           latest_goal_ = data.substr(quote1 + 1, quote2 - quote1 - 1);
         }
       }
+      // Extract goals array for coordinate display
+      pos = data.find("\"goals\"");
+      if (pos != std::string::npos) {
+        auto bracket = data.find('[', pos);
+        if (bracket != std::string::npos) {
+          // Find matching outer bracket
+          auto end = data.find("]]", bracket);
+          if (end != std::string::npos) {
+            goal_coords_str_ = data.substr(bracket, end - bracket + 2);
+          } else {
+            // Single or no goals: "[]"
+            auto single_end = data.find(']', bracket);
+            if (single_end != std::string::npos) {
+              goal_coords_str_ = data.substr(bracket, single_end - bracket + 1);
+            }
+          }
+        }
+      }
     });
 
   vel_scale_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
@@ -454,6 +489,7 @@ void UR10ePanel::onGripperClose() { publishCmd("close"); }
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
+void UR10ePanel::onSubscribeMulti() { publishCmd("subscribe_multi"); }
 void UR10ePanel::onUpdateVoxel() { publishCmd("update_voxel"); }
 void UR10ePanel::onExit() { publishCmd("exit"); }
 void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
@@ -527,6 +563,30 @@ void UR10ePanel::updateDisplay()
   if (!latest_goal_.empty()) {
     latest_goal_label_->setText(QString("Latest: %1").arg(
       QString::fromStdString(latest_goal_)));
+  }
+  // Show goal coordinates
+  if (!goal_coords_str_.empty() && goal_coords_str_ != "[]") {
+    // Format: [[x,y,z],[x,y,z],...] → readable lines
+    QString coords_text;
+    // Simple parsing: split by ],[
+    std::string s = goal_coords_str_;
+    int goal_num = 1;
+    size_t p = 0;
+    while ((p = s.find('[', p)) != std::string::npos) {
+      auto close = s.find(']', p);
+      if (close == std::string::npos) break;
+      std::string inner = s.substr(p + 1, close - p - 1);
+      // Skip if inner contains another bracket (outer bracket)
+      if (inner.find('[') != std::string::npos) { p = close + 1; continue; }
+      if (!inner.empty()) {
+        if (!coords_text.isEmpty()) coords_text += "\n";
+        coords_text += QString("G%1: %2").arg(goal_num++).arg(QString::fromStdString(inner));
+      }
+      p = close + 1;
+    }
+    goal_coords_label_->setText(coords_text);
+  } else {
+    goal_coords_label_->setText("");
   }
 }
 

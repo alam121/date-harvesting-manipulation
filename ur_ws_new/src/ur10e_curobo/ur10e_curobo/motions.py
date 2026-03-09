@@ -28,11 +28,14 @@ def get_curobo_dt(result) -> float:
 def publish_stop_trajectory(node):
     if node.current_joint_positions is None:
         return
-    stop = JointTrajectory(); stop.joint_names = node.joint_order
-    pt = JointTrajectoryPoint(); pt.positions = list(node.current_joint_positions)
-    pt.velocities = [0.0]*len(node.joint_order); pt.accelerations = [0.0]*len(node.joint_order)
-    pt.time_from_start.nanosec = 1_000_000; stop.points = [pt]
-    node.trajectory_pub.publish(stop)
+    try:
+        stop = JointTrajectory(); stop.joint_names = node.joint_order
+        pt = JointTrajectoryPoint(); pt.positions = list(node.current_joint_positions)
+        pt.velocities = [0.0]*len(node.joint_order); pt.accelerations = [0.0]*len(node.joint_order)
+        pt.time_from_start.nanosec = 1_000_000; stop.points = [pt]
+        node.trajectory_pub.publish(stop)
+    except Exception:
+        pass  # handle already destroyed during shutdown
 
 
 # Executes a single pose in Cartesian space.

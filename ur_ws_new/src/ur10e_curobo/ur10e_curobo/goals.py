@@ -65,6 +65,13 @@ class ThreadSafeGoalList:
         with self._lock:
             return any(math.dist(pos[:3], e[:3]) < threshold for e in self._goals)
 
+    def peek(self, index=0):
+        """Return goal at index without removing it, or None if out of range."""
+        with self._lock:
+            if index < len(self._goals):
+                return list(self._goals[index])
+            return None
+
     def sort(self, key=None, reverse=False):
         """Sort goals in place with optional key function."""
         with self._lock:
@@ -818,33 +825,43 @@ def execute_partial_reverse(node, clearance_m: float = 0.12):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=2, radius=0.08, z_tolerance=0.05):
-    """
-    Reacquire goal pose with improved Z-axis accuracy.
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=1.5, radius=0.08, z_tolerance=0.05):
+    """Fast reacquire across multiple candidate seeds.
 
-    Uses median filtering and Z-specific stability checks to reduce
-    depth noise from stereo camera.
+    Checks vision against all candidates. Returns first stable match.
+    With multiple candidates, accepts after just 1 stable reading.
+
+    Args:
+        seed_xyz: primary seed [x,y,z]
+        candidate_seeds: list of [x,y,z,...] alternate candidates (optional)
+        timeout: max wait time (default 1.5s, reduced from 3s)
     """
-    stable_count = 0
+    # Build seed list: primary first, then candidates
+    seeds = [seed_xyz[:3]]
+    if candidate_seeds:
+        for c in candidate_seeds:
+            xyz = c[:3] if len(c) > 3 else c
+            if all(math.dist(xyz, s) > 0.03 for s in seeds):
+                seeds.append(list(xyz))
+
+    multi = len(seeds) > 1
+    stable_needed = 1 if multi else 2
+
     last_pose = None
+    stable_count = 0
+    matched_seed = None
     start = time.time()
-
-    # Track Z history for median filtering (reduces depth noise)
-    z_history = []
-    stable_poses = []
-    prev_pose_tuple = None  # Track previous to skip duplicates
+    prev_pose_tuple = None
 
     while time.time() - start < timeout:
-        # Read fresh vision data, not the corrupted best_goal_xyz
         if node.latest_goal_pose:
-            pose = node.latest_goal_pose[:3]  # [x, y, z]
+            pose = node.latest_goal_pose[:3]
         else:
             pose = None
         if pose is None:
             time.sleep(0.001)
             continue
 
-        # Skip if same reading as last iteration (wait for fresh data)
         pose_tuple = tuple(pose)
         if pose_tuple == prev_pose_tuple:
             time.sleep(0.001)
@@ -853,71 +870,68 @@ def reacquire_goal_pose(node, seed_xyz, timeout=3.0, stable_needed=2, radius=0.0
 
         x, y, z = pose
 
-        # XY radius check
-        if math.hypot(x - seed_xyz[0], y - seed_xyz[1]) > radius:
+        # Find closest matching seed
+        best_seed = None
+        best_dist = float('inf')
+        for s in seeds:
+            d_xy = math.hypot(x - s[0], y - s[1])
+            d_z = abs(z - s[2])
+            d = math.dist(pose, s)
+            if d_xy <= radius and d_z <= z_tolerance and d < best_dist:
+                best_dist = d
+                best_seed = s
+
+        if best_seed is None:
             time.sleep(0.001)
             continue
 
-        # Z tolerance check against seed (reject if too far from original)
-        if abs(z - seed_xyz[2]) > z_tolerance:
-            #print(f"⚠️ Reacquire Z too far from seed: {z:.3f} vs {seed_xyz[2]:.3f}")
-            time.sleep(0.001)
-            continue
-
-        # Track Z history for filtering
-        z_history.append(z)
-        if len(z_history) > 20:
-            z_history.pop(0)
-
-        # Z outlier rejection: skip if Z deviates >8mm from median
-        if len(z_history) >= 5:
-            z_median = sorted(z_history)[len(z_history) // 2]
-            if abs(z - z_median) > 0.008:
-                time.sleep(0.001)
-                continue
-
-        # Fast path: if first valid reading is very close to seed, skip stability wait
-        if last_pose is None and math.dist(pose, seed_xyz) < 0.01:
-            print(f"Reacquire fast: pose matches seed within 1cm, skipping stability wait")
+        # Fast path: very close to any seed = accept immediately
+        if best_dist < 0.01:
+            node.get_logger().info(
+                f"Reacquire fast: {best_dist*100:.1f}cm from seed "
+                f"[{best_seed[0]:.3f},{best_seed[1]:.3f},{best_seed[2]:.3f}]")
             return tuple(pose)
 
-        # Stability check with tighter thresholds
+        # Stability check
+        if matched_seed != best_seed:
+            # Switched seeds — reset stability
+            stable_count = 0
+            matched_seed = best_seed
+
         if last_pose is not None:
             delta = math.dist(last_pose, pose)
-            z_delta = abs(z - last_pose[2])
-
-            # Require both total delta < 2mm AND Z delta < 2mm
-            if delta < 0.002 and z_delta < 0.002:
+            if delta < 0.003:
                 stable_count += 1
-                print(f"Stable reacquire pose: {[round(v,3) for v in pose]} (stable {stable_count}/{stable_needed})")
-                stable_poses.append(pose)
             else:
                 stable_count = 0
-                stable_poses.clear()
 
         last_pose = pose
 
         if stable_count >= stable_needed:
-            # Return median-filtered Z for accuracy
-            stable_z_values = [p[2] for p in stable_poses]
-            median_z = sorted(stable_z_values)[len(stable_z_values) // 2]
-            return (x, y, median_z)
+            node.get_logger().info(
+                f"Reacquire stable ({stable_count}): "
+                f"[{x:.3f},{y:.3f},{z:.3f}] near seed "
+                f"[{matched_seed[0]:.3f},{matched_seed[1]:.3f},{matched_seed[2]:.3f}]")
+            return (x, y, z)
 
         time.sleep(0.001)
 
-    # Timeout fallback: only use z_history if we got valid readings
-    if z_history:
-        z_median = sorted(z_history)[len(z_history) // 2]
-        return (seed_xyz[0], seed_xyz[1], z_median)
-
-    # No valid readings - return original seed (don't use corrupted best_goal_xyz)
-    print("⚠️ Reacquire timeout - using original seed position")
-    return seed_xyz
+    # Timeout — use primary seed
+    node.get_logger().warn("Reacquire timeout — using primary seed")
+    return tuple(seed_xyz[:3])
 
 
 
 def subscribe_to_goal_pose(node):
-    """Subscribe to /external_goal_pose and stop idle motion immediately when goal is received."""
+    """Subscribe to /external_goal_pose and collect up to 3 candidate goals.
+
+    Accepts first stable goal immediately, then keeps listening briefly
+    to collect additional distinct candidates (>5cm apart). All candidates
+    are stored for fast reacquire during approach.
+    """
+
+    MAX_CANDIDATES = 3
+    COLLECT_WINDOW = 0.8  # seconds to keep listening after first accept
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):
@@ -947,23 +961,61 @@ def subscribe_to_goal_pose(node):
     cur = node.get_end_effector_pose()
     current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
     node.goal_poses.clear()
+    node.candidate_goals = []  # list of [x,y,z,qw,qx,qy,qz]
 
-    # No cache - always wait for fresh goal from vision
     # Track position stability before accepting
-    goal_history = {"poses": [], "stable_count": 0, "accepted": False}
+    goal_history = {
+        "poses": [], "stable_count": 0,
+        "accepted": False, "accept_time": 0.0,
+        "collecting": False,
+    }
+
+    def _destroy_sub():
+        try:
+            if hasattr(node, 'goal_pose_sub'):
+                node.destroy_subscription(node.goal_pose_sub)
+                del node.goal_pose_sub
+        except Exception:
+            pass
 
     def _goal_cb(msg: PoseStamped):
         nonlocal goal_history
 
         new_xyz = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+        new_quat = [msg.pose.orientation.w, msg.pose.orientation.x,
+                     msg.pose.orientation.y, msg.pose.orientation.z]
 
         # ---- ALWAYS STORE LATEST GOAL POSE ----
-        node.latest_goal_pose = [*new_xyz,
-            msg.pose.orientation.w, msg.pose.orientation.x,
-            msg.pose.orientation.y, msg.pose.orientation.z]
+        node.latest_goal_pose = [*new_xyz, *new_quat]
         node.latest_goal_time = time.time()
 
-        # Already accepted a goal this cycle
+        # Phase 2: collecting additional candidates after first accept
+        if goal_history["collecting"]:
+            elapsed = time.time() - goal_history["accept_time"]
+            if elapsed > COLLECT_WINDOW or len(node.candidate_goals) >= MAX_CANDIDATES:
+                goal_history["collecting"] = False
+                n = len(node.candidate_goals)
+                node.get_logger().info(f"Collected {n} candidate goal(s)")
+                _destroy_sub()
+                return
+
+            # Add if distinct from all existing candidates (>5cm apart)
+            g = [*new_xyz, *new_quat]
+            is_distinct = all(
+                math.dist(new_xyz, c[:3]) > 0.05
+                for c in node.candidate_goals
+            )
+            if is_distinct:
+                node.candidate_goals.append(g)
+                publish_goal_marker(node, new_xyz)
+                LOW_Z_THRESH = 1.0
+                goal_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
+                node.get_logger().info(
+                    f"Candidate #{len(node.candidate_goals)}: {goal_type} "
+                    f"(z={new_xyz[2]:.2f}m) [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
+            return
+
+        # Phase 1: waiting for first stable goal
         if goal_history["accepted"]:
             return
 
@@ -972,7 +1024,6 @@ def subscribe_to_goal_pose(node):
             last_xyz = goal_history["poses"][-1]
             jump = math.dist(new_xyz, last_xyz)
             if jump > 0.10:  # >10cm = new fruit, reset
-                print(f"📍 Position jump {jump:.2f}m - waiting for stable...")
                 goal_history["poses"].clear()
                 goal_history["stable_count"] = 0
 
@@ -989,8 +1040,9 @@ def subscribe_to_goal_pose(node):
         # Accept after 2 stable readings (or after 5 total messages as fallback)
         if goal_history["stable_count"] >= 2 or len(goal_history["poses"]) >= 5:
             goal_history["accepted"] = True
+            goal_history["accept_time"] = time.time()
+            goal_history["collecting"] = True  # start collecting more candidates
             node.goal_received = True
-            print("✅ Goal position stable, accepting...")
 
             # Stop idle timer
             if hasattr(node, 'idle_timer'):
@@ -1002,35 +1054,23 @@ def subscribe_to_goal_pose(node):
 
             publish_stop_trajectory(node)
 
-            # Use latest stable position
             node.goal_seed_xy = [new_xyz[0], new_xyz[1]]
             node.best_goal_xyz = new_xyz
             node.best_goal_score = float("inf")
 
-            #g = [*new_xyz, *current_orientation]
-            g = [*new_xyz, 
-                msg.pose.orientation.w, msg.pose.orientation.x,
-                msg.pose.orientation.y, msg.pose.orientation.z]
-            
-            
-            if not node.goal_poses.any_within_distance(g, 0.01):
-                node.goal_poses.append(g)
-                publish_goal_marker(node, g[:3])
-                LOW_Z_THRESH = 1.0
-                is_low = g[2] < LOW_Z_THRESH
-                goal_type = "LOW" if is_low else "MID/HIGH"
-                print(f"Accepted goal pose: {g}")
-                print(f"   Goal type: {goal_type} (z={g[2]:.2f}m, thresh={LOW_Z_THRESH})")
-                node.get_logger().info(f"Goal accepted: {goal_type} (z={g[2]:.2f}m)")
-                node.obstacles.update_pose("fruit_obstacle", g[:3])
+            g = [*new_xyz, *new_quat]
 
-            # Destroy subscription
-            try:
-                if hasattr(node, 'goal_pose_sub'):
-                    node.destroy_subscription(node.goal_pose_sub)
-                    del node.goal_pose_sub
-            except Exception:
-                pass
+            # First candidate = primary goal
+            node.candidate_goals = [g]
+            node.goal_poses.append(g)
+            publish_goal_marker(node, new_xyz)
+            LOW_Z_THRESH = 1.0
+            is_low = new_xyz[2] < LOW_Z_THRESH
+            goal_type = "LOW" if is_low else "MID/HIGH"
+            print(f"Accepted primary goal: [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
+            print(f"   Goal type: {goal_type} (z={new_xyz[2]:.2f}m, thresh={LOW_Z_THRESH})")
+            node.get_logger().info(f"Primary goal accepted: {goal_type} (z={new_xyz[2]:.2f}m)")
+            node.obstacles.update_pose("fruit_obstacle", new_xyz)
 
     # Subscribe to /external_goal_pose with VOLATILE QoS
     # VOLATILE = don't receive old buffered messages, only fresh ones
@@ -1087,6 +1127,197 @@ def subscribe_to_goal_pose(node):
     # Start idle motion timer
     node.idle_timer = node.create_timer(5.0, _idle_cb)
 
+
+def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
+    """Subscribe to /external_goal_pose and collect up to max_goals distinct goals within timeout seconds.
+
+    Each goal must be stable (2 readings <2cm) and distinct (>8cm from all previously accepted goals).
+    Goals are queued in node.goal_poses for sequential execution.
+    """
+    DISTINCT_DIST = 0.02  # 8cm apart to count as a separate goal
+
+    # Wait until robot stops before subscribing
+    if is_robot_moving(node):
+        node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_multi_goals(node, max_goals, timeout))
+        return
+
+    # Cancel any existing idle timer
+    if hasattr(node, 'idle_timer'):
+        try:
+            node.idle_timer.cancel()
+            del node.idle_timer
+        except Exception:
+            pass
+
+    # Reset all tracking state
+    node.reset_goal_tracking()
+    node.latest_goal_pose = None
+    node.latest_goal_time = 0
+
+    # Destroy previous subscription
+    if hasattr(node, 'goal_pose_sub'):
+        node.destroy_subscription(node.goal_pose_sub)
+        del node.goal_pose_sub
+
+    node.goal_poses.clear()
+    node.candidate_goals = []
+
+    # Clear vision exclusions at start
+    from std_msgs.msg import Float32MultiArray
+    def _publish_exclusions(positions):
+        """Publish excluded positions to vision node so it picks different targets."""
+        msg = Float32MultiArray()
+        for pos in positions:
+            msg.data.extend([float(pos[0]), float(pos[1]), float(pos[2])])
+        node.exclude_pub.publish(msg)
+
+    _publish_exclusions([])  # clear any previous exclusions
+
+    state = {
+        "poses": [],
+        "stable_count": 0,
+        "accepted_goals": [],  # list of [x,y,z] for distinctness check
+        "start_time": time.time(),
+        "pending_xyz": None,
+        "pending_quat": None,
+    }
+
+    def _destroy_sub():
+        try:
+            if hasattr(node, 'goal_pose_sub'):
+                node.destroy_subscription(node.goal_pose_sub)
+                del node.goal_pose_sub
+        except Exception:
+            pass
+
+    def _cancel_timeout():
+        if hasattr(node, '_multi_timeout_timer'):
+            try:
+                node._multi_timeout_timer.cancel()
+                del node._multi_timeout_timer
+            except Exception:
+                pass
+
+    def _finish():
+        if state.get("finished"):
+            return
+        state["finished"] = True
+        _destroy_sub()
+        _cancel_timeout()
+        _publish_exclusions([])  # clear exclusions so vision returns to normal
+        n = len(state["accepted_goals"])
+        node.get_logger().info(f"Subscribe multi: collected {n}/{max_goals} goals in {time.time() - state['start_time']:.1f}s")
+        if n > 0:
+            node.goal_received = True
+
+    def _goal_cb(msg: PoseStamped):
+        nonlocal state
+
+        # Check timeout
+        if time.time() - state["start_time"] > timeout:
+            _finish()
+            return
+
+        # Already have enough goals
+        if len(state["accepted_goals"]) >= max_goals:
+            _finish()
+            return
+
+        new_xyz = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
+        new_quat = [msg.pose.orientation.w, msg.pose.orientation.x,
+                     msg.pose.orientation.y, msg.pose.orientation.z]
+
+        # Always store latest
+        node.latest_goal_pose = [*new_xyz, *new_quat]
+        node.latest_goal_time = time.time()
+
+        # Check for position jump (vision switched to new fruit)
+        if state["poses"]:
+            last_xyz = state["poses"][-1]
+            jump = math.dist(new_xyz, last_xyz)
+            if jump > 0.10:  # >10cm = new fruit, reset stability
+                state["poses"].clear()
+                state["stable_count"] = 0
+
+        state["poses"].append(new_xyz)
+        state["pending_xyz"] = new_xyz
+        state["pending_quat"] = new_quat
+
+        # Need at least 2 consistent readings
+        if len(state["poses"]) >= 2:
+            recent = state["poses"][-2:]
+            if math.dist(recent[0], recent[1]) < 0.02:
+                state["stable_count"] += 1
+            else:
+                state["stable_count"] = 0
+
+        # Accept after 2 stable readings
+        if state["stable_count"] >= 2:
+            xyz = state["pending_xyz"]
+            quat = state["pending_quat"]
+
+            # Check distinctness from all previously accepted goals
+            is_distinct = all(
+                math.dist(xyz, prev) > DISTINCT_DIST
+                for prev in state["accepted_goals"]
+            )
+
+            if not is_distinct:
+                # Don't reset stability — just keep waiting for vision to switch targets
+                return
+
+            # Accept this goal
+            g = [*xyz, *quat]
+            state["accepted_goals"].append(xyz)
+            node.goal_poses.append(g)
+            node.candidate_goals.append(g)
+            publish_goal_marker(node, xyz)
+
+            # Tell vision to exclude this position so it picks next-best
+            _publish_exclusions(state["accepted_goals"])
+
+            LOW_Z_THRESH = 1.0
+            goal_type = "LOW" if xyz[2] < LOW_Z_THRESH else "MID/HIGH"
+            n = len(state["accepted_goals"])
+            node.get_logger().info(
+                f"Multi goal #{n}/{max_goals}: {goal_type} "
+                f"(z={xyz[2]:.2f}m) [{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}]")
+            print(f"Multi goal #{n}: [{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}] ({goal_type})")
+
+            if n == 1:
+                node.best_goal_xyz = xyz
+                node.goal_seed_xy = [xyz[0], xyz[1]]
+
+            # Check if we have enough
+            if n >= max_goals:
+                _finish()
+                return
+
+            # Reset stability for next goal
+            state["poses"].clear()
+            state["stable_count"] = 0
+
+    # Subscribe with VOLATILE QoS
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+    fresh_qos = QoSProfile(
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+    )
+    node.goal_pose_sub = node.create_subscription(
+        PoseStamped,
+        '/external_goal_pose',
+        _goal_cb,
+        fresh_qos,
+    )
+
+    # Auto-finish after timeout
+    def _timeout_cb():
+        node.get_logger().info("Subscribe multi: timeout reached")
+        _finish()
+
+    node._multi_timeout_timer = node.create_timer(timeout, _timeout_cb)
 
 
 def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
@@ -1349,10 +1580,10 @@ def plan_and_execute(node):
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
             gripper_opened = True
 
-        # 2. Reacquire
+        # 2. Reacquire — check primary + all candidate seeds for fastest lock-on
         seed = [x,y,z]
-        print("Reacquiring goal pose near:", seed)
-        reacq = reacquire_goal_pose(node, seed_xyz=seed)
+        candidates = getattr(node, 'candidate_goals', [])
+        reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
         
         if reacq:
             x,y,z = reacq; publish_goal_marker(node, [x,y,z])
@@ -1466,7 +1697,68 @@ def plan_and_execute(node):
         # Reset 2-finger mode before dropoff open (all fingers active for release)
         node.gripper_controller.frozen_fingers = set()
         node.control_gripper("OPEN")
-        move_to_home_position(node)
+
+        # Smart return: if there are more goals, try direct approach instead of going home first
+        went_home = False
+        if node.goal_poses:
+            # Peek at next goal (don't pop it yet)
+            next_goal = node.goal_poses.peek(0)
+            if next_goal is not None:
+                nx, ny, nz = next_goal[:3]
+                next_quat = next_goal[3:]
+                LOW_Z_THRESH = 1.0
+                next_is_low = nz < LOW_Z_THRESH
+
+                # Compute approach pose for next goal
+                next_d_blend = blend_approach_direction(node, nx, ny, nz)
+                next_standoff = 0.12
+                if next_is_low:
+                    nax, nay, naz = nx, ny - 0.01, nz - 0.12
+                else:
+                    nax = nx - next_d_blend[0] * next_standoff
+                    nay = ny + abs(next_d_blend[1]) * next_standoff
+                    naz = nz - next_d_blend[2] * next_standoff
+
+                # Try planning from current (dropoff) position to next approach
+                cur_joints = node.current_joint_positions
+                if cur_joints is not None:
+                    next_start = JointState.from_position(
+                        torch.tensor([cur_joints], dtype=torch.float32, device=device),
+                        joint_names=node.joint_order,
+                    )
+                    cur_pose = node.get_end_effector_pose()
+                    cur_quat = cur_pose[3:] if cur_pose else [1.0, 0.0, 0.0, 0.0]
+                    next_orient = minimize_rotation_orientation(cur_quat, next_quat)
+                    next_approach = [nax, nay, naz, *next_orient]
+
+                    # Test plan (don't execute yet, just check feasibility)
+                    plan_cfg = PLAN_CFG_DEFAULT
+                    lock = getattr(node, '_planning_lock', None)
+                    if lock: lock.acquire()
+                    try:
+                        test_res = node.motion_gen.plan_single(
+                            next_start, Pose.from_list(next_approach), plan_cfg)
+                    finally:
+                        if lock: lock.release()
+
+                    if test_res.success:
+                        node.get_logger().info(
+                            f"Direct path to next goal approach is COLLISION-FREE — skipping HOME")
+                        # Don't go home, the main loop will handle approach planning
+                    else:
+                        node.get_logger().info(
+                            f"Direct path to next goal BLOCKED — going HOME first")
+                        move_to_home_position(node)
+                        went_home = True
+                else:
+                    move_to_home_position(node)
+                    went_home = True
+            else:
+                move_to_home_position(node)
+                went_home = True
+        else:
+            move_to_home_position(node)
+            went_home = True
 
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
         if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:

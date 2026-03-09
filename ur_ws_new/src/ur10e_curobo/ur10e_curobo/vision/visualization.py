@@ -167,15 +167,33 @@ class VisionVisualizer:
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
 
-        # Color: best fruit = BLUE, others = RED
+        # Color: best = BLUE, top-3 candidates = YELLOW, others = RED
+        candidate_rank = target.get("candidate_rank")
         if is_best:
             color = (255, 0, 0, 255)  # blue
             radius = 7
+        elif candidate_rank is not None:
+            color = (0, 255, 255, 255)  # yellow for top-3 candidates
+            radius = 6
         else:
             color = (0, 0, 255, 255)  # red
             radius = 5
 
         cv2.circle(image, (cx, cy), radius, color, -1)
+
+        # Draw rank label for top-3 candidates
+        if candidate_rank is not None:
+            rank_color = (255, 0, 0, 255) if is_best else (0, 255, 255, 255)
+            cv2.putText(
+                image,
+                f"#{candidate_rank}",
+                (cx - 15, cy - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                rank_color,
+                2,
+                cv2.LINE_AA,
+            )
 
         # Draw approach axis for best target
         if is_best:
@@ -317,16 +335,31 @@ class VisionVisualizer:
             )
         else:
             dist_grip = target.get("dist", 0.0)
-            cv2.putText(
-                image,
-                f"D:{dist_grip:.2f}m",
-                (cx + 10, cy + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (200, 200, 200, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            candidate_rank = target.get("candidate_rank")
+            if candidate_rank is not None:
+                # Show score for top-3 candidates
+                total_score = target.get("score", 0.0)
+                cv2.putText(
+                    image,
+                    f"D:{dist_grip:.2f}m S:{total_score:.2f}",
+                    (cx + 10, cy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.putText(
+                    image,
+                    f"D:{dist_grip:.2f}m",
+                    (cx + 10, cy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (200, 200, 200, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
     def draw_hud(self, image: np.ndarray, net_fps: float, loop_fps: float) -> None:
         """Draw heads-up display with FPS info."""

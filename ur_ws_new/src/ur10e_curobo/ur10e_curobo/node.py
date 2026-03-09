@@ -80,6 +80,7 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
+        self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
@@ -280,6 +281,10 @@ class UR10eCuroboMoveIt(Node):
             goals_mod.subscribe_to_goal_pose(self)
             self.goal_capture_active = False
             self.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
+        elif cmd == "subscribe_multi":
+            goals_mod.subscribe_multi_goals(self)
+            self.goal_capture_active = False
+            self.get_logger().info("Subscribe multi: collecting up to 3 goals in 10s")
         elif cmd == "update_voxel":
             self._update_voxel_snapshot()
         elif cmd == "grasp_success":
@@ -630,12 +635,25 @@ class UR10eCuroboMoveIt(Node):
         markers_mod.publish_goal_marker(self, goal[:3])
 
     def _prep_and_execute(self):
-        
-        if self.goal_capture_active: 
+
+        if self.goal_capture_active:
             self.stop_goal_capture()
-        if hasattr(self, 'goal_pose_sub'): 
-            self.destroy_subscription(self.goal_pose_sub)
-            del self.goal_pose_sub
+        if hasattr(self, 'goal_pose_sub'):
+            try:
+                self.destroy_subscription(self.goal_pose_sub)
+            except Exception:
+                pass
+            try:
+                del self.goal_pose_sub
+            except Exception:
+                pass
+        # Cancel multi-subscribe timeout timer if active
+        if hasattr(self, '_multi_timeout_timer'):
+            try:
+                self._multi_timeout_timer.cancel()
+                del self._multi_timeout_timer
+            except Exception:
+                pass
             
         self.get_logger().info("Executing stored goals…")
         goals_mod.plan_and_execute(self)

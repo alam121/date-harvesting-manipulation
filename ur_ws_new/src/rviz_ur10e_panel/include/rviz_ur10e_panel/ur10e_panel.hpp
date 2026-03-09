@@ -49,6 +49,7 @@ private Q_SLOTS:
   void onCapture();
   void onCaptureStop();
   void onSubscribe();
+  void onSubscribeMulti();
   void onUpdateVoxel();
   void onExit();
   void onRefreshMain();
@@ -84,6 +85,7 @@ private:
   double velocity_scale_ = 5.0;
   int goal_count_ = 0;
   std::string latest_goal_;
+  std::string goal_coords_str_;
 
   // UI
   QLabel * status_label_;
@@ -92,6 +94,7 @@ private:
   QLabel * current_velocity_label_;
   QLabel * goal_count_label_;
   QLabel * latest_goal_label_;
+  QLabel * goal_coords_label_;
   QSlider * velocity_slider_;
   QLabel * joint_labels_[6];
   QLabel * force_labels_[3];
