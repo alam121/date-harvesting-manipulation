@@ -189,7 +189,12 @@ class StateManager:
             return
         self._node.get_logger().warn("Emergency stop!")
         self._stop_requested = True
-        # Note: The main node or MotionExecutor should call publish_stop_trajectory
+        # Immediately publish stop trajectory to halt the robot
+        try:
+            from ..motions import publish_stop_trajectory
+            publish_stop_trajectory(self._node)
+        except Exception:
+            pass
 
     def _marker_cb(self, msg: InteractiveMarkerFeedback) -> None:
         """Store last clicked RViz interactive marker pose."""

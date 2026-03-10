@@ -19,6 +19,9 @@ JOINT_ORDER = [
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
 ]
 
+# Height threshold (m) that classifies targets as LOW vs MID/HIGH.
+LOW_Z_THRESH = 0.95
+
 # ---------- Static Obstacles (single source of truth) ----------
 # Define obstacles once here, used for both cuRobo planning and RViz visualization
 STATIC_OBSTACLES = [

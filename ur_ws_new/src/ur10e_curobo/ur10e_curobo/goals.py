@@ -78,7 +78,7 @@ class ThreadSafeGoalList:
             self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
-from .config import PLAN_CFG_DEFAULT, VOXEL_CONFIG
+from .config import LOW_Z_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
@@ -1008,7 +1008,6 @@ def subscribe_to_goal_pose(node):
             if is_distinct:
                 node.candidate_goals.append(g)
                 publish_goal_marker(node, new_xyz)
-                LOW_Z_THRESH = 1.0
                 goal_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
                 node.get_logger().info(
                     f"Candidate #{len(node.candidate_goals)}: {goal_type} "
@@ -1064,7 +1063,6 @@ def subscribe_to_goal_pose(node):
             node.candidate_goals = [g]
             node.goal_poses.append(g)
             publish_goal_marker(node, new_xyz)
-            LOW_Z_THRESH = 1.0
             is_low = new_xyz[2] < LOW_Z_THRESH
             goal_type = "LOW" if is_low else "MID/HIGH"
             print(f"Accepted primary goal: [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
@@ -1276,7 +1274,6 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
             # Tell vision to exclude this position so it picks next-best
             _publish_exclusions(state["accepted_goals"])
 
-            LOW_Z_THRESH = 1.0
             goal_type = "LOW" if xyz[2] < LOW_Z_THRESH else "MID/HIGH"
             n = len(state["accepted_goals"])
             node.get_logger().info(
@@ -1401,23 +1398,29 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
 
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
-    
+
     if node.current_joint_positions is None:
         node.get_logger().warn("No joint state yet."); return
     if not node.goal_poses:
         node.get_logger().warn("No stored goals."); return
     if not node.robot_running:
         node.get_logger().error("Robot program OFF; may fail.")
-        
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    
-    while node.goal_poses and getattr(node, 'running', True):
+
+    def _check_stop():
+        """Check if stop was requested; if so, halt robot and clear goals."""
         if getattr(node, "stop_requested", False):
-            node.get_logger().warn("Stop requested; aborting goal execution.")
+            node.get_logger().warn("STOP requested — aborting immediately.")
             publish_stop_trajectory(node)
             node.goal_poses.clear()
             node.stop_requested = False
+            unlock_target(node)
+            return True
+        return False
+
+    while node.goal_poses and getattr(node, 'running', True):
+        if _check_stop():
             break
         
         start = JointState.from_position(
@@ -1449,7 +1452,6 @@ def plan_and_execute(node):
         gripper_opened = False
 
         # Height-based approach strategy
-        LOW_Z_THRESH = 1.0  # below 0.9m = low-hanging
         is_low = z < LOW_Z_THRESH
 
         standoff = 0.12  # 12cm standoff distance
@@ -1541,7 +1543,7 @@ def plan_and_execute(node):
             print(f"Going for LOW approach: {approach[:3]}")
         else:
             # Mid/high: use vision direction (surface normal + collision avoidance) for orientation
-            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=1.0)
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=0.25)
             approach = [ax, ay, az, *orientation]
             node.get_logger().info(
                 f"MID/HIGH approach pose: {approach[:3]} "
@@ -1557,6 +1559,7 @@ def plan_and_execute(node):
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
                 gripper_opened = True
             wait_until_xyz(node, approach[:3])
+            if _check_stop(): break
             log_path_deviation(node, "APPROACH")
             blend_motion(node)
 
@@ -1580,6 +1583,8 @@ def plan_and_execute(node):
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
             gripper_opened = True
 
+        if _check_stop(): break
+
         # 2. Reacquire — check primary + all candidate seeds for fastest lock-on
         seed = [x,y,z]
         candidates = getattr(node, 'candidate_goals', [])
@@ -1592,6 +1597,8 @@ def plan_and_execute(node):
             unlock_target(node)
             continue
             
+        if _check_stop(): break
+
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
@@ -1620,7 +1627,9 @@ def plan_and_execute(node):
             continue
         log_path_deviation(node, "FINAL")
 
+        if _check_stop(): break
         node.control_gripper("CLOSE"); time.sleep(0.5)
+        if _check_stop(): break
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
@@ -1678,6 +1687,7 @@ def plan_and_execute(node):
             )
 
         # 4. Drop-off and return
+        if _check_stop(): break
         time.sleep(0.2)
 
         # Attempt CUDA recovery before dropoff/home planning
@@ -1698,6 +1708,8 @@ def plan_and_execute(node):
         node.gripper_controller.frozen_fingers = set()
         node.control_gripper("OPEN")
 
+        if _check_stop(): break
+
         # Smart return: if there are more goals, try direct approach instead of going home first
         went_home = False
         if node.goal_poses:
@@ -1706,7 +1718,6 @@ def plan_and_execute(node):
             if next_goal is not None:
                 nx, ny, nz = next_goal[:3]
                 next_quat = next_goal[3:]
-                LOW_Z_THRESH = 1.0
                 next_is_low = nz < LOW_Z_THRESH
 
                 # Compute approach pose for next goal
