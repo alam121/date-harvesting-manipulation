@@ -6,7 +6,7 @@ from typing import Optional, List, Tuple, TYPE_CHECKING
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
 from std_msgs.msg import Bool
-from geometry_msgs.msg import Vector3Stamped
+from geometry_msgs.msg import Vector3Stamped, PointStamped
 from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import InteractiveMarkerFeedback
 from tf2_ros import Buffer, TransformListener
@@ -52,6 +52,9 @@ class StateManager:
         # Branch gap detection (for 2-finger mode)
         self.fruit_between_branches: bool = False
         self.fruit_gap_angle: float = 0.0
+
+        # Trunk position from vision (updated continuously)
+        self._trunk_x: Optional[float] = None
 
         # Timer reference for cleanup
         self._timer_wait_js = None
@@ -109,6 +112,14 @@ class StateManager:
             10
         )
 
+        # Trunk position from vision (continuous updates)
+        self._node.create_subscription(
+            PointStamped,
+            "/trunk_position",
+            self._trunk_position_cb,
+            10
+        )
+
         # Timer to check for initial joint states
         self._timer_wait_js = self._node.create_timer(0.5, self._check_joint_states)
 
@@ -160,6 +171,10 @@ class StateManager:
     def robot_running(self, value: bool):
         self._robot_running = value
 
+    @property
+    def trunk_x(self) -> Optional[float]:
+        return self._trunk_x
+
     # ============ Callbacks ============
 
     def _joint_state_cb(self, msg: ROSJointState) -> None:
@@ -209,6 +224,10 @@ class StateManager:
         if len(msg.data) >= 2:
             self.fruit_between_branches = msg.data[0] > 0.5
             self.fruit_gap_angle = float(msg.data[1])
+
+    def _trunk_position_cb(self, msg: PointStamped) -> None:
+        """Update trunk x position from vision."""
+        self._trunk_x = msg.point.x
 
     def _check_joint_states(self) -> None:
         """Check if initial joint states have been received."""

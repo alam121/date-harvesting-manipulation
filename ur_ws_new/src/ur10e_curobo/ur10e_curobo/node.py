@@ -360,6 +360,7 @@ class UR10eCuroboMoveIt(Node):
                 [round(v, 4) for v in self.best_goal_xyz]
                 if self.best_goal_xyz else None
             ),
+            "goal_classification": getattr(self, "latest_goal_classification", None),
             "capture_active": self.goal_capture_active,
             "capture_count": getattr(self, "goal_capture_count", 0),
             "velocity_scale": self.cfg.planner.global_speed_multiplier,
@@ -729,6 +730,18 @@ class UR10eCuroboMoveIt(Node):
     @property
     def home_joints(self) -> list:
         return self._config_mgr.home_joints
+
+    @property
+    def home_left_joints(self) -> list:
+        return self._config_mgr.home_left_joints
+
+    @property
+    def home_right_joints(self) -> list:
+        return self._config_mgr.home_right_joints
+
+    @property
+    def trunk_x(self):
+        return self._state_mgr.trunk_x
 
     @property
     def dropoff_joints(self) -> list:

@@ -1008,9 +1008,12 @@ def subscribe_to_goal_pose(node):
             if is_distinct:
                 node.candidate_goals.append(g)
                 publish_goal_marker(node, new_xyz)
-                goal_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
+                h_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
+                _trunk = getattr(node, 'trunk_x', None) or 0.16
+                _dx = abs(new_xyz[0] - _trunk)
+                l_type = ("LEFT" if new_xyz[0] > _trunk else "RIGHT") if _dx > 0.05 else "CENTER"
                 node.get_logger().info(
-                    f"Candidate #{len(node.candidate_goals)}: {goal_type} "
+                    f"Candidate #{len(node.candidate_goals)}: {h_type} | {l_type} "
                     f"(z={new_xyz[2]:.2f}m) [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
             return
 
@@ -1064,10 +1067,24 @@ def subscribe_to_goal_pose(node):
             node.goal_poses.append(g)
             publish_goal_marker(node, new_xyz)
             is_low = new_xyz[2] < LOW_Z_THRESH
-            goal_type = "LOW" if is_low else "MID/HIGH"
+            height_type = "LOW" if is_low else "MID/HIGH"
+
+            # Lateral classification: left / center / right relative to trunk
+            trunk_x = getattr(node, 'trunk_x', None)
+            if trunk_x is None:
+                trunk_x = 0.16  # fallback
+            dx_trunk = abs(new_xyz[0] - trunk_x)
+            if dx_trunk > 0.05:
+                lateral_type = "LEFT" if new_xyz[0] > trunk_x else "RIGHT"
+            else:
+                lateral_type = "CENTER"
+
+            node.latest_goal_classification = f"{height_type} | {lateral_type}"
             print(f"Accepted primary goal: [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
-            print(f"   Goal type: {goal_type} (z={new_xyz[2]:.2f}m, thresh={LOW_Z_THRESH})")
-            node.get_logger().info(f"Primary goal accepted: {goal_type} (z={new_xyz[2]:.2f}m)")
+            print(f"   Height: {height_type} (z={new_xyz[2]:.2f}m)  Lateral: {lateral_type} (fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f}, dx_trunk={dx_trunk:.2f}m)")
+            node.get_logger().info(
+                f"Primary goal accepted: {height_type} | {lateral_type} "
+                f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f})")
             node.obstacles.update_pose("fruit_obstacle", new_xyz)
 
     # Subscribe to /external_goal_pose with VOLATILE QoS
@@ -1467,9 +1484,9 @@ def plan_and_execute(node):
                 f"fruit=[{x:.3f},{y:.3f},{z:.3f}]")
         else:
             # Mid/high: d_blend direction-driven approach from front
-            ax = x - d_blend[0] * standoff
-            ay = y + abs(d_blend[1]) * standoff  # ALWAYS toward robot
-            az = z - d_blend[2] * standoff
+            ax = x - standoff
+            ay = y + standoff  # ALWAYS toward robot
+            az = z - standoff
             node.get_logger().info(
                 f"MID/HIGH approach (z={z:.2f} >= {LOW_Z_THRESH}): "
                 f"fruit=[{x:.3f},{y:.3f},{z:.3f}] standoff=[{ax:.3f},{ay:.3f},{az:.3f}] "
@@ -1483,20 +1500,27 @@ def plan_and_execute(node):
         print("Current quat:", cur_quat)
         print("Target quat:", target_quat)
 
-        # Dynamic side HOME: adjust shoulder pan for laterally distant fruits
-        TRUNK_X = 0.16
+        # Side HOME: use predefined home_left / home_right based on fruit vs trunk position
+        is_side_approach = False
+        trunk_x = node.trunk_x  # live trunk x from /trunk_position topic
+        if trunk_x is None:
+            trunk_x = 0.16  # fallback if vision hasn't published yet
+            node.get_logger().warn("No trunk_position received yet, using default trunk_x=0.16")
         if cur_pose is not None:
-            dx_ee_to_fruit = abs(x - cur_pose[0])
-            print(f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m")
-            node.get_logger().info(f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m")
-            if dx_ee_to_fruit > 0.20:
-                dx_from_trunk = x - TRUNK_X
-                pan_offset = max(-0.52, min(0.52, dx_from_trunk * 1.0))  # ±30° max
-                side_home = list(node.home_joints)
-                side_home[0] = node.home_joints[0] + pan_offset
+            dx_ee_to_fruit = abs(x - trunk_x)
+            node.get_logger().info(
+                f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}")
+            if dx_ee_to_fruit > 0.03:   # only do side HOME if fruit is laterally far enough from EE (to justify the extra motion)
+                if x > trunk_x:
+                    side_joints = node.home_left_joints
+                    side_label = "HOME_LEFT"
+                else:
+                    side_joints = node.home_right_joints
+                    side_label = "HOME_RIGHT"
                 node.get_logger().info(
-                    f"Side HOME: fruit x={x:.2f}, pan_offset={math.degrees(pan_offset):.1f}deg")
-                plan_execute_js(node, side_home, label="SIDE_HOME", motion_type="home")
+                    f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
+                plan_execute_js(node, side_joints, label=side_label, motion_type="home")
+                is_side_approach = True
                 # Update start state and cur_pose after side HOME
                 cur_pose = node.get_end_effector_pose()
                 cur_quat = cur_pose[3:] if cur_pose else cur_quat
@@ -1505,8 +1529,7 @@ def plan_and_execute(node):
                     joint_names=node.joint_order,
                 )
             else:
-                print("Fruit near center; using default HOME without pan offset.")
-                node.get_logger().info("Fruit near center; using default HOME without pan offset.")
+                node.get_logger().info("Fruit near center; using default HOME without side move.")
 
         # Skip approach if EE is already close to the goal
         skip_approach = False
@@ -1536,17 +1559,18 @@ def plan_and_execute(node):
         if skip_approach:
             pass  # jump straight to reacquire + final below
         elif is_low:
-            # Low-hanging: blend 25% toward vision orientation
-            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=0.25)
-            approach = [ax, ay - 0.01, az - 0.12, *orientation]
-            node.get_logger().info(f"LOW approach pose: {approach[:3]}")
+            side_blend = 0.25
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
+            approach = [ax, ay + 0.01, az - 0.12, *orientation]
+            node.get_logger().info(
+                f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
             print(f"Going for LOW approach: {approach[:3]}")
         else:
-            # Mid/high: use vision direction (surface normal + collision avoidance) for orientation
-            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=0.25)
+            side_blend =0.0
+            orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
             approach = [ax, ay, az, *orientation]
             node.get_logger().info(
-                f"MID/HIGH approach pose: {approach[:3]} "
+                f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
                 f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
             print(f"Going for MID/HIGH approach: {approach[:3]}")
 

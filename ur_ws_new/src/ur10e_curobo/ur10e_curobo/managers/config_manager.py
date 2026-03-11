@@ -36,6 +36,8 @@ class ConfigManager:
         # Shortcut attributes (exposed for backward compatibility)
         self.speed_scale: float = 0.5
         self.home_joints: List[float] = []
+        self.home_left_joints: List[float] = []
+        self.home_right_joints: List[float] = []
         self.dropoff_joints: List[float] = []
         self.predropoff_joints: List[float] = []
         self.yoffset: float = 0.0
@@ -106,6 +108,8 @@ class ConfigManager:
 
         # Joint preset params
         self._node.declare_parameter("joints.home", self.cfg.joints.home)
+        self._node.declare_parameter("joints.home_left", self.cfg.joints.home_left)
+        self._node.declare_parameter("joints.home_right", self.cfg.joints.home_right)
         self._node.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
         self._node.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
 
@@ -158,6 +162,8 @@ class ConfigManager:
 
         # Joints (arrays come back as tuples in some ROS versions)
         self.cfg.joints.home = list(self._node.get_parameter("joints.home").value)
+        self.cfg.joints.home_left = list(self._node.get_parameter("joints.home_left").value)
+        self.cfg.joints.home_right = list(self._node.get_parameter("joints.home_right").value)
         self.cfg.joints.dropoff = list(self._node.get_parameter("joints.dropoff").value)
         self.cfg.joints.predropoff = list(self._node.get_parameter("joints.predropoff").value)
 
@@ -169,6 +175,8 @@ class ConfigManager:
         """Expose commonly-used config values as direct attributes for convenience."""
         self.speed_scale = self.cfg.planner.speed_scale
         self.home_joints = self.cfg.joints.home
+        self.home_left_joints = self.cfg.joints.home_left
+        self.home_right_joints = self.cfg.joints.home_right
         self.dropoff_joints = self.cfg.joints.dropoff
         self.predropoff_joints = self.cfg.joints.predropoff
         self.yoffset = self.cfg.planner.pre_dropoff_y_offset
