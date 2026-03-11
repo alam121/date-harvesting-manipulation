@@ -737,6 +737,26 @@ class MainWindow(QtWidgets.QWidget):
         clear_btn.setStyleSheet("background-color: #9e9e9e; color: white;")
         clear_btn.clicked.connect(lambda: self._send_cmd("clear"))
         motion_layout.addWidget(clear_btn, 1, 1)
+
+        self.debug_preview_cb = QtWidgets.QCheckBox("Debug Plan Preview")
+        self.debug_preview_cb.setChecked(True)
+        self.debug_preview_cb.setToolTip("Show full plan in RViz before executing")
+        self.debug_preview_cb.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 4px;")
+        self.debug_preview_cb.stateChanged.connect(self._on_debug_preview_changed)
+        motion_layout.addWidget(self.debug_preview_cb, 2, 0, 1, 2)
+
+        # Plan confirm/cancel buttons (shown when plan preview is waiting)
+        self.plan_confirm_btn = QtWidgets.QPushButton("Confirm Plan")
+        self.plan_confirm_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
+        self.plan_confirm_btn.clicked.connect(lambda: self._send_cmd("plan_confirm"))
+        self.plan_confirm_btn.setVisible(False)
+        motion_layout.addWidget(self.plan_confirm_btn, 3, 0)
+
+        self.plan_cancel_btn = QtWidgets.QPushButton("Cancel Plan")
+        self.plan_cancel_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
+        self.plan_cancel_btn.clicked.connect(lambda: self._send_cmd("plan_cancel"))
+        self.plan_cancel_btn.setVisible(False)
+        motion_layout.addWidget(self.plan_cancel_btn, 3, 1)
         layout.addWidget(motion_group)
 
         # Gripper
@@ -950,6 +970,15 @@ class MainWindow(QtWidgets.QWidget):
 
             self.current_velocity_label.setText(f"Velocity: {goal_info.get('velocity_scale', 5.0):.1f}x")
 
+            if "debug_plan_preview" in goal_info:
+                self.debug_preview_cb.blockSignals(True)
+                self.debug_preview_cb.setChecked(goal_info["debug_plan_preview"])
+                self.debug_preview_cb.blockSignals(False)
+
+            waiting = goal_info.get("plan_waiting_confirm", False)
+            self.plan_confirm_btn.setVisible(waiting)
+            self.plan_cancel_btn.setVisible(waiting)
+
         # Graphs
         if PYQTGRAPH_AVAILABLE:
             self.elapsed_time += 0.05
@@ -995,6 +1024,11 @@ class MainWindow(QtWidgets.QWidget):
         scale = self.velocity_slider.value() / 10.0
         self.ros.publish_velocity_scale(scale)
         self.status_update.emit(f"Velocity: {scale:.1f}x", False)
+
+    def _on_debug_preview_changed(self, state):
+        enabled = "true" if state == Qt.Checked else "false"
+        self.ros.publish_cmd(f"set_debug_preview {enabled}")
+        self.status_update.emit(f"Debug preview: {enabled}", False)
 
     def _set_status_slot(self, text: str, error: bool):
         if not self._status:

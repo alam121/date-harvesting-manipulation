@@ -152,6 +152,113 @@ def publish_goal_marker(node, position, rank=None):
         node.goal_marker_pub.publish(t)
 
 
+def publish_plan_preview(node, steps):
+    """Publish plan preview markers in RViz.
+
+    steps: list of dicts with keys:
+        label: str          — e.g. "HOME", "HOME_RIGHT", "APPROACH", "FINAL", "DROPOFF"
+        position: [x,y,z]   — Cartesian position (or None to compute from joints)
+        joints: [j1..j6]    — joint positions (used if position is None)
+        color: (r,g,b,a)    — marker color
+    """
+    from .fk import forward_kinematics
+    stamp = node.get_clock().now().to_msg()
+    prev_pt = None
+
+    # Colors per stage
+    COLORS = {
+        "HOME":       (0.2, 0.8, 0.2, 1.0),   # green
+        "HOME_LEFT":  (0.2, 0.8, 0.8, 1.0),   # cyan
+        "HOME_RIGHT": (0.2, 0.8, 0.8, 1.0),   # cyan
+        "APPROACH":   (0.0, 0.5, 1.0, 1.0),   # blue
+        "FINAL":      (1.0, 0.3, 0.0, 1.0),   # orange
+        "DROPOFF":    (0.8, 0.0, 0.8, 1.0),   # purple
+    }
+
+    for i, step in enumerate(steps):
+        label = step["label"]
+        pos = step.get("position")
+        joints = step.get("joints")
+        r, g, b, a = step.get("color") or COLORS.get(label, (1.0, 1.0, 1.0, 1.0))
+
+        # Resolve position
+        if pos is None and joints is not None:
+            fk_pt = forward_kinematics(node, joints)
+            if fk_pt:
+                pos = [fk_pt.x, fk_pt.y, fk_pt.z]
+        if pos is None:
+            node.get_logger().warn(f"Plan preview: skipping step '{label}' — position is None")
+            continue
+
+        # Sphere marker for this waypoint
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = stamp
+        m.ns = "plan_preview"
+        m.id = i * 2
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = pos[0]
+        m.pose.position.y = pos[1]
+        m.pose.position.z = pos[2]
+        m.pose.orientation.w = 1.0
+        sz = 0.06 if label in ("APPROACH", "FINAL") else 0.04
+        m.scale.x = m.scale.y = m.scale.z = sz
+        m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, a
+        m.lifetime.sec = 30
+        node.goal_marker_pub.publish(m)
+
+        # Text label above sphere
+        t = Marker()
+        t.header.frame_id = "base_link"
+        t.header.stamp = stamp
+        t.ns = "plan_preview"
+        t.id = i * 2 + 1
+        t.type = Marker.TEXT_VIEW_FACING
+        t.action = Marker.ADD
+        t.pose.position.x = pos[0]
+        t.pose.position.y = pos[1]
+        t.pose.position.z = pos[2] + 0.06
+        t.scale.z = 0.04
+        t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+        t.text = f"{i+1}. {label}"
+        t.lifetime.sec = 30
+        node.goal_marker_pub.publish(t)
+
+        # Connecting line to previous waypoint
+        cur_pt = Point(x=pos[0], y=pos[1], z=pos[2])
+        if prev_pt is not None:
+            line = Marker()
+            line.header.frame_id = "base_link"
+            line.header.stamp = stamp
+            line.ns = "plan_preview_lines"
+            line.id = i
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.scale.x = 0.005
+            line.color.r, line.color.g, line.color.b, line.color.a = 1.0, 1.0, 1.0, 0.5
+            line.points.append(prev_pt)
+            line.points.append(cur_pt)
+            line.lifetime.sec = 30
+            node.goal_marker_pub.publish(line)
+        prev_pt = cur_pt
+
+    labels = [s["label"] for s in steps]
+    node.get_logger().info(f"Published plan preview with {len(steps)} steps in RViz: {labels}")
+
+
+def clear_plan_preview(node):
+    """Clear all plan preview markers from RViz."""
+    stamp = node.get_clock().now().to_msg()
+    for ns in ("plan_preview", "plan_preview_lines"):
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = stamp
+        m.ns = ns
+        m.action = Marker.DELETEALL
+        node.goal_marker_pub.publish(m)
+
+
 def publish_path_marker(node):
     
     m = Marker(); m.header.frame_id = "base_link"; m.header.stamp = node.get_clock().now().to_msg()

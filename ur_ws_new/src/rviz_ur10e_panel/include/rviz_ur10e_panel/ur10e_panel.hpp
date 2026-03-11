@@ -6,6 +6,7 @@
 #include <QSlider>
 #include <QLabel>
 #include <QLineEdit>
+#include <QCheckBox>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QKeyEvent>
@@ -56,6 +57,9 @@ private Q_SLOTS:
   void onRefreshCamera();
   void onGraspSuccess();
   void onGraspFail();
+  void onDebugPreviewChanged(int state);
+  void onPlanConfirm();
+  void onPlanCancel();
   void updateDisplay();
 
 private:
@@ -86,6 +90,8 @@ private:
   int goal_count_ = 0;
   std::string latest_goal_;
   std::string goal_coords_str_;
+  bool plan_waiting_confirm_ = false;
+  bool debug_plan_preview_ = true;
 
   // UI
   QLabel * status_label_;
@@ -100,6 +106,9 @@ private:
   QLabel * force_labels_[3];
   QLineEdit * x_in_, * y_in_, * z_in_;
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
+  QCheckBox * debug_preview_cb_;
+  QPushButton * plan_confirm_btn_;
+  QPushButton * plan_cancel_btn_;
   QTimer * update_timer_;
 };
 

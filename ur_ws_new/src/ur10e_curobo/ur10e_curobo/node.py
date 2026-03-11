@@ -308,6 +308,18 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "refresh_camera":
             self._refresh_camera_pub.publish(String(data="refresh"))
             self.get_logger().info("Camera refresh requested")
+        elif cmd == "plan_confirm":
+            self._state_mgr.plan_confirmed = True
+            self._state_mgr.plan_confirm_event.set()
+            self.get_logger().info("Plan confirmed (GUI)")
+        elif cmd == "plan_cancel":
+            self._state_mgr.plan_confirmed = False
+            self._state_mgr.plan_confirm_event.set()
+            self.get_logger().info("Plan cancelled (GUI)")
+        elif cmd.startswith("set_debug_preview "):
+            val = cmd.split()[1].lower()
+            self.cfg.planner.debug_plan_preview = val in ("true", "1", "yes")
+            self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
         elif cmd == "debug_world":
             self.debug_print_world()
         else:
@@ -368,6 +380,8 @@ class UR10eCuroboMoveIt(Node):
             "speed_dropoff": self.cfg.planner.speed_dropoff,
             "speed_approach": self.cfg.planner.speed_approach,
             "speed_predropoff": self.cfg.planner.speed_predropoff,
+            "debug_plan_preview": self.cfg.planner.debug_plan_preview,
+            "plan_waiting_confirm": self._state_mgr.plan_waiting,
         }
         msg = String()
         msg.data = json.dumps(msg_data)
@@ -398,6 +412,19 @@ class UR10eCuroboMoveIt(Node):
 
             # echo keypress
             print(f"[{ts()}] key='{key}'")
+
+            # Plan preview confirmation intercept
+            if self._state_mgr.plan_waiting:
+                if key in ('\r', '\n', ''):
+                    print(f"[{ts()}] Plan CONFIRMED (ENTER)")
+                    self._state_mgr.plan_confirmed = True
+                    self._state_mgr.plan_confirm_event.set()
+                    continue
+                elif key == 'k':
+                    print(f"[{ts()}] Plan CANCELLED (k)")
+                    self._state_mgr.plan_confirmed = False
+                    self._state_mgr.plan_confirm_event.set()
+                    continue
 
             if key == 'y':
                 if self.latest_marker_pose:
@@ -742,6 +769,26 @@ class UR10eCuroboMoveIt(Node):
     @property
     def trunk_x(self):
         return self._state_mgr.trunk_x
+
+    @property
+    def plan_confirm_event(self):
+        return self._state_mgr.plan_confirm_event
+
+    @property
+    def plan_confirmed(self):
+        return self._state_mgr.plan_confirmed
+
+    @plan_confirmed.setter
+    def plan_confirmed(self, val):
+        self._state_mgr.plan_confirmed = val
+
+    @property
+    def plan_waiting(self):
+        return self._state_mgr.plan_waiting
+
+    @plan_waiting.setter
+    def plan_waiting(self, val):
+        self._state_mgr.plan_waiting = val
 
     @property
     def dropoff_joints(self) -> list:

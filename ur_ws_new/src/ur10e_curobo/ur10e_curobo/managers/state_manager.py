@@ -56,6 +56,11 @@ class StateManager:
         # Trunk position from vision (updated continuously)
         self._trunk_x: Optional[float] = None
 
+        # Plan preview confirmation (set by keyboard thread or GUI)
+        self.plan_waiting: bool = False  # True when plan preview is awaiting user input
+        self.plan_confirm_event = threading.Event()
+        self.plan_confirmed: Optional[bool] = None  # True=execute, False=cancel
+
         # Timer reference for cleanup
         self._timer_wait_js = None
 

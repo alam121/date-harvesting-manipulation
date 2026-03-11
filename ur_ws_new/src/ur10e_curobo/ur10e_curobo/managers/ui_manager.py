@@ -139,6 +139,14 @@ class UIManager:
             goals_mod.subscribe_to_goal_pose(self._node)
             self._node.goal_capture_active = False
             self._node.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
+        elif cmd == "plan_confirm":
+            self._state.plan_confirmed = True
+            self._state.plan_confirm_event.set()
+        elif cmd == "plan_cancel":
+            self._state.plan_confirmed = False
+            self._state.plan_confirm_event.set()
+        elif cmd.startswith("set_debug_preview "):
+            self._handle_set_debug_preview(cmd)
         elif cmd == "update_voxel":
             self._node._update_voxel_snapshot()
         elif cmd in ("grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera"):
@@ -163,6 +171,13 @@ class UIManager:
             )
         except (ValueError, IndexError) as e:
             self._node.get_logger().warn(f"Invalid set_speeds format: {e}")
+
+    def _handle_set_debug_preview(self, cmd: str) -> None:
+        """Handle set_debug_preview command."""
+        val = cmd.split()[1].lower()
+        enabled = val in ("true", "1", "yes")
+        self._config.cfg.planner.debug_plan_preview = enabled
+        self._node.get_logger().info(f"Debug plan preview set to {enabled}")
 
     def _handle_set_velocity_scale(self, cmd: str) -> None:
         """Handle set_velocity_scale command."""
@@ -217,6 +232,8 @@ class UIManager:
             "speed_dropoff": self._config.cfg.planner.speed_dropoff,
             "speed_approach": self._config.cfg.planner.speed_approach,
             "speed_predropoff": self._config.cfg.planner.speed_predropoff,
+            "debug_plan_preview": self._config.cfg.planner.debug_plan_preview,
+            "plan_waiting_confirm": self._state.plan_waiting,
         }
         msg = String()
         msg.data = json.dumps(msg_data)
@@ -239,6 +256,19 @@ class UIManager:
                 continue
 
             print(f"[{ts()}] key='{key}'")
+
+            # Plan preview confirmation intercept
+            if self._state.plan_waiting:
+                if key in ('\r', '\n', ''):
+                    print(f"[{ts()}] Plan CONFIRMED (ENTER)")
+                    self._state.plan_confirmed = True
+                    self._state.plan_confirm_event.set()
+                    continue
+                elif key == 'k':
+                    print(f"[{ts()}] Plan CANCELLED (k)")
+                    self._state.plan_confirmed = False
+                    self._state.plan_confirm_event.set()
+                    continue
 
             if key == 'y':
                 self._handle_key_save_marker(ts)

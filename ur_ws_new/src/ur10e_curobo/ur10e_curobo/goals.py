@@ -78,7 +78,7 @@ class ThreadSafeGoalList:
             self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
-from .config import LOW_Z_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG
+from .config import LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
@@ -90,6 +90,7 @@ from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
 from .grasp_learner import GraspRecord
 from . import gripper as gripper_mod
+from . import markers as markers_mod
 
 def pose_to_vec7(p: ROSPose):
     return [p.position.x, p.position.y, p.position.z, p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
@@ -1011,7 +1012,7 @@ def subscribe_to_goal_pose(node):
                 h_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
                 _trunk = getattr(node, 'trunk_x', None) or 0.16
                 _dx = abs(new_xyz[0] - _trunk)
-                l_type = ("LEFT" if new_xyz[0] > _trunk else "RIGHT") if _dx > 0.05 else "CENTER"
+                l_type = ("LEFT" if new_xyz[0] > _trunk else "RIGHT") if _dx > LATERAL_THRESH else "CENTER"
                 node.get_logger().info(
                     f"Candidate #{len(node.candidate_goals)}: {h_type} | {l_type} "
                     f"(z={new_xyz[2]:.2f}m) [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
@@ -1074,7 +1075,7 @@ def subscribe_to_goal_pose(node):
             if trunk_x is None:
                 trunk_x = 0.16  # fallback
             dx_trunk = abs(new_xyz[0] - trunk_x)
-            if dx_trunk > 0.05:
+            if dx_trunk > LATERAL_THRESH:
                 lateral_type = "LEFT" if new_xyz[0] > trunk_x else "RIGHT"
             else:
                 lateral_type = "CENTER"
@@ -1510,7 +1511,7 @@ def plan_and_execute(node):
             dx_ee_to_fruit = abs(x - trunk_x)
             node.get_logger().info(
                 f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}")
-            if dx_ee_to_fruit > 0.03:   # only do side HOME if fruit is laterally far enough from EE (to justify the extra motion)
+            if dx_ee_to_fruit > LATERAL_THRESH:   # only do side HOME if fruit is laterally far enough from EE
                 if x > trunk_x:
                     side_joints = node.home_left_joints
                     side_label = "HOME_LEFT"
@@ -1573,6 +1574,49 @@ def plan_and_execute(node):
                 f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
                 f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
             print(f"Going for MID/HIGH approach: {approach[:3]}")
+
+        # === DEBUG PLAN PREVIEW (RViz visualization) ===
+        if node.cfg.planner.debug_plan_preview:
+            preview_steps = []
+            # 1. Current position (HOME or side HOME)
+            if is_side_approach:
+                side_label = "HOME_LEFT" if x > (node.trunk_x or 0.16) else "HOME_RIGHT"
+                side_js = node.home_left_joints if "LEFT" in side_label else node.home_right_joints
+                preview_steps.append({"label": side_label, "joints": side_js})
+            else:
+                preview_steps.append({"label": "HOME", "joints": node.home_joints})
+            # 2. Approach
+            if not skip_approach:
+                preview_steps.append({"label": "APPROACH", "position": approach[:3]})
+            # 3. Final
+            preview_steps.append({"label": "FINAL", "position": [x, y + 0.03, z + 0.03]})
+            # 4. Dropoff
+            preview_steps.append({"label": "DROPOFF", "joints": node.dropoff_joints})
+            # 5. Return HOME
+            preview_steps.append({"label": "HOME", "joints": node.home_joints})
+
+            markers_mod.publish_plan_preview(node, preview_steps)
+
+            trunk_x_val = node.trunk_x or 0.16
+            dx_trunk = abs(x - trunk_x_val)
+            height_label = "LOW" if is_low else "MID/HIGH"
+            lateral_label = ("LEFT" if x > trunk_x_val else "RIGHT") if dx_trunk > LATERAL_THRESH else "CENTER"
+            node.get_logger().info(
+                f"PLAN PREVIEW: {height_label} | {lateral_label} | "
+                f"side={is_side_approach} | goal=[{x:.3f},{y:.3f},{z:.3f}] | "
+                f"Waiting for confirm (GUI 'confirm'/'cancel' or keyboard ENTER/k)")
+
+            # Wait for confirmation via event (set by keyboard thread or GUI command)
+            node.plan_confirmed = None
+            node.plan_confirm_event.clear()
+            node.plan_waiting = True
+            node.plan_confirm_event.wait()  # blocks until set
+            node.plan_waiting = False
+            markers_mod.clear_plan_preview(node)
+            if not node.plan_confirmed:
+                node.get_logger().info("Plan cancelled by user.")
+                unlock_target(node)
+                continue
 
         if not skip_approach:
             if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):

@@ -20,7 +20,10 @@ JOINT_ORDER = [
 ]
 
 # Height threshold (m) that classifies targets as LOW vs MID/HIGH.
-LOW_Z_THRESH = 0.95
+LOW_Z_THRESH = 0.90
+
+# Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
+LATERAL_THRESH = 0.03
 
 # ---------- Static Obstacles (single source of truth) ----------
 # Define obstacles once here, used for both cuRobo planning and RViz visualization
@@ -101,7 +104,8 @@ class JointsPreset:
     predropoff: List[float] = field(default_factory=lambda: [-1.5009062925921839, -1.7099877796568812, 2.0609028975116175, -4.172773023644918, 4.572351932525635, 0.05295269936323166]
 )
     # Side home positions for laterally distant fruits
-    home_left: List[float] = field(default_factory=lambda: [-0.905651871358053, -1.391455964451172, 1.7457168737994593, -4.479874750176901, 4.034928321838379, -0.6950586477862757]
+    home_left: List[float] = field(default_factory=lambda:  [-0.8943255583392542, -1.4516684126904984, 1.7941930929767054, -4.197223564187521, 3.9590818881988525, -0.848304573689596]
+
 
 )
     home_right: List[float] = field(default_factory=lambda: [-2.1765440146075647, -1.531268910770752, 2.0052130858050745, -4.843977590600485, 5.513174057006836, 1.2792410850524902]
@@ -140,6 +144,9 @@ class Planner:
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff
+
+    # === DEBUG ===
+    debug_plan_preview: bool = True    # show full plan and wait for confirmation before executing
 
 @dataclass
 class Perception:

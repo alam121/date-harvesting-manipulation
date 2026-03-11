@@ -85,6 +85,29 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(sub_multi_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribeMulti);
   motion_layout->addWidget(sub_multi_btn, 2, 1);
 
+  debug_preview_cb_ = new QCheckBox("Debug Plan Preview");
+  debug_preview_cb_->setChecked(true);
+  debug_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
+  debug_preview_cb_->setToolTip("Show full plan in RViz before executing");
+  connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
+  motion_layout->addWidget(debug_preview_cb_, 3, 0, 1, 2);
+
+  plan_confirm_btn_ = new QPushButton("Confirm Plan");
+  plan_confirm_btn_->setStyleSheet(
+    "background-color: #4caf50; color: white; font-weight: bold; "
+    "font-size: 11pt; padding: 8px;");
+  connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
+  plan_confirm_btn_->setVisible(false);
+  motion_layout->addWidget(plan_confirm_btn_, 4, 0);
+
+  plan_cancel_btn_ = new QPushButton("Cancel Plan");
+  plan_cancel_btn_->setStyleSheet(
+    "background-color: #d32f2f; color: white; font-weight: bold; "
+    "font-size: 11pt; padding: 8px;");
+  connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
+  plan_cancel_btn_->setVisible(false);
+  motion_layout->addWidget(plan_cancel_btn_, 4, 1);
+
   layout->addWidget(motion_group);
 
   // Gripper
@@ -322,6 +345,15 @@ bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
       return false;
     }
     auto * ke = static_cast<QKeyEvent *>(event);
+    // Plan confirmation intercept
+    if (plan_waiting_confirm_) {
+      if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) {
+        onPlanConfirm(); return true;
+      }
+      if (ke->key() == Qt::Key_K) {
+        onPlanCancel(); return true;
+      }
+    }
     switch (ke->key()) {
       case Qt::Key_H: onHome(); return true;
       case Qt::Key_D: onDropoff(); return true;
@@ -407,6 +439,24 @@ void UR10ePanel::setupRos()
         auto quote2 = data.find('"', quote1 + 1);
         if (quote1 != std::string::npos && quote2 != std::string::npos) {
           latest_goal_ = data.substr(quote1 + 1, quote2 - quote1 - 1);
+        }
+      }
+      // Extract plan_waiting_confirm
+      pos = data.find("\"plan_waiting_confirm\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        if (colon != std::string::npos) {
+          auto val_start = data.find_first_not_of(" ", colon + 1);
+          plan_waiting_confirm_ = (data.substr(val_start, 4) == "true");
+        }
+      }
+      // Extract debug_plan_preview
+      pos = data.find("\"debug_plan_preview\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        if (colon != std::string::npos) {
+          auto val_start = data.find_first_not_of(" ", colon + 1);
+          debug_plan_preview_ = (data.substr(val_start, 4) == "true");
         }
       }
       // Extract goals array for coordinate display
@@ -496,6 +546,13 @@ void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
 void UR10ePanel::onRefreshCamera() { publishCmd("refresh_camera"); }
 void UR10ePanel::onGraspSuccess() { publishCmd("grasp_success"); }
 void UR10ePanel::onGraspFail() { publishCmd("grasp_fail"); }
+void UR10ePanel::onPlanConfirm() { publishCmd("plan_confirm"); }
+void UR10ePanel::onPlanCancel() { publishCmd("plan_cancel"); }
+
+void UR10ePanel::onDebugPreviewChanged(int state)
+{
+  publishCmd(state == Qt::Checked ? "set_debug_preview true" : "set_debug_preview false");
+}
 
 void UR10ePanel::onSendGoal()
 {
@@ -564,6 +621,15 @@ void UR10ePanel::updateDisplay()
     latest_goal_label_->setText(QString("Latest: %1").arg(
       QString::fromStdString(latest_goal_)));
   }
+  // Plan confirm/cancel visibility
+  plan_confirm_btn_->setVisible(plan_waiting_confirm_);
+  plan_cancel_btn_->setVisible(plan_waiting_confirm_);
+
+  // Sync debug preview checkbox
+  debug_preview_cb_->blockSignals(true);
+  debug_preview_cb_->setChecked(debug_plan_preview_);
+  debug_preview_cb_->blockSignals(false);
+
   // Show goal coordinates
   if (!goal_coords_str_.empty() && goal_coords_str_ != "[]") {
     // Format: [[x,y,z],[x,y,z],...] → readable lines

@@ -82,6 +82,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
         self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
         self._node.declare_parameter("planner.max_traj_velocity", self.cfg.planner.max_traj_velocity)
+        self._node.declare_parameter("planner.debug_plan_preview", self.cfg.planner.debug_plan_preview)
 
         # Grasp learning params
         self._node.declare_parameter("grasp.learning_enabled", self.cfg.grasp.learning_enabled)
@@ -136,6 +137,7 @@ class ConfigManager:
         self.cfg.planner.min_dt = float(self._node.get_parameter("planner.min_dt").value)
         self.cfg.planner.max_dt = float(self._node.get_parameter("planner.max_dt").value)
         self.cfg.planner.max_traj_velocity = float(self._node.get_parameter("planner.max_traj_velocity").value)
+        self.cfg.planner.debug_plan_preview = bool(self._node.get_parameter("planner.debug_plan_preview").value)
 
         # Grasp learning
         self.cfg.grasp.learning_enabled = bool(self._node.get_parameter("grasp.learning_enabled").value)
@@ -206,6 +208,7 @@ class ConfigManager:
             "planner.min_dt": (self.cfg.planner, "min_dt", float),
             "planner.max_dt": (self.cfg.planner, "max_dt", float),
             "planner.max_traj_velocity": (self.cfg.planner, "max_traj_velocity", float),
+            "planner.debug_plan_preview": (self.cfg.planner, "debug_plan_preview", bool),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
             "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),
