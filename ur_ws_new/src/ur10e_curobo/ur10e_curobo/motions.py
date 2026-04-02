@@ -129,7 +129,13 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         # dt: Time step for trajectory interpolation.
         
 # Publishes /joint_trajectory_controller/joint_trajectory.
-def plan_execute_js(node, target_joints: List[float], label: str, motion_type: str = "default"):
+def plan_execute_js(
+    node,
+    target_joints: List[float],
+    label: str,
+    motion_type: str = "default",
+    speed_factor: float = 1.0,
+):
     if node.current_joint_positions is None:
         # Wait briefly for joint state callback to fire (can be delayed after blocking ops)
         for _ in range(10):
@@ -177,6 +183,7 @@ def plan_execute_js(node, target_joints: List[float], label: str, motion_type: s
         "predropoff": planner.speed_predropoff,
     }
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
+    scale *= max(speed_factor, 1e-6)
 
     # ------------------------------
     # 3. cuRobo plan (hold lock to prevent concurrent CUDA ops)

@@ -104,8 +104,7 @@ class JointsPreset:
     predropoff: List[float] = field(default_factory=lambda: [-1.5009062925921839, -1.7099877796568812, 2.0609028975116175, -4.172773023644918, 4.572351932525635, 0.05295269936323166]
 )
     # Side home positions for laterally distant fruits
-    home_left: List[float] = field(default_factory=lambda:  [-0.8943255583392542, -1.4516684126904984, 1.7941930929767054, -4.197223564187521, 3.9590818881988525, -0.848304573689596]
-
+    home_left: List[float] = field(default_factory=lambda:   [-0.7984879652606409, -1.2919612687877198, 1.7527521292315882, -4.203655859033102, 3.8313863277435303, -0.41989452043642217]
 
 )
     home_right: List[float] = field(default_factory=lambda: [-2.1765440146075647, -1.531268910770752, 2.0052130858050745, -4.843977590600485, 5.513174057006836, 1.2792410850524902]
@@ -124,7 +123,7 @@ class Planner:
     global_speed_multiplier: float = 5.0
 
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
-    speed_home: float = 0.5        # for move_to_home_position
+    speed_home: float = 0.08        # for move_to_home_position
     speed_dropoff: float = 2.0    # for move_to_dropoff_position
     speed_predropoff: float = 0.2  # for pre-dropoff reverse
     speed_approach: float = 1.0    # for approach motion

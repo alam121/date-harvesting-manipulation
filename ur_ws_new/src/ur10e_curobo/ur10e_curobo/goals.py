@@ -759,7 +759,7 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
     return True
 
 
-def execute_partial_reverse(node, clearance_m: float = 0.12):
+def execute_partial_reverse(node, clearance_m: float = 0.28):
     """
     Reverse only enough of the stored trajectory to pull back `clearance_m` from
     the grasp position, then stop. This clears the date bunch so cuRobo can plan
@@ -1520,7 +1520,7 @@ def plan_and_execute(node):
                     side_label = "HOME_RIGHT"
                 node.get_logger().info(
                     f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
-                plan_execute_js(node, side_joints, label=side_label, motion_type="home")
+                plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
                 is_side_approach = True
                 # Update start state and cur_pose after side HOME
                 cur_pose = node.get_end_effector_pose()
@@ -1763,7 +1763,7 @@ def plan_and_execute(node):
             try_cuda_recovery(node)
 
         # Partial reverse: pull back ~12cm to clear the date bunch, then plan to dropoff
-        execute_partial_reverse(node, clearance_m=0.12)
+        execute_partial_reverse(node, clearance_m=0.28)
 
         # Plan directly to dropoff — cuRobo avoids trunk via voxel obstacles
         if not move_to_dropoff_position(node):
