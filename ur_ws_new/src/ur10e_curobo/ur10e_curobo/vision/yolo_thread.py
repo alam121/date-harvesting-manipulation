@@ -41,7 +41,7 @@ class YoloThread:
             raise RuntimeError("CUDA is required for YOLO; GPU not available.")
 
         device = torch.device("cuda")
-        self._model = YOLO(self.weights)
+        self._model = YOLO(self.weights, task='segment')
         self.class_names = getattr(self._model, 'names', {})
 
         # Separate fruit vs trunk vs bunch class IDs

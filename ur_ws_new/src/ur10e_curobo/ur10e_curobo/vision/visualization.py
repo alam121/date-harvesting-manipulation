@@ -405,7 +405,7 @@ class VisionVisualizer:
                         # Semi-transparent purple fill via overlay blend
                         overlay = image.copy()
                         cv2.fillPoly(overlay, [pts], BUNCH_COLOR)
-                        cv2.addWeighted(overlay, 0.4, image, 0.6, 0, image)
+                        cv2.addWeighted(overlay, 0.01, image, 0.8, 0, image)
                         # Solid purple contour on top
                         cv2.polylines(image, [pts], isClosed=True, color=BUNCH_COLOR, thickness=2)
                     except Exception:

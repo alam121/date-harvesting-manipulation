@@ -78,18 +78,30 @@ class VisionNode:
         self.tf_buffer = None
 
     def run(self):
-        """Main entry point."""
+        """Main entry point — restarts _run_main on camera refresh."""
         import torch
         with torch.no_grad():
-            self._run_main()
+            while True:
+                self._refresh_requested = False
+                self._run_main()
+                if not self._refresh_requested:
+                    break
+                self.node.get_logger().info("Camera refresh — restarting ZED...")
+                sleep(1.0)
 
     def _run_main(self):
         """Main execution loop."""
-        # ROS2 setup
-        rclpy.init()
+        self.exit_signal = False
+
+        # ROS2 setup — only init rclpy once; recreate node/executor on each refresh
+        if not rclpy.ok():
+            rclpy.init()
+        if self.node is not None:
+            self.node.destroy_node()
         self.node = rclpy.create_node("zed_date_detector_ros")
+        # NOTE: executor.add_node() is deferred until just before executor.spin()
+        # so that rclpy.spin_once() inside wait_for_transform() works without conflict.
         self.executor = MultiThreadedExecutor(num_threads=4)
-        self.executor.add_node(self.node)
 
         fast_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -162,7 +174,9 @@ class VisionNode:
             cmd = msg.data.strip()
             if cmd == "refresh":
                 self.node.get_logger().info("Camera refresh requested — reinitializing ZED...")
-                self.exit_signal = True  # will restart the main loop
+                self._refresh_requested = True
+                self.exit_signal = True  # breaks perception loop
+                self.executor.shutdown(wait=False)  # breaks rclpy.spin()
 
         from std_msgs.msg import String as StdString
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
@@ -176,14 +190,14 @@ class VisionNode:
         for target, source in required_tfs:
             wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
-        # YOLO thread
-        self.yolo_thread = YoloThread(
-            weights=self.args.weights,
-            img_size=self.args.img_size,
-            conf_thres=self.args.conf_thres,
-        )
-        yolo_thread = Thread(target=self.yolo_thread.run, daemon=True)
-        yolo_thread.start()
+        # YOLO thread — keep alive across refreshes (model loading is expensive)
+        if self.yolo_thread is None:
+            self.yolo_thread = YoloThread(
+                weights=self.args.weights,
+                img_size=self.args.img_size,
+                conf_thres=self.args.conf_thres,
+            )
+            Thread(target=self.yolo_thread.run, daemon=True).start()
 
         # ZED init
         input_type = sl.InputType()
@@ -365,13 +379,15 @@ class VisionNode:
         perception_thread.start()
 
         try:
-            rclpy.spin(self.node)
+            self.executor.add_node(self.node)
+            self.executor.spin()
         finally:
             self.exit_signal = True
-            self.yolo_thread.stop()
             perception_thread.join(timeout=1.0)
             zed.close()
-            rclpy.shutdown()
+            if not getattr(self, '_refresh_requested', False):
+                self.yolo_thread.stop()
+                rclpy.shutdown()
 
     def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub) -> None:
         """Publish depth point cloud for voxel obstacle avoidance."""

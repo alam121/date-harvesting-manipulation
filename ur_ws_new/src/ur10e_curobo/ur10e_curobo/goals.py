@@ -1659,7 +1659,8 @@ def plan_and_execute(node):
         reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
         
         if reacq:
-            x,y,z = reacq; publish_goal_marker(node, [x,y,z])
+            x,y,z = reacq
+            publish_goal_marker(node, [x,y,z])
         else:
             node.get_logger().warn("No reacquire; skipping goal.")
             unlock_target(node)
@@ -1755,7 +1756,8 @@ def plan_and_execute(node):
             )
 
         # 4. Drop-off and return
-        if _check_stop(): break
+        if _check_stop(): 
+            break
         time.sleep(0.2)
 
         # Attempt CUDA recovery before dropoff/home planning
@@ -1776,7 +1778,8 @@ def plan_and_execute(node):
         node.gripper_controller.frozen_fingers = set()
         node.control_gripper("OPEN")
 
-        if _check_stop(): break
+        if _check_stop(): 
+            break
 
         # Smart return: if there are more goals, try direct approach instead of going home first
         went_home = False
