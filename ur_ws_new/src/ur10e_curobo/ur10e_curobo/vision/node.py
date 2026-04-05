@@ -274,6 +274,7 @@ class VisionNode:
                 if current_dets is None:
                     continue
                 trunk_boxes = self.yolo_thread.get_trunk_boxes()
+                bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 zed.ingest_custom_mask_objects(current_dets)
                 zed.retrieve_custom_objects(objects, obj_runtime_param)
@@ -316,7 +317,7 @@ class VisionNode:
                     with self.pub_lock:
                         self.latest_goal_msg = None
 
-                # Build viz entries for trunk bboxes (display only)
+                # Build viz entries for trunk and bunch bboxes (display only)
                 trunk_viz = []
                 for bx1, by1, bx2, by2 in trunk_boxes:
                     tx1 = max(0, min(int(bx1 * image_scale[0]), image_left_ocv.shape[1] - 1))
@@ -324,6 +325,17 @@ class VisionNode:
                     tx2 = max(0, min(int(bx2 * image_scale[0]), image_left_ocv.shape[1]))
                     ty2 = max(0, min(int(by2 * image_scale[1]), image_left_ocv.shape[0]))
                     trunk_viz.append({"bb": (tx1, ty1, tx2, ty2), "class": "trunk", "conf": 1.0})
+                for b in bunch_boxes:
+                    bx1, by1, bx2, by2 = b["bb"]
+                    tx1 = max(0, min(int(bx1 * image_scale[0]), image_left_ocv.shape[1] - 1))
+                    ty1 = max(0, min(int(by1 * image_scale[1]), image_left_ocv.shape[0] - 1))
+                    tx2 = max(0, min(int(bx2 * image_scale[0]), image_left_ocv.shape[1]))
+                    ty2 = max(0, min(int(by2 * image_scale[1]), image_left_ocv.shape[0]))
+                    polygon = b.get("polygon")
+                    polygon_scaled = None
+                    if polygon is not None:
+                        polygon_scaled = (polygon * np.array([[image_scale[0], image_scale[1]]])).astype(np.int32)
+                    trunk_viz.append({"bb": (tx1, ty1, tx2, ty2), "class": "bunch", "conf": b["conf"], "polygon": polygon_scaled})
 
                 # Visualization
                 now = time()

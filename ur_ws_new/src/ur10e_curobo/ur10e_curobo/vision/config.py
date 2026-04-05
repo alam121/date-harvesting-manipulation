@@ -19,7 +19,7 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg_v2.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_improved_exposure_data.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
@@ -87,7 +87,7 @@ CAM_FRAME = "zed2_left_camera_frame"
 # Set to False for single-class models (e.g. dates-only) where all detections are goals.
 CLASS_FILTER_ENABLED = True
 GOAL_CLASS_NAME = "datefruit"  # class picked as grasp target (must match model.names)
-VIZ_ONLY_CLASSES = ["trunk"]     # classes shown in visualization only
+VIZ_ONLY_CLASSES = ["trunk", "bunch"]  # classes shown in visualization only
 
 # Trunk depth correction: camera overestimates trunk distance (Y in base_link)
 # Positive value moves pole closer to robot. Tune per setup.

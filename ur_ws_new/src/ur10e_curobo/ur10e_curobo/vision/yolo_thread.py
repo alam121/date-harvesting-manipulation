@@ -28,6 +28,7 @@ class YoloThread:
         self.image_net: Optional[np.ndarray] = None
         self.detections = None       # fruit-only detections (for ZED)
         self.trunk_boxes = []        # trunk bbox list: [(x1,y1,x2,y2), ...]
+        self.bunch_boxes = []        # bunch bbox list: [(x1,y1,x2,y2), ...]
         self.net_fps = 0.0
 
         self._model: Optional[YOLO] = None
@@ -43,13 +44,17 @@ class YoloThread:
         self._model = YOLO(self.weights)
         self.class_names = getattr(self._model, 'names', {})
 
-        # Separate fruit vs trunk class IDs
-        skip_names = {"bunch", "stem"}
+        # Separate fruit vs trunk vs bunch class IDs
+        skip_names = {"stem"}
         self._trunk_class_ids = set(
             cid for cid, name in self.class_names.items()
             if name.lower() == "trunk"
         )
-        # Classes to run inference on: fruit + trunk (skip bunch, stem)
+        self._bunch_class_ids = set(
+            cid for cid, name in self.class_names.items()
+            if name.lower() == "bunch"
+        )
+        # Classes to run inference on: fruit + trunk + bunch (skip stem only)
         self._detect_class_ids = [
             cid for cid, name in self.class_names.items()
             if name.lower() not in skip_names
@@ -57,6 +62,7 @@ class YoloThread:
         print(f"Network Initialized... classes: {self.class_names}")
         print(f"  Detect class IDs: {self._detect_class_ids} (skipping: {skip_names})")
         print(f"  Trunk class IDs: {self._trunk_class_ids}")
+        print(f"  Bunch class IDs: {self._bunch_class_ids}")
 
         while not self.exit_signal:
             if self.run_event.is_set():
@@ -77,12 +83,14 @@ class YoloThread:
                 dt = time() - t0
                 self.net_fps = (1.0 / dt) if dt > 0 else 0.0
 
-                fruit_dets, trunk_boxes = detections_to_custom_masks(
-                    det, trunk_class_ids=self._trunk_class_ids
+                fruit_dets, trunk_boxes, bunch_boxes = detections_to_custom_masks(
+                    det, trunk_class_ids=self._trunk_class_ids,
+                    bunch_class_ids=self._bunch_class_ids
                 )
                 with self.lock:
                     self.detections = fruit_dets
                     self.trunk_boxes = trunk_boxes
+                    self.bunch_boxes = bunch_boxes
 
                 self.run_event.clear()
                 self.dets_ready.set()
@@ -104,6 +112,11 @@ class YoloThread:
         """Get latest trunk bounding boxes (thread-safe)."""
         with self.lock:
             return list(self.trunk_boxes)
+
+    def get_bunch_boxes(self):
+        """Get latest bunch bounding boxes (thread-safe)."""
+        with self.lock:
+            return list(self.bunch_boxes)
 
     def stop(self) -> None:
         """Signal thread to stop."""

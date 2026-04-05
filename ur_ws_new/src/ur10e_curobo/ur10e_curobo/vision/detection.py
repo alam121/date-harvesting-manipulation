@@ -24,19 +24,23 @@ def xywh2abcd(xywh: np.ndarray) -> np.ndarray:
     return out
 
 
-def detections_to_custom_masks(dets, trunk_class_ids=None):
+def detections_to_custom_masks(dets, trunk_class_ids=None, bunch_class_ids=None):
     """Convert YOLO detections to ZED CustomMaskObjectData format.
 
-    Returns (fruit_dets, trunk_boxes) where:
-      - fruit_dets: list of sl.CustomMaskObjectData for non-trunk classes
+    Returns (fruit_dets, trunk_boxes, bunch_boxes) where:
+      - fruit_dets: list of sl.CustomMaskObjectData for non-trunk/bunch classes
       - trunk_boxes: list of (x1, y1, x2, y2) int tuples for trunk detections
+      - bunch_boxes: list of dicts {"bb": (x1,y1,x2,y2), "polygon": np.ndarray|None, "conf": float}
     """
     global _sl_mats
     fruit_output = []
     trunk_boxes = []
+    bunch_boxes = []
     _sl_mats = []
     if trunk_class_ids is None:
         trunk_class_ids = set()
+    if bunch_class_ids is None:
+        bunch_class_ids = set()
     H, W = dets.orig_shape
 
     for di in range(len(dets.boxes)):
@@ -46,13 +50,27 @@ def detections_to_custom_masks(dets, trunk_class_ids=None):
         abcd[:, 0] = np.clip(abcd[:, 0], 0, W - 1)
         abcd[:, 1] = np.clip(abcd[:, 1], 0, H - 1)
 
+        x1 = int(abcd[0, 0])
+        y1 = int(abcd[0, 1])
+        x2 = int(abcd[2, 0])
+        y2 = int(abcd[2, 1])
+
         # Trunk → just save bbox, don't create ZED object
         if cls_id in trunk_class_ids:
-            x1 = int(abcd[0, 0])
-            y1 = int(abcd[0, 1])
-            x2 = int(abcd[2, 0])
-            y2 = int(abcd[2, 1])
             trunk_boxes.append((x1, y1, x2, y2))
+            continue
+
+        # Bunch → save bbox + segmentation polygon for rich visualization
+        # Use masks.xy which gives polygon points in original image coords —
+        # avoids any resolution-mismatch issues with masks.data.
+        if cls_id in bunch_class_ids:
+            conf = float(dets.boxes.conf[di].item())
+            polygon = None
+            if dets.masks is not None and dets.masks.xy is not None:
+                xy = dets.masks.xy[di]
+                if len(xy) > 2:
+                    polygon = xy.astype(np.float32)
+            bunch_boxes.append({"bb": (x1, y1, x2, y2), "polygon": polygon, "conf": conf})
             continue
 
         obj = sl.CustomMaskObjectData()
@@ -82,4 +100,4 @@ def detections_to_custom_masks(dets, trunk_class_ids=None):
             obj.box_mask = sl_mat
 
         fruit_output.append(obj)
-    return fruit_output, trunk_boxes
+    return fruit_output, trunk_boxes, bunch_boxes

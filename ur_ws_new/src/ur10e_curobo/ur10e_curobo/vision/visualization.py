@@ -385,16 +385,42 @@ class VisionVisualizer:
         )
 
     def draw_viz_only(self, image: np.ndarray, viz_only: List[Dict[str, Any]]) -> None:
-        """Draw visualization-only detections (e.g. trunk) with colored bbox + label."""
+        """Draw visualization-only detections.
+        trunk  → orange bounding box
+        bunch  → purple semi-transparent mask fill + contour outline
+        """
+        TRUNK_COLOR = (0, 165, 255, 255)   # orange
+        BUNCH_COLOR = (220, 0, 255, 255)   # purple/violet
+
         for v in viz_only:
             x1, y1, x2, y2 = v["bb"]
             cls = v.get("class", "?")
             conf = v.get("conf", 0.0)
-            # Orange bounding box for viz-only classes
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 165, 255, 255), 2)
-            label = f"{cls} {conf:.0%}"
-            cv2.putText(image, label, (x1 + 4, y1 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255, 255), 2, cv2.LINE_AA)
+
+            if cls == "bunch":
+                polygon = v.get("polygon")
+                if polygon is not None and len(polygon) > 2:
+                    try:
+                        pts = polygon.reshape((-1, 1, 2))
+                        # Semi-transparent purple fill via overlay blend
+                        overlay = image.copy()
+                        cv2.fillPoly(overlay, [pts], BUNCH_COLOR)
+                        cv2.addWeighted(overlay, 0.4, image, 0.6, 0, image)
+                        # Solid purple contour on top
+                        cv2.polylines(image, [pts], isClosed=True, color=BUNCH_COLOR, thickness=2)
+                    except Exception:
+                        cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, 2)
+                else:
+                    cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, 2)
+                label = f"bunch {conf:.0%}"
+                cv2.putText(image, label, (x1 + 4, y1 + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, BUNCH_COLOR, 2, cv2.LINE_AA)
+            else:
+                # Trunk: orange bounding box
+                cv2.rectangle(image, (x1, y1), (x2, y2), TRUNK_COLOR, 2)
+                label = f"{cls} {conf:.0%}"
+                cv2.putText(image, label, (x1 + 4, y1 + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, TRUNK_COLOR, 2, cv2.LINE_AA)
 
     def render_frame(
         self,
