@@ -12,8 +12,10 @@ Usage:
 The result (4x4 camera-to-gripper transform) is saved to a YAML file.
 """
 
+import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -24,6 +26,12 @@ import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 from scipy.spatial.transform import Rotation
+
+# ── URDFs to update when calibration is confirmed ─────────────────────────────
+URDF_FILES = [
+    Path(__file__).resolve().parents[4] / "universal_robot/urdf/ur_macro.xacro",
+    Path(__file__).resolve().parents[6] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
+]
 
 # ── Chessboard parameters ─────────────────────────────────────────────
 BOARD_ROWS = 17         # inner corners per row    (18 squares → 17 inner corners)
@@ -264,10 +272,13 @@ def main():
     print(T_cam2gripper)
 
     # ── Save to YAML ──────────────────────────────────────────────────
+    rpy = Rotation.from_matrix(R_cam2gripper).as_euler("xyz")  # radians
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     result = {
         "hand_eye_calibration": {
             "parent_frame": EE_FRAME,
-            "child_frame": "zed2_left_camera_frame",  # ZED X Mini
+            "child_frame": "zed2_left_camera_frame",
             "translation": {
                 "x": float(t_cam2gripper[0, 0]),
                 "y": float(t_cam2gripper[1, 0]),
@@ -282,6 +293,7 @@ def main():
             "matrix": T_cam2gripper.tolist(),
             "method": best_method_name,
             "num_samples": sample_count,
+            "calibrated_at": timestamp,
         }
     }
 
@@ -290,7 +302,77 @@ def main():
 
     print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
     print("=" * 60)
+
+    # ── Ask user to confirm URDF update ───────────────────────────────
+    print("\n" + "=" * 60)
+    print("UPDATE URDFs?")
+    print("=" * 60)
+    print(f"  New transform (tool0 → zed2_left_camera_frame):")
+    print(f"    xyz=\"{t_cam2gripper[0,0]:.6f} {t_cam2gripper[1,0]:.6f} {t_cam2gripper[2,0]:.6f}\"")
+    print(f"    rpy=\"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}\"")
+    print(f"\n  Files to update:")
+    for f in URDF_FILES:
+        exists = "✓" if f.exists() else "✗ NOT FOUND"
+        print(f"    [{exists}] {f}")
+    print()
+
+    confirm = input("Apply to URDFs? [y/N]: ").strip().lower()
+    if confirm == "y":
+        _update_urdfs(t_cam2gripper, rpy, best_method_name, best_error, sample_count, timestamp)
+    else:
+        print("URDFs not updated. Values saved to YAML only.")
+
     rclpy.shutdown()
+
+
+def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp):
+    """Update the tool0→camera joint origin in each URDF/xacro file."""
+    xyz_str = f"{t[0,0]:.6f} {t[1,0]:.6f} {t[2,0]:.6f}"
+    rpy_str = f"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}"
+    comment = (
+        f"hand-eye calibrated ({method}, {error_m*1000:.2f}mm error, "
+        f"{n_samples} samples, updated {timestamp})"
+    )
+
+    # Pattern A: xyz before rpy, comment on same line
+    # <origin xyz="..." rpy="..."/>   <!-- ... -->
+    pat_xyz_first = re.compile(
+        r'(<origin\s[^>]*xyz=")[^"]*("\s*rpy=")[^"]*("\s*/>[ \t]*)<!--.*?-->'
+    )
+    repl_xyz_first = rf'\g<1>{xyz_str}\g<2>{rpy_str}\g<3><!-- {comment} -->'
+
+    # Pattern B: rpy before xyz, comment on next line
+    # <origin rpy="..." xyz="..."/>
+    # <!-- ... -->
+    pat_rpy_first = re.compile(
+        r'(<origin\s[^>]*rpy=")[^"]*("\s*xyz=")[^"]*("\s*/>)([ \t]*\n[ \t]*)<!--.*?-->'
+    )
+    repl_rpy_first = rf'\g<1>{rpy_str}\g<2>{xyz_str}\g<3>\g<4><!-- {comment} -->'
+
+    joint_pattern = re.compile(
+        r'(joint name="tool0_to_zed2_left_camera_frame".*?</joint>)',
+        re.DOTALL,
+    )
+
+    for urdf_path in URDF_FILES:
+        if not urdf_path.exists():
+            print(f"  SKIP (not found): {urdf_path}")
+            continue
+        text = urdf_path.read_text()
+        match = joint_pattern.search(text)
+        if not match:
+            print(f"  SKIP (joint not found): {urdf_path}")
+            continue
+        joint_old = match.group(1)
+        joint_new = pat_xyz_first.sub(repl_xyz_first, joint_old)
+        if joint_new == joint_old:
+            joint_new = pat_rpy_first.sub(repl_rpy_first, joint_old)
+        if joint_new == joint_old:
+            print(f"  SKIP (origin pattern not matched): {urdf_path}")
+            continue
+        new_text = text[:match.start(1)] + joint_new + text[match.end(1):]
+        urdf_path.write_text(new_text)
+        print(f"  UPDATED: {urdf_path}")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ def get_commands(fake_hardware=False, use_panel=False):
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
-        "hand_eye": f'sleep 3 && {SOURCE} && ros2 run ur10e_curobo hand_eye',
+        "hand_eye": f'sleep 4 && {SOURCE} && ros2 run ur10e_curobo hand_eye',
     }
     if use_panel:
         cmds["rviz_panel"] = f'sleep 5 && {SOURCE} && rviz2 -d {RVIZ_CONFIG}'
@@ -42,7 +42,7 @@ TITLES = {
     "gui": "GUI",
     "rviz_panel": "RViz+Panel",
     "calibrate": "Calibrate",
-    "hand_eye": "Hand-Eye Cal",
+    "hand_eye": "Hand-Eye",
 }
 
 def make_command(cmd):
@@ -278,7 +278,7 @@ def update_config(nodes, fake_hardware=False, use_panel=False):
         f.writelines(final_lines)
 
 def main():
-    valid = ["main", "vision", "teleop", "gui", "calibrate"]
+    valid = ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]
     args = sys.argv[1:]
 
     # Check for fake hardware flag
@@ -297,6 +297,7 @@ def main():
         print("  teleop    - Teleop node")
         print("  gui       - GUI node (standalone PyQt)")
         print("  calibrate - Grasp force calibration tool")
+        print("  hand_eye  - Hand-eye camera calibration")
         print()
         print("Examples:")
         print("  launch_ur10e main              # Real robot + main + RViz with panel")
@@ -305,6 +306,7 @@ def main():
         print("  launch_ur10e main teleop       # Real robot + main + teleop")
         print("  launch_ur10e calibrate         # Grasp force calibration only")
         print("  launch_ur10e calibrate teleop  # Calibrate + teleop (jog robot)")
+        print("  launch_ur10e hand_eye          # Hand-eye calibration (UR bringup + calibration tool)")
         sys.exit(1)
 
     # When main is specified, use panel-integrated RViz
@@ -313,7 +315,7 @@ def main():
 
     # Reorder to: main, vision, teleop, gui, calibrate
     ordered = []
-    for n in ["main", "vision", "teleop", "gui", "calibrate"]:
+    for n in ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]:
         if n in nodes:
             ordered.append(n)
 

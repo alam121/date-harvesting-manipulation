@@ -12,14 +12,11 @@ if not _SRC_MODELS.exists():
     _SRC_MODELS = Path("/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models")
 DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "lab_dates_realbunch6.engine")
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "weights_yolo26_v2_updated.engine")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_improved_exposure_data.engine")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_seg_v2.engine")
-
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_improved_exposure_corrected.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
@@ -76,7 +73,7 @@ SHOW_REJECTED = False
 SKIP_DRAW = False
 
 # Z limit in base_link frame
-Z_MAX = 1.34
+Z_MAX = 1.50
 
 # Camera frame name
 CAM_FRAME = "zed2_left_camera_frame"

@@ -34,6 +34,7 @@ class RosBridge:
         self.robot_running = False
         self.goal_info_data = {}
         self.velocity_scale = 5.0
+        self.calib_check_result = None
 
         # Subscribers
         node.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
@@ -41,6 +42,7 @@ class RosBridge:
         node.create_subscription(Bool, "/io_and_status_controller/robot_program_running", self._robot_running_cb, 10)
         node.create_subscription(String, "/goal_info", self._goal_info_cb, 10)
         node.create_subscription(Float32, "/velocity_scale", self._velocity_scale_cb, 10)
+        node.create_subscription(String, "/calib_check_result", self._calib_check_cb, 10)
 
     def _joint_state_cb(self, msg):
         self.joint_state_data = msg
@@ -62,6 +64,9 @@ class RosBridge:
 
     def _velocity_scale_cb(self, msg):
         self.velocity_scale = msg.data
+
+    def _calib_check_cb(self, msg):
+        self.calib_check_result = msg.data
 
     def publish_cmd(self, cmd: str):
         msg = String()

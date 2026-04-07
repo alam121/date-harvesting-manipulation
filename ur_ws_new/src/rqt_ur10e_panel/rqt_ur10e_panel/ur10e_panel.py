@@ -99,6 +99,19 @@ class UR10ePanel(Plugin):
             btn.setStyleSheet(f"background-color: {color}; color: white; font-weight: bold;")
             btn.clicked.connect(lambda _, c=cmd: self._send_cmd(c))
             motion_layout.addWidget(btn, i // 2, i % 2)
+
+        check_calib_btn = QPushButton("Check Calibration (trunk)")
+        check_calib_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
+        check_calib_btn.setToolTip("Check hand-eye calibration using the detected trunk as the reference")
+        check_calib_btn.clicked.connect(lambda: self._send_cmd("check_calibration"))
+        motion_layout.addWidget(check_calib_btn, 2, 0, 1, 2)
+
+        self.calib_result_label = QLabel("—")
+        self.calib_result_label.setWordWrap(True)
+        self.calib_result_label.setStyleSheet(
+            "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;"
+        )
+        motion_layout.addWidget(self.calib_result_label, 3, 0, 1, 2)
         layout.addWidget(motion_group)
 
         # Gripper
@@ -331,6 +344,26 @@ class UR10ePanel(Plugin):
                 self.goal_list_widget.addItem(f"#{i+1}: {g[0]:.3f}, {g[1]:.3f}, {g[2]:.3f}")
 
             self.current_velocity_label.setText(f"Velocity: {gi.get('velocity_scale', 5.0):.1f}x")
+
+        calib = ros.calib_check_result
+        if calib is not None:
+            self.calib_result_label.setText(calib)
+            if calib.startswith("GOOD"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #e8f5e9; color: #2e7d32; border-radius: 4px;"
+                )
+            elif calib.startswith("ACCEPTABLE"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #fff8e1; color: #e65100; border-radius: 4px;"
+                )
+            elif calib.startswith("POOR") or calib.startswith("FAIL"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #ffebee; color: #c62828; border-radius: 4px;"
+                )
+            else:
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #f3e5f5; border-radius: 4px;"
+                )
 
         # Graphs
         if PYQTGRAPH_AVAILABLE:

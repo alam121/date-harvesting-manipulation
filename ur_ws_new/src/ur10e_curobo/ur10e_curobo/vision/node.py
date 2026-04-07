@@ -54,6 +54,11 @@ class VisionNode:
         self._heatmap_interval = 3  # recompute every 3rd frame
         self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
 
+        # Bunch detection — refreshed periodically so it stays current as robot moves
+        self._locked_bunch_boxes = None
+        self._bunch_last_update = 0.0
+        self._bunch_refresh_interval = 2.0  # seconds between bunch updates
+
         # Target lock
         self.target_lock_position: Optional[List[float]] = None
         self.target_lock_active = False
@@ -87,7 +92,7 @@ class VisionNode:
                 if not self._refresh_requested:
                     break
                 self.node.get_logger().info("Camera refresh — restarting ZED...")
-                sleep(1.0)
+                sleep(0.5)  # extra buffer after the 2s in finally
 
     def _run_main(self):
         """Main execution loop."""
@@ -176,7 +181,10 @@ class VisionNode:
                 self.node.get_logger().info("Camera refresh requested — reinitializing ZED...")
                 self._refresh_requested = True
                 self.exit_signal = True  # breaks perception loop
-                self.executor.shutdown(wait=False)  # breaks rclpy.spin()
+                if self.executor is not None:
+                    # Request shutdown off-thread so we don't block inside the callback
+                    # that's currently running on this executor.
+                    Thread(target=self.executor.shutdown, daemon=True).start()
 
         from std_msgs.msg import String as StdString
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
@@ -226,7 +234,7 @@ class VisionNode:
         obj_param = sl.ObjectDetectionParameters()
         obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
         obj_param.enable_tracking = True
-        obj_param.enable_segmentation = True
+        obj_param.enable_segmentation = False  # YOLO handles segmentation; ZED's TRT segmentation model segfaults on re-init
         zed.enable_object_detection(obj_param)
 
         camera_infos = zed.get_camera_information()
@@ -288,7 +296,15 @@ class VisionNode:
                 if current_dets is None:
                     continue
                 trunk_boxes = self.yolo_thread.get_trunk_boxes()
-                bunch_boxes = self.yolo_thread.get_bunch_boxes()
+                live_bunch_boxes = self.yolo_thread.get_bunch_boxes()
+                t_now_bunch = time()
+                if live_bunch_boxes and (
+                    self._locked_bunch_boxes is None or
+                    (t_now_bunch - self._bunch_last_update) >= self._bunch_refresh_interval
+                ):
+                    self._locked_bunch_boxes = live_bunch_boxes
+                    self._bunch_last_update = t_now_bunch
+                bunch_boxes = self._locked_bunch_boxes if self._locked_bunch_boxes is not None else []
 
                 zed.ingest_custom_mask_objects(current_dets)
                 zed.retrieve_custom_objects(objects, obj_runtime_param)
@@ -383,8 +399,13 @@ class VisionNode:
             self.executor.spin()
         finally:
             self.exit_signal = True
-            perception_thread.join(timeout=1.0)
+            perception_thread.join(timeout=3.0)  # give grab() time to return
+            if perception_thread.is_alive():
+                print("[Vision] WARNING: perception thread did not exit cleanly before ZED close")
             zed.close()
+            sleep(2.0)  # allow GPU/ZED resources to fully release before potential reopen
+            self._locked_bunch_boxes = None  # reset so bunch is re-detected on next session
+            self._bunch_last_update = 0.0
             if not getattr(self, '_refresh_requested', False):
                 self.yolo_thread.stop()
                 rclpy.shutdown()
@@ -842,9 +863,11 @@ class VisionNode:
                 dz_dv = cv2.Sobel(z_ch, cv2.CV_32F, 0, 1, ksize=5)
 
                 # Cross product dP/du x dP/dv = surface normal per pixel
-                nx = dy_du * dz_dv - dz_du * dy_dv
-                ny = dz_du * dx_dv - dx_du * dz_dv
-                nz = dx_du * dy_dv - dy_du * dx_dv
+                # Suppress NaN warnings — NaNs from invalid depth are masked out by `combined` below
+                with np.errstate(invalid='ignore'):
+                    nx = dy_du * dz_dv - dz_du * dy_dv
+                    ny = dz_du * dx_dv - dx_du * dz_dv
+                    nz = dx_du * dy_dv - dy_du * dx_dv
 
                 norms = np.sqrt(nx**2 + ny**2 + nz**2)
                 good = combined & (norms > 1e-6)

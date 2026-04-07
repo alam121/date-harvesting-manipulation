@@ -75,22 +75,34 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(clear_btn, &QPushButton::clicked, this, &UR10ePanel::onClear);
   motion_layout->addWidget(clear_btn, 1, 1);
 
+  auto * check_calib_btn = new QPushButton("Check Calibration (trunk)");
+  check_calib_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
+  check_calib_btn->setToolTip("Check hand-eye calibration using the detected trunk as the reference");
+  connect(check_calib_btn, &QPushButton::clicked, this, &UR10ePanel::onCheckCalibration);
+  motion_layout->addWidget(check_calib_btn, 2, 0, 1, 2);
+
   auto * sub_btn = new QPushButton("Subscribe (S)");
   sub_btn->setStyleSheet("background-color: #7b1fa2; color: white; font-weight: bold;");
   connect(sub_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribe);
-  motion_layout->addWidget(sub_btn, 2, 0);
+  motion_layout->addWidget(sub_btn, 3, 0);
 
   auto * sub_multi_btn = new QPushButton("Sub Multi (M)");
   sub_multi_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
   connect(sub_multi_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribeMulti);
-  motion_layout->addWidget(sub_multi_btn, 2, 1);
+  motion_layout->addWidget(sub_multi_btn, 3, 1);
+
+  calib_result_label_ = new QLabel("—");
+  calib_result_label_->setWordWrap(true);
+  calib_result_label_->setStyleSheet(
+    "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;");
+  motion_layout->addWidget(calib_result_label_, 4, 0, 1, 2);
 
   debug_preview_cb_ = new QCheckBox("Debug Plan Preview");
   debug_preview_cb_->setChecked(true);
   debug_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
   debug_preview_cb_->setToolTip("Show full plan in RViz before executing");
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
-  motion_layout->addWidget(debug_preview_cb_, 3, 0, 1, 2);
+  motion_layout->addWidget(debug_preview_cb_, 5, 0, 1, 2);
 
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
@@ -98,7 +110,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 4, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 6, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -106,7 +118,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 4, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 6, 1);
 
   layout->addWidget(motion_group);
 
@@ -485,6 +497,13 @@ void UR10ePanel::setupRos()
       std::lock_guard<std::mutex> lock(data_mutex_);
       velocity_scale_ = msg->data;
     });
+
+  calib_check_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/calib_check_result", 10,
+    [this](std_msgs::msg::String::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      calib_check_result_ = msg->data;
+    });
 }
 
 void UR10ePanel::publishCmd(const std::string & cmd)
@@ -534,6 +553,7 @@ void UR10ePanel::onHome() { publishCmd("home"); }
 void UR10ePanel::onDropoff() { publishCmd("dropoff"); }
 void UR10ePanel::onExecute() { publishCmd("execute"); }
 void UR10ePanel::onClear() { publishCmd("clear"); }
+void UR10ePanel::onCheckCalibration() { publishCmd("check_calibration"); }
 void UR10ePanel::onGripperOpen() { publishCmd("open"); }
 void UR10ePanel::onGripperClose() { publishCmd("close"); }
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
@@ -624,6 +644,23 @@ void UR10ePanel::updateDisplay()
   // Plan confirm/cancel visibility
   plan_confirm_btn_->setVisible(plan_waiting_confirm_);
   plan_cancel_btn_->setVisible(plan_waiting_confirm_);
+
+  if (!calib_check_result_.empty()) {
+    calib_result_label_->setText(QString::fromStdString(calib_check_result_));
+    if (calib_check_result_.rfind("GOOD", 0) == 0) {
+      calib_result_label_->setStyleSheet(
+        "font-size: 10pt; padding: 4px; background: #e8f5e9; color: #2e7d32; border-radius: 4px;");
+    } else if (calib_check_result_.rfind("ACCEPTABLE", 0) == 0) {
+      calib_result_label_->setStyleSheet(
+        "font-size: 10pt; padding: 4px; background: #fff8e1; color: #e65100; border-radius: 4px;");
+    } else if (calib_check_result_.rfind("POOR", 0) == 0 || calib_check_result_.rfind("FAIL", 0) == 0) {
+      calib_result_label_->setStyleSheet(
+        "font-size: 10pt; padding: 4px; background: #ffebee; color: #c62828; border-radius: 4px;");
+    } else {
+      calib_result_label_->setStyleSheet(
+        "font-size: 10pt; padding: 4px; background: #f3e5f5; border-radius: 4px;");
+    }
+  }
 
   // Sync debug preview checkbox
   debug_preview_cb_->blockSignals(true);

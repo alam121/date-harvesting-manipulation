@@ -81,6 +81,7 @@ class UR10eCuroboMoveIt(Node):
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
+        self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
@@ -322,8 +323,76 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
         elif cmd == "debug_world":
             self.debug_print_world()
+        elif cmd == "check_calibration":
+            threading.Thread(target=self._run_calib_check, daemon=True).start()
         else:
             self.get_logger().warn(f"Unknown UI command: {cmd}")
+
+    def _run_calib_check(self):
+        """
+        Check calibration accuracy using the trunk as a static reference.
+
+        The trunk position in base_link (from vision) should match the trunk
+        position computed by transforming the raw camera-frame point through
+        the current T_gripper2cam calibration manually.
+
+        We compare:
+          A) node.trunk_xyz  — already transformed by the live TF chain
+          B) A 10-sample average of /trunk_position over ~2 seconds
+
+        Then we report the stability (std) as a proxy for calibration quality:
+        a well-calibrated system gives a consistent trunk position regardless
+        of arm motion. We also report the XYZ value so the user can compare
+        against a known physical measurement.
+        """
+        import math, time
+        import numpy as np
+        from std_msgs.msg import String as StdString
+
+        def pub(text):
+            self.calib_check_pub.publish(StdString(data=text))
+            self.get_logger().info(f"[CALIB CHECK] {text}")
+
+        pub("RUNNING — collecting trunk samples for 5s, keep arm still...")
+
+        # Collect trunk_xyz samples over 5 seconds
+        samples = []
+        t_end = time.time() + 5.0
+        while time.time() < t_end:
+            xyz = self.trunk_xyz
+            if xyz is not None:
+                samples.append(xyz)
+            time.sleep(0.1)
+
+        if len(samples) < 5:
+            pub("FAIL — trunk not detected. Is the trunk visible and vision node running?")
+            return
+
+        arr = np.array(samples)  # (N, 3)
+
+        mean_xyz = arr.mean(axis=0)
+        std_xyz  = arr.std(axis=0)
+        rms_std  = float(np.linalg.norm(std_xyz)) * 1000  # mm
+
+        # Per-sample distance from mean
+        dists = np.linalg.norm(arr - mean_xyz, axis=1) * 1000  # mm
+        max_err = float(dists.max())
+        rms_err = float(np.sqrt(np.mean(dists**2)))
+
+        # Verdict
+        if rms_err < 5.0:
+            quality = "GOOD"
+        elif rms_err < 15.0:
+            quality = "ACCEPTABLE"
+        else:
+            quality = "POOR — consider recalibrating"
+
+        result = (
+            f"{quality} | "
+            f"trunk=({mean_xyz[0]:.3f}, {mean_xyz[1]:.3f}, {mean_xyz[2]:.3f}) m | "
+            f"RMS={rms_err:.1f}mm  max={max_err:.1f}mm  n={len(samples)}"
+        )
+        pub(result)
 
     def _update_voxel_snapshot(self):
         """Update voxel obstacles from latest depth data (triggered by 'u' key).
@@ -769,6 +838,10 @@ class UR10eCuroboMoveIt(Node):
     @property
     def trunk_x(self):
         return self._state_mgr.trunk_x
+
+    @property
+    def trunk_xyz(self):
+        return self._state_mgr.trunk_xyz
 
     @property
     def plan_confirm_event(self):

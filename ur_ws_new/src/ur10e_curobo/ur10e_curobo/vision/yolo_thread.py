@@ -76,6 +76,8 @@ class YoloThread:
                     retina_masks=True,
                     imgsz=self.img_size,
                     conf=self.conf_thres,
+                    iou=0.3,       # lower NMS IoU so overlapping bunches aren't suppressed
+                    max_det=50,    # allow more detections per frame
                     device=device,
                     verbose=False,
                     classes=self._detect_class_ids if self._detect_class_ids else None,

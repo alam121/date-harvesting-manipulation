@@ -99,6 +99,15 @@ class UiBridge(Node):
             10
         )
 
+        # Calibration check result
+        self.calib_check_result: Optional[str] = None
+        self.create_subscription(
+            String,
+            "/calib_check_result",
+            self._calib_check_cb,
+            10
+        )
+
     def _joint_state_cb(self, msg: JointState):
         self.joint_state_data = msg
 
@@ -145,6 +154,9 @@ class UiBridge(Node):
 
     def _velocity_scale_cb(self, msg: Float32):
         self.velocity_scale = msg.data
+
+    def _calib_check_cb(self, msg: String):
+        self.calib_check_result = msg.data
 
     def publish_velocity_scale(self, scale: float):
         """Send velocity scale command to node."""
@@ -738,25 +750,37 @@ class MainWindow(QtWidgets.QWidget):
         clear_btn.clicked.connect(lambda: self._send_cmd("clear"))
         motion_layout.addWidget(clear_btn, 1, 1)
 
+        check_calib_btn = QtWidgets.QPushButton("Check Calibration (trunk)")
+        check_calib_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
+        check_calib_btn.setToolTip("Check hand-eye calibration using the detected trunk as the reference")
+        check_calib_btn.clicked.connect(lambda: self._send_cmd("check_calibration"))
+        motion_layout.addWidget(check_calib_btn, 2, 0, 1, 2)
+
+        self.calib_result_label = QtWidgets.QLabel("—")
+        self.calib_result_label.setWordWrap(True)
+        self.calib_result_label.setStyleSheet(
+            "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;")
+        motion_layout.addWidget(self.calib_result_label, 3, 0, 1, 2)
+
         self.debug_preview_cb = QtWidgets.QCheckBox("Debug Plan Preview")
         self.debug_preview_cb.setChecked(True)
         self.debug_preview_cb.setToolTip("Show full plan in RViz before executing")
         self.debug_preview_cb.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 4px;")
         self.debug_preview_cb.stateChanged.connect(self._on_debug_preview_changed)
-        motion_layout.addWidget(self.debug_preview_cb, 2, 0, 1, 2)
+        motion_layout.addWidget(self.debug_preview_cb, 4, 0, 1, 2)
 
         # Plan confirm/cancel buttons (shown when plan preview is waiting)
         self.plan_confirm_btn = QtWidgets.QPushButton("Confirm Plan")
         self.plan_confirm_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
         self.plan_confirm_btn.clicked.connect(lambda: self._send_cmd("plan_confirm"))
         self.plan_confirm_btn.setVisible(False)
-        motion_layout.addWidget(self.plan_confirm_btn, 3, 0)
+        motion_layout.addWidget(self.plan_confirm_btn, 5, 0)
 
         self.plan_cancel_btn = QtWidgets.QPushButton("Cancel Plan")
         self.plan_cancel_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
         self.plan_cancel_btn.clicked.connect(lambda: self._send_cmd("plan_cancel"))
         self.plan_cancel_btn.setVisible(False)
-        motion_layout.addWidget(self.plan_cancel_btn, 3, 1)
+        motion_layout.addWidget(self.plan_cancel_btn, 5, 1)
         layout.addWidget(motion_group)
 
         # Gripper
@@ -978,6 +1002,23 @@ class MainWindow(QtWidgets.QWidget):
             waiting = goal_info.get("plan_waiting_confirm", False)
             self.plan_confirm_btn.setVisible(waiting)
             self.plan_cancel_btn.setVisible(waiting)
+
+        # Calibration check result
+        calib = self.ros.calib_check_result
+        if calib is not None:
+            self.calib_result_label.setText(calib)
+            if calib.startswith("GOOD"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #e8f5e9; color: #2e7d32; border-radius: 4px;")
+            elif calib.startswith("ACCEPTABLE"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #fff8e1; color: #e65100; border-radius: 4px;")
+            elif calib.startswith("POOR") or calib.startswith("FAIL"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #ffebee; color: #c62828; border-radius: 4px;")
+            else:
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #f3e5f5; border-radius: 4px;")
 
         # Graphs
         if PYQTGRAPH_AVAILABLE:

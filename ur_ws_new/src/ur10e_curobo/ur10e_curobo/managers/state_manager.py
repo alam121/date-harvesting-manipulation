@@ -55,6 +55,7 @@ class StateManager:
 
         # Trunk position from vision (updated continuously)
         self._trunk_x: Optional[float] = None
+        self._trunk_xyz: Optional[Tuple[float, float, float]] = None  # full XYZ in base_link
 
         # Plan preview confirmation (set by keyboard thread or GUI)
         self.plan_waiting: bool = False  # True when plan preview is awaiting user input
@@ -180,6 +181,10 @@ class StateManager:
     def trunk_x(self) -> Optional[float]:
         return self._trunk_x
 
+    @property
+    def trunk_xyz(self) -> Optional[Tuple[float, float, float]]:
+        return self._trunk_xyz
+
     # ============ Callbacks ============
 
     def _joint_state_cb(self, msg: ROSJointState) -> None:
@@ -231,8 +236,9 @@ class StateManager:
             self.fruit_gap_angle = float(msg.data[1])
 
     def _trunk_position_cb(self, msg: PointStamped) -> None:
-        """Update trunk x position from vision."""
+        """Update trunk position from vision."""
         self._trunk_x = msg.point.x
+        self._trunk_xyz = (msg.point.x, msg.point.y, msg.point.z)
 
     def _check_joint_states(self) -> None:
         """Check if initial joint states have been received."""

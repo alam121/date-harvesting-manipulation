@@ -41,6 +41,7 @@ private Q_SLOTS:
   void onDropoff();
   void onExecute();
   void onClear();
+  void onCheckCalibration();
   void onGripperOpen();
   void onGripperClose();
   void onSendGoal();
@@ -80,6 +81,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr running_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_info_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_scale_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr calib_check_sub_;
 
   // Data
   std::mutex data_mutex_;
@@ -90,6 +92,7 @@ private:
   int goal_count_ = 0;
   std::string latest_goal_;
   std::string goal_coords_str_;
+  std::string calib_check_result_;
   bool plan_waiting_confirm_ = false;
   bool debug_plan_preview_ = true;
 
@@ -101,6 +104,7 @@ private:
   QLabel * goal_count_label_;
   QLabel * latest_goal_label_;
   QLabel * goal_coords_label_;
+  QLabel * calib_result_label_;
   QSlider * velocity_slider_;
   QLabel * joint_labels_[6];
   QLabel * force_labels_[3];

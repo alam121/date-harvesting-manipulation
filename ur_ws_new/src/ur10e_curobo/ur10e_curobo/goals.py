@@ -429,8 +429,17 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
-    wait_until_xyz(node, target_pose_list[:3], tol=0.015, timeout=8.0, target_quat=target_quat)
+    wait_until_xyz(node, target_pose_list[:3], tol=0.008, timeout=8.0, target_quat=target_quat)
     blend_motion(node)
+
+    # Reject stall-acceptance far from target — prevents gripper close from wrong position
+    cur_pose = node.get_end_effector_pose()
+    if cur_pose:
+        final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
+        if final_dist > 0.015:
+            node.get_logger().warn(
+                f"[DIRECT] {label}: stalled {final_dist*100:.1f}cm from target — treating as failure")
+            return False
 
     if store_trajectory:
         if not hasattr(node, 'stored_trajectory_states'):
@@ -453,6 +462,13 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
+        # Flush any deferred async CUDA errors before the next planning call
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
         return False
 
     states = interpolated_positions(res)
@@ -1426,6 +1442,10 @@ def plan_and_execute(node):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def _safe_return_home():
+        """Return to center HOME directly. cuRobo + voxel obstacles handles trunk avoidance."""
+        move_to_home_position(node)
+
     def _check_stop():
         """Check if stop was requested; if so, halt robot and clear goals."""
         if getattr(node, "stop_requested", False):
@@ -1529,6 +1549,26 @@ def plan_and_execute(node):
                     torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
                     joint_names=node.joint_order,
                 )
+                # Reacquire goal after side HOME — target may have shifted during the move
+                candidates = getattr(node, 'candidate_goals', [])
+                reacq = reacquire_goal_pose(node, seed_xyz=[x, y, z], candidate_seeds=candidates, timeout=2.0)
+                if reacq:
+                    x, y, z = reacq
+                    node.get_logger().info(
+                        f"Reacquired after {side_label}: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                    publish_goal_marker(node, [x, y, z])
+                    # Recompute approach standoff with updated position
+                    is_low = z < LOW_Z_THRESH
+                    d_blend = blend_approach_direction(node, x, y, z)
+                    if is_low:
+                        ax, ay, az = x, y, z
+                    else:
+                        ax = x - standoff
+                        ay = y + standoff
+                        az = z - standoff
+                else:
+                    node.get_logger().warn(
+                        f"Reacquire after {side_label} failed — using original goal position")
             else:
                 node.get_logger().info("Fruit near center; using default HOME without side move.")
 
@@ -1672,7 +1712,7 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
+        z_offset = 0.04  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
@@ -1684,11 +1724,11 @@ def plan_and_execute(node):
                 # Move 5cm back (away from fruit, along -Y in base frame)
                 retreat = [cur[0], cur[1] + 0.05, cur[2], *cur[3:]]
                 _direct_ik_move(node, retreat, label="FINAL_RETREAT",
-                                motion_type="final", store_trajectory=True)
+                                motion_type="final", store_trajectory=False)
 
             # Retry FINAL from new position
             final_ok = _direct_ik_move(node, final_target, label="FINAL_RETRY",
-                                       motion_type="final", store_trajectory=True)
+                                       motion_type="final", store_trajectory=False)
         if not final_ok:
             # Both attempts failed — skip this goal
             node.get_logger().warn("FINAL IK retry also failed — skipping goal.")
@@ -1729,6 +1769,17 @@ def plan_and_execute(node):
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius); time.sleep(0.1)
             cur = node.get_end_effector_pose()
             if cur:
+                # Log EE vs fruit offset so we can tune re-grip direction from real data
+                ee_x, ee_y, ee_z = cur[0], cur[1], cur[2]
+                dx = x - ee_x
+                dy = y - ee_y
+                dz = z - ee_z
+                node.get_logger().info(
+                    f"[REGRIP] EE=[{ee_x:.3f},{ee_y:.3f},{ee_z:.3f}] "
+                    f"fruit=[{x:.3f},{y:.3f},{z:.3f}] "
+                    f"offset=[{dx:+.3f},{dy:+.3f},{dz:+.3f}]m "
+                    f"first_contact={first_contact}/{gc.steps}"
+                )
                 closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.015, *cur[3:]]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
@@ -1764,14 +1815,21 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # Partial reverse: pull back ~12cm to clear the date bunch, then plan to dropoff
+        # Partial reverse: pull back ~28cm to clear the date bunch
         execute_partial_reverse(node, clearance_m=0.28)
+
+        # If we came from a side HOME, the partial reverse ends near the trunk.
+        # Go to center HOME first to get into a safe, known configuration before dropoff.
+        if is_side_approach:
+            node.get_logger().info(
+                "Side approach detected — going to center HOME before dropoff to avoid trunk")
+            _safe_return_home()
 
         # Plan directly to dropoff — cuRobo avoids trunk via voxel obstacles
         if not move_to_dropoff_position(node):
             # Dropoff plan failed (trunk in the way) — go HOME first to clear
             node.get_logger().info("Direct dropoff failed, going HOME first")
-            move_to_home_position(node)
+            _safe_return_home()
             move_to_dropoff_position(node)
         time.sleep(0.2)
         # Reset 2-finger mode before dropoff open (all fingers active for release)
@@ -1830,16 +1888,16 @@ def plan_and_execute(node):
                     else:
                         node.get_logger().info(
                             f"Direct path to next goal BLOCKED — going HOME first")
-                        move_to_home_position(node)
+                        _safe_return_home()
                         went_home = True
                 else:
-                    move_to_home_position(node)
+                    _safe_return_home()
                     went_home = True
             else:
-                move_to_home_position(node)
+                _safe_return_home()
                 went_home = True
         else:
-            move_to_home_position(node)
+            _safe_return_home()
             went_home = True
 
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
