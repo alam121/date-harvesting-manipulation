@@ -838,6 +838,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
         if not is_robot_moving(node, velocity_threshold=0.005):
             break
         time.sleep(0.1)
+
     blend_motion(node)
     return True
 
@@ -1712,7 +1713,7 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.04  # approach to 3cm above target, then direct move down for grasp
+        z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
@@ -1769,18 +1770,40 @@ def plan_and_execute(node):
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius); time.sleep(0.1)
             cur = node.get_end_effector_pose()
             if cur:
-                # Log EE vs fruit offset so we can tune re-grip direction from real data
-                ee_x, ee_y, ee_z = cur[0], cur[1], cur[2]
-                dx = x - ee_x
-                dy = y - ee_y
-                dz = z - ee_z
+                f0, f1, f2 = deltas[0], deltas[1], deltas[2]  # left, center, right
+
+                # Lateral correction: imbalance between left (F0) and right (F2)
+                # F0 > F2 → fruit is left of center → shift gripper left (−X)
+                # F2 > F0 → fruit is right of center → shift gripper right (+X)
+                lateral_imbalance = f0 - f2
+                lateral_correction = -float(lateral_imbalance) * 0.008  # ~8mm per 1N imbalance
+                lateral_correction = max(-0.02, min(0.02, lateral_correction))  # clamp ±20mm
+
+                # Forward correction: late contact = gripper too far from fruit → move forward
+                # first_contact close to gc.steps = near fully closed before touching
+                contact_ratio = first_contact / max(gc.steps, 1)
+                forward_correction = -(contact_ratio - 0.5) * 0.04  # up to 20mm forward if late
+                forward_correction = max(-0.025, min(0.0, forward_correction))  # clamp, never pull back
+
+                # Vertical correction: if center (F1) much weaker than sides → fruit is below center
+                center_vs_sides = f1 - (f0 + f2) / 2.0
+                vertical_correction = -float(center_vs_sides) * 0.005  # small, ±5mm max
+                vertical_correction = max(-0.01, min(0.01, vertical_correction))
+
                 node.get_logger().info(
-                    f"[REGRIP] EE=[{ee_x:.3f},{ee_y:.3f},{ee_z:.3f}] "
-                    f"fruit=[{x:.3f},{y:.3f},{z:.3f}] "
-                    f"offset=[{dx:+.3f},{dy:+.3f},{dz:+.3f}]m "
-                    f"first_contact={first_contact}/{gc.steps}"
+                    f"[REGRIP] F=[{f0:.2f},{f1:.2f},{f2:.2f}]N "
+                    f"contact={first_contact}/{gc.steps} ({contact_ratio:.0%}) | "
+                    f"corrections: lateral={lateral_correction*1000:+.1f}mm "
+                    f"forward={forward_correction*1000:+.1f}mm "
+                    f"vertical={vertical_correction*1000:+.1f}mm"
                 )
-                closer_target = [cur[0], cur[1] - 0.001, cur[2] + 0.015, *cur[3:]]
+
+                closer_target = [
+                    cur[0] + lateral_correction,
+                    cur[1] + forward_correction,
+                    cur[2] + vertical_correction,
+                    *cur[3:]
+                ]
                 exec_pose(node, closer_target)
                 wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
             node.control_gripper("CLOSE"); time.sleep(0.1)
@@ -1815,20 +1838,18 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # Partial reverse: pull back ~28cm to clear the date bunch
+        # Reverse along the stored approach path (28cm clearance from fruit).
         execute_partial_reverse(node, clearance_m=0.28)
 
-        # If we came from a side HOME, the partial reverse ends near the trunk.
-        # Go to center HOME first to get into a safe, known configuration before dropoff.
+        # After partial reverse, return to the correct home position:
+        # - Side approach: go back to home_left or home_right (arm is near trunk, needs to clear)
+        # - Center approach: try direct dropoff, fall back to center HOME only if planning fails
         if is_side_approach:
-            node.get_logger().info(
-                "Side approach detected — going to center HOME before dropoff to avoid trunk")
+            node.get_logger().info("Side approach — returning to center HOME before dropoff")
             _safe_return_home()
 
-        # Plan directly to dropoff — cuRobo avoids trunk via voxel obstacles
         if not move_to_dropoff_position(node):
-            # Dropoff plan failed (trunk in the way) — go HOME first to clear
-            node.get_logger().info("Direct dropoff failed, going HOME first")
+            node.get_logger().info("Direct dropoff failed, going to center HOME first")
             _safe_return_home()
             move_to_dropoff_position(node)
         time.sleep(0.2)

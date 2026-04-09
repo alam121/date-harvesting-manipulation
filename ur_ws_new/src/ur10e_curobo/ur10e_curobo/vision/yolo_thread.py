@@ -23,6 +23,7 @@ class YoloThread:
         self.lock = Lock()
         self.run_event = Event()
         self.dets_ready = Event()
+        self.stopped = Event()  # set when run() loop exits
         self.exit_signal = False
 
         self.image_net: Optional[np.ndarray] = None
@@ -98,6 +99,8 @@ class YoloThread:
                 self.dets_ready.set()
 
             sleep(0.005)
+
+        self.stopped.set()  # signal that the loop has fully exited
 
     def set_image(self, image: np.ndarray) -> None:
         """Set new image for inference."""

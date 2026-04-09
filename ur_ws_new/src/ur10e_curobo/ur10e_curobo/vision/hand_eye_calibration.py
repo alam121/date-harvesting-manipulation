@@ -2,12 +2,13 @@
 Hand-eye calibration: find the transform from camera to gripper (eye-in-hand).
 
 Usage:
-  1. Place a chessboard flat and stationary in the robot's workspace.
-  2. Run this script.
-  3. Move the robot to ~15-20 different poses (vary rotation and translation)
-     while keeping the chessboard fully visible in the camera.
-  4. Press 'c' to capture a sample at each pose.
-  5. Press 'q' when done collecting — the script computes the calibration.
+  1. Print the chessboard pattern (18x25 squares, 30 mm each).
+  2. Place the board flat and stationary in the robot's workspace.
+  3. Run this script.
+  4. Move the robot to ~15-20 different poses (vary rotation and translation)
+     while keeping the board visible in the camera.
+  5. Press 'c' to capture a sample at each pose.
+  6. Press 'q' when done collecting — the script computes the calibration.
 
 The result (4x4 camera-to-gripper transform) is saved to a YAML file.
 """
@@ -29,8 +30,8 @@ from scipy.spatial.transform import Rotation
 
 # ── URDFs to update when calibration is confirmed ─────────────────────────────
 URDF_FILES = [
-    Path(__file__).resolve().parents[4] / "universal_robot/urdf/ur_macro.xacro",
-    Path(__file__).resolve().parents[6] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
+    Path(__file__).resolve().parents[4] / "src/universal_robot/urdf/ur_macro.xacro",
+    Path(__file__).resolve().parents[5] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
 ]
 
 # ── Chessboard parameters ─────────────────────────────────────────────
@@ -316,7 +317,16 @@ def main():
         print(f"    [{exists}] {f}")
     print()
 
+    import sys
+    sys.stdout.flush()
+    # Drain any buffered newlines left over from the capture loop
+    try:
+        import termios
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
     confirm = input("Apply to URDFs? [y/N]: ").strip().lower()
+    print(f"  (input received: {repr(confirm)})")
     if confirm == "y":
         _update_urdfs(t_cam2gripper, rpy, best_method_name, best_error, sample_count, timestamp)
     else:

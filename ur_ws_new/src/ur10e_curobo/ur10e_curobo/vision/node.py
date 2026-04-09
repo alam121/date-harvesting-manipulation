@@ -54,10 +54,6 @@ class VisionNode:
         self._heatmap_interval = 3  # recompute every 3rd frame
         self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
 
-        # Bunch detection — refreshed periodically so it stays current as robot moves
-        self._locked_bunch_boxes = None
-        self._bunch_last_update = 0.0
-        self._bunch_refresh_interval = 2.0  # seconds between bunch updates
 
         # Target lock
         self.target_lock_position: Optional[List[float]] = None
@@ -83,29 +79,20 @@ class VisionNode:
         self.tf_buffer = None
 
     def run(self):
-        """Main entry point — restarts _run_main on camera refresh."""
+        """Main entry point."""
         import torch
         with torch.no_grad():
-            while True:
-                self._refresh_requested = False
-                self._run_main()
-                if not self._refresh_requested:
-                    break
-                self.node.get_logger().info("Camera refresh — restarting ZED...")
-                sleep(0.5)  # extra buffer after the 2s in finally
+            self._run_main()
 
     def _run_main(self):
-        """Main execution loop."""
+        """Main execution loop. ROS2 is initialized once; ZED can be refreshed
+        inside the perception thread without restarting the executor."""
         self.exit_signal = False
+        self._refresh_requested = False
 
-        # ROS2 setup — only init rclpy once; recreate node/executor on each refresh
-        if not rclpy.ok():
-            rclpy.init()
-        if self.node is not None:
-            self.node.destroy_node()
+        # ROS2 setup — init once for the lifetime of the process
+        rclpy.init()
         self.node = rclpy.create_node("zed_date_detector_ros")
-        # NOTE: executor.add_node() is deferred until just before executor.spin()
-        # so that rclpy.spin_once() inside wait_for_transform() works without conflict.
         self.executor = MultiThreadedExecutor(num_threads=4)
 
         fast_qos = QoSProfile(
@@ -174,17 +161,19 @@ class VisionNode:
 
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
-        # Camera refresh command
+        # Camera refresh command — restart the entire process.
+        # ZED X Mini cannot reopen in-process (driver doesn't release cleanly);
+        # the only reliable refresh is a full process restart via exec().
         def camera_cmd_cb(msg):
             cmd = msg.data.strip()
             if cmd == "refresh":
-                self.node.get_logger().info("Camera refresh requested — reinitializing ZED...")
+                self.node.get_logger().info("Camera refresh requested — restarting process...")
+                self.exit_signal = True
                 self._refresh_requested = True
-                self.exit_signal = True  # breaks perception loop
-                if self.executor is not None:
-                    # Request shutdown off-thread so we don't block inside the callback
-                    # that's currently running on this executor.
-                    Thread(target=self.executor.shutdown, daemon=True).start()
+                # Shut down executor from a separate thread — calling shutdown()
+                # from inside a callback that runs on this executor would deadlock.
+                _exec = self.executor
+                Thread(target=_exec.shutdown, daemon=True).start()
 
         from std_msgs.msg import String as StdString
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
@@ -198,44 +187,11 @@ class VisionNode:
         for target, source in required_tfs:
             wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
-        # YOLO thread — keep alive across refreshes (model loading is expensive)
-        if self.yolo_thread is None:
-            self.yolo_thread = YoloThread(
-                weights=self.args.weights,
-                img_size=self.args.img_size,
-                conf_thres=self.args.conf_thres,
-            )
-            Thread(target=self.yolo_thread.run, daemon=True).start()
-
-        # ZED init
-        input_type = sl.InputType()
-        if self.args.svo:
-            input_type.set_from_svo_file(self.args.svo)
-
-        init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
-        init_params.camera_resolution = sl.RESOLUTION.HD1080
-        init_params.coordinate_units = sl.UNIT.METER
-        init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
-        init_params.depth_minimum_distance = 0.15
-        init_params.depth_maximum_distance = 50.0
-
-        print("Initializing Camera...")
-        zed = sl.Camera()
-        status = zed.open(init_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            print(repr(status))
+        zed = self._init_zed_and_yolo()
+        if zed is None:
             rclpy.shutdown()
             return
-        print("Camera Initialized")
-        apply_zed_camera_settings(zed)
 
-        zed.enable_positional_tracking(sl.PositionalTrackingParameters())
-
-        obj_param = sl.ObjectDetectionParameters()
-        obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
-        obj_param.enable_tracking = True
-        obj_param.enable_segmentation = False  # YOLO handles segmentation; ZED's TRT segmentation model segfaults on re-init
-        zed.enable_object_detection(obj_param)
 
         camera_infos = zed.get_camera_information()
         camera_res = camera_infos.camera_configuration.resolution
@@ -271,7 +227,7 @@ class VisionNode:
         loop_fps = 0.0
 
         def perception_loop():
-            nonlocal last_viz, loop_fps
+            nonlocal last_viz, loop_fps, zed
             t_prev = time()
 
             while not self.exit_signal:
@@ -296,15 +252,7 @@ class VisionNode:
                 if current_dets is None:
                     continue
                 trunk_boxes = self.yolo_thread.get_trunk_boxes()
-                live_bunch_boxes = self.yolo_thread.get_bunch_boxes()
-                t_now_bunch = time()
-                if live_bunch_boxes and (
-                    self._locked_bunch_boxes is None or
-                    (t_now_bunch - self._bunch_last_update) >= self._bunch_refresh_interval
-                ):
-                    self._locked_bunch_boxes = live_bunch_boxes
-                    self._bunch_last_update = t_now_bunch
-                bunch_boxes = self._locked_bunch_boxes if self._locked_bunch_boxes is not None else []
+                bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 zed.ingest_custom_mask_objects(current_dets)
                 zed.retrieve_custom_objects(objects, obj_runtime_param)
@@ -399,16 +347,59 @@ class VisionNode:
             self.executor.spin()
         finally:
             self.exit_signal = True
-            perception_thread.join(timeout=3.0)  # give grab() time to return
-            if perception_thread.is_alive():
-                print("[Vision] WARNING: perception thread did not exit cleanly before ZED close")
-            zed.close()
-            sleep(2.0)  # allow GPU/ZED resources to fully release before potential reopen
-            self._locked_bunch_boxes = None  # reset so bunch is re-detected on next session
-            self._bunch_last_update = 0.0
-            if not getattr(self, '_refresh_requested', False):
+            perception_thread.join(timeout=3.0)
+            if self.yolo_thread is not None:
                 self.yolo_thread.stop()
-                rclpy.shutdown()
+                self.yolo_thread.stopped.wait(timeout=5.0)
+                self.yolo_thread = None
+            zed.close()
+            rclpy.shutdown()
+            if getattr(self, '_refresh_requested', False):
+                import os, sys
+                print("[Vision] Restarting process for camera refresh...")
+                sleep(4.0)  # let ZED/Argus driver release fully before exec
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _init_zed_and_yolo(self):
+        """Initialize ZED camera then start YOLO thread. Returns zed or None on failure.
+        ZED must be fully open before YOLO TRT loads — they share the GPU and
+        simultaneous TRT initialization causes a segfault."""
+        input_type = sl.InputType()
+        if self.args.svo:
+            input_type.set_from_svo_file(self.args.svo)
+
+        init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
+        init_params.camera_resolution = sl.RESOLUTION.HD1080
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
+        init_params.depth_minimum_distance = 0.15
+        init_params.depth_maximum_distance = 50.0
+
+        print("Initializing Camera...")
+        zed = sl.Camera()
+        status = zed.open(init_params)
+        if status != sl.ERROR_CODE.SUCCESS:
+            print(repr(status))
+            return None
+        print("Camera Initialized")
+        apply_zed_camera_settings(zed)
+
+        zed.enable_positional_tracking(sl.PositionalTrackingParameters())
+
+        obj_param = sl.ObjectDetectionParameters()
+        obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
+        obj_param.enable_tracking = True
+        obj_param.enable_segmentation = False  # YOLO handles segmentation; ZED's TRT segmentation model segfaults on re-init
+        zed.enable_object_detection(obj_param)
+
+        # ZED fully initialized — now safe to load YOLO TRT engine
+        self.yolo_thread = YoloThread(
+            weights=self.args.weights,
+            img_size=self.args.img_size,
+            conf_thres=self.args.conf_thres,
+        )
+        Thread(target=self.yolo_thread.run, daemon=True).start()
+        return zed
 
     def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub) -> None:
         """Publish depth point cloud for voxel obstacle avoidance."""
