@@ -15,7 +15,7 @@ from .detection import detections_to_custom_masks
 class YoloThread:
     """Background thread for YOLO inference."""
 
-    def __init__(self, weights: str, img_size: int = 512, conf_thres: float = 0.35):
+    def __init__(self, weights: str, img_size=640, conf_thres: float = 0.35):
         self.weights = weights
         self.img_size = img_size
         self.conf_thres = conf_thres

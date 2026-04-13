@@ -111,7 +111,14 @@ def parse_pointcloud2(msg: PointCloud2) -> np.ndarray:
     in the LiDAR frame.  NaN / inf rows are dropped.
     """
     gen = pc2_utils.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
-    pts = np.array(list(gen), dtype=np.float32)          # (N,3)
+    raw = np.array(list(gen))
+    if raw.ndim == 0 or raw.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    # ros2 humble returns a structured array — view as plain float32
+    if raw.dtype.names:
+        pts = np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float32)
+    else:
+        pts = raw.astype(np.float32)
     if pts.ndim != 2 or pts.shape[1] < 3:
         return np.empty((0, 3), dtype=np.float32)
     finite = np.isfinite(pts).all(axis=1)

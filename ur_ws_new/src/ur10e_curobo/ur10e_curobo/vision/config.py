@@ -16,11 +16,11 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_improved_exposure_data.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_improved_exposure_corrected.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolov26_small_zed_one4k.engine")
 
 # YOLO inference parameters
-DEFAULT_CONF_THRES = 0.2   # confidence threshold (lower = more detections)
-DEFAULT_IMG_SIZE = 640      # inference size in pixels
+DEFAULT_CONF_THRES = 0.1          # confidence threshold (lower = more detections)
+DEFAULT_IMG_SIZE = 1504            # must match compiled TRT engine exactly
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
@@ -69,7 +69,7 @@ TARGET_LOCK_RADIUS = 0.10     # 10cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
-SHOW_REJECTED = False
+SHOW_REJECTED = True
 SKIP_DRAW = False
 
 # Z limit in base_link frame
@@ -83,9 +83,38 @@ CAM_FRAME = "zed2_left_camera_frame"
 # Other classes (e.g. trunk) are shown in visualization but never become goals.
 # Set to False for single-class models (e.g. dates-only) where all detections are goals.
 CLASS_FILTER_ENABLED = True
-GOAL_CLASS_NAME = "datefruit"  # class picked as grasp target (must match model.names)
-VIZ_ONLY_CLASSES = ["trunk", "bunch"]  # classes shown in visualization only
+GOAL_CLASS_NAME = "date-fruits-77rw"  # class picked as grasp target (must match model.names)
+VIZ_ONLY_CLASSES = ["trunk"]          # classes shown in visualization only
 
 # Trunk depth correction: camera overestimates trunk distance (Y in base_link)
 # Positive value moves pole closer to robot. Tune per setup.
 TRUNK_Y_OFFSET = 0.0  # meters — added to detected Y (tune if camera depth is off)
+
+# ── ZED X One Mono (SN57931814) — QHD+ / QHDPLUS with HDR ───────────────────
+# QHDPLUS (3200x1800) is the maximum resolution that supports HDR on ZED X One.
+# Intrinsics are read at runtime from zed.get_camera_information() — values below
+# are kept as reference only (FHD1200 from SN57931814.conf).
+ZEDXONE_IMAGE_TOPIC = "/zedxone/image_raw"
+ZEDXONE_WIDTH  = 3200   # QHDPLUS
+ZEDXONE_HEIGHT = 1800
+ZEDXONE_FX = 738.615    # reference only — runtime values used instead
+ZEDXONE_FY = 738.284
+ZEDXONE_CX = 934.32
+ZEDXONE_CY = 642.52
+ZEDXONE_DIST = [-0.0137106, -0.0304117, 0.000282395, -0.000401063, 0.00817325]  # k1 k2 p1 p2 k3
+
+# ── LiDAR integration ─────────────────────────────────────────────────────────
+# When USE_LIDAR=True the ZED X One Mono provides images via ArgusBayerCapture
+# (published by zedxone_ros node) and Livox Mid-70 provides all depth.
+# Set to False for the stock ZED stereo depth pipeline.
+USE_LIDAR = False
+LIDAR_TOPIC = "/livox/lidar"
+LIDAR_Z_MIN = 0.10    # minimum valid LiDAR depth (m)
+LIDAR_Z_MAX = 5.0     # maximum valid LiDAR depth (m)
+# Camera←LiDAR extrinsic (4×4, transforms points FROM LiDAR frame TO camera frame).
+T_CAM_LIDAR = [
+    [ 0.193945, -0.972218, -0.131065, -0.667081],
+    [ 0.0420431, 0.141716, -0.989014, -0.305516],
+    [ 0.980111,  0.186304,  0.0683602, -0.177982],
+    [ 0.0,       0.0,       0.0,        1.0     ],
+]

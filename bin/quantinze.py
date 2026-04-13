@@ -1,5 +1,5 @@
 from ultralytics import YOLO
 
-mode = YOLO("yolo_26_improved_exposure_corrected.pt")
+mode = YOLO("yolov26_small_zed_one4k.pt")
 mode.export(format='engine',device=0,half=True)
 

@@ -22,6 +22,10 @@ def main():
         "--conf_thres", type=float, default=DEFAULT_CONF_THRES,
         help=f"YOLO confidence threshold (default: {DEFAULT_CONF_THRES})"
     )
+    parser.add_argument(
+        "--use_lidar", action="store_true",
+        help="Use Livox LiDAR for depth instead of ZED stereo depth"
+    )
     args = parser.parse_args()
 
     node = VisionNode(args)

@@ -422,6 +422,31 @@ class VisionVisualizer:
                 cv2.putText(image, label, (x1 + 4, y1 + 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, TRUNK_COLOR, 2, cv2.LINE_AA)
 
+    def draw_lidar_points(
+        self,
+        image: np.ndarray,
+        uv: np.ndarray,       # (N,2) projected pixel coords at display resolution
+        pts_cam: np.ndarray,  # (N,3) points in camera frame (Z = depth)
+        z_min: float = 0.1,
+        z_max: float = 5.0,
+    ) -> None:
+        """Draw projected LiDAR points colored by depth (red=close, blue=far)."""
+        if uv is None or uv.shape[0] == 0:
+            return
+        h, w = image.shape[:2]
+        zs = pts_cam[:, 2]
+        t = np.clip((zs - z_min) / max(z_max - z_min, 1e-3), 0.0, 1.0)
+        # Map t → BGR: 0=red (close), 0.5=green, 1=blue (far)
+        r = np.clip(255 * (1.0 - 2 * t),       0, 255).astype(np.uint8)
+        g = np.clip(255 * (1.0 - abs(2*t-1.0)), 0, 255).astype(np.uint8)
+        b = np.clip(255 * (2 * t - 1.0),        0, 255).astype(np.uint8)
+        xs = uv[:, 0].astype(np.int32)
+        ys = uv[:, 1].astype(np.int32)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        for i in np.where(valid)[0]:
+            color = (int(b[i]), int(g[i]), int(r[i]), 255)
+            cv2.circle(image, (xs[i], ys[i]), 2, color, -1)
+
     def render_frame(
         self,
         image: np.ndarray,
@@ -431,11 +456,15 @@ class VisionVisualizer:
         net_fps: float,
         loop_fps: float,
         viz_only: Optional[List[Dict[str, Any]]] = None,
+        lidar_uv: Optional[np.ndarray] = None,
+        lidar_pts_cam: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Render a complete frame with all visualizations."""
         if SKIP_DRAW:
             return image
 
+        if lidar_uv is not None and lidar_pts_cam is not None:
+            self.draw_lidar_points(image, lidar_uv, lidar_pts_cam)
         self.draw_rejected_targets(image, rejected_targets)
         if viz_only:
             self.draw_viz_only(image, viz_only)

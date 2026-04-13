@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>zedxone_ros</name>
+  <version>0.0.1</version>
+  <description>ZED X One Mono ROS2 image publisher using ArgusBayerCapture</description>
+  <maintainer email="user@kaust.edu.sa">user</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

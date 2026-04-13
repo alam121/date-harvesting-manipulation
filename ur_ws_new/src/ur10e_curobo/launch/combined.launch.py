@@ -22,6 +22,10 @@ def generate_launch_description():
         'vision', default_value='false',
         description='Launch vision node'
     )
+    lidar_arg = DeclareLaunchArgument(
+        'lidar', default_value='false',
+        description='Use Livox LiDAR for depth instead of ZED stereo depth'
+    )
     robot_ip_arg = DeclareLaunchArgument(
         'robot_ip', default_value='192.168.1.190',
         description='Robot IP address'
@@ -66,21 +70,40 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('teleop'))
     )
 
-    # Vision node (delayed to let other nodes initialize)
+    # Vision node — pass --use_lidar flag when lidar:=true
+    vision_args = PythonExpression([
+        '"--use_lidar" if "', LaunchConfiguration('lidar'), '" == "true" else ""'
+    ])
     vision_node = Node(
         package='ur10e_curobo',
         executable='vision',
         name='ur10e_vision',
         output='screen',
+        arguments=[vision_args],
         condition=IfCondition(LaunchConfiguration('vision'))
     )
+
+    # LiDAR driver node — only started when lidar:=true and vision:=true
+    lidar_node = Node(
+        package='livox_ros2_driver',
+        executable='livox_ros2_driver_node',
+        name='livox_lidar',
+        output='screen',
+        condition=IfCondition(PythonExpression([
+            '"true" if "', LaunchConfiguration('lidar'), '" == "true" and "',
+            LaunchConfiguration('vision'), '" == "true" else "false"'
+        ]))
+    )
+
     delayed_vision = TimerAction(period=3.0, actions=[vision_node])
+    delayed_lidar = TimerAction(period=1.0, actions=[lidar_node])
 
     return LaunchDescription([
         # Arguments
         main_arg,
         teleop_arg,
         vision_arg,
+        lidar_arg,
         robot_ip_arg,
         use_fake_hardware_arg,
         launch_rviz_arg,
@@ -88,5 +111,6 @@ def generate_launch_description():
         ur_bringup,
         main_node,
         teleop_node,
+        delayed_lidar,
         delayed_vision,
     ])

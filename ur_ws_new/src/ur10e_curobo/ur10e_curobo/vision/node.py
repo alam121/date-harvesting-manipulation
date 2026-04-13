@@ -25,6 +25,13 @@ from .config import (
     CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
     TRUNK_Y_OFFSET,
+    USE_LIDAR, LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
+    ZEDXONE_IMAGE_TOPIC, ZEDXONE_WIDTH, ZEDXONE_HEIGHT,
+    ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
+)
+from ..perception_lidar import (
+    parse_pointcloud2, project_lidar_to_image,
+    lidar_pts_in_mask, centroid_from_lidar_pts,
 )
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
@@ -67,6 +74,14 @@ class VisionNode:
         self.latest_goal_msg: Optional[PoseStamped] = None
         self.latest_dir_msg: Optional[Vector3Stamped] = None
         self.pub_lock = Lock()
+
+        # LiDAR cloud (used when --use_lidar)
+        self._latest_cloud: Optional[np.ndarray] = None
+        self._cloud_lock = Lock()
+
+        # ZED X One image from ROS topic (used when --use_lidar)
+        self._latest_ros_image: Optional[np.ndarray] = None
+        self._ros_image_lock = Lock()
 
         # Components
         self.tracker = FruitTracker()
@@ -187,39 +202,62 @@ class VisionNode:
         for target, source in required_tfs:
             wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
+        use_lidar = getattr(self.args, "use_lidar", False)
         zed = self._init_zed_and_yolo()
-        if zed is None:
-            rclpy.shutdown()
-            return
 
+        if use_lidar:
+            # ── ZED X One Mono path ─────────────────────────────────────────
+            # Read intrinsics directly from the opened camera (resolution-independent)
+            camera_infos = zed.get_camera_information()
+            cam_res = camera_infos.camera_configuration.resolution
+            cam_w, cam_h = cam_res.width, cam_res.height
+            left_cam = camera_infos.camera_configuration.calibration_parameters
+            fx, fy = float(left_cam.fx), float(left_cam.fy)
+            cx, cy = float(left_cam.cx), float(left_cam.cy)
+            disto  = left_cam.disto
+            print(f"[ZedXOne] {cam_w}x{cam_h}  fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
-        camera_infos = zed.get_camera_information()
-        camera_res = camera_infos.camera_configuration.resolution
-        left_cam = camera_infos.camera_configuration.calibration_parameters.left_cam
-        intrinsics = {
-            "fx": float(left_cam.fx),
-            "fy": float(left_cam.fy),
-            "cx": float(left_cam.cx),
-            "cy": float(left_cam.cy),
-        }
+            def _cloud_cb(msg):
+                pts = parse_pointcloud2(msg)
+                with self._cloud_lock:
+                    self._latest_cloud = pts
+            self.node.create_subscription(PointCloud2, LIDAR_TOPIC, _cloud_cb, fast_qos)
+            self.node.get_logger().info(f"[LiDAR] subscribed to {LIDAR_TOPIC}")
+        else:
+            # ── ZED stereo path ─────────────────────────────────────────────
+            if zed is None:
+                rclpy.shutdown()
+                return
+            camera_infos = zed.get_camera_information()
+            cam_res = camera_infos.camera_configuration.resolution
+            cam_w, cam_h = cam_res.width, cam_res.height
+            left_cam = camera_infos.camera_configuration.calibration_parameters.left_cam
+            fx, fy = float(left_cam.fx), float(left_cam.fy)
+            cx, cy = float(left_cam.cx), float(left_cam.cy)
+            disto  = left_cam.disto
 
+        intrinsics = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+
+        # Camera intrinsics matrix — needed for LiDAR projection
+        _K_full = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        _dist_coeffs = np.array(disto[:5], dtype=np.float64)
+        _T_cam_lidar = np.array(T_CAM_LIDAR, dtype=np.float64)
+
+        disp_w = cam_w
+        disp_h = cam_h
+        display_resolution = sl.Resolution(disp_w, disp_h)
+        image_left_ocv = np.full((disp_h, disp_w, 4), [245, 239, 239, 255], np.uint8)
+        image_scale = [disp_w / cam_w, disp_h / cam_h]
+        display_scale = 1.0
         image_left = sl.Mat()
         runtime_params = sl.RuntimeParameters()
-        obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters()
-        objects = sl.Objects()
-        point_cloud = sl.Mat()
-
-        display_resolution = sl.Resolution(min(camera_res.width, 1280), min(camera_res.height, 720))
-        image_left_ocv = np.full(
-            (display_resolution.height, display_resolution.width, 4),
-            [245, 239, 239, 255],
-            np.uint8,
-        )
-        image_scale = [
-            display_resolution.width / camera_res.width,
-            display_resolution.height / camera_res.height,
-        ]
-        display_scale = 0.6
+        obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters() if not use_lidar else None
+        objects = sl.Objects() if not use_lidar else None
+        point_cloud = sl.Mat() if not use_lidar else None
 
         self.visualizer = VisionVisualizer(intrinsics, image_scale, display_scale)
 
@@ -231,7 +269,8 @@ class VisionNode:
             t_prev = time()
 
             while not self.exit_signal:
-                if zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
+                grab_status = zed.grab() if use_lidar else zed.grab(runtime_params)
+                if grab_status != sl.ERROR_CODE.SUCCESS:
                     self.exit_signal = True
                     break
 
@@ -239,8 +278,11 @@ class VisionNode:
                 loop_fps = 1.0 / (t_now - t_prev) if (t_now - t_prev) > 0 else 0.0
                 t_prev = t_now
 
-                # Get image for YOLO
-                zed.retrieve_image(image_left, sl.VIEW.LEFT)
+                # Get full-res image for YOLO
+                if use_lidar:
+                    zed.retrieve_image(image_left)  # CameraOne: mono, no VIEW arg
+                else:
+                    zed.retrieve_image(image_left, sl.VIEW.LEFT)
                 self.yolo_thread.set_image(image_left.get_data())
 
                 if not self.yolo_thread.dets_ready.is_set():
@@ -254,35 +296,75 @@ class VisionNode:
                 trunk_boxes = self.yolo_thread.get_trunk_boxes()
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
-                zed.ingest_custom_mask_objects(current_dets)
-                zed.retrieve_custom_objects(objects, obj_runtime_param)
-
-                # Get image for display
-                zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU, display_resolution)
+                # Get display-resolution image
+                if use_lidar:
+                    zed.retrieve_image(image_left,
+                                       resolution=sl.Resolution(disp_w, disp_h))  # CameraOne: no VIEW, no MEM
+                else:
+                    zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU,
+                                       sl.Resolution(disp_w, disp_h))
                 np.copyto(image_left_ocv, image_left.get_data())
 
-                # Retrieve XYZ map
-                zed.retrieve_measure(point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU, display_resolution)
-                pc_np = point_cloud.get_data()[:, :, :3]
 
-                # Publish depth point cloud
-                depth_frame_count[0] += 1
-                if depth_frame_count[0] % 5 == 0:
-                    self._publish_depth_cloud(pc_np, depth_pub)
+                if use_lidar:
+                    # ── LiDAR depth path ──────────────────────────────────
+                    # Only project when there are detections to process
+                    pc_np = None
+                    sx, sy = image_scale
+                    K_disp = _K_full.copy()
+                    K_disp[0, 0] *= sx; K_disp[0, 2] *= sx
+                    K_disp[1, 1] *= sy; K_disp[1, 2] *= sy
+                    with self._cloud_lock:
+                        pts_lidar = self._latest_cloud
+                    if pts_lidar is not None and pts_lidar.shape[0] > 0 and len(current_dets) > 0:
+                        pts_cam_l, uv_l = project_lidar_to_image(
+                            pts_lidar, K_disp, _dist_coeffs, _T_cam_lidar,
+                            disp_w, disp_h,
+                            z_min=LIDAR_Z_MIN, z_max=LIDAR_Z_MAX,
+                        )
+                    else:
+                        pts_cam_l = np.empty((0, 3), np.float32)
+                        uv_l = np.empty((0, 2), np.float32)
+                else:
+                    # ── ZED stereo depth path ─────────────────────────────
+                    pts_cam_l = np.empty((0, 3), np.float32)
+                    uv_l = np.empty((0, 2), np.float32)
+                    zed.ingest_custom_mask_objects(current_dets)
+                    zed.retrieve_custom_objects(objects, obj_runtime_param)
+                    zed.retrieve_measure(point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
+                                        sl.Resolution(disp_w, disp_h))
+                    pc_np = point_cloud.get_data()[:, :, :3]
+                    depth_frame_count[0] += 1
+                    if depth_frame_count[0] % 5 == 0:
+                        self._publish_depth_cloud(pc_np, depth_pub)
+
+                # Debug: print detection counts every 30 frames
+                if self._heatmap_frame_count % 30 == 0:
+                    n_dets = len(current_dets) if use_lidar else len(current_dets.object_list if hasattr(current_dets, 'object_list') else [])
+                    n_lidar = pts_cam_l.shape[0] if use_lidar else 0
+                    rej_list = rejected_targets if 'rejected_targets' in dir() else []
+                    from collections import Counter
+                    rej_reasons = Counter(r.get("reason", "?") for r in rej_list)
+                    print(f"[DBG] dets={n_dets} lidar_pts={n_lidar} targets={len(targets) if 'targets' in dir() else '?'} rejected={dict(rej_reasons)}")
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
                 if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
                     self._cached_heatmaps.clear()  # prevent stale cache buildup
                 targets, rejected_targets, viz_only = self._process_objects(
-                    objects, pc_np, image_left_ocv, image_scale, display_resolution, intrinsics
+                    current_dets if use_lidar else objects,
+                    pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
+                    pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
                 )
 
                 # Temporal stabilization
                 targets = self.tracker.stabilize_detections(targets)
 
                 # Publish trunk position for pole obstacle (uses YOLO trunk boxes directly)
-                self._publish_trunk_position(trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub)
+                self._publish_trunk_position(
+                    trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
+                    pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
+                )
 
                 # Select best fruit
                 best_idx = self._select_best_fruit(targets)
@@ -322,6 +404,8 @@ class VisionNode:
                         image_left_ocv, targets, rejected_targets,
                         best_idx, self.yolo_thread.net_fps, loop_fps,
                         viz_only=trunk_viz,
+                        lidar_uv=None,
+                        lidar_pts_cam=None,
                     )
                     # Publish to RViz Image display
                     try:
@@ -352,7 +436,8 @@ class VisionNode:
                 self.yolo_thread.stop()
                 self.yolo_thread.stopped.wait(timeout=5.0)
                 self.yolo_thread = None
-            zed.close()
+            if zed is not None:
+                zed.close()
             rclpy.shutdown()
             if getattr(self, '_refresh_requested', False):
                 import os, sys
@@ -364,33 +449,58 @@ class VisionNode:
         """Initialize ZED camera then start YOLO thread. Returns zed or None on failure.
         ZED must be fully open before YOLO TRT loads — they share the GPU and
         simultaneous TRT initialization causes a segfault."""
-        input_type = sl.InputType()
-        if self.args.svo:
-            input_type.set_from_svo_file(self.args.svo)
+        use_lidar = getattr(self.args, "use_lidar", False)
 
-        init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
-        init_params.camera_resolution = sl.RESOLUTION.HD1080
-        init_params.coordinate_units = sl.UNIT.METER
-        init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
-        init_params.depth_minimum_distance = 0.15
-        init_params.depth_maximum_distance = 50.0
+        if use_lidar:
+            # ZED X One Mono — CameraOne API (pyzed.sl)
+            print("Initializing ZED X One Camera...")
+            zed = sl.CameraOne()
+            init_params = sl.InitParametersOne()
+            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # 3200x1800 — max res with HDR
+            init_params.camera_fps = 10
+            init_params.coordinate_units = sl.UNIT.METER
+            init_params.sdk_verbose = 1
+            init_params.enable_hdr = True
 
-        print("Initializing Camera...")
-        zed = sl.Camera()
-        status = zed.open(init_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            print(repr(status))
-            return None
-        print("Camera Initialized")
-        apply_zed_camera_settings(zed)
+            # Retry loop — daemon may need time to settle after restart
+            for attempt in range(1, 11):
+                status = zed.open(init_params)
+                if status == sl.ERROR_CODE.SUCCESS:
+                    break
+                print(f"[ZedXOne] Open attempt {attempt}/10 failed: {repr(status)}, retrying in 3s...")
+                sleep(3)
+            if status != sl.ERROR_CODE.SUCCESS:
+                print(f"[ZedXOne] Failed to open after 10 attempts: {repr(status)}")
+                return None
+            print("ZED X One Camera Initialized")
+            apply_zed_camera_settings(zed)
 
-        zed.enable_positional_tracking(sl.PositionalTrackingParameters())
+        else:
+            # ZED stereo — standard Camera API
+            input_type = sl.InputType()
+            if self.args.svo:
+                input_type.set_from_svo_file(self.args.svo)
+            zed = sl.Camera()
+            init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
+            init_params.camera_resolution = sl.RESOLUTION.HD1080
+            init_params.coordinate_units = sl.UNIT.METER
+            init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
+            init_params.depth_minimum_distance = 0.15
+            init_params.depth_maximum_distance = 50.0
 
-        obj_param = sl.ObjectDetectionParameters()
-        obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
-        obj_param.enable_tracking = True
-        obj_param.enable_segmentation = False  # YOLO handles segmentation; ZED's TRT segmentation model segfaults on re-init
-        zed.enable_object_detection(obj_param)
+            print("Initializing Camera...")
+            status = zed.open(init_params)
+            if status != sl.ERROR_CODE.SUCCESS:
+                print(repr(status))
+                return None
+            print("Camera Initialized")
+            apply_zed_camera_settings(zed)
+            zed.enable_positional_tracking(sl.PositionalTrackingParameters())
+            obj_param = sl.ObjectDetectionParameters()
+            obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
+            obj_param.enable_tracking = True
+            obj_param.enable_segmentation = False
+            zed.enable_object_detection(obj_param)
 
         # ZED fully initialized — now safe to load YOLO TRT engine
         self.yolo_thread = YoloThread(
@@ -422,7 +532,8 @@ class VisionNode:
         except Exception:
             pass
 
-    def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub) -> None:
+    def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
+                                pts_cam=None, uv=None, use_lidar=False) -> None:
         """Publish detected trunk position in base_link for pole obstacle update.
         Uses only the first (largest/most confident) trunk detection."""
         if not trunk_boxes:
@@ -440,15 +551,34 @@ class VisionNode:
         y2 = max(0, min(y2, image_left_ocv.shape[0]))
         if x2 <= x1 or y2 <= y1:
             return
-        roi_xyz = pc_np[y1:y2, x1:x2, :]
-        valid_z = np.isfinite(roi_xyz[:, :, 2]) & (roi_xyz[:, :, 2] > 0.1)
-        if np.count_nonzero(valid_z) < 10:
-            return
-        pts = roi_xyz[valid_z]
-        zs = pts[:, 2]
-        idx = np.argsort(zs)
-        k = max(10, int(0.2 * len(idx)))
-        pts_front = pts[idx[:k]]
+
+        if use_lidar and pts_cam is not None and pts_cam.shape[0] > 0:
+            # LiDAR path: filter projected points to trunk bounding box
+            in_bbox = (
+                (uv[:, 0] >= x1) & (uv[:, 0] < x2) &
+                (uv[:, 1] >= y1) & (uv[:, 1] < y2)
+            )
+            if not in_bbox.any():
+                return
+            pts_trunk = pts_cam[in_bbox]
+            zs = pts_trunk[:, 2]
+            idx = np.argsort(zs)
+            k = max(5, int(0.2 * len(idx)))
+            pts_front = pts_trunk[idx[:k]]
+        else:
+            # ZED depth path
+            if pc_np is None:
+                return
+            roi_xyz = pc_np[y1:y2, x1:x2, :]
+            valid_z = np.isfinite(roi_xyz[:, :, 2]) & (roi_xyz[:, :, 2] > 0.1)
+            if np.count_nonzero(valid_z) < 10:
+                return
+            pts = roi_xyz[valid_z]
+            zs = pts[:, 2]
+            idx = np.argsort(zs)
+            k = max(10, int(0.2 * len(idx)))
+            pts_front = pts[idx[:k]]
+
         point_msg = PointStamped()
         point_msg.header.frame_id = CAM_FRAME
         point_msg.header.stamp = rclpyTime().to_msg()
@@ -466,21 +596,27 @@ class VisionNode:
 
     def _process_objects(
         self,
-        objects,
-        pc_np: np.ndarray,
+        objects_or_dets,
+        pc_np,
         image_left_ocv: np.ndarray,
         image_scale: List[float],
         display_resolution,
         intrinsics: Dict[str, float],
+        pts_cam: Optional[np.ndarray] = None,
+        uv: Optional[np.ndarray] = None,
+        use_lidar: bool = False,
     ) -> tuple:
         """Process detected objects and extract 3D information.
         All objects from ZED are fruit (trunk is filtered at YOLO level).
+        When use_lidar=True, objects_or_dets is a list of sl.CustomMaskObjectData
+        iterated directly from YOLO; otherwise it is an sl.Objects container.
         Returns (targets, rejected_targets, viz_only)."""
         targets = []
         rejected_targets = []
         viz_only = []  # kept for API compat but always empty now
 
-        for o in objects.object_list:
+        obj_list = objects_or_dets if use_lidar else objects_or_dets.object_list
+        for o in obj_list:
             bb = o.bounding_box_2d
             x1 = int(bb[0][0] * image_scale[0])
             y1 = int(bb[0][1] * image_scale[1])
@@ -513,7 +649,8 @@ class VisionNode:
             try:
                 target = self._extract_target_3d(
                     o, mask_mat, pc_np, x1, y1, x2, y2,
-                    display_resolution, intrinsics, mark_reject
+                    display_resolution, intrinsics, mark_reject,
+                    pts_cam=pts_cam, uv=uv, use_lidar=use_lidar,
                 )
                 if target is not None:
                     targets.append(target)
@@ -525,10 +662,13 @@ class VisionNode:
 
     def _extract_target_3d(
         self,
-        obj, mask_mat, pc_np: np.ndarray,
+        obj, mask_mat, pc_np,
         x1: int, y1: int, x2: int, y2: int,
         display_resolution, intrinsics: Dict[str, float],
-        mark_reject
+        mark_reject,
+        pts_cam: Optional[np.ndarray] = None,
+        uv: Optional[np.ndarray] = None,
+        use_lidar: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Extract 3D information from a detected object."""
         mask_local = mask_mat.get_data()
@@ -547,66 +687,113 @@ class VisionNode:
         # Ellipse fit for orientation
         t_short_axis, long_axis_2d, t_angle = self._fit_ellipse(mask_clean)
 
-        # 3D point extraction
-        roi_xyz = pc_np[y1:y2, x1:x2, :]
-        valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
-
-        # Throttle heatmap computation — reuse cached on non-compute frames
-        target_key = (x1, y1, x2, y2)
-        if self._heatmap_frame_count % self._heatmap_interval == 0:
-            heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
-                roi_xyz, valid, mask_clean
+        if use_lidar and pts_cam is not None and pts_cam.shape[0] > 0:
+            # ── LiDAR depth path ─────────────────────────────────────────
+            # Filter projected LiDAR points to padded bounding box
+            # Padding compensates for small T_CAM_LIDAR calibration error
+            pad = max(20, int(0.15 * max(x2 - x1, y2 - y1)))  # 15% of bbox size, min 20px
+            in_bbox = (
+                (uv[:, 0] >= x1 - pad) & (uv[:, 0] < x2 + pad) &
+                (uv[:, 1] >= y1 - pad) & (uv[:, 1] < y2 + pad)
             )
-            self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+            if not in_bbox.any():
+                mark_reject("No LiDAR pts in bbox")
+                return None
+            # Shift UV to ROI-local coordinates for mask lookup (account for pad offset)
+            uv_local = uv[in_bbox].copy()
+            uv_local[:, 0] -= x1
+            uv_local[:, 1] -= y1
+            pts_bbox = pts_cam[in_bbox]
+            in_mask_pts = lidar_pts_in_mask(pts_bbox, uv_local, mask_resized > 0)
+            if in_mask_pts.shape[0] < 5:
+                mark_reject("Too few LiDAR pts in mask")
+                return None
+            # Front 20% of points by depth
+            zs_l = in_mask_pts[:, 2]
+            idx_l = np.argsort(zs_l)
+            k_l = max(5, int(0.2 * len(idx_l)))
+            pts_front = in_mask_pts[idx_l[:k_l]]
+            Xc = float(np.median(pts_front[:, 0]))
+            Yc = float(np.median(pts_front[:, 1]))
+            Zc = float(np.median(pts_front[:, 2]))
+            depth_std = float(np.std(pts_front[:, 2]))
+            vis_ratio = min(1.0, in_mask_pts.shape[0] / max(1, int(0.1 * mask_bool.sum())))
+            vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > LIDAR_Z_MAX:
+                mark_reject("Z out of range")
+                return None
+
+            heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
+
+            gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc,
+                          "between_branches": False, "gap_angle_cam": 0.0}
+            obj_confidence = float(getattr(obj, "probability", 0.5))
+
         else:
-            cached = self._cached_heatmaps.get(target_key)
-            if cached is not None:
-                heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
-            else:
+            # ── ZED stereo depth path (original) ─────────────────────────
+            if pc_np is None:
+                mark_reject("No depth data")
+                return None
+            roi_xyz = pc_np[y1:y2, x1:x2, :]
+            valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
+
+            # Throttle heatmap computation — reuse cached on non-compute frames
+            target_key = (x1, y1, x2, y2)
+            if self._heatmap_frame_count % self._heatmap_interval == 0:
                 heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
                 )
                 self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+            else:
+                cached = self._cached_heatmaps.get(target_key)
+                if cached is not None:
+                    heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
+                else:
+                    heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
+                        roi_xyz, valid, mask_clean
+                    )
+                    self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
 
-        # Visibility ratio
-        vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
-        mask_pixels = np.count_nonzero(vis_mask)
-        vis_ratio = (
-            float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
-            if mask_pixels > 0 else 0.0
-        )
-        vis_ratio = max(0.0, min(vis_ratio, 1.0))
+            # Visibility ratio
+            vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
+            mask_pixels = np.count_nonzero(vis_mask)
+            vis_ratio = (
+                float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
+                if mask_pixels > 0 else 0.0
+            )
+            vis_ratio = max(0.0, min(vis_ratio, 1.0))
 
-        if np.count_nonzero(valid) < 30:
-            mark_reject("Too few depth pts")
-            return None
+            if np.count_nonzero(valid) < 30:
+                mark_reject("Too few depth pts")
+                return None
 
-        pts = roi_xyz[valid]
-        zs = pts[:, 2]
+            pts = roi_xyz[valid]
+            zs = pts[:, 2]
+            idx = np.argsort(zs)
+            k = max(10, int(0.2 * len(idx)))
+            pts_front = pts[idx[:k]]
 
-        idx = np.argsort(zs)
-        k = max(10, int(0.2 * len(idx)))
-        pts_front = pts[idx[:k]]
+            depth_std = np.std(pts_front[:, 2])
+            vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
-        depth_std = np.std(pts_front[:, 2])
-        vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
+            Z_std = float(np.std(pts_front[:, 2]))
+            if Z_std > 0.05:
+                mark_reject("Depth variance")
+                return None
 
-        Z_std = float(np.std(pts_front[:, 2]))
-        if Z_std > 0.05:
-            mark_reject("Depth variance")
-            return None
+            Xc = float(np.mean(pts_front[:, 0]))
+            Yc = float(np.mean(pts_front[:, 1]))
+            Zc = float(np.mean(pts_front[:, 2]))
 
-        Xc = float(np.mean(pts_front[:, 0]))
-        Yc = float(np.mean(pts_front[:, 1]))
-        Zc = float(np.mean(pts_front[:, 2]))
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+                mark_reject("Z out of range")
+                return None
 
-        if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
-            mark_reject("Z out of range")
-            return None
+            # Branch gap detection (depth ring sampling around fruit)
+            gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
+            self._detect_branch_gap(pc_np, gap_target)
 
-        # Branch gap detection (depth ring sampling around fruit)
-        gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
-        self._detect_branch_gap(pc_np, gap_target)
+            obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
 
         # Transform to base_link
         point_msg = PointStamped()
@@ -622,7 +809,6 @@ class VisionNode:
 
             dist = math.sqrt(pt_grip.point.x ** 2 + pt_grip.point.y ** 2 + pt_grip.point.z ** 2)
 
-            obj_confidence = getattr(obj, "confidence", 0.5) / 100.0
             if not (0.0 <= obj_confidence <= 1.0):
                 obj_confidence = 0.5
 

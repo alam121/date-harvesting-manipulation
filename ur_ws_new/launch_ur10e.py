@@ -15,20 +15,30 @@ UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
 
 RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
 
-def get_commands(fake_hardware=False, use_panel=False):
+def get_commands(fake_hardware=False, use_panel=False, use_lidar=False):
     hw = "true" if fake_hardware else "false"
     # Skip unet.sh for fake hardware since no real robot
     ur_prefix = "" if fake_hardware else f"{UNET_SCRIPT} && "
     # When panel is used, disable default rviz and launch rviz with our panel config
     launch_rviz = "false" if use_panel else "true"
+    vision_flags = " --use_lidar" if use_lidar else ""
     cmds = {
         "ur": f'{ur_prefix}{SOURCE} && ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:={hw} launch_rviz:={launch_rviz}',
         "main": f'sleep 5 && {SOURCE} && ros2 run ur10e_curobo main',
-        "vision": f'sleep 2 && {SOURCE} && ros2 run ur10e_curobo vision',
+        "vision": f'sleep 4 && {SOURCE} && ros2 run ur10e_curobo vision{vision_flags}',
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
         "hand_eye": f'sleep 4 && {SOURCE} && ros2 run ur10e_curobo hand_eye',
+        "lidar": (
+            f'sleep 8 && {SOURCE} && '
+            # Static TF: zed2_left_camera_frame (parent) → livox_frame (child)
+            f'ros2 run tf2_ros static_transform_publisher '
+            f'--x -0.667081 --y -0.305516 --z -0.177982 '
+            f'--qx 0.495951 --qy -0.468885 --qz 0.427989 --qw 0.592457 '
+            f'--frame-id zed2_left_camera_frame --child-frame-id livox_frame & '
+            f'ros2 launch livox_ros2_driver livox_lidar_launch.py'
+        ),
     }
     if use_panel:
         cmds["rviz_panel"] = f'sleep 5 && {SOURCE} && rviz2 -d {RVIZ_CONFIG}'
@@ -43,13 +53,14 @@ TITLES = {
     "rviz_panel": "RViz+Panel",
     "calibrate": "Calibrate",
     "hand_eye": "Hand-Eye",
+    "lidar": "LiDAR",
 }
 
 def make_command(cmd):
     return f'bash -c "{cmd}; exec bash"'
 
-def build_layout(nodes, fake_hardware=False, use_panel=False):
-    COMMANDS = get_commands(fake_hardware, use_panel)
+def build_layout(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
+    COMMANDS = get_commands(fake_hardware, use_panel, use_lidar)
     """Build the dynamic layout section."""
     all_nodes = ["ur"] + nodes
     n = len(all_nodes)
@@ -242,7 +253,7 @@ def build_layout(nodes, fake_hardware=False, use_panel=False):
 
     return '\n'.join(lines)
 
-def update_config(nodes, fake_hardware=False, use_panel=False):
+def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
     """Update terminator config with dynamic layout."""
     with open(CONFIG_PATH, 'r') as f:
         lines = f.readlines()
@@ -265,7 +276,7 @@ def update_config(nodes, fake_hardware=False, use_panel=False):
         new_lines.append(line)
 
     # Build new layout
-    new_layout = build_layout(nodes, fake_hardware, use_panel)
+    new_layout = build_layout(nodes, fake_hardware, use_panel, use_lidar)
 
     # Find [plugins] and insert before it
     final_lines = []
@@ -281,17 +292,19 @@ def main():
     valid = ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]
     args = sys.argv[1:]
 
-    # Check for fake hardware flag
+    # Extract modifier flags
     fake_hardware = "fake" in args
-    args = [a for a in args if a != "fake"]
+    use_lidar = "lidar" in args
+    args = [a for a in args if a not in ("fake", "lidar")]
 
     nodes = [arg for arg in args if arg in valid]
 
     if not nodes:
-        print("Usage: launch_ur10e [fake] [main] [vision] [teleop] [gui] [calibrate]")
+        print("Usage: launch_ur10e [fake] [lidar] [main] [vision] [teleop] [gui] [calibrate]")
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
+        print("  lidar     - Use Livox Mid-70 LiDAR for depth (adds LiDAR pane, passes --use_lidar to vision)")
         print("  main      - Main control node (RViz includes control panel)")
         print("  vision    - Vision node")
         print("  teleop    - Teleop node")
@@ -300,35 +313,39 @@ def main():
         print("  hand_eye  - Hand-eye camera calibration")
         print()
         print("Examples:")
-        print("  launch_ur10e main              # Real robot + main + RViz with panel")
-        print("  launch_ur10e main vision       # Real robot + main + vision + RViz with panel")
-        print("  launch_ur10e fake main         # Fake hardware + main")
-        print("  launch_ur10e main teleop       # Real robot + main + teleop")
-        print("  launch_ur10e calibrate         # Grasp force calibration only")
-        print("  launch_ur10e calibrate teleop  # Calibrate + teleop (jog robot)")
-        print("  launch_ur10e hand_eye          # Hand-eye calibration (UR bringup + calibration tool)")
+        print("  launch_ur10e main                    # Real robot + main + RViz with panel")
+        print("  launch_ur10e main vision             # Real robot + main + vision")
+        print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
+        print("  launch_ur10e fake main               # Fake hardware + main")
+        print("  launch_ur10e main teleop             # Real robot + main + teleop")
+        print("  launch_ur10e calibrate               # Grasp force calibration only")
+        print("  launch_ur10e hand_eye                # Hand-eye calibration")
         sys.exit(1)
 
     # When main is specified, use panel-integrated RViz
-    # UR bringup launches with launch_rviz:=false, and we add a separate rviz_panel pane
     use_panel = "main" in nodes
 
-    # Reorder to: main, vision, teleop, gui, calibrate
+    # Reorder: main, vision, teleop, gui, calibrate, hand_eye
     ordered = []
     for n in ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]:
         if n in nodes:
             ordered.append(n)
+
+    # LiDAR pane comes before vision (driver must be up first)
+    if use_lidar and "vision" in ordered:
+        ordered.insert(ordered.index("vision"), "lidar")
 
     # Add rviz_panel pane (separate RViz with integrated control panel)
     if use_panel:
         ordered.append("rviz_panel")
 
     hw_mode = "FAKE hardware" if fake_hardware else "REAL robot"
+    lidar_note = " +LiDAR" if use_lidar else ""
     panel_note = " (RViz with control panel)" if use_panel else ""
-    print(f"Launching {len(ordered) + 1} panes ({hw_mode}): ur_bringup + {', '.join(ordered)}{panel_note}")
+    print(f"Launching {len(ordered) + 1} panes ({hw_mode}{lidar_note}): ur_bringup + {', '.join(ordered)}{panel_note}")
 
     # Update config with dynamic layout
-    update_config(ordered, fake_hardware, use_panel)
+    update_config(ordered, fake_hardware, use_panel, use_lidar)
 
     # Launch terminator with the layout
     subprocess.Popen(["terminator", "-l", "dynamic"])
