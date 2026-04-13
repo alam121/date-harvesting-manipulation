@@ -316,7 +316,7 @@ class VisionNode:
                     K_disp[1, 1] *= sy; K_disp[1, 2] *= sy
                     with self._cloud_lock:
                         pts_lidar = self._latest_cloud
-                    if pts_lidar is not None and pts_lidar.shape[0] > 0 and len(current_dets) > 0:
+                    if pts_lidar is not None and pts_lidar.shape[0] > 0:
                         pts_cam_l, uv_l = project_lidar_to_image(
                             pts_lidar, K_disp, _dist_coeffs, _T_cam_lidar,
                             disp_w, disp_h,
@@ -404,8 +404,8 @@ class VisionNode:
                         image_left_ocv, targets, rejected_targets,
                         best_idx, self.yolo_thread.net_fps, loop_fps,
                         viz_only=trunk_viz,
-                        lidar_uv=None,
-                        lidar_pts_cam=None,
+                        lidar_uv=uv_l if use_lidar else None,
+                        lidar_pts_cam=pts_cam_l if use_lidar else None,
                     )
                     # Publish to RViz Image display
                     try:
@@ -456,7 +456,7 @@ class VisionNode:
             print("Initializing ZED X One Camera...")
             zed = sl.CameraOne()
             init_params = sl.InitParametersOne()
-            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # 3200x1800 — max res with HDR
+            init_params.camera_resolution = sl.RESOLUTION.HD1200  # 1920x1200 — reliable fallback
             init_params.camera_fps = 10
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
@@ -687,6 +687,7 @@ class VisionNode:
         # Ellipse fit for orientation
         t_short_axis, long_axis_2d, t_angle = self._fit_ellipse(mask_clean)
 
+        in_mask_uv: Optional[np.ndarray] = None  # ROI-local UV for depth viz
         if use_lidar and pts_cam is not None and pts_cam.shape[0] > 0:
             # ── LiDAR depth path ─────────────────────────────────────────
             # Filter projected LiDAR points to padded bounding box
@@ -704,7 +705,13 @@ class VisionNode:
             uv_local[:, 0] -= x1
             uv_local[:, 1] -= y1
             pts_bbox = pts_cam[in_bbox]
-            in_mask_pts = lidar_pts_in_mask(pts_bbox, uv_local, mask_resized > 0)
+            # Inline mask filtering to also capture UV coords for depth viz
+            mask_bin = mask_resized > 0
+            col_m = np.clip(np.round(uv_local[:, 0]).astype(int), 0, mask_bin.shape[1] - 1)
+            row_m = np.clip(np.round(uv_local[:, 1]).astype(int), 0, mask_bin.shape[0] - 1)
+            inside_m = mask_bin[row_m, col_m]
+            in_mask_pts = pts_bbox[inside_m]
+            in_mask_uv = uv_local[inside_m]  # ROI-local pixel coords of LiDAR hits
             if in_mask_pts.shape[0] < 5:
                 mark_reject("Too few LiDAR pts in mask")
                 return None
@@ -853,6 +860,8 @@ class VisionNode:
                 "attempt_count": attempt_count,
                 "between_branches": gap_target.get("between_branches", False),
                 "gap_angle_cam": gap_target.get("gap_angle_cam", 0.0),
+                "lidar_depth_uv": in_mask_uv,
+                "lidar_depths": in_mask_pts[:, 2] if in_mask_uv is not None and in_mask_pts.shape[0] > 0 else None,
             }
         except Exception as e:
             print(f"[WARN] TF transform failed: {e}")

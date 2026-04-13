@@ -10,6 +10,9 @@ sudo systemctl restart zed_x_daemon
 echo "[3/4] Restarting nvargus-daemon..."
 sudo systemctl restart nvargus-daemon
 
+echo "[4/4] Waiting for daemons to settle..."
+sleep 10
+
 # OPTIONAL: uncomment ONLY if you previously lowered lane rate on Orin NX devkit
 # echo "[4/4] Re-applying MIPI lane rate (2.0 Gbps)..."
 # sudo i2cset -y -f 30 0x29 0x04 0x15 0x34 i

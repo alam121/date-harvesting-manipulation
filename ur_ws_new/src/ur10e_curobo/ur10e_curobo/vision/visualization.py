@@ -140,6 +140,24 @@ class VisionVisualizer:
             blended = cv2.addWeighted(colored_mask, 0.45, roi, 0.55, 0.0)
             image[y1:y2, x1:x2] = blended
 
+            # LiDAR depth dot overlay (when lidar mode active)
+            lidar_depth_uv = target.get("lidar_depth_uv")
+            lidar_depths = target.get("lidar_depths")
+            if lidar_depth_uv is not None and lidar_depths is not None and len(lidar_depths) > 0:
+                z_near = float(np.min(lidar_depths))
+                z_far = float(np.max(lidar_depths))
+                z_range = max(z_far - z_near, 0.05)
+                for (ux, uy), z in zip(lidar_depth_uv, lidar_depths):
+                    px = int(round(ux)) + x1
+                    py = int(round(uy)) + y1
+                    if 0 <= px < image.shape[1] and 0 <= py < image.shape[0]:
+                        t = float(np.clip((z - z_near) / z_range, 0.0, 1.0))
+                        # Jet-like: close=red, mid=green, far=blue
+                        r = int(255 * max(0.0, 1.0 - 2 * t))
+                        g = int(255 * (1.0 - abs(2 * t - 1.0)))
+                        b = int(255 * max(0.0, 2 * t - 1.0))
+                        cv2.circle(image, (px, py), 4, (b, g, r, 255), -1)
+
             # Heatmap overlay for BEST target
             if is_best:
                 heatmap = target.get("heatmap")
