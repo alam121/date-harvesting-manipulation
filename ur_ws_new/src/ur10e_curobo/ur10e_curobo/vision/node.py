@@ -37,7 +37,7 @@ from ..perception_lidar import (
 )
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
-from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings
+from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings, apply_zed_stereo_settings
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker
 from .scoring import compute_fruit_score, compute_collision_free_direction
@@ -667,7 +667,7 @@ class VisionNode:
                 print(repr(status))
                 return None
             print("Camera Initialized")
-            apply_zed_camera_settings(zed)
+            apply_zed_stereo_settings(zed)
             zed.enable_positional_tracking(sl.PositionalTrackingParameters())
             obj_param = sl.ObjectDetectionParameters()
             obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
@@ -828,6 +828,7 @@ class VisionNode:
                     pts_cam=pts_cam, uv=uv,
                     # use_zed_mini: raw dets but dense heatmap depth (use_lidar=False)
                     use_lidar=(use_lidar and not use_zed_mini),
+                    use_zed_mini=use_zed_mini,
                 )
                 if target is not None:
                     targets.append(target)
@@ -846,6 +847,7 @@ class VisionNode:
         pts_cam: Optional[np.ndarray] = None,
         uv: Optional[np.ndarray] = None,
         use_lidar: bool = False,
+        use_zed_mini: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Extract 3D information from a detected object."""
         mask_local = mask_mat.get_data()
@@ -961,7 +963,8 @@ class VisionNode:
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             Z_std = float(np.std(pts_front[:, 2]))
-            if Z_std > 0.05:
+            z_std_thresh = 0.08 if use_zed_mini else 0.05
+            if Z_std > z_std_thresh:
                 mark_reject("Depth variance")
                 return None
 

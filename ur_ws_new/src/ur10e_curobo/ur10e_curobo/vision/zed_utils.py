@@ -49,10 +49,43 @@ def apply_zed_one_settings(zed):
 apply_zed_camera_settings = apply_zed_one_settings
 
 
+def apply_zed_stereo_settings(zed):
+    """Apply ZED X Mini settings when used as the main stereo camera (no ZED X One).
+    Keeps auto-exposure active but applies EV compensation to prevent overexposure outdoors."""
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 2)
+
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.DENOISING, 100)
+    except Exception:
+        pass
+
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE_COMPENSATION, 58)
+    except Exception:
+        pass
+
+    # Verify settings
+    try:
+        print("[ZedStereo] sat:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SATURATION))
+        print("[ZedStereo] sharp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS))
+        print("[ZedStereo] gamma:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAMMA))
+        print("[ZedStereo] wb_auto:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO))
+        print("[ZedStereo] wb_temp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE))
+        print("[ZedStereo] aec_agc:", zed.get_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC))
+        print("[ZedStereo] gain:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAIN))
+        print("[ZedStereo] exp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE))
+    except Exception:
+        pass
+
+
 def apply_zed_mini_settings(zed):
     """Apply ZED X Mini settings for depth-only use (no HDR)."""
     try:
-        #zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, 4)
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, 4)
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 2)
+
     except Exception:
         pass
