@@ -1013,6 +1013,15 @@
     <child link="tool0_to_camera_mount_link"/>
     <origin rpy="0 0 0" xyz="0 0 -0.174"/>
   </joint>
+  <!-- ZED X One Mono (derived: T_tool0_zedmini @ inv(T_CAM_ZEDMINI), 2026-04-15) -->
+  <link name="zed_mini_left_camera_frame"/>
+  <joint name="tool0_to_zed_mini_left_camera_frame" type="fixed">
+    <parent link="tool0"/>
+    <child link="zed_mini_left_camera_frame"/>
+    <origin rpy="-0.121254 -0.002856 -0.017912" xyz="-0.000596 -0.146103 0.079483"/>
+  </joint>
+
+  <!-- ZED X Mini (hand-eye calibrated, DANIILIDIS 1.79mm error) — used as vision CAM_FRAME for testing -->
   <link name="zed2_left_camera_frame">
     <visual>
       <origin rpy="-3.142 0 0" xyz="0.007 0.01 -0.032"/>
@@ -1039,7 +1048,6 @@
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
     <origin rpy="-0.093175 0.004537 -0.010728" xyz="-0.026452 -0.116456 0.060776"/>
-    <!-- hand-eye calibrated (DANIILIDIS, 1.79mm error) -->
   </joint>
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>

@@ -75,7 +75,7 @@ class MotionExecutor:
         )
 
         # Wait for trunk detection to set pole position before cuRobo init
-        world_config = self._wait_for_trunk_and_build_world()
+        world_config = self._wait_for_trunk_and_build_world(timeout=40.0)
 
         # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
         from ..static_obstacles import StaticObstacleSpec

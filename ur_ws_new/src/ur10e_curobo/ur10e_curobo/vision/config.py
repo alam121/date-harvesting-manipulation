@@ -118,3 +118,21 @@ T_CAM_LIDAR = [
     [ 0.980111,  0.186304,  0.0683602, -0.177982],
     [ 0.0,       0.0,       0.0,        1.0     ],
 ]
+
+# ── Dual-camera: ZED One Mono (detection) + ZED X Mini (depth) ────────────────
+# When --use_zed_mini is passed the ZED X One Mono supplies RGB to YOLO and the
+# ZED X Mini is opened in-process (depth-only) to supply the point cloud.
+# Both cameras are grabbed simultaneously; no LiDAR subscription is needed.
+ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN to pin
+ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera
+ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
+ZEDMINI_DEPTH_Z_MAX = 5.0    # maximum valid ZED Mini depth (m)
+ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
+# Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
+# TO ZED One Mono camera frame).  Fill in after extrinsic calibration.
+T_CAM_ZEDMINI = [
+    [  0.99994366,  -0.00709704,   0.00789350,  -0.02646186],
+    [  0.00731502,   0.99958288,  -0.02793839,   0.03122307],
+    [ -0.00769193,   0.02799455,   0.99957848,  -0.01490936],
+    [  0.00000000,   0.00000000,   0.00000000,   1.00000000],
+]

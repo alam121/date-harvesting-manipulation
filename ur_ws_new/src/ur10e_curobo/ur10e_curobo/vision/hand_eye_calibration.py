@@ -81,32 +81,57 @@ def main():
     spin_thread = Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    # Wait a moment for TF tree to populate
-    node.get_logger().info("Waiting for TF tree...")
-    time.sleep(2.0)
+    # Poll until base_link→tool0 is available (UR bringup can take 10–30 s)
+    node.get_logger().info("Waiting for TF tree (base_link → tool0)...")
+    print("Waiting for robot driver TF... (start UR bringup if not running)")
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
+        try:
+            tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME,
+                                       rclpy.time.Time(),
+                                       timeout=rclpy.duration.Duration(seconds=1.0))
+            node.get_logger().info("TF ready.")
+            break
+        except Exception:
+            elapsed = int(time.time() - (deadline - 60.0))
+            print(f"\r  still waiting... {elapsed}s", end="", flush=True)
+    else:
+        print()
+        node.get_logger().error("TF not available after 60 s — is the robot driver running?")
+        zed.close()
+        rclpy.shutdown()
+        return
+    print()
 
-    # ── ZED camera setup ──────────────────────────────────────────────
-    zed = sl.Camera()
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD1080
+    # ── ZED X One Mono setup (CameraOne API) ─────────────────────────
+    zed = sl.CameraOne()
+    init_params = sl.InitParametersOne()
+    init_params.camera_resolution = sl.RESOLUTION.HD1200  # native ZED X One resolution
+    init_params.camera_fps = 30
     init_params.coordinate_units = sl.UNIT.METER
+    init_params.enable_hdr = True   # same setting used during normal operation
 
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
-        node.get_logger().error(f"ZED open failed: {status}")
+        node.get_logger().error(f"ZED X One Mono open failed: {status}")
         return
+    node.get_logger().info("ZED X One Mono opened for hand-eye calibration.")
 
+    # CameraOne: calibration_parameters is the mono calibration directly (no .left_cam)
     cam_info = zed.get_camera_information()
-    left_cam = cam_info.camera_configuration.calibration_parameters.left_cam
+    cam_params = cam_info.camera_configuration.calibration_parameters
     camera_matrix = np.array([
-        [left_cam.fx, 0, left_cam.cx],
-        [0, left_cam.fy, left_cam.cy],
+        [cam_params.fx, 0, cam_params.cx],
+        [0, cam_params.fy, cam_params.cy],
         [0, 0, 1],
     ], dtype=np.float64)
-    dist_coeffs = np.array(left_cam.disto[:5], dtype=np.float64)
+    dist_coeffs = np.array(cam_params.disto[:5], dtype=np.float64)
+    node.get_logger().info(
+        f"Intrinsics: fx={cam_params.fx:.1f} fy={cam_params.fy:.1f} "
+        f"cx={cam_params.cx:.1f} cy={cam_params.cy:.1f}"
+    )
 
     image_mat = sl.Mat()
-    runtime = sl.RuntimeParameters()
 
     # ── Chessboard object points ──────────────────────────────────────
     objp = np.zeros((BOARD_ROWS * BOARD_COLS, 3), np.float32)
@@ -129,11 +154,11 @@ def main():
     )
 
     while True:
-        if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+        if zed.grab() != sl.ERROR_CODE.SUCCESS:  # CameraOne: no RuntimeParameters arg
             continue
 
-        zed.retrieve_image(image_mat, sl.VIEW.LEFT)
-        frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel
+        zed.retrieve_image(image_mat)  # CameraOne: no VIEW arg
+        frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel (BGRA→BGR)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Try to find chessboard
@@ -167,7 +192,10 @@ def main():
             # Get end-effector pose
             ee_pose = get_ee_pose(tf_buffer, node)
             if ee_pose is None:
-                node.get_logger().warn("Could not get EE pose — skipping this sample.")
+                cv2.putText(display, "NO TF — is the robot driver running?",
+                            (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.imshow("Hand-Eye Calibration", display)
+                cv2.waitKey(1500)
                 continue
 
             # Solve chessboard pose in camera frame
@@ -194,10 +222,34 @@ def main():
     zed.close()
 
     # ── Run hand-eye calibration ──────────────────────────────────────
-    if sample_count < 3:
-        node.get_logger().error(f"Need at least 3 samples, got {sample_count}. Aborting.")
+    if sample_count < 10:
+        node.get_logger().error(f"Need at least 10 samples, got {sample_count}. Aborting.")
         rclpy.shutdown()
         return
+
+    # ── Rotation diversity check ──────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("ROTATION DIVERSITY CHECK")
+    print("=" * 60)
+    rot_vecs = [Rotation.from_matrix(R).as_rotvec() for R in R_gripper2base_list]
+    max_angle_deg = 0.0
+    for i in range(len(rot_vecs)):
+        for j in range(i + 1, len(rot_vecs)):
+            rel = Rotation.from_matrix(
+                R_gripper2base_list[i].T @ R_gripper2base_list[j]
+            ).magnitude()
+            max_angle_deg = max(max_angle_deg, np.degrees(rel))
+    print(f"  Max rotation between any two poses: {max_angle_deg:.1f}°")
+    if max_angle_deg < 30.0:
+        print(f"  WARNING: Max rotation {max_angle_deg:.1f}° < 30°.")
+        print("  Daniilidis rotation estimate will be unreliable.")
+        print("  Add poses with larger wrist_3 / wrist_1 rotations (±30°).")
+        confirm = input("  Continue anyway? [y/N]: ").strip().lower()
+        if confirm != "y":
+            rclpy.shutdown()
+            return
+    else:
+        print(f"  OK — sufficient rotation diversity.")
 
     node.get_logger().info(f"Running hand-eye calibration with {sample_count} samples...")
 
@@ -231,21 +283,32 @@ def main():
     best_T = None
 
     for name, method in methods.items():
-        R_x, t_x = cv2.calibrateHandEye(
-            R_gripper2base_list, t_gripper2base_list,
-            R_target2cam_list, t_target2cam_list,
-            method=method,
-        )
-        T_x = np.eye(4)
-        T_x[:3, :3] = R_x
-        T_x[:3, 3] = t_x.flatten()
-        err = compute_consistency_error(T_x)
-        print(f"  {name:12s}  mean error: {err*1000:.2f} mm  |  t=[{t_x[0,0]:.4f}, {t_x[1,0]:.4f}, {t_x[2,0]:.4f}]")
+        try:
+            R_x, t_x = cv2.calibrateHandEye(
+                R_gripper2base_list, t_gripper2base_list,
+                R_target2cam_list, t_target2cam_list,
+                method=method,
+            )
+            T_x = np.eye(4)
+            T_x[:3, :3] = R_x
+            T_x[:3, 3] = t_x.flatten()
+            err = compute_consistency_error(T_x)
+            if not np.isfinite(err):
+                raise ValueError("non-finite error")
+            print(f"  {name:12s}  mean error: {err*1000:.2f} mm  |  t=[{t_x[0,0]:.4f}, {t_x[1,0]:.4f}, {t_x[2,0]:.4f}]")
+            if err < best_error:
+                best_error = err
+                best_method_name = name
+                best_T = T_x
+        except Exception as e:
+            print(f"  {name:12s}  FAILED: {e}")
 
-        if err < best_error:
-            best_error = err
-            best_method_name = name
-            best_T = T_x
+    if best_T is None:
+        print("\n  >>> ALL METHODS FAILED.")
+        print("  The poses lack rotational diversity. Redo with larger wrist rotations (20-30 deg).")
+        zed.close()
+        rclpy.shutdown()
+        return
 
     print(f"\n  >>> Best method: {best_method_name} ({best_error*1000:.2f} mm)")
 

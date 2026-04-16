@@ -15,17 +15,22 @@ UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
 
 RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
 
-def get_commands(fake_hardware=False, use_panel=False, use_lidar=False):
+def get_commands(fake_hardware=False, use_panel=False, use_lidar=False, use_zed_mini=False):
     hw = "true" if fake_hardware else "false"
     # Skip unet.sh for fake hardware since no real robot
     ur_prefix = "" if fake_hardware else f"{UNET_SCRIPT} && "
     # When panel is used, disable default rviz and launch rviz with our panel config
     launch_rviz = "false" if use_panel else "true"
-    vision_flags = " --use_lidar" if use_lidar else ""
+    if use_zed_mini:
+        vision_flags = " --use_zed_mini"
+    elif use_lidar:
+        vision_flags = " --use_lidar"
+    else:
+        vision_flags = ""
     cmds = {
         "ur": f'{ur_prefix}{SOURCE} && ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:={hw} launch_rviz:={launch_rviz}',
-        "main": f'sleep 5 && {SOURCE} && ros2 run ur10e_curobo main',
-        "vision": f'sleep 4 && {SOURCE} && ros2 run ur10e_curobo vision{vision_flags}',
+        "main": f'sleep 15 && {SOURCE} && ros2 run ur10e_curobo main',
+        "vision": f'sleep 12 && {SOURCE} && ros2 run ur10e_curobo vision{vision_flags}',
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
@@ -59,8 +64,8 @@ TITLES = {
 def make_command(cmd):
     return f'bash -c "{cmd}; exec bash"'
 
-def build_layout(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
-    COMMANDS = get_commands(fake_hardware, use_panel, use_lidar)
+def build_layout(nodes, fake_hardware=False, use_panel=False, use_lidar=False, use_zed_mini=False):
+    COMMANDS = get_commands(fake_hardware, use_panel, use_lidar, use_zed_mini)
     """Build the dynamic layout section."""
     all_nodes = ["ur"] + nodes
     n = len(all_nodes)
@@ -253,7 +258,7 @@ def build_layout(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
 
     return '\n'.join(lines)
 
-def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
+def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False, use_zed_mini=False):
     """Update terminator config with dynamic layout."""
     with open(CONFIG_PATH, 'r') as f:
         lines = f.readlines()
@@ -276,7 +281,7 @@ def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False):
         new_lines.append(line)
 
     # Build new layout
-    new_layout = build_layout(nodes, fake_hardware, use_panel, use_lidar)
+    new_layout = build_layout(nodes, fake_hardware, use_panel, use_lidar, use_zed_mini)
 
     # Find [plugins] and insert before it
     final_lines = []
@@ -294,17 +299,19 @@ def main():
 
     # Extract modifier flags
     fake_hardware = "fake" in args
-    use_lidar = "lidar" in args
-    args = [a for a in args if a not in ("fake", "lidar")]
+    use_lidar     = "lidar" in args
+    use_zed_mini  = "zed_mini" in args
+    args = [a for a in args if a not in ("fake", "lidar", "zed_mini")]
 
     nodes = [arg for arg in args if arg in valid]
 
     if not nodes:
-        print("Usage: launch_ur10e [fake] [lidar] [main] [vision] [teleop] [gui] [calibrate]")
+        print("Usage: launch_ur10e [fake] [lidar|zed_mini] [main] [vision] [teleop] [gui] [calibrate]")
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
         print("  lidar     - Use Livox Mid-70 LiDAR for depth (adds LiDAR pane, passes --use_lidar to vision)")
+        print("  zed_mini  - Use ZED X Mini for depth + ZED One Mono for detection (passes --use_zed_mini to vision)")
         print("  main      - Main control node (RViz includes control panel)")
         print("  vision    - Vision node")
         print("  teleop    - Teleop node")
@@ -314,7 +321,8 @@ def main():
         print()
         print("Examples:")
         print("  launch_ur10e main                    # Real robot + main + RViz with panel")
-        print("  launch_ur10e main vision             # Real robot + main + vision")
+        print("  launch_ur10e main vision             # Real robot + main + vision (ZED stereo)")
+        print("  launch_ur10e main vision zed_mini    # Real robot + main + vision (ZED Mini depth)")
         print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
         print("  launch_ur10e fake main               # Fake hardware + main")
         print("  launch_ur10e main teleop             # Real robot + main + teleop")
@@ -340,12 +348,12 @@ def main():
         ordered.append("rviz_panel")
 
     hw_mode = "FAKE hardware" if fake_hardware else "REAL robot"
-    lidar_note = " +LiDAR" if use_lidar else ""
+    depth_note = " +ZedMini" if use_zed_mini else (" +LiDAR" if use_lidar else "")
     panel_note = " (RViz with control panel)" if use_panel else ""
-    print(f"Launching {len(ordered) + 1} panes ({hw_mode}{lidar_note}): ur_bringup + {', '.join(ordered)}{panel_note}")
+    print(f"Launching {len(ordered) + 1} panes ({hw_mode}{depth_note}): ur_bringup + {', '.join(ordered)}{panel_note}")
 
     # Update config with dynamic layout
-    update_config(ordered, fake_hardware, use_panel, use_lidar)
+    update_config(ordered, fake_hardware, use_panel, use_lidar, use_zed_mini)
 
     # Launch terminator with the layout
     subprocess.Popen(["terminator", "-l", "dynamic"])

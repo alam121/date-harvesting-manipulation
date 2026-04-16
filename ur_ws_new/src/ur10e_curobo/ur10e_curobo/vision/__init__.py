@@ -26,6 +26,10 @@ def main():
         "--use_lidar", action="store_true",
         help="Use Livox LiDAR for depth instead of ZED stereo depth"
     )
+    parser.add_argument(
+        "--use_zed_mini", action="store_true",
+        help="Dual-camera mode: ZED X One Mono for detection, ZED X Mini for depth"
+    )
     args = parser.parse_args()
 
     node = VisionNode(args)

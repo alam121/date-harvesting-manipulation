@@ -28,6 +28,8 @@ from .config import (
     USE_LIDAR, LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDXONE_IMAGE_TOPIC, ZEDXONE_WIDTH, ZEDXONE_HEIGHT,
     ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
+    ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS,
+    ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
 )
 from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
@@ -35,7 +37,8 @@ from ..perception_lidar import (
 )
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
-from .zed_utils import apply_zed_camera_settings
+from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings
+apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker
 from .scoring import compute_fruit_score, compute_collision_free_direction
 from .yolo_thread import YoloThread
@@ -75,13 +78,20 @@ class VisionNode:
         self.latest_dir_msg: Optional[Vector3Stamped] = None
         self.pub_lock = Lock()
 
-        # LiDAR cloud (used when --use_lidar)
+        # Sparse point cloud (used when --use_lidar)
         self._latest_cloud: Optional[np.ndarray] = None
         self._cloud_lock = Lock()
+
+        # Dense depth map (H×W×3 XYZ) at display resolution (used when --use_zed_mini)
+        self._latest_depth_map: Optional[np.ndarray] = None
+        self._depth_map_lock = Lock()
 
         # ZED X One image from ROS topic (used when --use_lidar)
         self._latest_ros_image: Optional[np.ndarray] = None
         self._ros_image_lock = Lock()
+
+        # ZED X Mini (depth camera for --use_zed_mini mode)
+        self._zed_mini = None
 
         # Components
         self.tracker = FruitTracker()
@@ -119,7 +129,7 @@ class VisionNode:
 
         goal_pub = self.node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
         dir_pub = self.node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
-        depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", fast_qos)
+        depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", 10)
         trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
@@ -202,12 +212,18 @@ class VisionNode:
         for target, source in required_tfs:
             wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
-        use_lidar = getattr(self.args, "use_lidar", False)
+        use_lidar   = getattr(self.args, "use_lidar",    False)
+        use_zed_mini = getattr(self.args, "use_zed_mini", False)
+        use_mono_depth = use_lidar or use_zed_mini  # ZED One Mono + external depth source
+        _pending_depth_thread = None  # set to a callable if ZED Mini warp thread is needed
         zed = self._init_zed_and_yolo()
 
-        if use_lidar:
-            # ── ZED X One Mono path ─────────────────────────────────────────
+        if use_mono_depth:
+            # ── ZED X One Mono path (LiDAR or ZED Mini depth) ───────────────
             # Read intrinsics directly from the opened camera (resolution-independent)
+            if zed is None:
+                rclpy.shutdown()
+                return
             camera_infos = zed.get_camera_information()
             cam_res = camera_infos.camera_configuration.resolution
             cam_w, cam_h = cam_res.width, cam_res.height
@@ -217,12 +233,113 @@ class VisionNode:
             disto  = left_cam.disto
             print(f"[ZedXOne] {cam_w}x{cam_h}  fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
-            def _cloud_cb(msg):
-                pts = parse_pointcloud2(msg)
-                with self._cloud_lock:
-                    self._latest_cloud = pts
-            self.node.create_subscription(PointCloud2, LIDAR_TOPIC, _cloud_cb, fast_qos)
-            self.node.get_logger().info(f"[LiDAR] subscribed to {LIDAR_TOPIC}")
+            if use_lidar:
+                def _cloud_cb(msg):
+                    pts = parse_pointcloud2(msg)
+                    with self._cloud_lock:
+                        self._latest_cloud = pts
+                self.node.create_subscription(PointCloud2, LIDAR_TOPIC, _cloud_cb, fast_qos)
+                self.node.get_logger().info(f"[LiDAR] subscribed to {LIDAR_TOPIC}")
+            else:
+                # ZED Mini depth — warp into ZED One's frame and image space.
+                # ZED Mini XYZ is in ZED Mini's frame; we must transform every point
+                # into ZED One's frame (T_CAM_ZEDMINI) and project to ZED One's image.
+                # The result is a dense depth map where bboxes from ZED One YOLO align
+                # directly and all XYZ values are in the ZED One camera frame.
+                # Thread will be started after image_scale / _K_full / disp_w / disp_h
+                # are defined below — store the function now, start it later.
+                try:
+                    from scipy.ndimage import distance_transform_edt as _edt
+                    _have_edt = True
+                except ImportError:
+                    _have_edt = False
+
+                def _zed_mini_depth_thread():
+                    # All closure variables (image_scale, _K_full, _dist_coeffs,
+                    # _T_cam_lidar, disp_w, disp_h) are defined before the thread
+                    # is actually started, so reading them here is safe.
+                    sx, sy = image_scale
+                    _K_disp_one = _K_full.copy()
+                    _K_disp_one[0, 0] *= sx;  _K_disp_one[0, 2] *= sx
+                    _K_disp_one[1, 1] *= sy;  _K_disp_one[1, 2] *= sy
+                    pc_mat = sl.Mat()
+                    _dbg_frame = 0
+                    while not self.exit_signal:
+                        if self._zed_mini is None:
+                            sleep(0.05)
+                            continue
+                        if self._zed_mini.grab() != sl.ERROR_CODE.SUCCESS:
+                            sleep(0.01)
+                            continue
+                        # Retrieve at native SVGA — no upscaling artifacts
+                        self._zed_mini.retrieve_measure(
+                            pc_mat, sl.MEASURE.XYZ, sl.MEM.CPU)
+                        raw = pc_mat.get_data()[:, :, :3]   # (H_mini, W_mini, 3) in ZED Mini frame
+
+                        # Flatten to sparse valid points
+                        pts = raw.reshape(-1, 3).astype(np.float32)
+                        valid_mask_flat = (np.isfinite(pts).all(axis=1) &
+                                 (pts[:, 2] > ZEDMINI_DEPTH_Z_MIN) &
+                                 (pts[:, 2] < ZEDMINI_DEPTH_Z_MAX))
+                        pts_valid = pts[valid_mask_flat]
+
+                        # Transform ZED Mini → ZED One frame and project to ZED One image
+                        depth_map = np.full((disp_h, disp_w, 3), np.nan, dtype=np.float32)
+                        if pts_valid.shape[0] > 0:
+                            pts_one, uv_one = project_lidar_to_image(
+                                pts_valid, _K_disp_one, _dist_coeffs, _T_cam_lidar,
+                                disp_w, disp_h,
+                                z_min=ZEDMINI_DEPTH_Z_MIN, z_max=ZEDMINI_DEPTH_Z_MAX,
+                            )
+                            if pts_one.shape[0] > 0:
+                                xs = uv_one[:, 0].astype(np.int32)
+                                ys = uv_one[:, 1].astype(np.int32)
+                                # Where multiple points hit the same pixel keep the closest
+                                order = np.argsort(pts_one[:, 2])[::-1]  # far→close
+                                # Transform back to ZED Mini frame — pixel alignment stays
+                                # in ZED One image space but 3D coords are in ZED Mini frame
+                                # so the well-calibrated ZED Mini hand-eye TF applies directly.
+                                T_mini_one = np.linalg.inv(_T_cam_lidar)
+                                ones_col = np.ones((pts_one.shape[0], 1), dtype=np.float32)
+                                pts_one_h = np.hstack([pts_one, ones_col])
+                                pts_mini = (T_mini_one @ pts_one_h.T).T[:, :3].astype(np.float32)
+                                depth_map[ys[order], xs[order]] = pts_mini[order]
+
+                        # ── Hole filling ─────────────────────────────────────
+                        # SVGA (752×480) → ZED One (1920×1200) leaves ~84 % of
+                        # pixels as NaN.  Fill gaps within 15 px of a valid pixel
+                        # using nearest-valid-neighbor so the heatmap path gets
+                        # dense coverage without far-field contamination.
+                        _valid_z = np.isfinite(depth_map[:, :, 2])
+                        n_valid = int(_valid_z.sum())
+                        if _have_edt and n_valid > 0 and not _valid_z.all():
+                            _dist, _idx = _edt(
+                                ~_valid_z,
+                                return_distances=True,
+                                return_indices=True,
+                            )
+                            fill = (_dist > 0) & (_dist <= 25.0)
+                            r_src = _idx[0][fill]
+                            c_src = _idx[1][fill]
+                            depth_map[fill, 0] = depth_map[r_src, c_src, 0]
+                            depth_map[fill, 1] = depth_map[r_src, c_src, 1]
+                            depth_map[fill, 2] = depth_map[r_src, c_src, 2]
+
+                        # ── Periodic diagnostics ─────────────────────────────
+                        _dbg_frame += 1
+                        if _dbg_frame % 30 == 0:
+                            _valid_after = np.isfinite(depth_map[:, :, 2]).sum()
+                            _total = disp_h * disp_w
+                            _zs = depth_map[:, :, 2][np.isfinite(depth_map[:, :, 2])]
+                            _z_med = float(np.median(_zs)) if _zs.size > 0 else float('nan')
+                            print(f"[ZedMini] scatter={n_valid}/{_total} "
+                                  f"filled={_valid_after}/{_total} "
+                                  f"({100*_valid_after/_total:.0f}%) "
+                                  f"median_Z={_z_med:.3f}m")
+
+                        with self._depth_map_lock:
+                            self._latest_depth_map = depth_map
+                _pending_depth_thread = _zed_mini_depth_thread
         else:
             # ── ZED stereo path ─────────────────────────────────────────────
             if zed is None:
@@ -238,14 +355,17 @@ class VisionNode:
 
         intrinsics = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
 
-        # Camera intrinsics matrix — needed for LiDAR projection
+        # Intrinsics matrix and depth-sensor extrinsic — used for point-cloud projection
         _K_full = np.array([
             [fx, 0.0, cx],
             [0.0, fy, cy],
             [0.0, 0.0, 1.0],
         ], dtype=np.float64)
         _dist_coeffs = np.array(disto[:5], dtype=np.float64)
-        _T_cam_lidar = np.array(T_CAM_LIDAR, dtype=np.float64)
+        if use_zed_mini:
+            _T_cam_lidar = np.array(T_CAM_ZEDMINI, dtype=np.float64)
+        else:
+            _T_cam_lidar = np.array(T_CAM_LIDAR, dtype=np.float64)
 
         disp_w = cam_w
         disp_h = cam_h
@@ -255,11 +375,16 @@ class VisionNode:
         display_scale = 1.0
         image_left = sl.Mat()
         runtime_params = sl.RuntimeParameters()
-        obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters() if not use_lidar else None
-        objects = sl.Objects() if not use_lidar else None
-        point_cloud = sl.Mat() if not use_lidar else None
+        obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters() if not use_mono_depth else None
+        objects = sl.Objects() if not use_mono_depth else None
+        point_cloud = sl.Mat() if not use_mono_depth else None
 
         self.visualizer = VisionVisualizer(intrinsics, image_scale, display_scale)
+
+        # Start ZED Mini depth warp thread now that all closure variables are defined
+        if _pending_depth_thread is not None:
+            self.node.get_logger().info("[ZedMini] depth warp thread starting")
+            Thread(target=_pending_depth_thread, daemon=True).start()
 
         last_viz = 0.0
         loop_fps = 0.0
@@ -269,7 +394,7 @@ class VisionNode:
             t_prev = time()
 
             while not self.exit_signal:
-                grab_status = zed.grab() if use_lidar else zed.grab(runtime_params)
+                grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
                 if grab_status != sl.ERROR_CODE.SUCCESS:
                     self.exit_signal = True
                     break
@@ -279,7 +404,7 @@ class VisionNode:
                 t_prev = t_now
 
                 # Get full-res image for YOLO
-                if use_lidar:
+                if use_mono_depth:
                     zed.retrieve_image(image_left)  # CameraOne: mono, no VIEW arg
                 else:
                     zed.retrieve_image(image_left, sl.VIEW.LEFT)
@@ -297,7 +422,7 @@ class VisionNode:
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 # Get display-resolution image
-                if use_lidar:
+                if use_mono_depth:
                     zed.retrieve_image(image_left,
                                        resolution=sl.Resolution(disp_w, disp_h))  # CameraOne: no VIEW, no MEM
                 else:
@@ -305,10 +430,21 @@ class VisionNode:
                                        sl.Resolution(disp_w, disp_h))
                 np.copyto(image_left_ocv, image_left.get_data())
 
-
-                if use_lidar:
-                    # ── LiDAR depth path ──────────────────────────────────
-                    # Only project when there are detections to process
+                if use_zed_mini:
+                    # ── ZED Mini dense depth path ─────────────────────────
+                    # Dense HxW depth map at ZED One display resolution —
+                    # same pixel grid as the image, so bboxes align directly.
+                    # Uses the full heatmap pipeline (surface normal, approach
+                    # direction, clearance) identical to the ZED stereo path.
+                    pts_cam_l = np.empty((0, 3), np.float32)
+                    uv_l = np.empty((0, 2), np.float32)
+                    with self._depth_map_lock:
+                        pc_np = self._latest_depth_map
+                    depth_frame_count[0] += 1
+                    if pc_np is not None and depth_frame_count[0] % 5 == 0:
+                        self._publish_depth_cloud(pc_np, depth_pub)
+                elif use_lidar:
+                    # ── LiDAR sparse depth path ───────────────────────────
                     pc_np = None
                     sx, sy = image_scale
                     K_disp = _K_full.copy()
@@ -340,21 +476,23 @@ class VisionNode:
 
                 # Debug: print detection counts every 30 frames
                 if self._heatmap_frame_count % 30 == 0:
-                    n_dets = len(current_dets) if use_lidar else len(current_dets.object_list if hasattr(current_dets, 'object_list') else [])
-                    n_lidar = pts_cam_l.shape[0] if use_lidar else 0
+                    n_dets = len(current_dets) if use_mono_depth else len(getattr(current_dets, 'object_list', []))
+                    n_depth_pts = pts_cam_l.shape[0] if use_lidar else 0
                     rej_list = rejected_targets if 'rejected_targets' in dir() else []
                     from collections import Counter
                     rej_reasons = Counter(r.get("reason", "?") for r in rej_list)
-                    print(f"[DBG] dets={n_dets} lidar_pts={n_lidar} targets={len(targets) if 'targets' in dir() else '?'} rejected={dict(rej_reasons)}")
+                    print(f"[DBG] dets={n_dets} depth_pts={n_depth_pts} targets={len(targets) if 'targets' in dir() else '?'} rejected={dict(rej_reasons)}")
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
                 if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
                     self._cached_heatmaps.clear()  # prevent stale cache buildup
                 targets, rejected_targets, viz_only = self._process_objects(
-                    current_dets if use_lidar else objects,
+                    current_dets if use_mono_depth else objects,
                     pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
-                    pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
+                    pts_cam=pts_cam_l, uv=uv_l,
+                    use_lidar=use_lidar,       # True only for actual LiDAR
+                    use_zed_mini=use_zed_mini, # raw dets + dense depth heatmap
                 )
 
                 # Temporal stabilization
@@ -436,6 +574,9 @@ class VisionNode:
                 self.yolo_thread.stop()
                 self.yolo_thread.stopped.wait(timeout=5.0)
                 self.yolo_thread = None
+            if self._zed_mini is not None:
+                self._zed_mini.close()
+                self._zed_mini = None
             if zed is not None:
                 zed.close()
             rclpy.shutdown()
@@ -449,15 +590,17 @@ class VisionNode:
         """Initialize ZED camera then start YOLO thread. Returns zed or None on failure.
         ZED must be fully open before YOLO TRT loads — they share the GPU and
         simultaneous TRT initialization causes a segfault."""
-        use_lidar = getattr(self.args, "use_lidar", False)
+        use_lidar    = getattr(self.args, "use_lidar",    False)
+        use_zed_mini = getattr(self.args, "use_zed_mini", False)
+        use_mono_depth = use_lidar or use_zed_mini
 
-        if use_lidar:
+        if use_mono_depth:
             # ZED X One Mono — CameraOne API (pyzed.sl)
-            print("Initializing ZED X One Camera...")
+            print("Initializing ZED X One Mono (detection camera)...")
             zed = sl.CameraOne()
             init_params = sl.InitParametersOne()
-            init_params.camera_resolution = sl.RESOLUTION.HD1200  # 1920x1200 — reliable fallback
-            init_params.camera_fps = 10
+            init_params.camera_resolution = sl.RESOLUTION.HD1200  # 1920x1200 — native on ZED X One
+            init_params.camera_fps = 30
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
             init_params.enable_hdr = True
@@ -472,8 +615,38 @@ class VisionNode:
             if status != sl.ERROR_CODE.SUCCESS:
                 print(f"[ZedXOne] Failed to open after 10 attempts: {repr(status)}")
                 return None
-            print("ZED X One Camera Initialized")
+            print("ZED X One Mono initialized")
             apply_zed_camera_settings(zed)
+
+            if use_zed_mini:
+                # ZED X Mini — stereo Camera opened for depth only
+                print("Initializing ZED X Mini (depth camera)...")
+                zed_mini = sl.Camera()
+                init_mini = sl.InitParameters()
+                if ZEDMINI_SERIAL > 0:
+                    init_mini.input.set_from_serial_number(ZEDMINI_SERIAL)
+                # HD720 is NOT supported on ZED X Mini — use SVGA (fast, sufficient for depth)
+                init_mini.camera_resolution = sl.RESOLUTION.HD1080
+                init_mini.camera_fps = ZEDMINI_DEPTH_FPS
+                init_mini.coordinate_units = sl.UNIT.METER
+                init_mini.depth_mode = sl.DEPTH_MODE.NEURAL  # higher accuracy than NEURAL_LIGHT
+                init_mini.depth_minimum_distance = ZEDMINI_DEPTH_Z_MIN
+                init_mini.depth_maximum_distance = ZEDMINI_DEPTH_Z_MAX
+                init_mini.sdk_verbose = 1
+
+                for attempt in range(1, 6):
+                    status_mini = zed_mini.open(init_mini)
+                    if status_mini == sl.ERROR_CODE.SUCCESS:
+                        break
+                    print(f"[ZedMini] Open attempt {attempt}/5 failed: {repr(status_mini)}, retrying in 3s...")
+                    sleep(3)
+                if status_mini != sl.ERROR_CODE.SUCCESS:
+                    print(f"[ZedMini] Failed to open: {repr(status_mini)}")
+                    zed.close()
+                    return None
+                apply_zed_mini_settings(zed_mini)
+                print("ZED X Mini initialized")
+                self._zed_mini = zed_mini
 
         else:
             # ZED stereo — standard Camera API
@@ -605,17 +778,19 @@ class VisionNode:
         pts_cam: Optional[np.ndarray] = None,
         uv: Optional[np.ndarray] = None,
         use_lidar: bool = False,
+        use_zed_mini: bool = False,
     ) -> tuple:
         """Process detected objects and extract 3D information.
-        All objects from ZED are fruit (trunk is filtered at YOLO level).
-        When use_lidar=True, objects_or_dets is a list of sl.CustomMaskObjectData
-        iterated directly from YOLO; otherwise it is an sl.Objects container.
+        use_lidar=True  — sparse LiDAR depth, iterate raw YOLO CustomMaskObjectData list.
+        use_zed_mini=True — dense ZED Mini depth (heatmap path), iterate raw YOLO list.
+        default — ZED stereo depth (heatmap path), iterate sl.Objects container.
         Returns (targets, rejected_targets, viz_only)."""
         targets = []
         rejected_targets = []
         viz_only = []  # kept for API compat but always empty now
 
-        obj_list = objects_or_dets if use_lidar else objects_or_dets.object_list
+        # use_zed_mini also iterates raw YOLO dets (ZED One has no object-detection API)
+        obj_list = objects_or_dets if (use_lidar or use_zed_mini) else objects_or_dets.object_list
         for o in obj_list:
             bb = o.bounding_box_2d
             x1 = int(bb[0][0] * image_scale[0])
@@ -650,7 +825,9 @@ class VisionNode:
                 target = self._extract_target_3d(
                     o, mask_mat, pc_np, x1, y1, x2, y2,
                     display_resolution, intrinsics, mark_reject,
-                    pts_cam=pts_cam, uv=uv, use_lidar=use_lidar,
+                    pts_cam=pts_cam, uv=uv,
+                    # use_zed_mini: raw dets but dense heatmap depth (use_lidar=False)
+                    use_lidar=(use_lidar and not use_zed_mini),
                 )
                 if target is not None:
                     targets.append(target)
@@ -795,6 +972,13 @@ class VisionNode:
             if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
                 mark_reject("Z out of range")
                 return None
+
+            # Depth diagnostic — printed periodically to monitor accuracy
+            if getattr(self, '_depth_dbg_count', 0) % 30 == 0:
+                print(f"[Depth] cam XYZ=({Xc:.3f},{Yc:.3f},{Zc:.3f}) "
+                      f"n_valid={np.count_nonzero(valid)} n_pts={len(pts)} n_front={len(pts_front)} "
+                      f"z_std={depth_std:.4f} bbox=({x1},{y1},{x2},{y2})")
+            self._depth_dbg_count = getattr(self, '_depth_dbg_count', 0) + 1
 
             # Branch gap detection (depth ring sampling around fruit)
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
@@ -1014,16 +1198,22 @@ class VisionNode:
                         dir_vec = np.array([1.0, 0.0], dtype=float)
                     t_best_dir2d = dir_vec
 
-                    # Collect scored 3D points for RViz marker (downsample to ~100)
+                    # Collect scored 3D points for RViz marker (front surface only)
                     valid_in_mask = np.zeros_like(valid)
                     valid_in_mask[ys, xs] = valid[ys, xs]
                     mask_ys, mask_xs = np.nonzero(valid_in_mask)
                     if len(mask_ys) > 0:
                         pts_3d = roi_xyz[mask_ys, mask_xs, :]
                         pts_scores = score[mask_ys, mask_xs]
-                        finite_mask = np.all(np.isfinite(pts_3d), axis=1)
+                        finite_mask = np.all(np.isfinite(pts_3d), axis=1) & (pts_3d[:, 2] > 0.05)
                         pts_3d = pts_3d[finite_mask]
                         pts_scores = pts_scores[finite_mask]
+                        # Keep only front 30% by depth to avoid background leakage
+                        if len(pts_3d) > 0:
+                            z_thresh = np.percentile(pts_3d[:, 2], 30)
+                            front_mask = pts_3d[:, 2] <= z_thresh
+                            pts_3d = pts_3d[front_mask]
+                            pts_scores = pts_scores[front_mask]
                         if len(pts_3d) > 100:
                             indices = np.linspace(0, len(pts_3d) - 1, 100, dtype=int)
                             pts_3d = pts_3d[indices]

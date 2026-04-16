@@ -44,8 +44,8 @@ fi
 
 # Fixed order commands (order: ur_bringup, main, vision, teleop, gui)
 CMD_UR="$SOURCE_CMD && ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true"
-CMD_MAIN="sleep 5 && $SOURCE_CMD && ros2 run ur10e_curobo main"
-CMD_VISION="sleep 7 && $SOURCE_CMD && ros2 run ur10e_curobo vision"
+CMD_MAIN="sleep 3 && $SOURCE_CMD && ros2 run ur10e_curobo main"
+CMD_VISION="sleep 1 && $SOURCE_CMD && ros2 run ur10e_curobo vision"
 CMD_TELEOP="sleep 6 && $SOURCE_CMD && ros2 run ur10e_curobo teleop"
 CMD_GUI="sleep 8 && $SOURCE_CMD && ros2 run ur10e_curobo gui"
 CMD_CALIBRATE="sleep 6 && $SOURCE_CMD && ros2 run ur10e_curobo calibrate"

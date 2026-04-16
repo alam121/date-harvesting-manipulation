@@ -1493,7 +1493,7 @@ def plan_and_execute(node):
         # Height-based approach strategy
         is_low = z < LOW_Z_THRESH
 
-        standoff = 0.12  # 12cm standoff distance
+        standoff = 0.25  # standoff distance from fruit for approach pose
         d_blend = blend_approach_direction(node, x, y, z)
 
         if is_low:
@@ -1532,7 +1532,7 @@ def plan_and_execute(node):
             dx_ee_to_fruit = abs(x - trunk_x)
             node.get_logger().info(
                 f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}")
-            if dx_ee_to_fruit > LATERAL_THRESH:   # only do side HOME if fruit is laterally far enough from EE
+            if dx_ee_to_fruit > LATERAL_THRESH and not is_low:   # skip side HOME for low fruits
                 if x > trunk_x:
                     side_joints = node.home_left_joints
                     side_label = "HOME_LEFT"
@@ -1552,7 +1552,7 @@ def plan_and_execute(node):
                 )
                 # Reacquire goal after side HOME — target may have shifted during the move
                 candidates = getattr(node, 'candidate_goals', [])
-                reacq = reacquire_goal_pose(node, seed_xyz=[x, y, z], candidate_seeds=candidates, timeout=2.0)
+                reacq = reacquire_goal_pose(node, seed_xyz=[x, y, z], candidate_seeds=candidates, timeout=10.0)
                 if reacq:
                     x, y, z = reacq
                     node.get_logger().info(
@@ -1603,7 +1603,7 @@ def plan_and_execute(node):
         elif is_low:
             side_blend = 0.25
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            approach = [ax, ay + 0.01, az - 0.12, *orientation]
+            approach = [ax, ay + 0.08, az - 0.12, *orientation]
             node.get_logger().info(
                 f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
             print(f"Going for LOW approach: {approach[:3]}")

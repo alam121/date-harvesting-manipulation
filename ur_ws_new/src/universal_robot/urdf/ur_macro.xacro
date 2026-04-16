@@ -528,10 +528,19 @@
 </link>
 
 
+  <!-- ZED X One Mono frame (derived: T_tool0_zedmini @ inv(T_CAM_ZEDMINI), 2026-04-15) — for RViz visualization -->
+  <link name="zed_mini_left_camera_frame"/>
+  <joint name="tool0_to_zed_mini_left_camera_frame" type="fixed">
+    <parent link="tool0"/>
+    <child link="zed_mini_left_camera_frame"/>
+    <origin xyz="-0.000596 -0.146103 0.079483" rpy="-0.121254 -0.002856 -0.017912"/>
+  </joint>
+
+  <!-- ZED X Mini frame (hand-eye calibrated, DANIILIDIS 1.79mm error) — CAM_FRAME, coords expressed in ZED Mini frame -->
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin xyz="-0.026452 -0.116456 0.060776" rpy="-0.093175 0.004537 -0.010728"/>   <!-- hand-eye calibrated (DANIILIDIS, 1.79mm error) -->
+    <origin xyz="-0.026452 -0.116456 0.060776" rpy="-0.093175 0.004537 -0.010728"/>
   </joint>
 
     
