@@ -84,7 +84,14 @@ class VisionNode:
 
         # Dense depth map (H×W×3 XYZ) at display resolution (used when --use_zed_mini)
         self._latest_depth_map: Optional[np.ndarray] = None
+        # Boolean mask of originally projected pixels (True = real data, False = EDT fill)
+        self._latest_depth_map_orig: Optional[np.ndarray] = None
         self._depth_map_lock = Lock()
+
+        # Raw ZED Mini points in ZED Mini frame + UV in ZED One image (no EDT fill).
+        # Used by _extract_target_3d for direct point queries — avoids scatter/fill artefacts.
+        self._latest_mini_pts: Optional[tuple] = None  # (pts_mini Nx3, uv_one Nx2)
+        self._mini_pts_lock = Lock()
 
         # ZED X One image from ROS topic (used when --use_lidar)
         self._latest_ros_image: Optional[np.ndarray] = None
@@ -271,7 +278,7 @@ class VisionNode:
                         if self._zed_mini.grab() != sl.ERROR_CODE.SUCCESS:
                             sleep(0.01)
                             continue
-                        # Retrieve at native SVGA — no upscaling artifacts
+                        # Retrieve at native HD1080 — matches ZED One resolution
                         self._zed_mini.retrieve_measure(
                             pc_mat, sl.MEASURE.XYZ, sl.MEM.CPU)
                         raw = pc_mat.get_data()[:, :, :3]   # (H_mini, W_mini, 3) in ZED Mini frame
@@ -285,6 +292,8 @@ class VisionNode:
 
                         # Transform ZED Mini → ZED One frame and project to ZED One image
                         depth_map = np.full((disp_h, disp_w, 3), np.nan, dtype=np.float32)
+                        _raw_mini_pts = np.empty((0, 3), np.float32)
+                        _raw_mini_uv  = np.empty((0, 2), np.float32)
                         if pts_valid.shape[0] > 0:
                             pts_one, uv_one = project_lidar_to_image(
                                 pts_valid, _K_disp_one, _dist_coeffs, _T_cam_lidar,
@@ -304,13 +313,19 @@ class VisionNode:
                                 pts_one_h = np.hstack([pts_one, ones_col])
                                 pts_mini = (T_mini_one @ pts_one_h.T).T[:, :3].astype(np.float32)
                                 depth_map[ys[order], xs[order]] = pts_mini[order]
+                                # ── Raw points for direct query (no EDT fill) ─────
+                                # pts_mini: ZED Mini-frame 3D coords
+                                # uv_one:   corresponding pixel positions in ZED One image
+                                _raw_mini_pts = pts_mini
+                                _raw_mini_uv  = uv_one
 
-                        # ── Hole filling ─────────────────────────────────────
-                        # SVGA (752×480) → ZED One (1920×1200) leaves ~84 % of
-                        # pixels as NaN.  Fill gaps within 15 px of a valid pixel
-                        # using nearest-valid-neighbor so the heatmap path gets
-                        # dense coverage without far-field contamination.
+                        # ── Hole filling (for heatmap visualisation only) ─────
+                        # Both cameras now at HD1080 with similar FOVs, so
+                        # scatter coverage is high (~95%+). Fill remaining gaps
+                        # (occlusion boundaries, textureless regions) up to 50px.
+                        # Save the pre-fill mask so RViz only shows real points.
                         _valid_z = np.isfinite(depth_map[:, :, 2])
+                        orig_valid = _valid_z.copy()
                         n_valid = int(_valid_z.sum())
                         if _have_edt and n_valid > 0 and not _valid_z.all():
                             _dist, _idx = _edt(
@@ -318,7 +333,7 @@ class VisionNode:
                                 return_distances=True,
                                 return_indices=True,
                             )
-                            fill = (_dist > 0) & (_dist <= 25.0)
+                            fill = (_dist > 0) & (_dist <= 50.0)
                             r_src = _idx[0][fill]
                             c_src = _idx[1][fill]
                             depth_map[fill, 0] = depth_map[r_src, c_src, 0]
@@ -339,6 +354,9 @@ class VisionNode:
 
                         with self._depth_map_lock:
                             self._latest_depth_map = depth_map
+                            self._latest_depth_map_orig = orig_valid
+                        with self._mini_pts_lock:
+                            self._latest_mini_pts = (_raw_mini_pts, _raw_mini_uv)
                 _pending_depth_thread = _zed_mini_depth_thread
         else:
             # ── ZED stereo path ─────────────────────────────────────────────
@@ -440,9 +458,10 @@ class VisionNode:
                     uv_l = np.empty((0, 2), np.float32)
                     with self._depth_map_lock:
                         pc_np = self._latest_depth_map
+                        pc_np_orig = self._latest_depth_map_orig
                     depth_frame_count[0] += 1
                     if pc_np is not None and depth_frame_count[0] % 5 == 0:
-                        self._publish_depth_cloud(pc_np, depth_pub)
+                        self._publish_depth_cloud(pc_np, depth_pub, orig_mask=pc_np_orig)
                 elif use_lidar:
                     # ── LiDAR sparse depth path ───────────────────────────
                     pc_np = None
@@ -599,11 +618,11 @@ class VisionNode:
             print("Initializing ZED X One Mono (detection camera)...")
             zed = sl.CameraOne()
             init_params = sl.InitParametersOne()
-            init_params.camera_resolution = sl.RESOLUTION.HD1200  # 1920x1200 — native on ZED X One
+            init_params.camera_resolution = sl.RESOLUTION.HD1080  # 1920x1080
             init_params.camera_fps = 30
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
-            init_params.enable_hdr = True
+            init_params.enable_hdr = False
 
             # Retry loop — daemon may need time to settle after restart
             for attempt in range(1, 11):
@@ -684,11 +703,16 @@ class VisionNode:
         Thread(target=self.yolo_thread.run, daemon=True).start()
         return zed
 
-    def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub) -> None:
-        """Publish depth point cloud for voxel obstacle avoidance."""
+    def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub,
+                             orig_mask: Optional[np.ndarray] = None) -> None:
+        """Publish depth point cloud for voxel obstacle avoidance.
+        orig_mask: if provided (ZED Mini mode), only publish originally projected
+        pixels — skips EDT-filled pixels which cause scattered artefacts in RViz."""
         try:
             valid = np.isfinite(pc_np).all(axis=-1)
             valid &= (pc_np[:, :, 2] > 0.1) & (pc_np[:, :, 2] < 2.0)
+            if orig_mask is not None:
+                valid &= orig_mask
             valid_points = pc_np[valid]
 
             if valid_points.shape[0] > 100:
@@ -915,6 +939,97 @@ class VisionNode:
                           "between_branches": False, "gap_angle_cam": 0.0}
             obj_confidence = float(getattr(obj, "probability", 0.5))
 
+        elif use_zed_mini:
+            # ── ZED Mini direct point query (no EDT fill artefacts) ───────
+            # Query raw projected points by UV — avoids scatter/fill bleed-in
+            # at depth discontinuities (fruit edge vs background).
+            with self._mini_pts_lock:
+                mini_pts_data = self._latest_mini_pts
+
+            if mini_pts_data is None or mini_pts_data[0].shape[0] == 0:
+                mark_reject("No depth data")
+                return None
+
+            pts_all, uv_all = mini_pts_data  # pts: ZED Mini frame, uv: ZED One pixels
+
+            # Filter to bbox
+            u = uv_all[:, 0]
+            v = uv_all[:, 1]
+            in_bbox = (u >= x1) & (u < x2) & (v >= y1) & (v < y2)
+            pts_bbox = pts_all[in_bbox]
+            uv_bbox  = uv_all[in_bbox]
+
+            if pts_bbox.shape[0] < 10:
+                mark_reject("Too few depth pts")
+                return None
+
+            # Apply segmentation mask
+            u_rel = np.clip((uv_bbox[:, 0] - x1).astype(np.int32), 0, mask_bool.shape[1] - 1)
+            v_rel = np.clip((uv_bbox[:, 1] - y1).astype(np.int32), 0, mask_bool.shape[0] - 1)
+            in_mask = mask_bool[v_rel, u_rel]
+            pts = pts_bbox[in_mask]
+
+            if pts.shape[0] < 10:
+                mark_reject("Too few depth pts")
+                return None
+
+            # Depth statistics — pure measured points, no interpolation.
+            # ZED Mini stereo produces mixed pixels at fruit/background edges,
+            # so cluster around the median depth before computing std.
+            zs  = pts[:, 2]
+            idx = np.argsort(zs)
+            k   = max(10, int(0.2 * len(idx)))
+            z_med = float(np.median(zs))
+            in_window = np.abs(zs - z_med) <= 0.08  # ±8 cm isolates fruit from edge noise
+            pts_front = pts[in_window] if in_window.sum() >= 10 else pts[idx[:k]]
+
+            depth_std = float(np.std(pts_front[:, 2]))
+            if depth_std > 0.05:
+                mark_reject("Depth variance")
+                return None
+
+            vis_ratio = min(1.0, float(pts.shape[0]) / max(1.0, float(np.count_nonzero(mask_bool))))
+            vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
+
+            Xc = float(np.mean(pts_front[:, 0]))
+            Yc = float(np.mean(pts_front[:, 1]))
+            Zc = float(np.mean(pts_front[:, 2]))
+
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+                mark_reject("Z out of range")
+                return None
+
+            # Heatmap — use EDT depth map (visualization quality, not used for position)
+            target_key = (x1, y1, x2, y2)
+            if pc_np is not None:
+                roi_xyz = pc_np[y1:y2, x1:x2, :]
+                valid   = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
+                if self._heatmap_frame_count % self._heatmap_interval == 0:
+                    heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
+                    self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+                else:
+                    cached = self._cached_heatmaps.get(target_key)
+                    if cached is not None:
+                        heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
+                    else:
+                        heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
+                        self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+            else:
+                heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
+
+            # Depth diagnostic
+            if getattr(self, '_depth_dbg_count', 0) % 30 == 0:
+                print(f"[Depth/mini] cam XYZ=({Xc:.3f},{Yc:.3f},{Zc:.3f}) "
+                      f"n_bbox={pts_bbox.shape[0]} n_mask={pts.shape[0]} n_front={len(pts_front)} "
+                      f"z_std={depth_std:.4f} bbox=({x1},{y1},{x2},{y2})")
+            self._depth_dbg_count = getattr(self, '_depth_dbg_count', 0) + 1
+
+            gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
+            self._detect_branch_gap(pc_np, gap_target)
+
+            in_mask_uv = None
+            obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
+
         else:
             # ── ZED stereo depth path (original) ─────────────────────────
             if pc_np is None:
@@ -963,8 +1078,7 @@ class VisionNode:
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             Z_std = float(np.std(pts_front[:, 2]))
-            z_std_thresh = 0.08 if use_zed_mini else 0.05
-            if Z_std > z_std_thresh:
+            if Z_std > 0.05:
                 mark_reject("Depth variance")
                 return None
 
