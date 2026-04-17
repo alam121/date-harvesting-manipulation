@@ -988,9 +988,6 @@ class VisionNode:
                 mark_reject("Depth variance")
                 return None
 
-            vis_ratio = min(1.0, float(pts.shape[0]) / max(1.0, float(np.count_nonzero(mask_bool))))
-            vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
-
             Xc = float(np.mean(pts_front[:, 0]))
             Yc = float(np.mean(pts_front[:, 1]))
             Zc = float(np.mean(pts_front[:, 2]))
@@ -999,11 +996,20 @@ class VisionNode:
                 mark_reject("Z out of range")
                 return None
 
-            # Heatmap — use EDT depth map (visualization quality, not used for position)
+            # Heatmap + vis_ratio — use EDT depth map so vis_ratio matches stereo mode.
+            # Position/z_std come from raw points above; EDT is for visualization only.
             target_key = (x1, y1, x2, y2)
             if pc_np is not None:
                 roi_xyz = pc_np[y1:y2, x1:x2, :]
                 valid   = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
+                # vis_ratio: same formula as stereo path so scoring is comparable
+                vis_mask_e = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
+                mask_pixels = np.count_nonzero(vis_mask_e)
+                vis_ratio = (
+                    float(np.count_nonzero(valid & vis_mask_e)) / float(mask_pixels)
+                    if mask_pixels > 0 else 0.0
+                )
+                vis_ratio = max(0.0, min(vis_ratio, 1.0))
                 if self._heatmap_frame_count % self._heatmap_interval == 0:
                     heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
                     self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
@@ -1015,7 +1021,10 @@ class VisionNode:
                         heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
                         self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
             else:
+                vis_ratio = min(1.0, float(pts.shape[0]) / max(1.0, float(np.count_nonzero(mask_bool))))
                 heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
+
+            vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             # Depth diagnostic
             if getattr(self, '_depth_dbg_count', 0) % 30 == 0:
@@ -1407,10 +1416,12 @@ class VisionNode:
         best_idx = None
         best_score = -1.0
 
+        _score_dbg = []
         for i, t in enumerate(targets):
             score_result = compute_fruit_score(t, prev_pt_base)
             t["score"] = score_result["total_score"]
             t["score_components"] = score_result["components"]
+            _score_dbg.append((i, t.get("bb"), t.get("dist", -1), score_result["total_score"], score_result["components"]))
 
             # Skip targets near excluded positions (multi-subscribe)
             if self.excluded_positions:
@@ -1425,6 +1436,14 @@ class VisionNode:
             if score_result["total_score"] > best_score:
                 best_score = score_result["total_score"]
                 best_idx = i
+
+        if getattr(self, '_score_dbg_count', 0) % 30 == 0:
+            for i, bb, dist, total, comps in _score_dbg:
+                print(f"[Score] i={i} bb={bb} dist={dist:.3f} total={total:.3f} "
+                      f"d={comps.get('distance',0):.2f} v={comps.get('visibility',0):.2f} "
+                      f"dq={comps.get('depth_quality',0):.2f} c={comps.get('confidence',0):.2f}")
+            print(f"[Score] best_idx={best_idx}")
+        self._score_dbg_count = getattr(self, '_score_dbg_count', 0) + 1
 
         # Hysteresis (skip excluded targets)
         if self.best_target_prev is not None and best_idx is not None:

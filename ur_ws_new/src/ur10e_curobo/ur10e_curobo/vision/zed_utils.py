@@ -16,8 +16,8 @@ def apply_zed_one_settings(zed):
 
     # Lock manual exposure so HDR tone-mapping doesn't converge dark
     try:
-        #zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 59)  # 0-100
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        #zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 33)  # 0-100
         #zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 70)      # 0-100
     except Exception:
         pass
