@@ -20,7 +20,7 @@ JOINT_ORDER = [
 ]
 
 # Height threshold (m) that classifies targets as LOW vs MID/HIGH.
-LOW_Z_THRESH = 0.90
+LOW_Z_THRESH = 0.99
 
 # Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
 LATERAL_THRESH = 0.03

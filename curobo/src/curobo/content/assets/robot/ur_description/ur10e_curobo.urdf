@@ -1047,7 +1047,7 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin rpy="-0.093175 0.004537 -0.010728" xyz="-0.026452 -0.116456 0.060776"/>
+    <origin rpy="-0.097892 -0.099072 0.218594" xyz="0.029453 -0.148011 0.081938"/>
   </joint>
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>

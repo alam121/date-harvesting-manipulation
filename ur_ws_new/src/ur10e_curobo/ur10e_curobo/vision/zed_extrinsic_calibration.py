@@ -27,14 +27,14 @@ import pyzed.sl as sl
 from scipy.spatial.transform import Rotation
 
 # ── Checkerboard parameters ────────────────────────────────────────────────────
-BOARD_ROWS   = 17      # inner corners along the long edge  (18 squares - 1)
-BOARD_COLS   = 24      # inner corners along the short edge (25 squares - 1)
+BOARD_ROWS   = 10      # inner corners along the long edge  (11 squares - 1)
+BOARD_COLS   = 7       # inner corners along the short edge (8 squares - 1)
 SQUARE_SIZE  = 0.030   # square side length in metres (30 mm)
 MIN_CAPTURES = 10      # minimum valid pairs before 'q' is accepted
 
 # ── Camera open parameters ─────────────────────────────────────────────────────
 # ZED X One Mono  (detection camera — CameraOne API)
-ZEDONE_RESOLUTION  = sl.RESOLUTION.HD1200
+ZEDONE_RESOLUTION  = sl.RESOLUTION.QHDPLUS
 ZEDONE_FPS         = 10
 
 # ZED X Mini  (depth camera — stereo Camera API)

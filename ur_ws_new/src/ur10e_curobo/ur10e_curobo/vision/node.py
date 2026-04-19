@@ -618,11 +618,11 @@ class VisionNode:
             print("Initializing ZED X One Mono (detection camera)...")
             zed = sl.CameraOne()
             init_params = sl.InitParametersOne()
-            init_params.camera_resolution = sl.RESOLUTION.HD1080  # 1920x1080
+            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # 1920x1080
             init_params.camera_fps = 30
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
-            init_params.enable_hdr = False
+            init_params.enable_hdr = True
 
             # Retry loop — daemon may need time to settle after restart
             for attempt in range(1, 11):

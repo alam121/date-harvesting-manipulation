@@ -1713,7 +1713,7 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.03  # approach to 3cm above target, then direct move down for grasp
+        z_offset = 0.0  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)

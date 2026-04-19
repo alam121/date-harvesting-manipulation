@@ -35,8 +35,8 @@ URDF_FILES = [
 ]
 
 # ── Chessboard parameters ─────────────────────────────────────────────
-BOARD_ROWS = 17         # inner corners per row    (18 squares → 17 inner corners)
-BOARD_COLS = 24         # inner corners per column (25 squares → 24 inner corners)
+BOARD_ROWS = 10         # inner corners per row    (11 squares → 10 inner corners)
+BOARD_COLS = 7          # inner corners per column (8 squares → 7 inner corners)
 SQUARE_SIZE = 0.030     # square side length in metres (30 mm)
 
 # ── Output path ───────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def main():
     # ── ZED X One Mono setup (CameraOne API) ─────────────────────────
     zed = sl.CameraOne()
     init_params = sl.InitParametersOne()
-    init_params.camera_resolution = sl.RESOLUTION.HD1200  # native ZED X One resolution
+    init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # match production resolution
     init_params.camera_fps = 30
     init_params.coordinate_units = sl.UNIT.METER
     init_params.enable_hdr = True   # same setting used during normal operation
