@@ -120,7 +120,8 @@ class VisionVisualizer:
         self,
         image: np.ndarray,
         target: Dict[str, Any],
-        is_best: bool
+        is_best: bool,
+        idx: int = -1
     ) -> None:
         """Draw a single target with mask, bbox, and annotations."""
         x1, y1, x2, y2 = target["bb"]
@@ -218,7 +219,7 @@ class VisionVisualizer:
             self._draw_approach_arrows(image, target, cx, cy, x1, y1, w_roi, h_roi)
 
         # Draw labels
-        self._draw_target_labels(image, target, cx, cy, is_best)
+        self._draw_target_labels(image, target, cx, cy, is_best, idx)
 
     def _draw_approach_arrows(
         self,
@@ -325,18 +326,23 @@ class VisionVisualizer:
         image: np.ndarray,
         target: Dict[str, Any],
         cx: int, cy: int,
-        is_best: bool
+        is_best: bool,
+        idx: int = -1
     ) -> None:
         """Draw labels and stats for a target."""
+        if idx >= 0:
+            x1, y1 = target["bb"][0], target["bb"][1]
+            cv2.putText(image, str(idx), (x1 + 4, y1 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 0, 255), 3, cv2.LINE_AA)
         if is_best:
             cv2.putText(
                 image,
                 "BEST",
                 (cx + 10, cy - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                1.8,
                 (255, 0, 0, 255),
-                2,
+                3,
                 cv2.LINE_AA,
             )
             dist_grip = target.get("dist", 0.0)
@@ -344,40 +350,26 @@ class VisionVisualizer:
             cv2.putText(
                 image,
                 f"D:{dist_grip:.2f}m S:{total_score:.2f}",
-                (cx + 10, cy + 20),
+                (cx + 10, cy + 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                1.3,
                 (0, 255, 0, 255),
-                1,
+                3,
                 cv2.LINE_AA,
             )
         else:
             dist_grip = target.get("dist", 0.0)
-            candidate_rank = target.get("candidate_rank")
-            if candidate_rank is not None:
-                # Show score for top-3 candidates
-                total_score = target.get("score", 0.0)
-                cv2.putText(
-                    image,
-                    f"D:{dist_grip:.2f}m S:{total_score:.2f}",
-                    (cx + 10, cy + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-            else:
-                cv2.putText(
-                    image,
-                    f"D:{dist_grip:.2f}m",
-                    (cx + 10, cy + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    (200, 200, 200, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+            total_score = target.get("score", 0.0)
+            cv2.putText(
+                image,
+                f"D:{dist_grip:.2f}m S:{total_score:.2f}",
+                (cx + 10, cy + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.3,
+                (200, 200, 200, 255),
+                3,
+                cv2.LINE_AA,
+            )
 
     def draw_hud(self, image: np.ndarray, net_fps: float, loop_fps: float) -> None:
         """Draw heads-up display with FPS info."""
@@ -491,7 +483,7 @@ class VisionVisualizer:
         for i, t in enumerate(targets):
             if DRAW_ONLY_BEST and (best_idx is not None) and i != best_idx:
                 continue
-            self.draw_target(image, t, is_best=(i == best_idx))
+            self.draw_target(image, t, is_best=(i == best_idx), idx=i)
 
         self.draw_hud(image, net_fps, loop_fps)
 

@@ -1600,10 +1600,12 @@ def plan_and_execute(node):
 
         if skip_approach:
             pass  # jump straight to reacquire + final below
+
+
         elif is_low:
             side_blend = 0.25
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            approach = [ax, ay + 0.08, az - 0.12, *orientation]
+            approach = [ax, ay + 0.12, az - 0.15, *orientation]
             node.get_logger().info(
                 f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
             print(f"Going for LOW approach: {approach[:3]}")
@@ -1713,7 +1715,7 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.0  # approach to 3cm above target, then direct move down for grasp
+        z_offset = -0.01  # approach to 3cm above target, then direct move down for grasp
         final_target = [x, y + 0.03, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)

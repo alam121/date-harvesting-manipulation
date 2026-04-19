@@ -125,7 +125,7 @@ def main():
         [0, cam_params.fy, cam_params.cy],
         [0, 0, 1],
     ], dtype=np.float64)
-    dist_coeffs = np.array(cam_params.disto[:5], dtype=np.float64)
+    dist_coeffs = np.zeros(5, dtype=np.float64)  # retrieve_image returns rectified frames — no distortion to pass to solvePnP
     node.get_logger().info(
         f"Intrinsics: fx={cam_params.fx:.1f} fy={cam_params.fy:.1f} "
         f"cx={cam_params.cx:.1f} cy={cam_params.cy:.1f}"

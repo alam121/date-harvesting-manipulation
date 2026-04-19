@@ -86,18 +86,19 @@ def open_zed_mini() -> sl.Camera:
 
 
 def get_intrinsics(cam_info, is_mono: bool):
-    """Return (K, dist) from ZED camera_information."""
+    """Return (K, dist) from ZED camera_information.
+    dist is always zeros — retrieve_image returns rectified frames so solvePnP
+    must not apply distortion correction a second time."""
     if is_mono:
         cal = cam_info.camera_configuration.calibration_parameters
         fx, fy = cal.fx, cal.fy
         cx, cy = cal.cx, cal.cy
-        dist   = np.array(cal.disto[:5], dtype=np.float64)
     else:
         cal = cam_info.camera_configuration.calibration_parameters.left_cam
         fx, fy = cal.fx, cal.fy
         cx, cy = cal.cx, cal.cy
-        dist   = np.array(cal.disto[:5], dtype=np.float64)
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    K    = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    dist = np.zeros(5, dtype=np.float64)
     return K, dist
 
 
@@ -167,7 +168,7 @@ def main():
     board_pts  = np.zeros((BOARD_ROWS * BOARD_COLS, 3), dtype=np.float32)
     board_pts[:, :2] = np.mgrid[0:BOARD_ROWS, 0:BOARD_COLS].T.reshape(-1, 2)
     board_pts *= SQUARE_SIZE
-
+    print(f"Checkerboard: {BOARD_ROWS}x{BOARD_COLS} corners, {SQUARE_SIZE*1000:.1f} mm squares")
     # Open cameras
     zed_one  = open_zed_one()
     zed_mini = open_zed_mini()

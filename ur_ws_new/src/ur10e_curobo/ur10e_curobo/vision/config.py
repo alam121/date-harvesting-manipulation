@@ -14,7 +14,7 @@ DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_improved_exposure_data.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_zedone4k_3classes.pt")
 
 DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolov26_small_zed_one4k.engine")
 
@@ -131,8 +131,8 @@ ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.
 T_CAM_ZEDMINI = [
-    [  0.99807127,  -0.00120591,   0.06206676,  -0.02452999],
-    [  0.00231255,   0.99983959,  -0.01776108,   0.03249404],
-    [ -0.06203538,   0.01787036,   0.99791395,  -0.01473851],
+    [  0.99791576,   0.00209274,   0.06449613,  -0.02496566],
+    [ -0.00190500,   0.99999377,  -0.00297231,   0.03234971],
+    [ -0.06450195,   0.00284325,   0.99791353,  -0.01475284],
     [  0.00000000,   0.00000000,   0.00000000,   1.00000000],
 ]

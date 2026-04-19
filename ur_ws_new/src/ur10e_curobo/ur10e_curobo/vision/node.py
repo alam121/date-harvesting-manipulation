@@ -61,7 +61,7 @@ class VisionNode:
 
         # Heatmap throttling — only recompute every N frames
         self._heatmap_frame_count = 0
-        self._heatmap_interval = 3  # recompute every 3rd frame
+        self._heatmap_interval = 10  # recompute every 10th frame
         self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
 
 
@@ -316,8 +316,16 @@ class VisionNode:
                                 # ── Raw points for direct query (no EDT fill) ─────
                                 # pts_mini: ZED Mini-frame 3D coords
                                 # uv_one:   corresponding pixel positions in ZED One image
-                                _raw_mini_pts = pts_mini
-                                _raw_mini_uv  = uv_one
+                                # Subsample to ZEDMINI_MAX_POINTS — bbox filtering in the
+                                # main loop iterates all points per target, so keeping
+                                # hundreds of thousands of points makes it very slow.
+                                if pts_mini.shape[0] > ZEDMINI_MAX_POINTS:
+                                    _sub_idx = np.random.choice(pts_mini.shape[0], ZEDMINI_MAX_POINTS, replace=False)
+                                    _raw_mini_pts = pts_mini[_sub_idx]
+                                    _raw_mini_uv  = uv_one[_sub_idx]
+                                else:
+                                    _raw_mini_pts = pts_mini
+                                    _raw_mini_uv  = uv_one
 
                         # ── Hole filling (for heatmap visualisation only) ─────
                         # Both cameras now at HD1080 with similar FOVs, so
@@ -410,6 +418,9 @@ class VisionNode:
         def perception_loop():
             nonlocal last_viz, loop_fps, zed
             t_prev = time()
+            current_dets = None
+            trunk_boxes  = []
+            bunch_boxes  = []
 
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
@@ -421,32 +432,29 @@ class VisionNode:
                 loop_fps = 1.0 / (t_now - t_prev) if (t_now - t_prev) > 0 else 0.0
                 t_prev = t_now
 
-                # Get full-res image for YOLO
-                if use_mono_depth:
-                    zed.retrieve_image(image_left)  # CameraOne: mono, no VIEW arg
-                else:
-                    zed.retrieve_image(image_left, sl.VIEW.LEFT)
-                self.yolo_thread.set_image(image_left.get_data())
-
-                if not self.yolo_thread.dets_ready.is_set():
-                    continue
-                self.yolo_thread.dets_ready.clear()
-
-                # Ingest YOLO fruit detections into ZED (trunk handled separately)
-                current_dets = self.yolo_thread.get_detections()
-                if current_dets is None:
-                    continue
-                trunk_boxes = self.yolo_thread.get_trunk_boxes()
-                bunch_boxes = self.yolo_thread.get_bunch_boxes()
-
-                # Get display-resolution image
+                _t0 = time()
+                # Retrieve once at display resolution — YOLO resizes internally so
+                # full QHDPLUS is wasted bandwidth. One retrieve serves both YOLO and display.
                 if use_mono_depth:
                     zed.retrieve_image(image_left,
-                                       resolution=sl.Resolution(disp_w, disp_h))  # CameraOne: no VIEW, no MEM
+                                       resolution=sl.Resolution(disp_w, disp_h))
                 else:
                     zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU,
                                        sl.Resolution(disp_w, disp_h))
                 np.copyto(image_left_ocv, image_left.get_data())
+                self.yolo_thread.set_image(image_left.get_data())
+                _t1 = time()
+
+                # Use fresh YOLO dets when ready, otherwise reuse cached dets so
+                # the loop runs at camera fps rather than YOLO inference fps.
+                if self.yolo_thread.dets_ready.is_set():
+                    self.yolo_thread.dets_ready.clear()
+                    current_dets = self.yolo_thread.get_detections()
+                    trunk_boxes  = self.yolo_thread.get_trunk_boxes()
+                    bunch_boxes  = self.yolo_thread.get_bunch_boxes()
+                elif current_dets is None:
+                    continue  # no cached dets yet — wait for first YOLO result
+                bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 if use_zed_mini:
                     # ── ZED Mini dense depth path ─────────────────────────
@@ -506,6 +514,7 @@ class VisionNode:
                 self._heatmap_frame_count += 1
                 if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
                     self._cached_heatmaps.clear()  # prevent stale cache buildup
+                _t2 = time()
                 targets, rejected_targets, viz_only = self._process_objects(
                     current_dets if use_mono_depth else objects,
                     pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
@@ -513,23 +522,28 @@ class VisionNode:
                     use_lidar=use_lidar,       # True only for actual LiDAR
                     use_zed_mini=use_zed_mini, # raw dets + dense depth heatmap
                 )
+                _t3 = time()
 
                 # Temporal stabilization
                 targets = self.tracker.stabilize_detections(targets)
+                _tp1 = time()
 
                 # Publish trunk position for pole obstacle (uses YOLO trunk boxes directly)
                 self._publish_trunk_position(
                     trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                     pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
                 )
+                _tp2 = time()
 
                 # Select best fruit
                 best_idx = self._select_best_fruit(targets)
+                _tp3 = time()
 
                 # Compute approach direction and publish
                 if best_idx is not None:
                     self._process_best_target(targets, best_idx, intrinsics)
-                elif self.excluded_positions:
+                _tp4 = time()
+                if best_idx is None and self.excluded_positions:
                     # All visible targets are excluded — stop publishing stale position
                     with self.pub_lock:
                         self.latest_goal_msg = None
@@ -553,6 +567,16 @@ class VisionNode:
                     if polygon is not None:
                         polygon_scaled = (polygon * np.array([[image_scale[0], image_scale[1]]])).astype(np.int32)
                     trunk_viz.append({"bb": (tx1, ty1, tx2, ty2), "class": "bunch", "conf": b["conf"], "polygon": polygon_scaled})
+
+                _t4 = time()
+                if getattr(self, '_perf_count', 0) % 30 == 0:
+                    _post = (_t4 - _t3) * 1000
+                    print(f"[PERF] retrieve={(_t1-_t0)*1000:.0f}ms  "
+                          f"process={(_t3-_t2)*1000:.0f}ms  "
+                          f"post={_post:.0f}ms  "
+                          f"other={(_t2-_t1)*1000:.0f}ms  "
+                          f"total={(_t4-_t0)*1000:.0f}ms")
+                self._perf_count = getattr(self, '_perf_count', 0) + 1
 
                 # Visualization
                 now = time()
@@ -784,7 +808,7 @@ class VisionNode:
         point_msg.point.z = float(np.mean(pts_front[:, 2]))
         try:
             pt_base = self.tf_buffer.transform(
-                point_msg, "base_link", timeout=rclpyDuration(seconds=0.1)
+                point_msg, "base_link", timeout=rclpyDuration(seconds=0.005)
             )
             pt_base.point.y += TRUNK_Y_OFFSET
             trunk_pub.publish(pt_base)
@@ -974,13 +998,14 @@ class VisionNode:
                 return None
 
             # Depth statistics — pure measured points, no interpolation.
-            # ZED Mini stereo produces mixed pixels at fruit/background edges,
-            # so cluster around the median depth before computing std.
+            # Cluster around the NEAREST depth, not the median — background points
+            # (floor/wall) are always farther than the fruit, so the closest cluster
+            # is the fruit. Median would lock onto the larger background cluster.
             zs  = pts[:, 2]
             idx = np.argsort(zs)
             k   = max(10, int(0.2 * len(idx)))
-            z_med = float(np.median(zs))
-            in_window = np.abs(zs - z_med) <= 0.08  # ±8 cm isolates fruit from edge noise
+            z_near = float(np.percentile(zs, 10))  # 10th percentile = nearest cluster anchor
+            in_window = np.abs(zs - z_near) <= 0.08  # ±8 cm window around nearest points
             pts_front = pts[in_window] if in_window.sum() >= 10 else pts[idx[:k]]
 
             depth_std = float(np.std(pts_front[:, 2]))
@@ -998,7 +1023,8 @@ class VisionNode:
 
             # Heatmap + vis_ratio — use EDT depth map so vis_ratio matches stereo mode.
             # Position/z_std come from raw points above; EDT is for visualization only.
-            target_key = (x1, y1, x2, y2)
+            # Key snapped to 16px grid — small YOLO bbox jitter no longer causes cache misses.
+            target_key = (x1 // 16 * 16, y1 // 16 * 16, x2 // 16 * 16, y2 // 16 * 16)
             if pc_np is not None:
                 roi_xyz = pc_np[y1:y2, x1:x2, :]
                 valid   = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
@@ -1018,8 +1044,9 @@ class VisionNode:
                     if cached is not None:
                         heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
                     else:
-                        heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
-                        self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+                        # Cache miss on non-compute frame — skip rather than computing.
+                        # Heatmap is visualization-only; position comes from raw mini points.
+                        heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
             else:
                 vis_ratio = min(1.0, float(pts.shape[0]) / max(1.0, float(np.count_nonzero(mask_bool))))
                 heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
@@ -1047,8 +1074,9 @@ class VisionNode:
             roi_xyz = pc_np[y1:y2, x1:x2, :]
             valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
 
-            # Throttle heatmap computation — reuse cached on non-compute frames
-            target_key = (x1, y1, x2, y2)
+            # Throttle heatmap computation — reuse cached on non-compute frames.
+            # Key snapped to 16px grid so YOLO bbox jitter doesn't cause cache misses.
+            target_key = (x1 // 16 * 16, y1 // 16 * 16, x2 // 16 * 16, y2 // 16 * 16)
             if self._heatmap_frame_count % self._heatmap_interval == 0:
                 heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
@@ -1059,10 +1087,8 @@ class VisionNode:
                 if cached is not None:
                     heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
                 else:
-                    heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
-                        roi_xyz, valid, mask_clean
-                    )
-                    self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
+                    # Cache miss on non-compute frame — skip rather than computing.
+                    heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
 
             # Visibility ratio
             vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
@@ -1121,8 +1147,8 @@ class VisionNode:
         point_msg.point.z = Zc
 
         try:
-            pt_base = self.tf_buffer.transform(point_msg, "base_link", timeout=rclpyDuration(seconds=0.2))
-            pt_grip = self.tf_buffer.transform(point_msg, "gripper_tip", timeout=rclpyDuration(seconds=0.2))
+            pt_base = self.tf_buffer.transform(point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
+            pt_grip = self.tf_buffer.transform(point_msg, "gripper_tip", timeout=rclpyDuration(seconds=0.005))
 
             dist = math.sqrt(pt_grip.point.x ** 2 + pt_grip.point.y ** 2 + pt_grip.point.z ** 2)
 
