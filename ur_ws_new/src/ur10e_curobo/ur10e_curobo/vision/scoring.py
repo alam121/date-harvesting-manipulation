@@ -15,7 +15,7 @@ from .config import (
     APPROACH_CHECK_DIST,
     NUM_CANDIDATE_DIRS,
 )
-from .math_utils import ray_sphere_intersection
+from .math_utils import ray_sphere_intersection  # kept for external callers
 
 
 def estimate_fruit_radius(target: Dict[str, Any], fx: Optional[float] = None) -> float:
@@ -150,128 +150,95 @@ def compute_collision_free_direction(
 ) -> Dict[str, Any]:
     """
     Find the approach direction with most clearance from other fruits.
-
-    Strategy:
-    1. Sample directions in a hemisphere (toward camera = -Z in camera frame)
-    2. For each direction, check clearance to other fruits
-    3. Blend best clearance direction with heatmap direction for grasp accuracy
-
-    Args:
-        best_target: The target fruit we want to approach
-        all_targets: List of all detected fruits
-        best_idx: Index of best_target in all_targets
-        heatmap_dir: Original heatmap-based direction (optional, for blending)
-
-    Returns:
-        dict with:
-            - direction: 3D unit vector for approach direction in camera frame
-            - clearance: Distance to nearest obstacle
-            - is_collision_free: Whether the chosen direction is clear
+    Fully vectorized: all candidate directions tested against all spheres in
+    a single numpy batch — no Python loops over candidates or spheres.
     """
-    centroid = np.array([best_target["Xc"], best_target["Yc"], best_target["Zc"]])
+    centroid = np.array([best_target["Xc"], best_target["Yc"], best_target["Zc"]], dtype=np.float64)
     best_radius = estimate_fruit_radius(best_target)
 
-    # Collect other fruits as spheres with adaptive radii
-    other_spheres = []
+    _default_dir = heatmap_dir if heatmap_dir is not None else np.array([0.0, 0.0, -1.0])
+
+    # Collect other fruits
+    sphere_c_list, sphere_r_list = [], []
     for i, t in enumerate(all_targets):
         if i == best_idx:
             continue
-        other_c = np.array([t["Xc"], t["Yc"], t["Zc"]])
-        other_r = estimate_fruit_radius(t)
-        other_spheres.append((other_c, other_r))
+        sphere_c_list.append([t["Xc"], t["Yc"], t["Zc"]])
+        sphere_r_list.append(estimate_fruit_radius(t))
 
-    # If no other fruits, just use heatmap direction
-    if len(other_spheres) == 0:
-        if heatmap_dir is not None:
-            return {
-                "direction": heatmap_dir,
-                "clearance": float('inf'),
-                "is_collision_free": True,
-                "num_blocked": 0,
-            }
-        else:
-            return {
-                "direction": np.array([0.0, 0.0, -1.0]),  # default: toward camera
-                "clearance": float('inf'),
-                "is_collision_free": True,
-                "num_blocked": 0,
-            }
+    if not sphere_c_list:
+        return {"direction": _default_dir, "clearance": float('inf'),
+                "is_collision_free": True, "num_blocked": 0}
 
-    # Generate candidate directions on a hemisphere (facing camera = -Z)
-    candidate_dirs = []
+    sphere_c = np.array(sphere_c_list, dtype=np.float64)  # (Ns, 3)
+    sphere_r = np.array(sphere_r_list, dtype=np.float64)  # (Ns,)
 
-    # Sample azimuth angles around Z axis
-    for i in range(NUM_CANDIDATE_DIRS):
-        azimuth = 2.0 * math.pi * i / NUM_CANDIDATE_DIRS
-
-        # Multiple elevation angles (0 = horizontal, positive = toward camera)
-        for elev_deg in [0, 20, 40, 60]:
-            elev = math.radians(elev_deg)
-            x = math.cos(azimuth) * math.cos(elev)
-            y = math.sin(azimuth) * math.cos(elev)
-            z = -math.sin(elev)  # negative Z = toward camera
-            candidate_dirs.append(np.array([x, y, z], dtype=float))
-
-    # Add straight toward camera
-    candidate_dirs.append(np.array([0.0, 0.0, -1.0]))
-
-    # Add the heatmap direction as a candidate (if available)
+    # ── Build candidate direction matrix (Nc, 3) ──────────────────────────────
+    azimuths = np.linspace(0.0, 2.0 * math.pi, NUM_CANDIDATE_DIRS, endpoint=False)
+    elevs = np.radians(np.array([0.0, 20.0, 40.0, 60.0]))
+    az_g, el_g = np.meshgrid(azimuths, elevs)  # (4, Nd)
+    xs = np.cos(az_g) * np.cos(el_g)
+    ys = np.sin(az_g) * np.cos(el_g)
+    zs = -np.sin(el_g)
+    grid_dirs = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1)  # (Nd*4, 3)
+    extra = [np.array([0.0, 0.0, -1.0])]
     if heatmap_dir is not None:
-        candidate_dirs.append(heatmap_dir.copy())
+        extra.append(heatmap_dir.copy())
+    dirs = np.vstack([grid_dirs] + [np.array(e) for e in extra])  # (Nc, 3)
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+    dirs /= np.where(norms > 1e-9, norms, 1.0)
 
-    # Score each direction by clearance
-    best_dir = None
-    best_clearance = -1.0
-    best_blocked = 0
+    # ── Vectorized ray-sphere intersection ────────────────────────────────────
+    # oc[j] = centroid - sphere_c[j], shape (Ns, 3)
+    oc = centroid - sphere_c  # (Ns, 3)
+    # b[i, j] = 2 * dirs[i] · oc[j]  →  dirs @ oc.T has shape (Nc, Ns)
+    b = 2.0 * (dirs @ oc.T)                      # (Nc, Ns)
+    c_coef = np.sum(oc ** 2, axis=1) - sphere_r ** 2  # (Ns,)
+    disc = b ** 2 - 4.0 * c_coef                  # (Nc, Ns) — c_coef broadcasts
+    sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
+    t1 = (-b - sqrt_disc) * 0.5
+    t2 = (-b + sqrt_disc) * 0.5
+    hit = disc >= 0.0
+    INF = 1e9
+    # t_enter: smallest positive root, or INF if no valid intersection
+    t_enter = np.where(hit & (t1 > 0.001), t1,
+              np.where(hit & (t2 > 0.001), t2, INF))  # (Nc, Ns)
 
-    for d in candidate_dirs:
-        d = d / (np.linalg.norm(d) + 1e-9)
+    # For near-miss (no hit): closest-approach clearance
+    to_sphere = -oc  # (Ns, 3)  sphere_c - centroid
+    t_cl = dirs @ to_sphere.T                        # (Nc, Ns)
+    # closest point on ray, then distance to sphere surface
+    cl_pts = centroid + t_cl[:, :, None] * dirs[:, None, :]  # (Nc, Ns, 3)
+    cl_dist = np.linalg.norm(cl_pts - sphere_c, axis=2) - sphere_r  # (Nc, Ns)
+    cl_dist = np.where((~hit) & (t_cl > 0), np.maximum(cl_dist, 0.0), INF)
 
-        # Cast ray from centroid in this direction
-        # Check for intersections with other fruit spheres
-        min_clearance = float('inf')
-        num_blocked = 0
+    # Per-direction, per-sphere clearance = min(t_enter, cl_dist)
+    clearance_mat = np.minimum(t_enter, cl_dist)       # (Nc, Ns)
+    min_clearance = clearance_mat.min(axis=1)           # (Nc,) — worst sphere per dir
+    num_blocked = (t_enter < APPROACH_CHECK_DIST).sum(axis=1)  # (Nc,)
 
-        for (sphere_c, sphere_r) in other_spheres:
-            hit, t_hit = ray_sphere_intersection(centroid, d, sphere_c, sphere_r)
+    best_i = int(np.argmax(min_clearance))
+    best_dir = dirs[best_i].copy()
+    best_clearance = float(min_clearance[best_i])
+    best_blocked = int(num_blocked[best_i])
 
-            if hit and t_hit < APPROACH_CHECK_DIST:
-                num_blocked += 1
-                min_clearance = min(min_clearance, t_hit)
-            elif not hit:
-                # Compute closest approach distance
-                # Project sphere center onto ray
-                to_sphere = sphere_c - centroid
-                t_closest = np.dot(to_sphere, d)
-                if t_closest > 0:  # sphere is in front
-                    closest_pt = centroid + t_closest * d
-                    dist_to_center = np.linalg.norm(closest_pt - sphere_c)
-                    clearance_at_closest = dist_to_center - sphere_r
-                    if clearance_at_closest < min_clearance:
-                        min_clearance = max(0.0, clearance_at_closest)
-
-        # Prefer directions with higher clearance
-        if min_clearance > best_clearance:
-            best_clearance = min_clearance
-            best_dir = d.copy()
-            best_blocked = num_blocked
-
-    # If heatmap direction has decent clearance, blend with it for grasp accuracy
+    # Blend toward heatmap direction if it also has good clearance
     if heatmap_dir is not None and best_clearance > best_radius:
-        # Check heatmap direction clearance
-        hm_clearance = float('inf')
         hm_d = heatmap_dir / (np.linalg.norm(heatmap_dir) + 1e-9)
-        for (sphere_c, sphere_r) in other_spheres:
-            hit, t_hit = ray_sphere_intersection(centroid, hm_d, sphere_c, sphere_r)
-            if hit:
-                hm_clearance = min(hm_clearance, t_hit)
-
-        # If heatmap direction is also clear, blend toward it
+        hm_d_row = hm_d[None, :]                        # (1, 3)
+        b_hm = 2.0 * (hm_d_row @ oc.T)                 # (1, Ns)
+        disc_hm = b_hm ** 2 - 4.0 * c_coef
+        sqrt_hm = np.sqrt(np.maximum(disc_hm, 0.0))
+        t1_hm = (-b_hm - sqrt_hm) * 0.5
+        t2_hm = (-b_hm + sqrt_hm) * 0.5
+        hit_hm = disc_hm >= 0.0
+        t_hm = np.where(hit_hm & (t1_hm > 0.001), t1_hm,
+               np.where(hit_hm & (t2_hm > 0.001), t2_hm, INF))
+        hm_clearance = float(t_hm.min())
         if hm_clearance > best_radius * 2:
-            # Blend: 60% collision-free, 40% heatmap for grasp accuracy
             blended = 0.6 * best_dir + 0.4 * hm_d
-            blended = blended / (np.linalg.norm(blended) + 1e-9)
-            best_dir = blended
+            n_bl = np.linalg.norm(blended)
+            best_dir = blended / n_bl if n_bl > 1e-9 else best_dir
 
     return {
         "direction": best_dir,

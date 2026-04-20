@@ -277,32 +277,31 @@ class VisionVisualizer:
             cv2.arrowedLine(image, (start_x, start_y), (dest_x, dest_y), axis_color, 2, tipLength=0.25)
 
         # Draw raw surface normal arrow (cyan, thin)
+        # Origin is always bbox center (cx,cy) — avoids frame mismatch when
+        # Xc/Yc/Zc are in ZED Mini frame but intrinsics are ZED One.
         surface_normal = target.get("surface_normal")
         if surface_normal is not None:
-            Xc, Yc, Zc = target["Xc"], target["Yc"], target["Zc"]
-            centroid_3d = np.array([Xc, Yc, Zc])
-            origin_2d = project_point_to_image(centroid_3d, self.intrinsics, self.image_scale)
-            if origin_2d is not None:
-                sn_end_3d = centroid_3d + surface_normal * 0.06
-                sn_end_2d = project_point_to_image(sn_end_3d, self.intrinsics, self.image_scale)
-                if sn_end_2d:
-                    cv2.arrowedLine(image, origin_2d, sn_end_2d, (255, 255, 0, 255), 1, tipLength=0.3)
+            Zc = target["Zc"]
+            if Zc > 0:
+                fx, fy = self.intrinsics["fx"], self.intrinsics["fy"]
+                sx, sy = self.image_scale
+                du = int(fx * surface_normal[0] / Zc * 0.06 * sx)
+                dv = int(fy * surface_normal[1] / Zc * 0.06 * sy)
+                sn_end_2d = (cx + du, cy + dv)
+                cv2.arrowedLine(image, (cx, cy), sn_end_2d, (255, 255, 0, 255), 1, tipLength=0.3)
 
         # Draw 3D approach direction arrow (magenta, thick)
         approach_dir_cam = target.get("approach_dir_cam")
         if approach_dir_cam is not None:
-            Xc, Yc, Zc = target["Xc"], target["Yc"], target["Zc"]
-            centroid_3d = np.array([Xc, Yc, Zc])
-            arrow_len_3d = 0.08
-
-            origin_2d = project_point_to_image(centroid_3d, self.intrinsics, self.image_scale)
-
-            if origin_2d is not None:
-                dir_end_3d = centroid_3d + approach_dir_cam * arrow_len_3d
-                dir_end_2d = project_point_to_image(dir_end_3d, self.intrinsics, self.image_scale)
-
-                if dir_end_2d:
-                    cv2.arrowedLine(image, origin_2d, dir_end_2d, (255, 0, 255, 255), 3, tipLength=0.25)
+            Zc = target["Zc"]
+            if Zc > 0:
+                fx, fy = self.intrinsics["fx"], self.intrinsics["fy"]
+                sx, sy = self.image_scale
+                arrow_len_3d = 0.10
+                du = int(fx * approach_dir_cam[0] / Zc * arrow_len_3d * sx)
+                dv = int(fy * approach_dir_cam[1] / Zc * arrow_len_3d * sy)
+                dir_end_2d = (cx + du, cy + dv)
+                cv2.arrowedLine(image, (cx, cy), dir_end_2d, (255, 0, 255, 255), 3, tipLength=0.25)
 
                 # Show clearance info
                 clearance = target.get("clearance", float('inf'))
@@ -376,21 +375,21 @@ class VisionVisualizer:
         cv2.putText(
             image,
             f"YOLO FPS: {net_fps:.1f}",
-            (12, 24),
+            (12, 55),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            1.7,
             (0, 255, 0, 255),
-            2,
+            3,
             cv2.LINE_AA,
         )
         cv2.putText(
             image,
             f"Loop FPS: {loop_fps:.1f}",
-            (12, 48),
+            (12, 110),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            1.7,
             (0, 200, 255, 255),
-            2,
+            3,
             cv2.LINE_AA,
         )
 

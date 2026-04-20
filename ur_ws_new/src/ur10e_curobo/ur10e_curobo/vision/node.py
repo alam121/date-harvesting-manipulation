@@ -1,6 +1,7 @@
 """Main VisionNode class for date fruit detection."""
 
 import math
+import queue
 from collections import deque
 from threading import Lock, Thread
 from time import sleep, time
@@ -45,6 +46,20 @@ from .yolo_thread import YoloThread
 from .visualization import VisionVisualizer
 
 
+def _tf_stamped_to_Rt(T):
+    """Convert TransformStamped → (R: 3×3, t: 3,) float64 numpy arrays."""
+    tr = T.transform.translation
+    q  = T.transform.rotation
+    w, x, y, z = q.w, q.x, q.y, q.z
+    R = np.array([
+        [1 - 2*(y*y + z*z),  2*(x*y - w*z),   2*(x*z + w*y)],
+        [2*(x*y + w*z),      1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y),      2*(y*z + w*x),   1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
+    t = np.array([tr.x, tr.y, tr.z], dtype=np.float64)
+    return R, t
+
+
 class VisionNode:
     """ROS2 node for date fruit detection using ZED camera and YOLO."""
 
@@ -56,13 +71,18 @@ class VisionNode:
         self.best_target_prev: Optional[Dict[str, Any]] = None
         self.prev_heat_point: Optional[np.ndarray] = None
         self.prev_direction_base: Optional[np.ndarray] = None
-        self.direction_history = deque(maxlen=15)
+        self.direction_history = deque(maxlen=5)
         self.best_history = deque(maxlen=3)
 
         # Heatmap throttling — only recompute every N frames
         self._heatmap_frame_count = 0
         self._heatmap_interval = 10  # recompute every 10th frame
         self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
+
+        # Per-frame TF cache — refreshed once at top of each loop iteration.
+        # Avoids 8+ expensive tf_buffer.transform calls per frame (each ~20ms on Jetson).
+        self._cached_tf_base: Optional[tuple] = None  # (R: 3×3, t: 3,) cam → base_link
+        self._cached_tf_grip: Optional[tuple] = None  # (R: 3×3, t: 3,) cam → gripper_tip
 
 
         # Target lock
@@ -140,6 +160,7 @@ class VisionNode:
         trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
+        self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
         self.cv_bridge = CvBridge()
@@ -270,7 +291,6 @@ class VisionNode:
                     _K_disp_one[0, 0] *= sx;  _K_disp_one[0, 2] *= sx
                     _K_disp_one[1, 1] *= sy;  _K_disp_one[1, 2] *= sy
                     pc_mat = sl.Mat()
-                    _dbg_frame = 0
                     while not self.exit_signal:
                         if self._zed_mini is None:
                             sleep(0.05)
@@ -348,18 +368,6 @@ class VisionNode:
                             depth_map[fill, 1] = depth_map[r_src, c_src, 1]
                             depth_map[fill, 2] = depth_map[r_src, c_src, 2]
 
-                        # ── Periodic diagnostics ─────────────────────────────
-                        _dbg_frame += 1
-                        if _dbg_frame % 30 == 0:
-                            _valid_after = np.isfinite(depth_map[:, :, 2]).sum()
-                            _total = disp_h * disp_w
-                            _zs = depth_map[:, :, 2][np.isfinite(depth_map[:, :, 2])]
-                            _z_med = float(np.median(_zs)) if _zs.size > 0 else float('nan')
-                            print(f"[ZedMini] scatter={n_valid}/{_total} "
-                                  f"filled={_valid_after}/{_total} "
-                                  f"({100*_valid_after/_total:.0f}%) "
-                                  f"median_Z={_z_med:.3f}m")
-
                         with self._depth_map_lock:
                             self._latest_depth_map = depth_map
                             self._latest_depth_map_orig = orig_valid
@@ -412,11 +420,44 @@ class VisionNode:
             self.node.get_logger().info("[ZedMini] depth warp thread starting")
             Thread(target=_pending_depth_thread, daemon=True).start()
 
-        last_viz = 0.0
         loop_fps = 0.0
 
+        # Viz queue: main loop drops frames here; background thread renders + publishes.
+        # maxsize=1 means the main loop never blocks — old frames are dropped automatically.
+        _viz_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def _viz_worker():
+            """Background thread: render and publish vision images without blocking main loop."""
+            while not self.exit_signal:
+                try:
+                    frame_data = _viz_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps, viz_only, uv_lidar, pts_lidar = frame_data
+                try:
+                    display_image = self.visualizer.render_frame(
+                        img_ocv, tgts, rej_tgts,
+                        b_idx, net_fps, l_fps,
+                        viz_only=viz_only,
+                        lidar_uv=uv_lidar,
+                        lidar_pts_cam=pts_lidar,
+                    )
+                    if len(display_image.shape) == 3 and display_image.shape[2] == 4:
+                        pub_image = cv2.cvtColor(display_image, cv2.COLOR_BGRA2BGR)
+                    else:
+                        pub_image = display_image
+                    img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
+                    img_msg.header.stamp = self.node.get_clock().now().to_msg()
+                    self.image_pub.publish(img_msg)
+                except Exception as e:
+                    if not getattr(self, '_img_pub_err_logged', False):
+                        print(f"[WARN] Failed to publish vision image: {e}")
+                        self._img_pub_err_logged = True
+
+        Thread(target=_viz_worker, daemon=True).start()
+
         def perception_loop():
-            nonlocal last_viz, loop_fps, zed
+            nonlocal loop_fps, zed
             t_prev = time()
             current_dets = None
             trunk_boxes  = []
@@ -444,6 +485,36 @@ class VisionNode:
                 np.copyto(image_left_ocv, image_left.get_data())
                 self.yolo_thread.set_image(image_left.get_data())
                 _t1 = time()
+
+                # Refresh per-frame TF cache — one lookup per frame instead of
+                # one per detection (was 8+ tf_buffer.transform calls at ~20ms each).
+                try:
+                    self._cached_tf_base = _tf_stamped_to_Rt(
+                        self.tf_buffer.lookup_transform("base_link", CAM_FRAME, rclpyTime()))
+                except Exception:
+                    pass  # keep previous cached value
+                try:
+                    self._cached_tf_grip = _tf_stamped_to_Rt(
+                        self.tf_buffer.lookup_transform("gripper_tip", CAM_FRAME, rclpyTime()))
+                except Exception:
+                    pass
+
+                # Motion detection: when the camera has moved >5mm since the last
+                # frame, clear all temporal state so detections update immediately.
+                # This prevents stale bboxes, old heatmaps, and smoothing history
+                # from lagging behind after a robot repositioning move.
+                if self._cached_tf_base is not None:
+                    _cur_t = self._cached_tf_base[1]
+                    _prev_t = getattr(self, '_prev_cam_t', None)
+                    if _prev_t is not None and float(np.linalg.norm(_cur_t - _prev_t)) > 0.005:
+                        self.tracker.detection_history.clear()
+                        self.direction_history.clear()
+                        self.best_history.clear()
+                        self._cached_heatmaps.clear()
+                        self.prev_heat_point = None
+                        self.prev_direction_base = None
+                        current_dets = None  # discard stale bboxes; wait for fresh YOLO
+                    self._prev_cam_t = _cur_t.copy()
 
                 # Use fresh YOLO dets when ready, otherwise reuse cached dets so
                 # the loop runs at camera fps rather than YOLO inference fps.
@@ -501,15 +572,6 @@ class VisionNode:
                     if depth_frame_count[0] % 5 == 0:
                         self._publish_depth_cloud(pc_np, depth_pub)
 
-                # Debug: print detection counts every 30 frames
-                if self._heatmap_frame_count % 30 == 0:
-                    n_dets = len(current_dets) if use_mono_depth else len(getattr(current_dets, 'object_list', []))
-                    n_depth_pts = pts_cam_l.shape[0] if use_lidar else 0
-                    rej_list = rejected_targets if 'rejected_targets' in dir() else []
-                    from collections import Counter
-                    rej_reasons = Counter(r.get("reason", "?") for r in rej_list)
-                    print(f"[DBG] dets={n_dets} depth_pts={n_depth_pts} targets={len(targets) if 'targets' in dir() else '?'} rejected={dict(rej_reasons)}")
-
                 # Process detected objects
                 self._heatmap_frame_count += 1
                 if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
@@ -528,11 +590,12 @@ class VisionNode:
                 targets = self.tracker.stabilize_detections(targets)
                 _tp1 = time()
 
-                # Publish trunk position for pole obstacle (uses YOLO trunk boxes directly)
-                self._publish_trunk_position(
-                    trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
-                    pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
-                )
+                # Publish trunk position every 5 frames — pole doesn't move frame-to-frame
+                if self._heatmap_frame_count % 5 == 0:
+                    self._publish_trunk_position(
+                        trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
+                        pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
+                    )
                 _tp2 = time()
 
                 # Select best fruit
@@ -543,6 +606,20 @@ class VisionNode:
                 if best_idx is not None:
                     self._process_best_target(targets, best_idx, intrinsics)
                 _tp4 = time()
+
+                # Publish ALL visible fruit positions so reacquire can find the
+                # target fruit even when it isn't ranked as best.
+                # Format: [x0,y0,z0, x1,y1,z1, ...] in base_link frame.
+                _all_flat = []
+                for _t in targets:
+                    _pb = _t.get("pt_base")
+                    if _pb is not None:
+                        _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
+                if _all_flat:
+                    _af_msg = Float32MultiArray()
+                    _af_msg.data = _all_flat
+                    self.all_fruits_pub.publish(_af_msg)
+
                 if best_idx is None and self.excluded_positions:
                     # All visible targets are excluded — stop publishing stale position
                     with self.pub_lock:
@@ -570,39 +647,29 @@ class VisionNode:
 
                 _t4 = time()
                 if getattr(self, '_perf_count', 0) % 30 == 0:
-                    _post = (_t4 - _t3) * 1000
                     print(f"[PERF] retrieve={(_t1-_t0)*1000:.0f}ms  "
                           f"process={(_t3-_t2)*1000:.0f}ms  "
-                          f"post={_post:.0f}ms  "
-                          f"other={(_t2-_t1)*1000:.0f}ms  "
+                          f"post={(_t4-_t3)*1000:.0f}ms"
+                          f"(stab={(_tp1-_t3)*1000:.0f} trunk={(_tp2-_tp1)*1000:.0f}"
+                          f" sel={(_tp3-_tp2)*1000:.0f} best={(_tp4-_tp3)*1000:.0f})  "
                           f"total={(_t4-_t0)*1000:.0f}ms")
                 self._perf_count = getattr(self, '_perf_count', 0) + 1
 
-                # Visualization
-                now = time()
-                if (now - last_viz) >= 0.1:
-                    display_image = self.visualizer.render_frame(
-                        image_left_ocv, targets, rejected_targets,
-                        best_idx, self.yolo_thread.net_fps, loop_fps,
-                        viz_only=trunk_viz,
-                        lidar_uv=uv_l if use_lidar else None,
-                        lidar_pts_cam=pts_cam_l if use_lidar else None,
-                    )
-                    # Publish to RViz Image display
-                    try:
-                        # ZED produces BGRA (4-channel); convert to BGR for ROS
-                        if len(display_image.shape) == 3 and display_image.shape[2] == 4:
-                            pub_image = cv2.cvtColor(display_image, cv2.COLOR_BGRA2BGR)
-                        else:
-                            pub_image = display_image
-                        img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
-                        img_msg.header.stamp = self.node.get_clock().now().to_msg()
-                        self.image_pub.publish(img_msg)
-                    except Exception as e:
-                        if not getattr(self, '_img_pub_err_logged', False):
-                            print(f"[WARN] Failed to publish vision image: {e}")
-                            self._img_pub_err_logged = True
-                    last_viz = now
+                # Enqueue a frame for the background viz thread.
+                # Non-blocking: if the worker is still rendering the previous frame, skip.
+                try:
+                    _viz_queue.put_nowait((
+                        image_left_ocv.copy(),
+                        targets, rejected_targets,
+                        best_idx,
+                        self.yolo_thread.net_fps,
+                        loop_fps,
+                        trunk_viz,
+                        uv_l if use_lidar else None,
+                        pts_cam_l if use_lidar else None,
+                    ))
+                except queue.Full:
+                    pass  # worker busy — drop frame, keep main loop running
 
         perception_thread = Thread(target=perception_loop, daemon=True)
         perception_thread.start()
@@ -642,11 +709,11 @@ class VisionNode:
             print("Initializing ZED X One Mono (detection camera)...")
             zed = sl.CameraOne()
             init_params = sl.InitParametersOne()
-            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # 1920x1080
-            init_params.camera_fps = 30
+            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS
+            init_params.camera_fps = 15
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
-            init_params.enable_hdr = True
+            init_params.enable_hdr = True  # HDR at QHDPLUS caps hardware to ~6fps
 
             # Retry loop — daemon may need time to settle after restart
             for attempt in range(1, 11):
@@ -800,17 +867,31 @@ class VisionNode:
             k = max(10, int(0.2 * len(idx)))
             pts_front = pts[idx[:k]]
 
-        point_msg = PointStamped()
-        point_msg.header.frame_id = CAM_FRAME
-        point_msg.header.stamp = rclpyTime().to_msg()
-        point_msg.point.x = float(np.mean(pts_front[:, 0]))
-        point_msg.point.y = float(np.mean(pts_front[:, 1]))
-        point_msg.point.z = float(np.mean(pts_front[:, 2]))
+        _trunk_xyz_cam = np.array([
+            float(np.mean(pts_front[:, 0])),
+            float(np.mean(pts_front[:, 1])),
+            float(np.mean(pts_front[:, 2])),
+        ], dtype=np.float64)
         try:
-            pt_base = self.tf_buffer.transform(
-                point_msg, "base_link", timeout=rclpyDuration(seconds=0.005)
-            )
-            pt_base.point.y += TRUNK_Y_OFFSET
+            if self._cached_tf_base is not None:
+                _R_b, _t_b = self._cached_tf_base
+                _xyz_b = _R_b @ _trunk_xyz_cam + _t_b
+                pt_base = PointStamped()
+                pt_base.header.frame_id = "base_link"
+                pt_base.header.stamp = rclpyTime().to_msg()
+                pt_base.point.x = float(_xyz_b[0])
+                pt_base.point.y = float(_xyz_b[1]) + TRUNK_Y_OFFSET
+                pt_base.point.z = float(_xyz_b[2])
+            else:
+                point_msg = PointStamped()
+                point_msg.header.frame_id = CAM_FRAME
+                point_msg.header.stamp = rclpyTime().to_msg()
+                point_msg.point.x = _trunk_xyz_cam[0]
+                point_msg.point.y = _trunk_xyz_cam[1]
+                point_msg.point.z = _trunk_xyz_cam[2]
+                pt_base = self.tf_buffer.transform(
+                    point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
+                pt_base.point.y += TRUNK_Y_OFFSET
             trunk_pub.publish(pt_base)
         except Exception:
             pass
@@ -1053,13 +1134,6 @@ class VisionNode:
 
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
-            # Depth diagnostic
-            if getattr(self, '_depth_dbg_count', 0) % 30 == 0:
-                print(f"[Depth/mini] cam XYZ=({Xc:.3f},{Yc:.3f},{Zc:.3f}) "
-                      f"n_bbox={pts_bbox.shape[0]} n_mask={pts.shape[0]} n_front={len(pts_front)} "
-                      f"z_std={depth_std:.4f} bbox=({x1},{y1},{x2},{y2})")
-            self._depth_dbg_count = getattr(self, '_depth_dbg_count', 0) + 1
-
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
             self._detect_branch_gap(pc_np, gap_target)
 
@@ -1125,13 +1199,6 @@ class VisionNode:
                 mark_reject("Z out of range")
                 return None
 
-            # Depth diagnostic — printed periodically to monitor accuracy
-            if getattr(self, '_depth_dbg_count', 0) % 30 == 0:
-                print(f"[Depth] cam XYZ=({Xc:.3f},{Yc:.3f},{Zc:.3f}) "
-                      f"n_valid={np.count_nonzero(valid)} n_pts={len(pts)} n_front={len(pts_front)} "
-                      f"z_std={depth_std:.4f} bbox=({x1},{y1},{x2},{y2})")
-            self._depth_dbg_count = getattr(self, '_depth_dbg_count', 0) + 1
-
             # Branch gap detection (depth ring sampling around fruit)
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
             self._detect_branch_gap(pc_np, gap_target)
@@ -1147,10 +1214,28 @@ class VisionNode:
         point_msg.point.z = Zc
 
         try:
-            pt_base = self.tf_buffer.transform(point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
-            pt_grip = self.tf_buffer.transform(point_msg, "gripper_tip", timeout=rclpyDuration(seconds=0.005))
+            _pt_cam = np.array([Xc, Yc, Zc], dtype=np.float64)
 
-            dist = math.sqrt(pt_grip.point.x ** 2 + pt_grip.point.y ** 2 + pt_grip.point.z ** 2)
+            # Use per-frame cached transform (refreshed once per loop iteration).
+            if self._cached_tf_base is not None:
+                _R_b, _t_b = self._cached_tf_base
+                _xyz_b = _R_b @ _pt_cam + _t_b
+                pt_base = PointStamped()
+                pt_base.header.frame_id = "base_link"
+                pt_base.header.stamp = point_msg.header.stamp
+                pt_base.point.x = float(_xyz_b[0])
+                pt_base.point.y = float(_xyz_b[1])
+                pt_base.point.z = float(_xyz_b[2])
+            else:
+                pt_base = self.tf_buffer.transform(point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
+
+            if self._cached_tf_grip is not None:
+                _R_g, _t_g = self._cached_tf_grip
+                _xyz_g = _R_g @ _pt_cam + _t_g
+                dist = math.sqrt(float(_xyz_g[0])**2 + float(_xyz_g[1])**2 + float(_xyz_g[2])**2)
+            else:
+                _pt_grip = self.tf_buffer.transform(point_msg, "gripper_tip", timeout=rclpyDuration(seconds=0.005))
+                dist = math.sqrt(_pt_grip.point.x**2 + _pt_grip.point.y**2 + _pt_grip.point.z**2)
 
             if not (0.0 <= obj_confidence <= 1.0):
                 obj_confidence = 0.5
@@ -1170,7 +1255,6 @@ class VisionNode:
                 "img_height": display_resolution.height,
                 "mask_resized": mask_resized,
                 "pt_base": pt_base,
-                "pt_grip": pt_grip,
                 "dist": dist,
                 "quat": None,
                 "approach_axis": None,
@@ -1210,6 +1294,11 @@ class VisionNode:
         Sets target["between_branches"] (bool) and target["gap_angle_cam"] (radians).
         The gap angle is in image space (0 = right, pi/2 = down).
         """
+        if pc_np is None:
+            target["between_branches"] = False
+            target["gap_angle_cam"] = 0.0
+            return
+
         x1, y1, x2, y2 = target["bb"]
         cx_img = (x1 + x2) / 2.0
         cy_img = (y1 + y2) / 2.0
@@ -1442,12 +1531,10 @@ class VisionNode:
         best_idx = None
         best_score = -1.0
 
-        _score_dbg = []
         for i, t in enumerate(targets):
             score_result = compute_fruit_score(t, prev_pt_base)
             t["score"] = score_result["total_score"]
             t["score_components"] = score_result["components"]
-            _score_dbg.append((i, t.get("bb"), t.get("dist", -1), score_result["total_score"], score_result["components"]))
 
             # Skip targets near excluded positions (multi-subscribe)
             if self.excluded_positions:
@@ -1462,14 +1549,6 @@ class VisionNode:
             if score_result["total_score"] > best_score:
                 best_score = score_result["total_score"]
                 best_idx = i
-
-        if getattr(self, '_score_dbg_count', 0) % 30 == 0:
-            for i, bb, dist, total, comps in _score_dbg:
-                print(f"[Score] i={i} bb={bb} dist={dist:.3f} total={total:.3f} "
-                      f"d={comps.get('distance',0):.2f} v={comps.get('visibility',0):.2f} "
-                      f"dq={comps.get('depth_quality',0):.2f} c={comps.get('confidence',0):.2f}")
-            print(f"[Score] best_idx={best_idx}")
-        self._score_dbg_count = getattr(self, '_score_dbg_count', 0) + 1
 
         # Hysteresis (skip excluded targets)
         if self.best_target_prev is not None and best_idx is not None:
@@ -1507,10 +1586,6 @@ class VisionNode:
                 self.target_lock_position[1] = pt.point.y
                 self.target_lock_position[2] = pt.point.z
 
-        if self.excluded_positions:
-            n_excl = sum(1 for t in targets if t.get("excluded"))
-            print(f"[EXCL] {n_excl}/{len(targets)} excluded, best_idx={best_idx}")
-
         if best_idx is not None:
             self.best_target_prev = targets[best_idx]
 
@@ -1536,18 +1611,11 @@ class VisionNode:
         """Process the best target and publish goal."""
         t_best = targets[best_idx]
 
-        # Cache TF lookup
-        cached_q_tf = None
-        try:
-            T = self.tf_buffer.lookup_transform("base_link", CAM_FRAME, rclpyTime())
-            cached_q_tf = (
-                T.transform.rotation.w,
-                T.transform.rotation.x,
-                T.transform.rotation.y,
-                T.transform.rotation.z,
-            )
-        except Exception:
-            pass
+        # Use per-frame cached TF — no new lookup needed
+        _R_tf: Optional[np.ndarray] = None
+        _t_tf: Optional[np.ndarray] = None
+        if self._cached_tf_base is not None:
+            _R_tf, _t_tf = self._cached_tf_base
 
         # Smooth best heatmap point
         best_pt = t_best.get("best_point2d")
@@ -1616,8 +1684,8 @@ class VisionNode:
                 t_best["heatmap_dir_cam"] = heatmap_dir.copy()
                 t_best["approach_dir_cam"] = dir_cam.copy()
 
-                if cached_q_tf is not None:
-                    dir_raw = np.array(quat_rotate_vec(cached_q_tf, dir_cam), dtype=float)
+                if _R_tf is not None:
+                    dir_raw = _R_tf @ dir_cam
                 else:
                     dir_raw = dir_cam.copy()
 
@@ -1712,13 +1780,13 @@ class VisionNode:
             between_branches = t_best.get("between_branches", False)
             gap_angle_cam = t_best.get("gap_angle_cam", 0.0)
             gap_angle_base = gap_angle_cam
-            if between_branches and cached_q_tf is not None:
+            if between_branches and _R_tf is not None:
                 gap_dir_cam = np.array([
                     math.cos(gap_angle_cam),
                     math.sin(gap_angle_cam),
                     0.0
                 ], dtype=float)
-                gap_dir_base = np.array(quat_rotate_vec(cached_q_tf, gap_dir_cam), dtype=float)
+                gap_dir_base = _R_tf @ gap_dir_cam
                 gap_angle_base = float(math.atan2(gap_dir_base[2], gap_dir_base[0]))
 
             gap_msg = Float32MultiArray()
@@ -1727,27 +1795,13 @@ class VisionNode:
 
             # Publish heatmap 3D data for goal marker (consumed on subscribe)
             scored_pts = t_best.get("scored_3d_points")
-            if scored_pts is not None and cached_q_tf is not None:
-                try:
-                    T = self.tf_buffer.lookup_transform("base_link", CAM_FRAME, rclpyTime())
-                    t_vec = np.array([
-                        T.transform.translation.x,
-                        T.transform.translation.y,
-                        T.transform.translation.z,
-                    ])
-                except Exception:
-                    t_vec = None
-
-                if t_vec is not None:
-                    # Transform all points to base_link, store as flat array
-                    # Format: [x0,y0,z0,s0, x1,y1,z1,s1, ...]
-                    flat = []
-                    for row in scored_pts:
-                        pt_cam = row[:3]
-                        pt_base = np.array(quat_rotate_vec(cached_q_tf, pt_cam), dtype=float) + t_vec
-                        flat.extend([float(pt_base[0]), float(pt_base[1]), float(pt_base[2]), float(row[3])])
-                    hm_msg = Float32MultiArray()
-                    hm_msg.data = flat
-                    self.heatmap_data_pub.publish(hm_msg)
+            if scored_pts is not None and _R_tf is not None and _t_tf is not None:
+                # Vectorised transform: (N,3) @ R.T + t  — no Python loop needed
+                pts_cam = scored_pts[:, :3].astype(np.float64)
+                pts_base = pts_cam @ _R_tf.T + _t_tf
+                flat = np.column_stack([pts_base, scored_pts[:, 3]]).flatten().tolist()
+                hm_msg = Float32MultiArray()
+                hm_msg.data = flat
+                self.heatmap_data_pub.publish(hm_msg)
         else:
             self.best_history.clear()

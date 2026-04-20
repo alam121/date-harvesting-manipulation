@@ -13,6 +13,7 @@ def apply_zed_one_settings(zed):
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)   # 0-8  (richer colour with HDR)
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)    # 0-8
     # zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 7)        # 1-9
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
 
     # Lock manual exposure so HDR tone-mapping doesn't converge dark
     try:

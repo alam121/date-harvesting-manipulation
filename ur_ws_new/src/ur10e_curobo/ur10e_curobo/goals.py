@@ -843,7 +843,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=1.5, radius=0.08, z_tolerance=0.05):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.05, z_tolerance=0.05):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -872,11 +872,37 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=1.5, radiu
     prev_pose_tuple = None
 
     while time.time() - start < timeout:
+        # Check best fruit first, then fall back to all visible fruits.
+        # This allows reacquire to find the target even when it isn't best-ranked
+        # (e.g. another fruit is closer during the approach phase).
+        pose = None
         if node.latest_goal_pose:
             pose = node.latest_goal_pose[:3]
-        else:
-            pose = None
-        if pose is None:
+
+        # If best fruit doesn't match any seed, scan all visible fruits
+        candidate_poses = [pose] if pose is not None else []
+        all_visible = getattr(node, 'all_fruit_poses', [])
+        for fp in all_visible:
+            if not any(fp == p for p in candidate_poses):
+                candidate_poses.append(fp)
+
+        best_seed = None
+        best_dist = float('inf')
+        pose = None
+        for candidate in candidate_poses:
+            if candidate is None:
+                continue
+            cx, cy, cz = candidate
+            for s in seeds:
+                d_xy = math.hypot(cx - s[0], cy - s[1])
+                d_z = abs(cz - s[2])
+                d = math.dist(candidate, s)
+                if d_xy <= radius and d_z <= z_tolerance and d < best_dist:
+                    best_dist = d
+                    best_seed = s
+                    pose = candidate
+
+        if best_seed is None or pose is None:
             time.sleep(0.001)
             continue
 
@@ -887,21 +913,6 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=1.5, radiu
         prev_pose_tuple = pose_tuple
 
         x, y, z = pose
-
-        # Find closest matching seed
-        best_seed = None
-        best_dist = float('inf')
-        for s in seeds:
-            d_xy = math.hypot(x - s[0], y - s[1])
-            d_z = abs(z - s[2])
-            d = math.dist(pose, s)
-            if d_xy <= radius and d_z <= z_tolerance and d < best_dist:
-                best_dist = d
-                best_seed = s
-
-        if best_seed is None:
-            time.sleep(0.001)
-            continue
 
         # Fast path: very close to any seed = accept immediately
         if best_dist < 0.01:
@@ -1605,7 +1616,7 @@ def plan_and_execute(node):
         elif is_low:
             side_blend = 0.25
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            approach = [ax, ay + 0.12, az - 0.15, *orientation]
+            approach = [ax, ay + 0.07, az - 0.14, *orientation]
             node.get_logger().info(
                 f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
             print(f"Going for LOW approach: {approach[:3]}")
@@ -1715,8 +1726,11 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = -0.01  # approach to 3cm above target, then direct move down for grasp
-        final_target = [x, y + 0.03, z + z_offset, *orientation]
+        z_offset = -0.01  # small downward adjustment during grasp
+        # y offset: fruit_radius (~3.5cm) + depth variability margin + ZED Mini frame offset (~3cm)
+        # total ~6cm keeps gripper at fruit surface rather than centroid
+        y_grasp_offset = 0.02
+        final_target = [x, y + y_grasp_offset, z + z_offset, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:

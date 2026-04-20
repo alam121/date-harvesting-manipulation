@@ -102,6 +102,17 @@ class UR10eCuroboMoveIt(Node):
             10
         )
 
+        # Subscribe to all visible fruit positions — used by reacquire so it can
+        # find the target fruit even when it isn't ranked as the best detection.
+        # Format: flat [x0,y0,z0, x1,y1,z1, ...] in base_link frame.
+        def _all_fruits_cb(msg):
+            data = msg.data
+            self.all_fruit_poses = [
+                [data[i], data[i+1], data[i+2]]
+                for i in range(0, len(data) - 2, 3)
+            ]
+        self.create_subscription(Float32MultiArray, '/vision/all_fruit_poses', _all_fruits_cb, 10)
+
         # timers
         self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers
         self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)
@@ -125,6 +136,7 @@ class UR10eCuroboMoveIt(Node):
         self.latest_goal_pose = None        # [x, y, z, qw, qx, qy, qz]
         self.latest_goal_time = 0.0         # timestamp of last valid pos
         self.latest_fruit_radius = None     # estimated fruit radius from vision (meters)
+        self.all_fruit_poses = []           # list of [x,y,z] for ALL visible fruits (not just best)
 
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")

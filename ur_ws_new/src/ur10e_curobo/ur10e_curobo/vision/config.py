@@ -61,15 +61,15 @@ FRUIT_ID_TIMEOUT = 30.0       # seconds before forgetting a fruit ID
 MAX_FRUIT_ATTEMPTS = 3        # max grasp attempts before blacklisting
 
 # Temporal stabilization (reduce flickering)
-MIN_FRAMES_TO_SHOW = 2        # Fruit must appear in N consecutive frames before showing
-MAX_FRAMES_TO_KEEP = 1        # Keep fruit for N frames after last seen (persistence)
+MIN_FRAMES_TO_SHOW = 1        # Fruit must appear in N consecutive frames before showing
+MAX_FRAMES_TO_KEEP = 0        # Keep fruit for N frames after last seen (persistence)
 
 # Target lock state
-TARGET_LOCK_RADIUS = 0.10     # 10cm - match locked target within this radius
+TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
-SHOW_REJECTED = True
+SHOW_REJECTED = False
 SKIP_DRAW = False
 
 # Z limit in base_link frame
