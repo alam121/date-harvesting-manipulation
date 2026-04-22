@@ -13,13 +13,12 @@ def apply_zed_one_settings(zed):
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)   # 0-8  (richer colour with HDR)
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)    # 0-8
     # zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 7)        # 1-9
-    zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
 
-    # Lock manual exposure so HDR tone-mapping doesn't converge dark
+    # Lock manual exposure so image doesn't go dark when robot moves
     try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
-        #zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 33)  # 0-100
-        #zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 70)      # 0-100
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)    # 0=manual, 1=auto
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 33)  # 0-100 — tune for your lighting
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 70)      # 0-100
     except Exception:
         pass
 

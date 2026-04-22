@@ -16,11 +16,12 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_zedone4k_3classes.pt")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolov26_small_zed_one4k.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolov26_small_zed_one4k.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_small_zedone4k_3classes.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.1          # confidence threshold (lower = more detections)
-DEFAULT_IMG_SIZE = 1504            # must match compiled TRT engine exactly
+DEFAULT_IMG_SIZE = 1248            # must match compiled TRT engine exactly
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
@@ -69,7 +70,7 @@ TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
-SHOW_REJECTED = False
+SHOW_REJECTED = True
 SKIP_DRAW = False
 
 # Z limit in base_link frame

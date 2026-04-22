@@ -914,13 +914,6 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
 
         x, y, z = pose
 
-        # Fast path: very close to any seed = accept immediately
-        if best_dist < 0.01:
-            node.get_logger().info(
-                f"Reacquire fast: {best_dist*100:.1f}cm from seed "
-                f"[{best_seed[0]:.3f},{best_seed[1]:.3f},{best_seed[2]:.3f}]")
-            return tuple(pose)
-
         # Stability check
         if matched_seed != best_seed:
             # Switched seeds — reset stability
@@ -945,9 +938,9 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
 
         time.sleep(0.001)
 
-    # Timeout — use primary seed
+    # Timeout — no stable detection found
     node.get_logger().warn("Reacquire timeout — using primary seed")
-    return tuple(seed_xyz[:3])
+    return None
 
 
 
@@ -1711,14 +1704,23 @@ def plan_and_execute(node):
         seed = [x,y,z]
         candidates = getattr(node, 'candidate_goals', [])
         reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
-        
+
+        if reacq is None:
+            # Nudge EE down a few cm and retry — fruit may be just below FOV
+            node.get_logger().warn("Reacquire timed out — nudging down to search for detection.")
+            cur = node.get_end_effector_pose()
+            if cur and not _check_stop():
+                nudge = [cur[0], cur[1], cur[2] - 0.05, *cur[3:]]
+                _direct_ik_move(node, nudge, label="REACQ_NUDGE",
+                                motion_type="final", store_trajectory=False)
+                reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0)
+
         if reacq:
             x,y,z = reacq
             publish_goal_marker(node, [x,y,z])
         else:
-            node.get_logger().warn("No reacquire; skipping goal.")
-            unlock_target(node)
-            continue
+            node.get_logger().warn("No reacquire after nudge — falling back to original seed.")
+            x, y, z = seed
             
         if _check_stop(): break
 
@@ -1726,11 +1728,24 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = -0.01  # small downward adjustment during grasp
-        # y offset: fruit_radius (~3.5cm) + depth variability margin + ZED Mini frame offset (~3cm)
-        # total ~6cm keeps gripper at fruit surface rather than centroid
-        y_grasp_offset = 0.02
-        final_target = [x, y + y_grasp_offset, z + z_offset, *orientation]
+        z_offset = 0.015  # small downward adjustment during grasp
+        y_offset = 0.005  # no lateral adjustment
+        # Pull back along the approach direction by 1× estimated fruit radius.
+        # This adapts to fruit size and approach angle rather than a fixed Y offset,
+        # preventing overshoot when depth is measured at the centroid vs near-surface.
+        fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
+        _sm_dir = getattr(getattr(node, 'state_manager', None), 'fruit_direction', None)
+        approach_dir = list(_sm_dir) if _sm_dir is not None else None  # [dx,dy,dz] unit vec in base_link
+        if approach_dir is not None and len(approach_dir) == 3:
+            # Move the grasp point back by 1 radius along the approach direction
+            pullback = float(fruit_radius)
+            gx = x - approach_dir[0] * pullback
+            gy = y - approach_dir[1] * pullback + y_offset  # add fixed Y offset on top of directional pullback
+            gz = z - approach_dir[2] * pullback + z_offset
+        else:
+            # Fallback: fixed Y pullback
+            gx, gy, gz = x, y + fruit_radius, z + z_offset
+        final_target = [gx, gy, gz, *orientation]
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:

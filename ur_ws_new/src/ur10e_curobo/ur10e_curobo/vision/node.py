@@ -108,9 +108,11 @@ class VisionNode:
         self._latest_depth_map_orig: Optional[np.ndarray] = None
         self._depth_map_lock = Lock()
 
-        # Raw ZED Mini points in ZED Mini frame + UV in ZED One image (no EDT fill).
+        # Raw ZED Mini points + UV in ZED One image (no EDT fill).
+        # pts_one: ZED One (CAM_FRAME) coordinates — used for centroid so TF to base_link is correct.
+        # pts_mini: ZED Mini frame — kept for depth_map visualisation only.
         # Used by _extract_target_3d for direct point queries — avoids scatter/fill artefacts.
-        self._latest_mini_pts: Optional[tuple] = None  # (pts_mini Nx3, uv_one Nx2)
+        self._latest_mini_pts: Optional[tuple] = None  # (pts_one Nx3, uv_one Nx2)
         self._mini_pts_lock = Lock()
 
         # ZED X One image from ROS topic (used when --use_lidar)
@@ -334,17 +336,17 @@ class VisionNode:
                                 pts_mini = (T_mini_one @ pts_one_h.T).T[:, :3].astype(np.float32)
                                 depth_map[ys[order], xs[order]] = pts_mini[order]
                                 # ── Raw points for direct query (no EDT fill) ─────
-                                # pts_mini: ZED Mini-frame 3D coords
-                                # uv_one:   corresponding pixel positions in ZED One image
+                                # pts_one: ZED One (CAM_FRAME) 3D coords — correct frame for TF to base_link.
+                                # uv_one:  corresponding pixel positions in ZED One image.
                                 # Subsample to ZEDMINI_MAX_POINTS — bbox filtering in the
                                 # main loop iterates all points per target, so keeping
                                 # hundreds of thousands of points makes it very slow.
-                                if pts_mini.shape[0] > ZEDMINI_MAX_POINTS:
-                                    _sub_idx = np.random.choice(pts_mini.shape[0], ZEDMINI_MAX_POINTS, replace=False)
-                                    _raw_mini_pts = pts_mini[_sub_idx]
+                                if pts_one.shape[0] > ZEDMINI_MAX_POINTS:
+                                    _sub_idx = np.random.choice(pts_one.shape[0], ZEDMINI_MAX_POINTS, replace=False)
+                                    _raw_mini_pts = pts_one[_sub_idx]
                                     _raw_mini_uv  = uv_one[_sub_idx]
                                 else:
-                                    _raw_mini_pts = pts_mini
+                                    _raw_mini_pts = pts_one
                                     _raw_mini_uv  = uv_one
 
                         # ── Hole filling (for heatmap visualisation only) ─────
@@ -583,6 +585,7 @@ class VisionNode:
                     pts_cam=pts_cam_l, uv=uv_l,
                     use_lidar=use_lidar,       # True only for actual LiDAR
                     use_zed_mini=use_zed_mini, # raw dets + dense depth heatmap
+
                 )
                 _t3 = time()
 
@@ -1078,25 +1081,32 @@ class VisionNode:
                 mark_reject("Too few depth pts")
                 return None
 
-            # Depth statistics — pure measured points, no interpolation.
-            # Cluster around the NEAREST depth, not the median — background points
-            # (floor/wall) are always farther than the fruit, so the closest cluster
-            # is the fruit. Median would lock onto the larger background cluster.
+            # Depth: use ZED Mini pts (in ZED One frame) for Z only.
+            # Use all in-mask points within FRUIT_DEPTH_RANGE of the nearest valid point.
+            # Background is always farther so ~10 cm cap excludes it.
+            FRUIT_DEPTH_RANGE = 0.10
             zs  = pts[:, 2]
-            idx = np.argsort(zs)
-            k   = max(10, int(0.2 * len(idx)))
-            z_near = float(np.percentile(zs, 10))  # 10th percentile = nearest cluster anchor
-            in_window = np.abs(zs - z_near) <= 0.08  # ±8 cm window around nearest points
-            pts_front = pts[in_window] if in_window.sum() >= 10 else pts[idx[:k]]
+            z_min_anchor = float(np.percentile(zs, 5))
+            in_fruit = zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)
+            pts_front = pts[in_fruit] if in_fruit.sum() >= 10 else pts[np.argsort(zs)[:max(10, int(0.2 * len(zs)))]]
 
             depth_std = float(np.std(pts_front[:, 2]))
             if depth_std > 0.05:
                 mark_reject("Depth variance")
                 return None
 
-            Xc = float(np.mean(pts_front[:, 0]))
-            Yc = float(np.mean(pts_front[:, 1]))
-            Zc = float(np.mean(pts_front[:, 2]))
+            Zc = float(np.median(pts_front[:, 2]))
+
+            # X,Y: reproject from the mask centroid in image space using ZED One intrinsics.
+            # Avoids T_cam_lidar rotation errors which amplify for off-axis (bottom-edge) fruit —
+            # the ZED One's own camera model is exact for X,Y given a known Z.
+            mask_ys, mask_xs = np.where(mask_bool)
+            u_c = float(np.mean(mask_xs)) + x1  # full-image coordinates
+            v_c = float(np.mean(mask_ys)) + y1
+            fx_ = intrinsics["fx"]; fy_ = intrinsics["fy"]
+            cx_ = intrinsics["cx"]; cy_ = intrinsics["cy"]
+            Xc = (u_c - cx_) * Zc / fx_
+            Yc = (v_c - cy_) * Zc / fy_
 
             if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
                 mark_reject("Z out of range")
@@ -1117,7 +1127,18 @@ class VisionNode:
                     if mask_pixels > 0 else 0.0
                 )
                 vis_ratio = max(0.0, min(vis_ratio, 1.0))
-                if self._heatmap_frame_count % self._heatmap_interval == 0:
+
+                # Only compute heatmap for the previous best fruit — heatmap is only
+                # consumed by _process_best_target, so computing it for every detection
+                # wastes N× Sobel passes per heatmap frame.
+                _prev = self.best_target_prev
+                _is_prev_best = (
+                    _prev is not None and
+                    abs(_prev.get("Xc", 1e9) - Xc) < 0.05 and
+                    abs(_prev.get("Yc", 1e9) - Yc) < 0.05 and
+                    abs(_prev.get("Zc", 1e9) - Zc) < 0.05
+                )
+                if _is_prev_best and self._heatmap_frame_count % self._heatmap_interval == 0:
                     heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
                     self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
                 else:
@@ -1125,8 +1146,6 @@ class VisionNode:
                     if cached is not None:
                         heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
                     else:
-                        # Cache miss on non-compute frame — skip rather than computing.
-                        # Heatmap is visualization-only; position comes from raw mini points.
                         heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
             else:
                 vis_ratio = min(1.0, float(pts.shape[0]) / max(1.0, float(np.count_nonzero(mask_bool))))
@@ -1148,10 +1167,16 @@ class VisionNode:
             roi_xyz = pc_np[y1:y2, x1:x2, :]
             valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
 
-            # Throttle heatmap computation — reuse cached on non-compute frames.
-            # Key snapped to 16px grid so YOLO bbox jitter doesn't cause cache misses.
+            # Only compute heatmap for the previous best fruit (same as ZED Mini path).
             target_key = (x1 // 16 * 16, y1 // 16 * 16, x2 // 16 * 16, y2 // 16 * 16)
-            if self._heatmap_frame_count % self._heatmap_interval == 0:
+            _prev = self.best_target_prev
+            _is_prev_best = (
+                _prev is not None and
+                abs(_prev.get("Xc", 1e9) - Xc) < 0.05 and
+                abs(_prev.get("Yc", 1e9) - Yc) < 0.05 and
+                abs(_prev.get("Zc", 1e9) - Zc) < 0.05
+            )
+            if _is_prev_best and self._heatmap_frame_count % self._heatmap_interval == 0:
                 heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
                 )
@@ -1161,7 +1186,6 @@ class VisionNode:
                 if cached is not None:
                     heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = cached
                 else:
-                    # Cache miss on non-compute frame — skip rather than computing.
                     heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
 
             # Visibility ratio
@@ -1676,7 +1700,13 @@ class VisionNode:
                 else:
                     heatmap_dir = np.array([dx / offset_mag, dy / offset_mag, 0.0], dtype=float)
 
-                collision_result = compute_collision_free_direction(t_best, targets, best_idx, heatmap_dir)
+                # Only run collision direction when target is locked (robot committed to grasp).
+                # Idle/scanning frames skip the vectorized ray-sphere math entirely.
+                if self.target_lock_active:
+                    collision_result = compute_collision_free_direction(t_best, targets, best_idx, heatmap_dir)
+                else:
+                    collision_result = {"direction": heatmap_dir, "clearance": float('inf'),
+                                        "is_collision_free": True, "num_blocked": 0}
                 dir_cam = collision_result["direction"]
 
                 t_best["clearance"] = collision_result["clearance"]

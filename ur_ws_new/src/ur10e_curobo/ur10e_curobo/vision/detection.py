@@ -55,22 +55,22 @@ def detections_to_custom_masks(dets, trunk_class_ids=None, bunch_class_ids=None)
         x2 = int(abcd[2, 0])
         y2 = int(abcd[2, 1])
 
-        # Trunk → just save bbox, don't create ZED object
+        # Trunk → just save bbox, don't create ZED object (only one trunk)
         if cls_id in trunk_class_ids:
-            trunk_boxes.append((x1, y1, x2, y2))
+            if not trunk_boxes:
+                trunk_boxes.append((x1, y1, x2, y2))
             continue
 
-        # Bunch → save bbox + segmentation polygon for rich visualization
-        # Use masks.xy which gives polygon points in original image coords —
-        # avoids any resolution-mismatch issues with masks.data.
+        # Bunch → save bbox + segmentation polygon (only one bunch)
         if cls_id in bunch_class_ids:
-            conf = float(dets.boxes.conf[di].item())
-            polygon = None
-            if dets.masks is not None and dets.masks.xy is not None:
-                xy = dets.masks.xy[di]
-                if len(xy) > 2:
-                    polygon = xy.astype(np.float32)
-            bunch_boxes.append({"bb": (x1, y1, x2, y2), "polygon": polygon, "conf": conf})
+            if not bunch_boxes:
+                conf = float(dets.boxes.conf[di].item())
+                polygon = None
+                if dets.masks is not None and dets.masks.xy is not None:
+                    xy = dets.masks.xy[di]
+                    if len(xy) > 2:
+                        polygon = xy.astype(np.float32)
+                bunch_boxes.append({"bb": (x1, y1, x2, y2), "polygon": polygon, "conf": conf})
             continue
 
         obj = sl.CustomMaskObjectData()
