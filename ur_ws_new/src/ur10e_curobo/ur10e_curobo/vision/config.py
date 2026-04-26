@@ -13,10 +13,7 @@ if not _SRC_MODELS.exists():
 DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_dates_trunk_bunch_seg.engine")
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_zedone4k_3classes.pt")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolov26_small_zed_one4k.engine")
 DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_small_zedone4k_3classes.engine")
 
 # YOLO inference parameters
@@ -48,7 +45,7 @@ STICKY_BONUS = 0.02   # small bonus — distance should override easily
 SWITCH_THRESHOLD = 0.02  # low threshold — switch quickly to closer fruit
 
 # Best fruit tracking
-BEST_REUSE_THRESH = 0.05  # 5 cm positional tolerance in base_link
+BEST_REUSE_THRESH = 0.08  # 8 cm positional tolerance in base_link
 
 # Collision avoidance parameters
 FRUIT_RADIUS_DEFAULT = 0.035  # default radius of a date fruit (3.5cm)
@@ -132,8 +129,8 @@ ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.
 T_CAM_ZEDMINI = [
-    [  0.99791576,   0.00209274,   0.06449613,  -0.02496566],
-    [ -0.00190500,   0.99999377,  -0.00297231,   0.03234971],
-    [ -0.06450195,   0.00284325,   0.99791353,  -0.01475284],
+    [  0.99997176,  -0.00567234,  -0.00492976,  -0.02432635],
+    [  0.00516021,   0.99514099,  -0.09832485,   0.03795027],
+    [  0.00546354,   0.09829664,   0.99514216,  -0.01018928],
     [  0.00000000,   0.00000000,   0.00000000,   1.00000000],
-]
+]  # extrinsic calibration 2026-04-26, 42 pairs, max residual 0.5mm

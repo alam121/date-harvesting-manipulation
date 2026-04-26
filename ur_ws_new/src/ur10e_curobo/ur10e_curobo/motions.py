@@ -109,7 +109,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
 
     dt = curobo_dt / max(scale, 1e-6)
-    dt = min(max(dt, planner.min_dt), planner.max_dt)
+    dt = min(max(dt, curobo_dt), planner.max_dt)
 
     traj = build_trajectory(
         node.joint_order,
@@ -189,20 +189,25 @@ def plan_execute_js(
     # 3. cuRobo plan (hold lock to prevent concurrent CUDA ops)
     # ------------------------------
     lock = getattr(node, '_planning_lock', None)
-    if lock: lock.acquire()
-    try:
-        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
-    except Exception as e:
-        msg = str(e)
-        if "CUDA error" in msg or "illegal memory access" in msg:
-            node._cuda_faulted = True
-        node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
-        return False
-    finally:
-        if lock: lock.release()
-    if not res.success:
+    res = None
+    for _attempt in range(3):
+        if lock: lock.acquire()
+        try:
+            res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+        except Exception as e:
+            msg = str(e)
+            if "CUDA error" in msg or "illegal memory access" in msg:
+                node._cuda_faulted = True
+            node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
+            return False
+        finally:
+            if lock: lock.release()
+        if res.success:
+            break
         status = getattr(res, 'status', 'unknown')
-        node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
+        node.get_logger().warn(
+            f"Joint-space plan to {label} failed (attempt {_attempt+1}/3). status={status}")
+    if res is None or not res.success:
         return False
 
     # ------------------------------
@@ -213,7 +218,7 @@ def plan_execute_js(
     curobo_dt = get_curobo_dt(res)
 
     dt = curobo_dt / max(scale, 1e-6)
-    dt = min(max(dt, planner.min_dt), planner.max_dt)
+    dt = min(max(dt, curobo_dt), planner.max_dt)
 
     traj = build_trajectory(
         node.joint_order,

@@ -32,6 +32,7 @@ from scipy.spatial.transform import Rotation
 URDF_FILES = [
     Path(__file__).resolve().parents[4] / "src/universal_robot/urdf/ur_macro.xacro",
     Path(__file__).resolve().parents[5] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
+    Path(__file__).resolve().parents[3] / "ur10e_curobo.urdf",
 ]
 
 # ── Chessboard parameters ─────────────────────────────────────────────
@@ -407,20 +408,19 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp):
         f"{n_samples} samples, updated {timestamp})"
     )
 
-    # Pattern A: xyz before rpy, comment on same line
-    # <origin xyz="..." rpy="..."/>   <!-- ... -->
+    # Pattern A: xyz before rpy, optional trailing comment
+    # <origin xyz="..." rpy="..."/>   <!-- ... -->   or without comment
     pat_xyz_first = re.compile(
-        r'(<origin\s[^>]*xyz=")[^"]*("\s*rpy=")[^"]*("\s*/>[ \t]*)<!--.*?-->'
+        r'(<origin\s[^>]*xyz=")[^"]*("\s*rpy=")[^"]*("\s*/>[ \t]*)(<!--.*?-->)?'
     )
     repl_xyz_first = rf'\g<1>{xyz_str}\g<2>{rpy_str}\g<3><!-- {comment} -->'
 
-    # Pattern B: rpy before xyz, comment on next line
-    # <origin rpy="..." xyz="..."/>
-    # <!-- ... -->
+    # Pattern B: rpy before xyz, optional trailing comment
+    # <origin rpy="..." xyz="..."/>   <!-- ... -->   or without comment
     pat_rpy_first = re.compile(
-        r'(<origin\s[^>]*rpy=")[^"]*("\s*xyz=")[^"]*("\s*/>)([ \t]*\n[ \t]*)<!--.*?-->'
+        r'(<origin\s[^>]*rpy=")[^"]*("\s*xyz=")[^"]*("\s*/>[ \t]*)(<!--.*?-->)?'
     )
-    repl_rpy_first = rf'\g<1>{rpy_str}\g<2>{xyz_str}\g<3>\g<4><!-- {comment} -->'
+    repl_rpy_first = rf'\g<1>{rpy_str}\g<2>{xyz_str}\g<3><!-- {comment} -->'
 
     joint_pattern = re.compile(
         r'(joint name="tool0_to_zed2_left_camera_frame".*?</joint>)',

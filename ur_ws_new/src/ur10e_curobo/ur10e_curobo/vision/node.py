@@ -83,6 +83,9 @@ class VisionNode:
         # Avoids 8+ expensive tf_buffer.transform calls per frame (each ~20ms on Jetson).
         self._cached_tf_base: Optional[tuple] = None  # (R: 3×3, t: 3,) cam → base_link
         self._cached_tf_grip: Optional[tuple] = None  # (R: 3×3, t: 3,) cam → gripper_tip
+        # Camera position at the moment the last YOLO result was accepted.
+        # Used to detect cumulative drift (slow moves that never cross the per-frame threshold).
+        self._yolo_accepted_cam_t: Optional[np.ndarray] = None
 
 
         # Target lock
@@ -464,6 +467,7 @@ class VisionNode:
             current_dets = None
             trunk_boxes  = []
             bunch_boxes  = []
+            _YOLO_STALE_DRIFT = 0.003  # 3 mm — discard cached dets if camera drifted this far
 
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
@@ -520,13 +524,24 @@ class VisionNode:
 
                 # Use fresh YOLO dets when ready, otherwise reuse cached dets so
                 # the loop runs at camera fps rather than YOLO inference fps.
+                _cur_t_now = self._cached_tf_base[1] if self._cached_tf_base is not None else None
                 if self.yolo_thread.dets_ready.is_set():
                     self.yolo_thread.dets_ready.clear()
                     current_dets = self.yolo_thread.get_detections()
                     trunk_boxes  = self.yolo_thread.get_trunk_boxes()
                     bunch_boxes  = self.yolo_thread.get_bunch_boxes()
+                    # Record where the camera was when this result was accepted
+                    self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
                 elif current_dets is None:
                     continue  # no cached dets yet — wait for first YOLO result
+                else:
+                    # Cumulative-drift check: discard cached dets if camera has drifted
+                    # since the last accepted YOLO result (handles slow/incremental moves
+                    # that never cross the per-frame 5 mm threshold).
+                    if (_cur_t_now is not None and self._yolo_accepted_cam_t is not None and
+                            float(np.linalg.norm(_cur_t_now - self._yolo_accepted_cam_t)) > _YOLO_STALE_DRIFT):
+                        current_dets = None
+                        continue
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 if use_zed_mini:
@@ -576,8 +591,9 @@ class VisionNode:
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
-                if self._heatmap_frame_count % (self._heatmap_interval * 10) == 0:
-                    self._cached_heatmaps.clear()  # prevent stale cache buildup
+                # Heatmap is computed once per fruit (see target_key logic below);
+                # periodic clear removed — camera-movement clear (above) is the
+                # correct invalidation trigger when the robot repositions.
                 _t2 = time()
                 targets, rejected_targets, viz_only = self._process_objects(
                     current_dets if use_mono_depth else objects,
@@ -1138,7 +1154,8 @@ class VisionNode:
                     abs(_prev.get("Yc", 1e9) - Yc) < 0.05 and
                     abs(_prev.get("Zc", 1e9) - Zc) < 0.05
                 )
-                if _is_prev_best and self._heatmap_frame_count % self._heatmap_interval == 0:
+                if _is_prev_best and target_key not in self._cached_heatmaps:
+                    # Compute once per fruit — reuse cache every subsequent frame
                     heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(roi_xyz, valid, mask_clean)
                     self._cached_heatmaps[target_key] = (heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal)
                 else:
@@ -1176,7 +1193,8 @@ class VisionNode:
                 abs(_prev.get("Yc", 1e9) - Yc) < 0.05 and
                 abs(_prev.get("Zc", 1e9) - Zc) < 0.05
             )
-            if _is_prev_best and self._heatmap_frame_count % self._heatmap_interval == 0:
+            if _is_prev_best and target_key not in self._cached_heatmaps:
+                # Compute once per fruit — reuse cache every subsequent frame
                 heatmap, t_best_point, t_best_dir2d, t_best_point_3d, scored_3d_pts, surface_normal = self._compute_heatmap(
                     roi_xyz, valid, mask_clean
                 )

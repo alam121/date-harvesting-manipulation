@@ -45,7 +45,14 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         return msg
 
     n_joints = len(joint_names)
-    t = 0.0
+    states_arr = np.array(states_list, dtype=float)  # (n_points, n_joints)
+
+    # Start at t=dt (not 0) so the controller has one timestep to reach the first
+    # waypoint from its current actual position.  This prevents an instantaneous
+    # position jump when cuRobo reads joints, spends ~200 ms planning, then
+    # publishes a trajectory whose first point is time_from_start=0 ("be here NOW")
+    # while gravity has drifted the arm slightly during that planning window.
+    t = dt
     for i, q in enumerate(states_list):
         if stop_flag and stop_flag():
             break
@@ -53,6 +60,16 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         pt.positions = list(q)
         if i == 0 or i == n_points - 1:
             pt.velocities = [0.0] * n_joints
+            pt.accelerations = [0.0] * n_joints
+        else:
+            # Central-difference velocity: v_i = (q[i+1] - q[i-1]) / (2*dt)
+            v = (states_arr[i + 1] - states_arr[i - 1]) / (2.0 * dt)
+            v = np.clip(v, -max_vel, max_vel)
+            pt.velocities = v.tolist()
+            # Second central-difference acceleration: a_i = (q[i+1] - 2*q[i] + q[i-1]) / dt^2
+            a = (states_arr[i + 1] - 2.0 * states_arr[i] + states_arr[i - 1]) / (dt * dt)
+            a = np.clip(a, -max_acc, max_acc)
+            pt.accelerations = a.tolist()
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)

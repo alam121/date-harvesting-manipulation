@@ -159,7 +159,7 @@ def lock_target(node, position_xyz):
     msg.point.y = float(position_xyz[1])
     msg.point.z = float(position_xyz[2])
     node._target_lock_pub.publish(msg)
-    print(f"🔒 Target lock sent: [{position_xyz[0]:.3f}, {position_xyz[1]:.3f}, {position_xyz[2]:.3f}]")
+    node.get_logger().info(f"Target lock sent: [{position_xyz[0]:.3f}, {position_xyz[1]:.3f}, {position_xyz[2]:.3f}]")
 
 
 def unlock_target(node):
@@ -175,7 +175,7 @@ def unlock_target(node):
     msg.header.frame_id = "base_link"
     msg.point.x = msg.point.y = msg.point.z = 0.0  # Zero = unlock signal
     node._target_lock_pub.publish(msg)
-    print("🔓 Target lock released")
+    node.get_logger().info("Target lock released")
 
 
 def quat_multiply(a, b):
@@ -398,11 +398,12 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if best_delta > 1.05:  # ~60 degrees
         node.get_logger().warn(f"[DIRECT] {label}: IK too far ({best_delta*57.3:.1f}deg)"); return False
 
-    # 3) Linearly interpolate in joint space
+    # 3) S-curve (cosine) interpolation in joint space — avoids velocity discontinuities
     states = []
     for i in range(num_steps + 1):
-        t = i / num_steps
-        wp = [s + t * (g - s) for s, g in zip(start_js, best_js)]
+        alpha = i / num_steps
+        t_smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+        wp = [s + t_smooth * (g - s) for s, g in zip(start_js, best_js)]
         states.append(wp)
 
     # 4) Build slow, smooth trajectory
@@ -659,7 +660,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
     # 3) UR10e-friendly dt and velocity
     raw_dt = base_dt / max(scale, 1e-6)
-    dt = min(max(raw_dt, planner.min_dt), planner.max_dt)
+    # Never go faster than cuRobo's own interpolation timing: the positions were
+    # planned for curobo_dt intervals; compressing them produces velocities and
+    # accelerations that exceed what the robot can physically follow → jerks.
+    # Scale > 1 ("go faster") has no effect — cuRobo already runs at max speed.
+    dt = min(max(raw_dt, curobo_dt), planner.max_dt)
 
     # Velocity: linear scaling with cap
     base_vel = 0.08        # slightly gentler than 0.1
@@ -843,7 +848,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.05, z_tolerance=0.05):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -1102,8 +1107,6 @@ def subscribe_to_goal_pose(node):
                 lateral_type = "CENTER"
 
             node.latest_goal_classification = f"{height_type} | {lateral_type}"
-            print(f"Accepted primary goal: [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
-            print(f"   Height: {height_type} (z={new_xyz[2]:.2f}m)  Lateral: {lateral_type} (fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f}, dx_trunk={dx_trunk:.2f}m)")
             node.get_logger().info(
                 f"Primary goal accepted: {height_type} | {lateral_type} "
                 f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f})")
@@ -1154,10 +1157,9 @@ def subscribe_to_goal_pose(node):
 
         curp = node.get_end_effector_pose()
         if curp and not is_robot_moving(node):
-            print("Performing idle micro-motion...")
             dx, dy, dz = sequence[idx['i']]
             tgt = [curp[0] + dx, curp[1] + dy, curp[2] + dz, *current_orientation]
-            print(f"Idle move to: {tgt}")
+            node.get_logger().info(f"Idle micro-motion to: [{tgt[0]:.3f},{tgt[1]:.3f},{tgt[2]:.3f}]")
             _exec(node, tgt)
             idx['i'] += 1
 
@@ -1318,7 +1320,6 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
             node.get_logger().info(
                 f"Multi goal #{n}/{max_goals}: {goal_type} "
                 f"(z={xyz[2]:.2f}m) [{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}]")
-            print(f"Multi goal #{n}: [{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}] ({goal_type})")
 
             if n == 1:
                 node.best_goal_xyz = xyz
@@ -1478,8 +1479,6 @@ def plan_and_execute(node):
             node.get_logger().warn("Goal queue empty during pop; skipping.")
             continue
         x,y,z = goal[:3]
-        grasp_orientation = goal[3:]  # Store grasp orientation for pre-dropoff
-        yoffset = node.yoffset
 
         # Clear previous trajectory markers from RViz
         clear_path_markers(node)
@@ -1523,8 +1522,6 @@ def plan_and_execute(node):
         cur_pose = node.get_end_effector_pose()
         cur_quat = cur_pose[3:] if cur_pose else None
         target_quat = goal[3:]
-        print("Current quat:", cur_quat)
-        print("Target quat:", target_quat)
 
         # Side HOME: use predefined home_left / home_right based on fruit vs trunk position
         is_side_approach = False
@@ -1609,10 +1606,9 @@ def plan_and_execute(node):
         elif is_low:
             side_blend = 0.25
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            approach = [ax, ay + 0.07, az - 0.14, *orientation]
+            approach = [ax, ay + 0.07, az - 0.09, *orientation]
             node.get_logger().info(
                 f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
-            print(f"Going for LOW approach: {approach[:3]}")
         else:
             side_blend =0.0
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
@@ -1620,7 +1616,6 @@ def plan_and_execute(node):
             node.get_logger().info(
                 f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
                 f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
-            print(f"Going for MID/HIGH approach: {approach[:3]}")
 
         # === DEBUG PLAN PREVIEW (RViz visualization) ===
         if node.cfg.planner.debug_plan_preview:
@@ -1710,7 +1705,7 @@ def plan_and_execute(node):
             node.get_logger().warn("Reacquire timed out — nudging down to search for detection.")
             cur = node.get_end_effector_pose()
             if cur and not _check_stop():
-                nudge = [cur[0], cur[1], cur[2] - 0.05, *cur[3:]]
+                nudge = [cur[0], cur[1], cur[2] - 0.02, *cur[3:]]
                 _direct_ik_move(node, nudge, label="REACQ_NUDGE",
                                 motion_type="final", store_trajectory=False)
                 reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0)
@@ -1785,8 +1780,7 @@ def plan_and_execute(node):
         if learner and learner.enabled and learner.has_enough_data():
             prediction = learner.predict_grasp_success(first_contact, gc.steps, stopped_early)
             action = learner.suggest_action(first_contact, gc.steps, stopped_early)
-            print(f"[LEARNER] prediction={prediction}, action={action}, "
-                  f"first_contact={first_contact}/{gc.steps}")
+            node.get_logger().info(f"[LEARNER] prediction={prediction}, action={action}, first_contact={first_contact}/{gc.steps}")
         else:
             # Fallback: early contact or stopped_early = PROCEED
             if stopped_early or first_contact < gc.steps - 2:
@@ -1797,7 +1791,7 @@ def plan_and_execute(node):
                 action = "REGRIP"
 
         if action == "REGRIP":
-            print(f"Weak grip ({prediction}) - re-gripping...")
+            node.get_logger().warn(f"Weak grip ({prediction}) — re-gripping...")
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius); time.sleep(0.1)
             cur = node.get_end_effector_pose()
             if cur:
@@ -1847,7 +1841,7 @@ def plan_and_execute(node):
                 prediction = learner.predict_grasp_success(first_contact, gc.steps, stopped_early)
             else:
                 prediction = "PROPER" if (stopped_early or first_contact < gc.steps - 2) else "NO_CONTACT"
-            print(f"Re-grip result: {prediction}, first_contact={first_contact}/{gc.steps}")
+            node.get_logger().info(f"Re-grip result: {prediction}, first_contact={first_contact}/{gc.steps}")
 
         # Log grasp attempt for learning (success filled in by user feedback later)
         if learner:
@@ -1892,7 +1886,6 @@ def plan_and_execute(node):
             break
 
         # Smart return: if there are more goals, try direct approach instead of going home first
-        went_home = False
         if node.goal_poses:
             # Peek at next goal (don't pop it yet)
             next_goal = node.goal_poses.peek(0)
@@ -1941,16 +1934,12 @@ def plan_and_execute(node):
                         node.get_logger().info(
                             f"Direct path to next goal BLOCKED — going HOME first")
                         _safe_return_home()
-                        went_home = True
                 else:
                     _safe_return_home()
-                    went_home = True
             else:
                 _safe_return_home()
-                went_home = True
         else:
             _safe_return_home()
-            went_home = True
 
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
         if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:

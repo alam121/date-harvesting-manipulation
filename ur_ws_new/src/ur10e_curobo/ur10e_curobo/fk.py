@@ -86,7 +86,7 @@ def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
         with torch.no_grad():
             ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
         pos = ee_pos.squeeze().cpu().tolist()
-        return Point(x=pos[0], y=pos[1], z=pos[2])
+        return Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
     except Exception as e:
         node.get_logger().warn(f"CuRobo FK failed: {e}")
         return None
@@ -108,7 +108,7 @@ def forward_kinematics_batch(node, joint_states: List[List[float]]) -> List[Poin
         # Handle single-waypoint edge case
         if len(joint_states) == 1 and len(positions) == 3 and not isinstance(positions[0], list):
             positions = [positions]
-        return [Point(x=p[0], y=p[1], z=p[2]) for p in positions]
+        return [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in positions]
     except Exception as e:
         node.get_logger().warn(f"Batched FK failed: {e}")
         return []

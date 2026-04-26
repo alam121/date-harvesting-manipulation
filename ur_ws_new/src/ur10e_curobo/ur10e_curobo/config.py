@@ -91,7 +91,7 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.4997957388507288, -1.5250585836223145, 2.258034054433004, -4.589322467843527, 4.572384357452393, 0.048272740095853806]
+    home: List[float] = field(default_factory=lambda: [-1.5053446928607386, -1.6020904980101527, 2.2053263823138636, -4.459911724130148, 4.5944719314575195, 0.03221730515360832]
 
 
 
@@ -126,7 +126,7 @@ class Planner:
 
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
     speed_home: float = 0.08        # for move_to_home_position
-    speed_dropoff: float = 2.0    # for move_to_dropoff_position
+    speed_dropoff: float = 0.15   # for move_to_dropoff_position
     speed_predropoff: float = 0.2  # for pre-dropoff reverse
     speed_approach: float = 1.0    # for approach motion
     speed_final: float = 0.2       # for precise grasp (slow & gentle)
