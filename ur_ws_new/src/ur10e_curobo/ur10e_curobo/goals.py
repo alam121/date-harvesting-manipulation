@@ -84,7 +84,7 @@ from .markers import publish_goal_marker, publish_planned_path, clear_path_marke
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
-from .motions import blend_motion, preplan_js, plan_execute_js
+from .motions import blend_motion, preplan_js, plan_execute_js, nearest_joint_config
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, solve_ik_fast
@@ -379,6 +379,50 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if best_js is None:
         node.get_logger().warn(f"[DIRECT] {label}: all IK solvers failed"); return False
 
+    # Normalise IK solution to the same 2π branch as current joints.
+    # cuRobo IK can return an equivalent config that is ±2π away, which would
+    # make the interpolation travel a full revolution instead of staying put.
+    best_js = nearest_joint_config(start_js, best_js)
+
+    # If the IK solution is on a different kinematic branch (large joint delta even
+    # after 2π normalisation), retry with perturbed seeds to find the nearest branch.
+    # This prevents the arm taking a long arc when a shorter path exists.
+    _total_delta = sum(abs(g - c) for g, c in zip(best_js, start_js))
+    _RETRY_THRESH_RAD = 0.70  # ~40° total — above this, search for a closer branch
+    if _total_delta > _RETRY_THRESH_RAD and not getattr(node, "_cuda_faulted", False):
+        try:
+            import random as _random
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            pos  = torch.tensor([target_pose_list[:3]], dtype=torch.float32, device=device)
+            quat = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=device)
+            goal_pose = Pose(position=pos, quaternion=quat)
+            retract   = torch.tensor([start_js], dtype=torch.float32, device=device)
+
+            # Build a batch of seeds: current config + 8 small random perturbations
+            _seeds = [start_js]
+            for _ in range(8):
+                _perturb = [j + _random.uniform(-0.3, 0.3) for j in start_js]
+                _seeds.append(_perturb)
+
+            _best_alt = best_js
+            _best_total = _total_delta
+            for _s in _seeds:
+                _seed_t = torch.tensor([_s], dtype=torch.float32, device=device).unsqueeze(0)
+                _r = node.motion_gen.ik_solver.solve_single(goal_pose, seed_config=_seed_t, retract_config=retract)
+                if _r.success.item():
+                    _candidate = nearest_joint_config(start_js, _r.js_solution.position.squeeze().cpu().tolist())
+                    _d = sum(abs(g - c) for g, c in zip(_candidate, start_js))
+                    if _d < _best_total:
+                        _best_total = _d
+                        _best_alt = _candidate
+            if _best_alt is not best_js:
+                node.get_logger().info(
+                    f"[DIRECT] {label}: branch retry found shorter path "
+                    f"({_total_delta*57.3:.1f}° → {_best_total*57.3:.1f}° total)")
+                best_js = _best_alt
+        except Exception as _e:
+            node.get_logger().warn(f"[DIRECT] {label}: branch retry exception: {_e}")
+
     best_delta = max(abs(g - c) for g, c in zip(best_js, start_js))
 
     # Scale num_steps with Cartesian distance (1 step per 5mm, clamped 10-60)
@@ -398,13 +442,70 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if best_delta > 1.05:  # ~60 degrees
         node.get_logger().warn(f"[DIRECT] {label}: IK too far ({best_delta*57.3:.1f}deg)"); return False
 
-    # 3) S-curve (cosine) interpolation in joint space — avoids velocity discontinuities
+    # 3) Cartesian IK waypoints → per-segment S-curve interpolation
+    #
+    # Direct joint-space interpolation from approach to final can arc through
+    # dangerous wrist configurations (lower-arm / tool-flange clamping) on
+    # left+low fruits.  Instead, solve IK at N evenly-spaced Cartesian positions
+    # along the straight EE line — each seeded from the previous solution so the
+    # arm stays on the same kinematic branch throughout.
+    _N_CART = 5   # intermediate IK waypoints (6 segments total)
+    _states_built = False
     states = []
-    for i in range(num_steps + 1):
-        alpha = i / num_steps
-        t_smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
-        wp = [s + t_smooth * (g - s) for s, g in zip(start_js, best_js)]
-        states.append(wp)
+    _cur_ee = node.get_end_effector_pose()
+    if _cur_ee is not None and not getattr(node, "_cuda_faulted", False):
+        try:
+            _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _quat_t = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=_dev)
+            _wp_js = [start_js]
+            _prev_js = start_js
+            _cart_ok = True
+            for _k in range(1, _N_CART + 1):
+                _a = _k / (_N_CART + 1)
+                _wp_xyz = [_cur_ee[i] + _a * (target_pose_list[i] - _cur_ee[i]) for i in range(3)]
+                _pos_t   = torch.tensor([_wp_xyz],  dtype=torch.float32, device=_dev)
+                _seed_t  = torch.tensor([_prev_js], dtype=torch.float32, device=_dev).unsqueeze(0)
+                _ret_t   = torch.tensor([_prev_js], dtype=torch.float32, device=_dev)
+                _r = node.motion_gen.ik_solver.solve_single(
+                    Pose(position=_pos_t, quaternion=_quat_t),
+                    seed_config=_seed_t, retract_config=_ret_t)
+                if _r.success.item():
+                    _wj = nearest_joint_config(
+                        _prev_js, _r.js_solution.position.squeeze().cpu().tolist())
+                    _wp_js.append(_wj)
+                    _prev_js = _wj
+                else:
+                    _cart_ok = False
+                    node.get_logger().warn(
+                        f"[DIRECT] {label}: Cartesian IK failed at step {_k}/{_N_CART}")
+                    break
+            if _cart_ok:
+                _wp_js.append(best_js)
+                _steps_per = max(3, num_steps // len(_wp_js))
+                for _si in range(len(_wp_js) - 1):
+                    _s0, _s1 = _wp_js[_si], _wp_js[_si + 1]
+                    _is_last = (_si == len(_wp_js) - 2)
+                    _n = _steps_per
+                    for _i in range(_n + 1):
+                        if _i == 0 and _si > 0:
+                            continue  # avoid duplicate at segment boundary
+                        _t = (1.0 - math.cos(math.pi * _i / _n)) / 2.0
+                        states.append([_s0[j] + _t * (_s1[j] - _s0[j]) for j in range(len(_s0))])
+                _states_built = True
+                node.get_logger().info(
+                    f"[DIRECT] {label}: Cartesian IK path — "
+                    f"{len(_wp_js)} waypoints, {len(states)} states")
+        except Exception as _ce:
+            node.get_logger().warn(f"[DIRECT] {label}: Cartesian IK path failed: {_ce}")
+
+    if not _states_built:
+        # Fallback: original single-step joint-space S-curve
+        node.get_logger().info(f"[DIRECT] {label}: fallback to joint-space interpolation")
+        for i in range(num_steps + 1):
+            alpha = i / num_steps
+            t_smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+            wp = [s + t_smooth * (g - s) for s, g in zip(start_js, best_js)]
+            states.append(wp)
 
     # 4) Build slow, smooth trajectory
     planner = node.cfg.planner
@@ -810,6 +911,18 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
                 if dist >= clearance_m:
                     break
 
+    # Prepend actual current joint positions so the trajectory starts exactly where
+    # the robot is now. Any gap between stored final waypoint and actual position
+    # (position error, gripper micro-jolt, etc.) would otherwise cause a jerk at t=0.
+    if node.current_joint_positions is not None:
+        current_pos = list(node.current_joint_positions)
+        max_diff = max(abs(c - f) for c, f in zip(current_pos, partial[0]))
+        if max_diff > 0.002:
+            node.get_logger().info(
+                f"Partial reverse: bridging {max_diff*57.3:.2f}° gap from actual position"
+            )
+            partial = [current_pos] + partial
+
     node.get_logger().info(
         f"Partial reverse: {len(partial)}/{len(reversed_states)} waypoints "
         f"({clearance_m*100:.0f}cm clearance)"
@@ -848,7 +961,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.15, z_tolerance=0.08):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -872,7 +985,7 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
             node.set_vision_mode("full")
 
 
-def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
+def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.15, z_tolerance=0.08):
     # Build seed list: primary first, then candidates
     seeds = [seed_xyz[:3]]
     if candidate_seeds:
@@ -884,7 +997,6 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
     multi = len(seeds) > 1
     stable_needed = 1 if multi else 2
 
-    last_pose = None
     stable_count = 0
     matched_seed = None
     start = time.time()
@@ -908,6 +1020,8 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
         best_seed = None
         best_dist = float('inf')
         pose = None
+        _closest_miss = None   # for diagnostics
+        _closest_miss_d = float('inf')
         for candidate in candidate_poses:
             if candidate is None:
                 continue
@@ -920,8 +1034,27 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                     best_dist = d
                     best_seed = s
                     pose = candidate
+                elif d < _closest_miss_d:
+                    _closest_miss_d = d
+                    _closest_miss = (candidate, s, d_xy, d_z)
 
         if best_seed is None or pose is None:
+            # Log once per second so we can see why reacquire keeps missing
+            _now = time.time()
+            if not hasattr(_reacquire_goal_pose_impl, '_last_miss_log') or \
+                    _now - _reacquire_goal_pose_impl._last_miss_log > 1.0:
+                _reacquire_goal_pose_impl._last_miss_log = _now
+                if _closest_miss is not None:
+                    _cm, _cs, _dxy, _dz = _closest_miss
+                    node.get_logger().warn(
+                        f"[REACQ] No match — closest candidate "
+                        f"[{_cm[0]:.3f},{_cm[1]:.3f},{_cm[2]:.3f}] "
+                        f"seed [{_cs[0]:.3f},{_cs[1]:.3f},{_cs[2]:.3f}] "
+                        f"d_xy={_dxy*100:.1f}cm d_z={_dz*100:.1f}cm "
+                        f"(limit: xy={radius*100:.0f}cm z={z_tolerance*100:.0f}cm)"
+                    )
+                else:
+                    node.get_logger().warn("[REACQ] No candidates visible at all")
             time.sleep(0.001)
             continue
 
@@ -933,20 +1066,14 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
 
         x, y, z = pose
 
-        # Stability check
+        # Stability check: count how many distinct readings land near the seed.
+        # Depth noise is typically 5-20mm so a tight consecutive-delta gate (old 3mm)
+        # would reset on every noisy frame. Instead just count distinct detections.
         if matched_seed != best_seed:
-            # Switched seeds — reset stability
             stable_count = 0
             matched_seed = best_seed
 
-        if last_pose is not None:
-            delta = math.dist(last_pose, pose)
-            if delta < 0.003:
-                stable_count += 1
-            else:
-                stable_count = 0
-
-        last_pose = pose
+        stable_count += 1
 
         if stable_count >= stable_needed:
             node.get_logger().info(
@@ -1463,7 +1590,10 @@ def plan_and_execute(node):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _safe_return_home():
-        """Return to center HOME directly. cuRobo + voxel obstacles handles trunk avoidance."""
+        """Return to center HOME via predropoff to avoid the lower-arm/tool-flange
+        clamping error that occurs on the direct approach→home path."""
+        node.motion_phase = "HOME"
+        move_to_predropoff_position(node)
         move_to_home_position(node)
 
     def _check_stop():
@@ -1556,6 +1686,8 @@ def plan_and_execute(node):
                     side_label = "HOME_RIGHT"
                 node.get_logger().info(
                     f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
+                if node.current_joint_positions is not None:
+                    side_joints = nearest_joint_config(node.current_joint_positions, side_joints)
                 plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
                 is_side_approach = True
                 # Update start state and cur_pose after side HOME
@@ -1614,6 +1746,7 @@ def plan_and_execute(node):
             node.gripper_controller.frozen_fingers = set()  # all 3 fingers active
 
         if skip_approach:
+            node.reacquire_result = ""  # reset at start of each attempt
             pass  # jump straight to reacquire + final below
 
 
@@ -1675,6 +1808,8 @@ def plan_and_execute(node):
                 continue
 
         if not skip_approach:
+            node.reacquire_result = ""  # reset at start of each attempt
+            node.motion_phase = "APPROACH"
             if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
                 unlock_target(node)
                 continue
@@ -1710,6 +1845,9 @@ def plan_and_execute(node):
         if _check_stop(): break
 
         # 2. Reacquire — check primary + all candidate seeds for fastest lock-on
+        node.motion_phase = "REACQUIRE"
+        node.reacquire_result = "SEARCH"   # show live state: searching
+        node._publish_goal_info()          # push immediately — timer blocked during long waits
         seed = [x,y,z]
         candidates = getattr(node, 'candidate_goals', [])
         reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
@@ -1717,20 +1855,29 @@ def plan_and_execute(node):
         if reacq is None:
             # Nudge EE down a few cm and retry — fruit may be just below FOV
             node.get_logger().warn("Reacquire timed out — nudging down to search for detection.")
+            node.reacquire_result = "NUDGING"  # show live state: nudging
+            node._publish_goal_info()          # push immediately
             cur = node.get_end_effector_pose()
             if cur and not _check_stop():
                 nudge = [cur[0], cur[1], cur[2] - 0.02, *cur[3:]]
                 _direct_ik_move(node, nudge, label="REACQ_NUDGE",
                                 motion_type="final", store_trajectory=False)
                 reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0)
-
-        if reacq:
+            if reacq:
+                x,y,z = reacq
+                publish_goal_marker(node, [x,y,z])
+                node.get_logger().info(f"Reacquired after nudge: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                node.reacquire_result = "NUDGE OK"
+            else:
+                node.get_logger().warn("No reacquire after nudge — falling back to original seed.")
+                x, y, z = seed
+                node.reacquire_result = "NUDGE FAIL"
+            node._publish_goal_info()      # push final nudge result immediately
+        else:
             x,y,z = reacq
             publish_goal_marker(node, [x,y,z])
             node.get_logger().info(f"Reacquired goal: [{x:.3f}, {y:.3f}, {z:.3f}]")
-        else:
-            node.get_logger().warn("No reacquire after nudge — falling back to original seed.")
-            x, y, z = seed
+            node.reacquire_result = "OK"
             
         if _check_stop(): break
 
@@ -1756,6 +1903,10 @@ def plan_and_execute(node):
             # Fallback: fixed Y pullback
             gx, gy, gz = x, y + fruit_radius, z + z_offset
         final_target = [gx, gy, gz, *orientation]
+        node.motion_phase = "FINAL"
+        # Suppress heatmap/scoring during final grasp — target is locked, no new selection needed
+        if hasattr(node, 'set_vision_mode'):
+            node.set_vision_mode("reacquire")
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
@@ -1774,6 +1925,8 @@ def plan_and_execute(node):
         if not final_ok:
             # Both attempts failed — skip this goal
             node.get_logger().warn("FINAL IK retry also failed — skipping goal.")
+            if hasattr(node, 'set_vision_mode'):
+                node.set_vision_mode("full")
             unlock_target(node)
             continue
         log_path_deviation(node, "FINAL")
@@ -1781,8 +1934,11 @@ def plan_and_execute(node):
         if _check_stop(): break
         node.control_gripper("CLOSE")
         time.sleep(0.5)
-        if _check_stop(): 
+        if _check_stop():
             break
+        # Restore full vision mode now that the grasp is done
+        if hasattr(node, 'set_vision_mode'):
+            node.set_vision_mode("full")
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
@@ -1881,6 +2037,7 @@ def plan_and_execute(node):
             try_cuda_recovery(node)
 
         # Reverse along the stored approach path (28cm clearance from fruit).
+        node.motion_phase = "REVERSING"
         execute_partial_reverse(node, clearance_m=0.28)
 
         # After partial reverse, return to the correct home position:
@@ -1890,9 +2047,12 @@ def plan_and_execute(node):
             node.get_logger().info("Side approach — returning to center HOME before dropoff")
             _safe_return_home()
 
+        node.motion_phase = "DROPOFF"
         if not move_to_dropoff_position(node):
             node.get_logger().info("Direct dropoff failed, going to center HOME first")
+            node.motion_phase = "HOME"
             _safe_return_home()
+            node.motion_phase = "DROPOFF"
             move_to_dropoff_position(node)
         time.sleep(0.2)
         # Reset 2-finger mode before dropoff open (all fingers active for release)

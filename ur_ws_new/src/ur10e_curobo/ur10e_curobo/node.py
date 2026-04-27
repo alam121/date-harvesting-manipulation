@@ -5,6 +5,7 @@ import rclpy
 import os
 import numpy as np
 import math
+from collections import deque
 
 from rclpy.timer import Timer
 from rclpy.qos import QoSProfile
@@ -138,6 +139,10 @@ class UR10eCuroboMoveIt(Node):
         self.latest_goal_time = 0.0         # timestamp of last valid pos
         self.latest_fruit_radius = None     # estimated fruit radius from vision (meters)
         self.all_fruit_poses = []           # list of [x,y,z] for ALL visible fruits (not just best)
+
+        self.motion_phase: str = "IDLE"                   # current robot phase for GUI
+        self.grasp_history: deque = deque(maxlen=15)      # last 15 grasp outcomes for GUI
+        self.reacquire_result: str = ""                   # "OK" | "NUDGE" | "FAIL" | ""
 
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")
@@ -315,11 +320,11 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().info("Grasp feedback: FAIL")
         elif cmd == "exit":
             self.get_logger().info("Exit requested from GUI — killing all nodes")
-            import os, signal, subprocess
+            import os, signal, subprocess, time as _time
             # Kill the entire launch process group (all terminator panes)
             subprocess.Popen(["pkill", "-f", "ros2"])
             subprocess.Popen(["pkill", "-f", "rviz2"])
-            time.sleep(0.5)
+            _time.sleep(0.5)
             os.kill(os.getpid(), signal.SIGKILL)
         elif cmd == "refresh_main":
             self.get_logger().info("Refresh requested — restarting main node")
@@ -470,6 +475,9 @@ class UR10eCuroboMoveIt(Node):
             "speed_predropoff": self.cfg.planner.speed_predropoff,
             "debug_plan_preview": self.cfg.planner.debug_plan_preview,
             "plan_waiting_confirm": self._state_mgr.plan_waiting,
+            "motion_phase": self.motion_phase,
+            "grasp_history": list(self.grasp_history),
+            "reacquire_result": self.reacquire_result,
         }
         msg = String()
         msg.data = json.dumps(msg_data)

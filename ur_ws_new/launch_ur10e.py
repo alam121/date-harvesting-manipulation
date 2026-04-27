@@ -33,6 +33,7 @@ def get_commands(fake_hardware=False, use_panel=False, use_lidar=False, use_zed_
         "vision": f'sleep 12 && {SOURCE} && ros2 run ur10e_curobo vision{vision_flags}',
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
+        "rqt": f'sleep 8 && {SOURCE} && rqt --force-discover --standalone rqt_ur10e_panel',
         "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
         "hand_eye": f'sleep 4 && {SOURCE} && ros2 run ur10e_curobo hand_eye',
         "lidar": (
@@ -55,6 +56,7 @@ TITLES = {
     "vision": "Vision",
     "teleop": "Teleop",
     "gui": "GUI",
+    "rqt": "RQT Panel",
     "rviz_panel": "RViz+Panel",
     "calibrate": "Calibrate",
     "hand_eye": "Hand-Eye",
@@ -294,7 +296,7 @@ def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False, 
         f.writelines(final_lines)
 
 def main():
-    valid = ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]
+    valid = ["main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye"]
     args = sys.argv[1:]
 
     # Extract modifier flags
@@ -316,6 +318,7 @@ def main():
         print("  vision    - Vision node")
         print("  teleop    - Teleop node")
         print("  gui       - GUI node (standalone PyQt)")
+        print("  rqt       - RQT UR10e panel (auto-added with main)")
         print("  calibrate - Grasp force calibration tool")
         print("  hand_eye  - Hand-eye camera calibration")
         print()
@@ -333,9 +336,9 @@ def main():
     # When main is specified, use panel-integrated RViz
     use_panel = "main" in nodes
 
-    # Reorder: main, vision, teleop, gui, calibrate, hand_eye
+    # Reorder: main, vision, teleop, gui, rqt, calibrate, hand_eye
     ordered = []
-    for n in ["main", "vision", "teleop", "gui", "calibrate", "hand_eye"]:
+    for n in ["main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye"]:
         if n in nodes:
             ordered.append(n)
 

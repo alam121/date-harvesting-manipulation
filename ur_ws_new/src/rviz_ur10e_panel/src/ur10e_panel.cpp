@@ -6,9 +6,13 @@
 #include <QScrollArea>
 #include <QFont>
 #include <QApplication>
+#include <QMessageBox>
 
 #include <cmath>
+#include <csignal>
 #include <sstream>
+#include <unistd.h>
+#include <sys/types.h>
 
 #include <rclcpp/qos.hpp>
 #include <rviz_common/display_context.hpp>
@@ -41,6 +45,70 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   robot_state_label_ = new QLabel("Program: Unknown");
   robot_state_label_->setStyleSheet("font-size: 10pt; padding: 2px;");
   layout->addWidget(robot_state_label_);
+
+  // Motion phase + reacquire result (side by side)
+  auto * phase_row = new QHBoxLayout();
+
+  auto * phase_group = new QGroupBox("Motion Phase");
+  auto * phase_inner = new QVBoxLayout(phase_group);
+  phase_label_ = new QLabel("IDLE");
+  phase_label_->setAlignment(Qt::AlignCenter);
+  phase_label_->setFont(QFont("Helvetica", 13, QFont::Bold));
+  phase_label_->setStyleSheet(
+    "background: #455a64; color: #eceff1; padding: 6px; border-radius: 6px;");
+  phase_inner->addWidget(phase_label_);
+  phase_row->addWidget(phase_group, 3);
+
+  auto * reacq_group = new QGroupBox("Reacquire");
+  auto * reacq_inner = new QVBoxLayout(reacq_group);
+  reacq_label_ = new QLabel("\xe2\x80\x94");  // em dash
+  reacq_label_->setAlignment(Qt::AlignCenter);
+  reacq_label_->setFont(QFont("Helvetica", 13, QFont::Bold));
+  reacq_label_->setStyleSheet(
+    "background: #455a64; color: #eceff1; padding: 6px; border-radius: 6px;");
+  reacq_inner->addWidget(reacq_label_);
+  phase_row->addWidget(reacq_group, 2);
+
+  layout->addLayout(phase_row);
+
+  // Last harvest result banner + session tally
+  auto * harvest_group = new QGroupBox("Last Harvest Result");
+  auto * harvest_vlayout = new QVBoxLayout(harvest_group);
+
+  harvest_banner_ = new QLabel("\xe2\x80\x94");
+  harvest_banner_->setAlignment(Qt::AlignCenter);
+  harvest_banner_->setFont(QFont("Helvetica", 18, QFont::Bold));
+  harvest_banner_->setFixedHeight(48);
+  harvest_banner_->setStyleSheet(
+    "background: #455a64; color: #eceff1; border-radius: 8px;");
+  harvest_vlayout->addWidget(harvest_banner_);
+
+  auto * tally_row = new QHBoxLayout();
+  struct TallyDef { QLabel ** lbl; const char * name; const char * color; };
+  TallyDef tallies[] = {
+    {&grab_count_label_, "Grabbed", "#4caf50"},
+    {&slip_count_label_, "Slipped", "#ff9800"},
+    {&miss_count_label_, "Miss",    "#f44336"},
+    {&total_count_label_,"Total",   "#90a4ae"},
+  };
+  for (auto & t : tallies) {
+    auto * cell = new QWidget();
+    auto * cl = new QVBoxLayout(cell);
+    cl->setSpacing(1);
+    cl->setContentsMargins(2, 2, 2, 2);
+    *t.lbl = new QLabel("0");
+    (*t.lbl)->setAlignment(Qt::AlignCenter);
+    (*t.lbl)->setFont(QFont("Courier", 12, QFont::Bold));
+    (*t.lbl)->setStyleSheet(QString("color: %1;").arg(t.color));
+    cl->addWidget(*t.lbl);
+    auto * name_lbl = new QLabel(t.name);
+    name_lbl->setAlignment(Qt::AlignCenter);
+    name_lbl->setStyleSheet("font-size: 8pt; color: #666;");
+    cl->addWidget(name_lbl);
+    tally_row->addWidget(cell);
+  }
+  harvest_vlayout->addLayout(tally_row);
+  layout->addWidget(harvest_group);
 
   // Emergency Stop
   auto * stop_btn = new QPushButton("EMERGENCY STOP");
@@ -471,6 +539,69 @@ void UR10ePanel::setupRos()
           debug_plan_preview_ = (data.substr(val_start, 4) == "true");
         }
       }
+      // Extract motion_phase
+      pos = data.find("\"motion_phase\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        auto q1 = data.find('"', colon + 1);
+        auto q2 = data.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+          motion_phase_ = data.substr(q1 + 1, q2 - q1 - 1);
+      }
+      // Extract reacquire_result
+      pos = data.find("\"reacquire_result\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        auto q1 = data.find('"', colon + 1);
+        auto q2 = data.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+          reacquire_result_ = data.substr(q1 + 1, q2 - q1 - 1);
+      }
+      // Parse grasp_history array
+      pos = data.find("\"grasp_history\"");
+      if (pos != std::string::npos) {
+        auto bracket = data.find('[', pos);
+        if (bracket != std::string::npos) {
+          int grabbed = 0, slipped = 0, miss = 0;
+          std::string last_outcome, last_end;
+          size_t search = bracket;
+          while (true) {
+            auto ob = data.find('{', search);
+            if (ob == std::string::npos) break;
+            auto cb = data.find('}', ob);
+            if (cb == std::string::npos) break;
+            std::string item = data.substr(ob, cb - ob + 1);
+            std::string outcome, end;
+            auto op = item.find("\"outcome\"");
+            if (op != std::string::npos) {
+              auto oc = item.find(':', op);
+              auto oq1 = item.find('"', oc + 1);
+              auto oq2 = item.find('"', oq1 + 1);
+              if (oq1 != std::string::npos && oq2 != std::string::npos)
+                outcome = item.substr(oq1 + 1, oq2 - oq1 - 1);
+            }
+            auto ep = item.find("\"end\"");
+            if (ep != std::string::npos) {
+              auto ec = item.find(':', ep);
+              auto eq1 = item.find('"', ec + 1);
+              auto eq2 = item.find('"', eq1 + 1);
+              if (eq1 != std::string::npos && eq2 != std::string::npos)
+                end = item.substr(eq1 + 1, eq2 - eq1 - 1);
+            }
+            if (outcome == "GRABBED") grabbed++;
+            else if (outcome == "SLIPPED") slipped++;
+            else if (outcome == "NO_GRAB") miss++;
+            last_outcome = outcome;
+            last_end = end;
+            search = cb + 1;
+          }
+          grab_count_ = grabbed;
+          slip_count_ = slipped;
+          miss_count_ = miss;
+          last_outcome_ = last_outcome;
+          last_end_ = last_end;
+        }
+      }
       // Extract goals array for coordinate display
       pos = data.find("\"goals\"");
       if (pos != std::string::npos) {
@@ -561,7 +692,23 @@ void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
 void UR10ePanel::onSubscribeMulti() { publishCmd("subscribe_multi"); }
 void UR10ePanel::onUpdateVoxel() { publishCmd("update_voxel"); }
-void UR10ePanel::onExit() { publishCmd("exit"); }
+void UR10ePanel::onExit()
+{
+  auto reply = QMessageBox::question(
+    this, "Exit System",
+    "Shut down the entire system (main, vision, RViz)?",
+    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+  if (reply != QMessageBox::Yes) return;
+
+  // 1. Signal all ROS nodes to shut down cleanly
+  publishCmd("exit");
+
+  // 2. Small delay so "exit" message is published before we die
+  QTimer::singleShot(400, this, []() {
+    // Kill the entire process group — takes RViz and all child processes with it
+    ::kill(-::getpgid(0), SIGTERM);
+  });
+}
 void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
 void UR10ePanel::onRefreshCamera() { publishCmd("refresh_camera"); }
 void UR10ePanel::onGraspSuccess() { publishCmd("grasp_success"); }
@@ -616,6 +763,58 @@ void UR10ePanel::onVelocityPreset()
 void UR10ePanel::updateDisplay()
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
+
+  // Motion phase badge
+  {
+    const char * bg = "#455a64", * fg = "#eceff1";
+    if      (motion_phase_ == "APPROACH")  { bg = "#1565c0"; fg = "#e3f2fd"; }
+    else if (motion_phase_ == "REACQUIRE") { bg = "#6a1b9a"; fg = "#f3e5f5"; }
+    else if (motion_phase_ == "FINAL")     { bg = "#e65100"; fg = "#fff3e0"; }
+    else if (motion_phase_ == "REVERSING") { bg = "#558b2f"; fg = "#f1f8e9"; }
+    else if (motion_phase_ == "DROPOFF")   { bg = "#00838f"; fg = "#e0f7fa"; }
+    else if (motion_phase_ == "HOME")      { bg = "#2e7d32"; fg = "#e8f5e9"; }
+    phase_label_->setText(QString::fromStdString(motion_phase_.empty() ? "IDLE" : motion_phase_));
+    phase_label_->setStyleSheet(QString(
+      "background: %1; color: %2; padding: 6px; border-radius: 6px; "
+      "font-size: 13pt; font-weight: bold;").arg(bg).arg(fg));
+  }
+
+  // Reacquire badge
+  {
+    const char * txt = "\xe2\x80\x94", * bg = "#455a64", * fg = "#eceff1";
+    if      (reacquire_result_ == "OK")         { txt = "OK";         bg = "#1b5e20"; fg = "#e8f5e9"; }
+    else if (reacquire_result_ == "SEARCH")     { txt = "SEARCH\xe2\x80\xa6"; bg = "#1565c0"; fg = "#e3f2fd"; }
+    else if (reacquire_result_ == "NUDGING")    { txt = "NUDGING\xe2\x80\xa6"; bg = "#f57f17"; fg = "#fffde7"; }
+    else if (reacquire_result_ == "NUDGE OK")   { txt = "NUDGE OK";  bg = "#33691e"; fg = "#f1f8e9"; }
+    else if (reacquire_result_ == "NUDGE FAIL") { txt = "NUDGE FAIL"; bg = "#b71c1c"; fg = "#ffebee"; }
+    reacq_label_->setText(txt);
+    reacq_label_->setStyleSheet(QString(
+      "background: %1; color: %2; padding: 6px; border-radius: 6px; "
+      "font-size: 13pt; font-weight: bold;").arg(bg).arg(fg));
+  }
+
+  // Harvest result banner + tally
+  {
+    const char * txt = "\xe2\x80\x94", * bg = "#455a64", * fg = "#eceff1";
+    if (!last_outcome_.empty()) {
+      if      (last_outcome_ == "GRABBED" && last_end_ == "PROPER")
+        { txt = "SUCCESS"; bg = "#2e7d32"; fg = "#e8f5e9"; }
+      else if (last_outcome_ == "GRABBED" && last_end_ == "WEAK")
+        { txt = "PARTIAL"; bg = "#e65100"; fg = "#fff3e0"; }
+      else if (last_outcome_ == "SLIPPED")
+        { txt = "SLIPPED"; bg = "#f57f17"; fg = "#fffde7"; }
+      else if (last_outcome_ == "NO_GRAB")
+        { txt = "FAIL";    bg = "#b71c1c"; fg = "#ffebee"; }
+    }
+    harvest_banner_->setText(txt);
+    harvest_banner_->setStyleSheet(QString(
+      "background: %1; color: %2; border-radius: 8px; "
+      "font-size: 18pt; font-weight: bold;").arg(bg).arg(fg));
+    grab_count_label_->setText(QString::number(grab_count_));
+    slip_count_label_->setText(QString::number(slip_count_));
+    miss_count_label_->setText(QString::number(miss_count_));
+    total_count_label_->setText(QString::number(grab_count_ + slip_count_ + miss_count_));
+  }
 
   // Robot state
   robot_state_label_->setText(robot_running_ ? "Program: Running" : "Program: Stopped");

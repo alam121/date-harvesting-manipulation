@@ -65,14 +65,21 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         else:
             # Central-difference velocity: v_i = (q[i+1] - q[i-1]) / (2*dt)
             v = (states_arr[i + 1] - states_arr[i - 1]) / (2.0 * dt)
-            v = np.clip(v, -max_vel, max_vel)
+            # Scale the entire velocity vector proportionally instead of per-joint clipping.
+            # Per-joint clipping changes the velocity direction, making (pos, vel) inconsistent
+            # — the UR controller then computes huge implied accelerations → sanity check fail.
+            v_max_component = float(np.max(np.abs(v)))
+            if v_max_component > max_vel:
+                v = v * (max_vel / v_max_component)
             pt.velocities = v.tolist()
             # Accelerations only for analytically-consistent paths (S-curve).
             # Do NOT set for cuRobo paths: cuRobo's ~10 rad/s² peaks get clipped
             # to max_acc, making (pos, vel, acc) inconsistent → quintic spline jerk.
             if include_acc:
                 a = (states_arr[i + 1] - 2.0 * states_arr[i] + states_arr[i - 1]) / (dt * dt)
-                a = np.clip(a, -max_acc, max_acc)
+                a_max_component = float(np.max(np.abs(a)))
+                if a_max_component > max_acc:
+                    a = a * (max_acc / a_max_component)
                 pt.accelerations = a.tolist()
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)

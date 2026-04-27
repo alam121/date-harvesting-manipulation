@@ -112,6 +112,8 @@ def on_grasp_outcome(node, outcome: str, end: str):
         f"[grasp] outcome={outcome} end={end} slip={node.slip_detection} "
         f"miss={node.grab_miss} weak={node.weak_grab}"
     )
+    if hasattr(node, "grasp_history"):
+        node.grasp_history.append({"outcome": outcome, "end": end})
     if hasattr(node, "visualizer"):
         node.visualizer.update_outcome(outcome)
 

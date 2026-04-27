@@ -31,6 +31,227 @@ except ImportError:
     print("[WARN] Graphs will be disabled.")
 
 
+# ==================== SCORE BAR WIDGET ====================
+
+class ScoreBarWidget(QtWidgets.QWidget):
+    """Horizontal bar chart for fruit detection score components."""
+
+    LABELS = [
+        ("distance",     "Distance",    "#ef5350"),
+        ("visibility",   "Visibility",  "#42a5f5"),
+        ("depth_quality","Depth",       "#66bb6a"),
+        ("confidence",   "Confidence",  "#ffa726"),
+        ("ellipse",      "Shape",       "#ab47bc"),
+        ("center_bias",  "Center",      "#26c6da"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.scores: dict = {}
+        self.setMinimumHeight(115)
+        self.setMaximumHeight(140)
+
+    def update_scores(self, components: dict):
+        self.scores = components
+        self.update()
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        w = self.width()
+        h = self.height()
+
+        if not self.scores:
+            p.setPen(QtGui.QColor("#888"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No detection")
+            return
+
+        n = len(self.LABELS)
+        margin = 3
+        label_w = 62
+        bar_area = w - label_w - margin * 3
+        row_h = max(10, (h - margin * (n + 1)) // n)
+
+        fm = QtGui.QFontMetrics(p.font())
+
+        for i, (key, name, color) in enumerate(self.LABELS):
+            y = margin + i * (row_h + margin)
+            val = float(self.scores.get(key, 0.0))
+            val = max(0.0, min(1.0, val))
+            bar_w = int(bar_area * val)
+
+            # Label
+            p.setPen(QtGui.QColor("#333"))
+            p.drawText(margin, y, label_w, row_h, Qt.AlignVCenter | Qt.AlignLeft, name)
+
+            # Background track
+            bg = QtCore.QRect(label_w + margin, y, bar_area, row_h)
+            p.fillRect(bg, QtGui.QColor("#e0e0e0"))
+
+            # Filled bar
+            if bar_w > 0:
+                p.fillRect(QtCore.QRect(label_w + margin, y, bar_w, row_h), QtGui.QColor(color))
+
+            # Value text
+            val_str = f"{val:.2f}"
+            text_x = label_w + margin + max(bar_w - fm.horizontalAdvance(val_str) - 2, 2)
+            p.setPen(QtGui.QColor("#fff") if bar_w > 30 else QtGui.QColor("#555"))
+            p.drawText(text_x, y, bar_area - (text_x - label_w - margin), row_h,
+                       Qt.AlignVCenter | Qt.AlignLeft, val_str)
+
+
+# ==================== HARVEST RESULT WIDGET ====================
+
+class HarvestResultWidget(QtWidgets.QWidget):
+    """
+    Large banner showing SUCCESS / PARTIAL / SLIPPED / FAIL for the last
+    harvest cycle, plus a session tally bar (grabbed / slipped / miss).
+    """
+
+    RESULT_MAP = {
+        # (outcome, end) -> (label, bg, fg)
+        ("GRABBED", "PROPER"):  ("SUCCESS",  "#2e7d32", "#e8f5e9"),
+        ("GRABBED", "WEAK"):    ("PARTIAL",  "#e65100", "#fff3e0"),
+        ("SLIPPED", "WEAK"):    ("SLIPPED",  "#f57f17", "#fffde7"),
+        ("SLIPPED", ""):        ("SLIPPED",  "#f57f17", "#fffde7"),
+        ("NO_GRAB", ""):        ("FAIL",     "#b71c1c", "#ffebee"),
+    }
+    DEFAULT = ("—",        "#455a64", "#eceff1")
+
+    def __init__(self):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Large result banner
+        self.banner = QtWidgets.QLabel("—")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setFont(QtGui.QFont("Helvetica", 20, QtGui.QFont.Bold))
+        self.banner.setFixedHeight(52)
+        self.banner.setStyleSheet(
+            "background: #455a64; color: #eceff1; border-radius: 8px; letter-spacing: 3px;")
+        layout.addWidget(self.banner)
+
+        # Tally row: grabbed | slipped | miss | total
+        tally_row = QtWidgets.QHBoxLayout()
+        tally_row.setSpacing(6)
+
+        self._tally_labels = {}
+        for key, label, color in [
+            ("grabbed", "Grabbed", "#4caf50"),
+            ("slipped", "Slipped", "#ff9800"),
+            ("miss",    "Miss",    "#f44336"),
+            ("total",   "Total",   "#90a4ae"),
+        ]:
+            cell = QtWidgets.QWidget()
+            cell_layout = QtWidgets.QVBoxLayout(cell)
+            cell_layout.setSpacing(1)
+            cell_layout.setContentsMargins(2, 2, 2, 2)
+
+            count = QtWidgets.QLabel("0")
+            count.setAlignment(Qt.AlignCenter)
+            count.setFont(QtGui.QFont("Courier", 14, QtGui.QFont.Bold))
+            count.setStyleSheet(f"color: {color};")
+            cell_layout.addWidget(count)
+
+            name = QtWidgets.QLabel(label)
+            name.setAlignment(Qt.AlignCenter)
+            name.setStyleSheet("font-size: 8pt; color: #666;")
+            cell_layout.addWidget(name)
+
+            tally_row.addWidget(cell)
+            self._tally_labels[key] = count
+
+        layout.addLayout(tally_row)
+
+    def update_result(self, history: list):
+        """Update banner from last entry and recount session tallies."""
+        if not history:
+            self.banner.setText("—")
+            self.banner.setStyleSheet(
+                "background: #455a64; color: #eceff1; border-radius: 8px; letter-spacing: 3px;")
+            for k in self._tally_labels:
+                self._tally_labels[k].setText("0")
+            return
+
+        # Last grasp
+        last = history[-1]
+        outcome = last.get("outcome", "")
+        end = last.get("end", "")
+        key = (outcome, end)
+        if key not in self.RESULT_MAP:
+            key = (outcome, "")  # try without end
+        label, bg, fg = self.RESULT_MAP.get(key, self.DEFAULT)
+        self.banner.setText(label)
+        self.banner.setStyleSheet(
+            f"background: {bg}; color: {fg}; border-radius: 8px; letter-spacing: 3px;")
+
+        # Tally
+        grabbed = slipped = miss = 0
+        for item in history:
+            o = item.get("outcome", "")
+            if o == "GRABBED":
+                grabbed += 1
+            elif o == "SLIPPED":
+                slipped += 1
+            elif o == "NO_GRAB":
+                miss += 1
+        total = grabbed + slipped + miss
+        self._tally_labels["grabbed"].setText(str(grabbed))
+        self._tally_labels["slipped"].setText(str(slipped))
+        self._tally_labels["miss"].setText(str(miss))
+        self._tally_labels["total"].setText(str(total))
+
+
+# ==================== GRASP OUTCOME DOTS ====================
+
+class GraspOutcomeWidget(QtWidgets.QWidget):
+    """Row of coloured circles showing last N grasp outcomes."""
+
+    COLORS = {
+        ("GRABBED", "PROPER"):  "#4caf50",  # green
+        ("GRABBED", "WEAK"):    "#ffeb3b",  # yellow
+        ("SLIPPED", ""):        "#ff9800",  # orange
+        ("NO_GRAB", ""):        "#f44336",  # red
+    }
+    DEFAULT_COLOR = "#9e9e9e"
+
+    def __init__(self):
+        super().__init__()
+        self.outcomes: list = []
+        self.setFixedHeight(28)
+
+    def update_outcomes(self, outcomes: list):
+        self.outcomes = outcomes[-15:]
+        self.update()
+
+    def _color(self, item):
+        outcome = item.get("outcome", "")
+        end = item.get("end", "")
+        for (o, e), c in self.COLORS.items():
+            if outcome == o and (e == "" or end == e):
+                return c
+        return self.DEFAULT_COLOR
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        if not self.outcomes:
+            p.setPen(QtGui.QColor("#aaa"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No grasps yet")
+            return
+        r = 10
+        gap = 4
+        x = gap
+        for item in self.outcomes:
+            color = QtGui.QColor(self._color(item))
+            p.setBrush(color)
+            p.setPen(QtGui.QColor("#555"))
+            p.drawEllipse(x, (self.height() - r * 2) // 2, r * 2, r * 2)
+            x += r * 2 + gap
+
+
 class UiBridge(Node):
     """ROS bridge that the Qt UI talks to."""
 
@@ -108,6 +329,15 @@ class UiBridge(Node):
             10
         )
 
+        # Fruit score components from vision node
+        self.fruit_score_data: dict = {}
+        self.create_subscription(
+            String,
+            "/vision/fruit_score",
+            self._fruit_score_cb,
+            10
+        )
+
     def _joint_state_cb(self, msg: JointState):
         self.joint_state_data = msg
 
@@ -157,6 +387,12 @@ class UiBridge(Node):
 
     def _calib_check_cb(self, msg: String):
         self.calib_check_result = msg.data
+
+    def _fruit_score_cb(self, msg: String):
+        try:
+            self.fruit_score_data = json.loads(msg.data)
+        except Exception:
+            pass
 
     def publish_velocity_scale(self, scale: float):
         """Send velocity scale command to node."""
@@ -601,7 +837,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # Data storage for graphs
         self.force_history = [deque(maxlen=200), deque(maxlen=200), deque(maxlen=200)]
-        self.joint_history = [deque(maxlen=200) for _ in range(6)]
+        self.joint_history  = [deque(maxlen=200) for _ in range(6)]
+        self.joint_vel_history = [deque(maxlen=200) for _ in range(6)]
         self.time_data = deque(maxlen=200)
         self.elapsed_time = 0.0
 
@@ -841,6 +1078,31 @@ class MainWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setSpacing(6)
 
+        # Motion phase + reacquire result (side by side)
+        phase_row = QtWidgets.QHBoxLayout()
+
+        phase_group = QtWidgets.QGroupBox("Motion Phase")
+        phase_inner = QtWidgets.QVBoxLayout(phase_group)
+        self.phase_label = QtWidgets.QLabel("IDLE")
+        self.phase_label.setAlignment(Qt.AlignCenter)
+        self.phase_label.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        self.phase_label.setStyleSheet(
+            "background: #455a64; color: #eceff1; padding: 8px; border-radius: 6px; letter-spacing: 2px;")
+        phase_inner.addWidget(self.phase_label)
+        phase_row.addWidget(phase_group, stretch=3)
+
+        reacq_group = QtWidgets.QGroupBox("Reacquire")
+        reacq_inner = QtWidgets.QVBoxLayout(reacq_group)
+        self.reacq_label = QtWidgets.QLabel("—")
+        self.reacq_label.setAlignment(Qt.AlignCenter)
+        self.reacq_label.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        self.reacq_label.setStyleSheet(
+            "background: #455a64; color: #eceff1; padding: 8px; border-radius: 6px;")
+        reacq_inner.addWidget(self.reacq_label)
+        phase_row.addWidget(reacq_group, stretch=2)
+
+        layout.addLayout(phase_row)
+
         # Gripper forces (compact)
         gripper_group = QtWidgets.QGroupBox("Gripper Forces")
         gripper_layout = QtWidgets.QHBoxLayout(gripper_group)
@@ -909,6 +1171,40 @@ class MainWindow(QtWidgets.QWidget):
         goals_layout.addWidget(self.current_velocity_label)
         layout.addWidget(goals_group)
 
+        # Fruit score bar chart
+        score_group = QtWidgets.QGroupBox("Fruit Score Components")
+        score_layout = QtWidgets.QVBoxLayout(score_group)
+        score_layout.setContentsMargins(4, 4, 4, 4)
+        self.score_bar = ScoreBarWidget()
+        score_layout.addWidget(self.score_bar)
+        layout.addWidget(score_group)
+
+        # Harvest result banner + session tally
+        result_group = QtWidgets.QGroupBox("Last Harvest Result")
+        result_layout = QtWidgets.QVBoxLayout(result_group)
+        result_layout.setContentsMargins(4, 4, 4, 4)
+        self.harvest_result = HarvestResultWidget()
+        result_layout.addWidget(self.harvest_result)
+        layout.addWidget(result_group)
+
+        # Grasp history dots
+        grasp_group = QtWidgets.QGroupBox("Grasp History (last 15)")
+        grasp_layout = QtWidgets.QVBoxLayout(grasp_group)
+        grasp_layout.setContentsMargins(4, 4, 4, 4)
+        legend_row = QtWidgets.QHBoxLayout()
+        for ltext, lcolor in [("Proper", "#4caf50"), ("Weak", "#ffeb3b"), ("Slipped", "#ff9800"), ("No-grab", "#f44336")]:
+            dot = QtWidgets.QLabel("●")
+            dot.setStyleSheet(f"color: {lcolor}; font-size: 14pt;")
+            legend_row.addWidget(dot)
+            lbl = QtWidgets.QLabel(ltext)
+            lbl.setStyleSheet("font-size: 8pt;")
+            legend_row.addWidget(lbl)
+        legend_row.addStretch()
+        grasp_layout.addLayout(legend_row)
+        self.grasp_dots = GraspOutcomeWidget()
+        grasp_layout.addWidget(self.grasp_dots)
+        layout.addWidget(grasp_group)
+
         # Graphs
         if PYQTGRAPH_AVAILABLE:
             force_graph_group = QtWidgets.QGroupBox("Force History")
@@ -938,6 +1234,24 @@ class MainWindow(QtWidgets.QWidget):
             self.joint_curves = [self.joint_plot.plot(pen=mkPen(color=c, width=1.5)) for c in jcolors]
             joint_graph_layout.addWidget(self.joint_plot)
             layout.addWidget(joint_graph_group)
+
+            jvel_graph_group = QtWidgets.QGroupBox("Joint Velocity History (rad/s)")
+            jvel_graph_layout = QtWidgets.QVBoxLayout(jvel_graph_group)
+
+            self.joint_vel_plot = PlotWidget()
+            self.joint_vel_plot.setBackground('w')
+            self.joint_vel_plot.setLabel('left', 'Vel (rad/s)')
+            self.joint_vel_plot.showGrid(x=True, y=True, alpha=0.3)
+            self.joint_vel_plot.setMaximumHeight(150)
+            self.joint_vel_plot.addLegend(offset=(5, 5))
+
+            jnames = ["Pan", "Lift", "Elbow", "W1", "W2", "W3"]
+            self.joint_vel_curves = [
+                self.joint_vel_plot.plot(pen=mkPen(color=c, width=1.5), name=n)
+                for c, n in zip(jcolors, jnames)
+            ]
+            jvel_graph_layout.addWidget(self.joint_vel_plot)
+            layout.addWidget(jvel_graph_group)
 
         layout.addStretch(1)
         return panel
@@ -974,8 +1288,49 @@ class MainWindow(QtWidgets.QWidget):
             for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
                 self.joint_labels[i].setText(f"{pos:.3f}")
 
-        # Goals
+        # Motion phase badge
         goal_info = self.ros.goal_info_data
+        phase = goal_info.get("motion_phase", "IDLE") if goal_info else "IDLE"
+        phase_colors = {
+            "IDLE":      ("#455a64", "#eceff1"),
+            "APPROACH":  ("#1565c0", "#e3f2fd"),
+            "REACQUIRE": ("#6a1b9a", "#f3e5f5"),
+            "FINAL":     ("#e65100", "#fff3e0"),
+            "REVERSING": ("#558b2f", "#f1f8e9"),
+            "DROPOFF":   ("#00838f", "#e0f7fa"),
+            "HOME":      ("#2e7d32", "#e8f5e9"),
+        }
+        bg, fg = phase_colors.get(phase, ("#455a64", "#eceff1"))
+        self.phase_label.setText(phase)
+        self.phase_label.setStyleSheet(
+            f"background: {bg}; color: {fg}; padding: 8px; border-radius: 6px; "
+            f"letter-spacing: 2px; font-size: 14pt; font-weight: bold;")
+
+        # Reacquire result badge
+        reacq = goal_info.get("reacquire_result", "") if goal_info else ""
+        reacq_style = {
+            "OK":    ("OK",    "#1b5e20", "#e8f5e9"),
+            "NUDGE": ("NUDGE", "#e65100", "#fff3e0"),
+            "FAIL":  ("FAIL",  "#b71c1c", "#ffebee"),
+            "":      ("—",     "#455a64", "#eceff1"),
+        }
+        r_text, r_bg, r_fg = reacq_style.get(reacq, reacq_style[""])
+        self.reacq_label.setText(r_text)
+        self.reacq_label.setStyleSheet(
+            f"background: {r_bg}; color: {r_fg}; padding: 8px; border-radius: 6px; "
+            f"font-size: 14pt; font-weight: bold;")
+
+        # Fruit score bar chart
+        self.score_bar.update_scores(self.ros.fruit_score_data)
+
+        # Harvest result + session tally
+        grasp_history = goal_info.get("grasp_history", []) if goal_info else []
+        self.harvest_result.update_result(grasp_history)
+
+        # Grasp history dots
+        self.grasp_dots.update_outcomes(grasp_history)
+
+        # Goals
         if goal_info:
             self.goal_count_label.setText(f"Goals: {goal_info.get('goal_count', 0)}")
             if goal_info.get("capture_active"):
@@ -1031,10 +1386,16 @@ class MainWindow(QtWidgets.QWidget):
                     self.force_curves[i].setData(list(self.time_data)[-len(self.force_history[i]):], list(self.force_history[i]))
 
             if self.ros.joint_state_data and len(self.ros.joint_state_data.position) >= 6:
+                vels = list(self.ros.joint_state_data.velocity) if self.ros.joint_state_data.velocity else [0.0] * 6
                 for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
                     self.joint_history[i].append(pos)
                     if self.time_data and self.joint_history[i]:
                         self.joint_curves[i].setData(list(self.time_data)[-len(self.joint_history[i]):], list(self.joint_history[i]))
+                for i in range(6):
+                    v = vels[i] if i < len(vels) else 0.0
+                    self.joint_vel_history[i].append(v)
+                    if self.time_data and self.joint_vel_history[i]:
+                        self.joint_vel_curves[i].setData(list(self.time_data)[-len(self.joint_vel_history[i]):], list(self.joint_vel_history[i]))
 
     def _handle_send_goal(self):
         try:

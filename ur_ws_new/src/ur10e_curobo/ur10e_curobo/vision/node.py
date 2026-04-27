@@ -173,6 +173,8 @@ class VisionNode:
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
+        from std_msgs.msg import String as _Str
+        self.score_pub = self.node.create_publisher(_Str, "/vision/fruit_score", 10)
         self.cv_bridge = CvBridge()
 
         depth_frame_count = [0]
@@ -667,10 +669,31 @@ class VisionNode:
                     with self.pub_lock:
                         self.latest_goal_msg = None
 
-                # Build viz entries — skip in reacquire mode
+                # Build viz entries — skip heavy overlays in reacquire mode but still
+                # publish the live frame so the display doesn't freeze.
                 if _reacquire:
                     _t4 = time()
                     self._perf_count = getattr(self, '_perf_count', 0) + 1
+                    # Strip cached heatmap data so the viz thread doesn't draw stale overlays
+                    _HEATMAP_KEYS = ("heatmap", "best_point2d", "best_point2d_smooth",
+                                     "approach_dir", "approach_dir_cam", "approach_axis")
+                    _tgts_lite = [
+                        {k: v for k, v in t.items() if k not in _HEATMAP_KEYS}
+                        for t in targets
+                    ]
+                    try:
+                        _viz_queue.put_nowait((
+                            image_left_ocv.copy(),
+                            _tgts_lite, rejected_targets,
+                            best_idx,
+                            self.yolo_thread.net_fps,
+                            loop_fps,
+                            [],   # no trunk/bunch polygon overlays in reacquire mode
+                            uv_l if use_lidar else None,
+                            pts_cam_l if use_lidar else None,
+                        ))
+                    except queue.Full:
+                        pass
                     continue
 
                 trunk_viz = []
@@ -1135,9 +1158,7 @@ class VisionNode:
             pts_front = pts[in_fruit] if in_fruit.sum() >= 10 else pts[np.argsort(zs)[:max(10, int(0.2 * len(zs)))]]
 
             depth_std = float(np.std(pts_front[:, 2]))
-            if depth_std > 0.05:
-                mark_reject("Depth variance")
-                return None
+            # Don't hard-reject — let depth_quality score handle noisy early frames.
 
             Zc = float(np.median(pts_front[:, 2]))
 
@@ -1243,7 +1264,7 @@ class VisionNode:
             )
             vis_ratio = max(0.0, min(vis_ratio, 1.0))
 
-            if np.count_nonzero(valid) < 30:
+            if np.count_nonzero(valid) < 10:
                 mark_reject("Too few depth pts")
                 return None
 
@@ -1256,10 +1277,10 @@ class VisionNode:
             depth_std = np.std(pts_front[:, 2])
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
-            Z_std = float(np.std(pts_front[:, 2]))
-            if Z_std > 0.05:
-                mark_reject("Depth variance")
-                return None
+            # Don't hard-reject on high depth variance — include as low-quality candidate.
+            # The depth_quality score component will naturally rank it lower until depth
+            # stabilises over the first few frames. Hard-rejecting causes the fruit to
+            # flash between "rejected" and "best" on first appearance.
 
             Xc = float(np.mean(pts_front[:, 0]))
             Yc = float(np.mean(pts_front[:, 1]))
@@ -1874,6 +1895,15 @@ class VisionNode:
             gap_msg = Float32MultiArray()
             gap_msg.data = [1.0 if between_branches else 0.0, float(gap_angle_base)]
             self.gap_info_pub.publish(gap_msg)
+
+            # Publish score components for GUI bar chart
+            score_components = t_best.get("score_components")
+            if score_components:
+                import json as _json
+                from std_msgs.msg import String as _Str
+                sm = _Str()
+                sm.data = _json.dumps({k: round(float(v), 3) for k, v in score_components.items()})
+                self.score_pub.publish(sm)
 
             # Publish heatmap 3D data for goal marker (consumed on subscribe)
             scored_pts = t_best.get("scored_3d_points")

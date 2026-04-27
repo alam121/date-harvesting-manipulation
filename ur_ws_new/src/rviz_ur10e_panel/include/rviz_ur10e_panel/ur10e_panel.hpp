@@ -95,6 +95,13 @@ private:
   std::string calib_check_result_;
   bool plan_waiting_confirm_ = false;
   bool debug_plan_preview_ = true;
+  std::string motion_phase_ = "IDLE";
+  std::string reacquire_result_;
+  std::string last_outcome_;
+  std::string last_end_;
+  int grab_count_ = 0;
+  int slip_count_ = 0;
+  int miss_count_ = 0;
 
   // UI
   QLabel * status_label_;
@@ -114,6 +121,13 @@ private:
   QPushButton * plan_confirm_btn_;
   QPushButton * plan_cancel_btn_;
   QTimer * update_timer_;
+  QLabel * phase_label_;
+  QLabel * reacq_label_;
+  QLabel * harvest_banner_;
+  QLabel * grab_count_label_;
+  QLabel * slip_count_label_;
+  QLabel * miss_count_label_;
+  QLabel * total_count_label_;
 };
 
 }  // namespace rviz_ur10e_panel

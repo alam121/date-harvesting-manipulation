@@ -35,6 +35,7 @@ class RosBridge:
         self.goal_info_data = {}
         self.velocity_scale = 5.0
         self.calib_check_result = None
+        self.fruit_score_data = {}
 
         # Subscribers
         node.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
@@ -43,6 +44,7 @@ class RosBridge:
         node.create_subscription(String, "/goal_info", self._goal_info_cb, 10)
         node.create_subscription(Float32, "/velocity_scale", self._velocity_scale_cb, 10)
         node.create_subscription(String, "/calib_check_result", self._calib_check_cb, 10)
+        node.create_subscription(String, "/vision/fruit_score", self._fruit_score_cb, 10)
 
     def _joint_state_cb(self, msg):
         self.joint_state_data = msg
@@ -67,6 +69,12 @@ class RosBridge:
 
     def _calib_check_cb(self, msg):
         self.calib_check_result = msg.data
+
+    def _fruit_score_cb(self, msg):
+        try:
+            self.fruit_score_data = json.loads(msg.data)
+        except Exception:
+            pass
 
     def publish_cmd(self, cmd: str):
         msg = String()
