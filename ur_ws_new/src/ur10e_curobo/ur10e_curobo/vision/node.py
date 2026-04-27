@@ -87,6 +87,11 @@ class VisionNode:
         # Used to detect cumulative drift (slow moves that never cross the per-frame threshold).
         self._yolo_accepted_cam_t: Optional[np.ndarray] = None
 
+        # Detection mode: "full" (approach) or "reacquire" (lightweight — fruit position only).
+        # Set by the main node via /vision/mode topic.
+        self.detection_mode: str = "full"
+        self._reacquire_frame_skip: int = 0  # frame counter for YOLO throttle in reacquire mode
+
 
         # Target lock
         self.target_lock_position: Optional[List[float]] = None
@@ -216,6 +221,15 @@ class VisionNode:
                 print("Exclusion zones cleared")
 
         self.node.create_subscription(Float32MultiArray, "/exclude_fruit_positions", exclude_cb, 10)
+
+        # Detection mode — "full" (approach) or "reacquire" (lightweight).
+        # Main node publishes to /vision/mode to switch modes on the fly.
+        from std_msgs.msg import String as _String
+        def _mode_cb(msg):
+            mode = msg.data.strip()
+            if mode in ("full", "reacquire"):
+                self.detection_mode = mode
+        self.node.create_subscription(_String, "/vision/mode", _mode_cb, 10)
 
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
@@ -489,7 +503,12 @@ class VisionNode:
                     zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU,
                                        sl.Resolution(disp_w, disp_h))
                 np.copyto(image_left_ocv, image_left.get_data())
-                self.yolo_thread.set_image(image_left.get_data())
+                # In reacquire mode send frames to YOLO only every 3rd iteration —
+                # we only need position confirmation, not rapid scene updates.
+                _reacquire = self.detection_mode == "reacquire"
+                self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
+                if not _reacquire or self._reacquire_frame_skip == 0:
+                    self.yolo_thread.set_image(image_left.get_data())
                 _t1 = time()
 
                 # Refresh per-frame TF cache — one lookup per frame instead of
@@ -609,8 +628,12 @@ class VisionNode:
                 targets = self.tracker.stabilize_detections(targets)
                 _tp1 = time()
 
-                # Publish trunk position every 5 frames — pole doesn't move frame-to-frame
-                if self._heatmap_frame_count % 5 == 0:
+                # --- mode-gated operations -------------------------------------------
+                # "full" mode  : all operations (approach, scoring, heatmap, viz)
+                # "reacquire"  : fruit positions only — skip trunk, heatmap direction, viz
+
+                # Publish trunk position every 5 frames — skip in reacquire mode
+                if not _reacquire and self._heatmap_frame_count % 5 == 0:
                     self._publish_trunk_position(
                         trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                         pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
@@ -621,8 +644,8 @@ class VisionNode:
                 best_idx = self._select_best_fruit(targets)
                 _tp3 = time()
 
-                # Compute approach direction and publish
-                if best_idx is not None:
+                # Compute approach direction and publish — skip in reacquire mode
+                if best_idx is not None and not _reacquire:
                     self._process_best_target(targets, best_idx, intrinsics)
                 _tp4 = time()
 
@@ -644,7 +667,12 @@ class VisionNode:
                     with self.pub_lock:
                         self.latest_goal_msg = None
 
-                # Build viz entries for trunk and bunch bboxes (display only)
+                # Build viz entries — skip in reacquire mode
+                if _reacquire:
+                    _t4 = time()
+                    self._perf_count = getattr(self, '_perf_count', 0) + 1
+                    continue
+
                 trunk_viz = []
                 for bx1, by1, bx2, by2 in trunk_boxes:
                     tx1 = max(0, min(int(bx1 * image_scale[0]), image_left_ocv.shape[1] - 1))
@@ -1409,6 +1437,12 @@ class VisionNode:
 
         target["between_branches"] = True
         target["gap_angle_cam"] = float(gap_angle)
+        # Store raw ring data so visualization can draw the sample points
+        target["_ring_debug"] = {
+            "cx": cx_img, "cy": cy_img, "r": ring_r,
+            "blocked": blocked, "n_samples": n_samples,
+            "gap_angle": gap_angle,
+        }
 
     def _fit_ellipse(self, mask_clean: np.ndarray) -> tuple:
         """Fit ellipse to mask and extract short axis."""

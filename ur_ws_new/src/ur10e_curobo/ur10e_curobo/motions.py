@@ -225,6 +225,7 @@ def plan_execute_js(
         states,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
+        max_vel=math.pi,  # UR10e physical joint limit; prevents clipping cuRobo's natural velocities
     )
 
     node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
@@ -241,12 +242,33 @@ def plan_execute_js(
 
 
 
+def nearest_joint_config(current: List[float], target: List[float]) -> List[float]:
+    """Return the joint angles equivalent to `target` that are closest to `current`.
+
+    For each joint, picks the value in {target[i] + k*2π | k ∈ ℤ} that minimises
+    |current[i] - target[i]|. This prevents cuRobo from routing through a 360°
+    detour when the stored config and the current config have drifted by ≈2π.
+    """
+    out = []
+    for c, t in zip(current, target):
+        diff = c - t
+        k = round(diff / (2 * math.pi))
+        out.append(t + k * 2 * math.pi)
+    return out
+
+
 def move_to_home_position(node):
-    return plan_execute_js(node, node.home_joints, label="HOME", motion_type="home")
+    target = node.home_joints
+    if node.current_joint_positions is not None:
+        target = nearest_joint_config(node.current_joint_positions, target)
+    return plan_execute_js(node, target, label="HOME", motion_type="home")
 
 
 def move_to_dropoff_position(node):
-    return plan_execute_js(node, node.dropoff_joints, label="DROP-OFF", motion_type="dropoff")
+    target = node.dropoff_joints
+    if node.current_joint_positions is not None:
+        target = nearest_joint_config(node.current_joint_positions, target)
+    return plan_execute_js(node, target, label="DROP-OFF", motion_type="dropoff")
 
 
 def preplan_js(node, target_joints: List[float], start_joints: List[float],
@@ -289,7 +311,10 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
  
 
 def move_to_predropoff_position(node):
-    plan_execute_js(node, node.predropoff_joints, label="preDROP-OFF", motion_type="predropoff")
+    target = node.predropoff_joints
+    if node.current_joint_positions is not None:
+        target = nearest_joint_config(node.current_joint_positions, target)
+    plan_execute_js(node, target, label="preDROP-OFF", motion_type="predropoff")
 
 
 def rotate_wrist(node, degrees: float,

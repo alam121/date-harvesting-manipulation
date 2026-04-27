@@ -81,6 +81,7 @@ class UR10eCuroboMoveIt(Node):
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
+        self._vision_mode_pub = self.create_publisher(String, "/vision/mode", 10)
         self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
 
         # Timer to publish goal info periodically
@@ -168,6 +169,12 @@ class UR10eCuroboMoveIt(Node):
         # Voxel obstacles subscribe to /zed_depth_pointcloud from that node
 
         # Note: Teleop state, subscription, and timer moved to MotionExecutor
+
+    def set_vision_mode(self, mode: str):
+        """Switch the vision node between 'full' (approach) and 'reacquire' modes."""
+        msg = String()
+        msg.data = mode
+        self._vision_mode_pub.publish(msg)
 
     def reset_goal_tracking(self):
         """Reset all goal tracking state for a fresh cycle."""

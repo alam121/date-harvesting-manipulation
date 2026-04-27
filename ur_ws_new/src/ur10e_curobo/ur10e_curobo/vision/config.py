@@ -14,7 +14,7 @@ DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_small_zedone4k_3classes.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.1          # confidence threshold (lower = more detections)

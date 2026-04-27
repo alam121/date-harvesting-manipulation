@@ -218,6 +218,7 @@ class VisionVisualizer:
         if is_best:
             self._draw_approach_arrows(image, target, cx, cy, x1, y1, w_roi, h_roi)
 
+
         # Draw labels
         self._draw_target_labels(image, target, cx, cy, is_best, idx)
 

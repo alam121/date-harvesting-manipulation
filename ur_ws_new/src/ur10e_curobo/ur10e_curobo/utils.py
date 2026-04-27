@@ -30,7 +30,8 @@ def read_key(timeout=0.1):
 
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float = 0.1, dt: float = 0.02,
                      stop_flag: Optional[Callable[[], bool]] = None,
-                     max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8) -> JointTrajectory:
+                     max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8,
+                     include_acc: bool = False) -> JointTrajectory:
     """
     Build a simple trajectory — positions + constant dt only.
     cuRobo already handles velocity profiling in its interpolated plan.
@@ -66,10 +67,13 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
             v = (states_arr[i + 1] - states_arr[i - 1]) / (2.0 * dt)
             v = np.clip(v, -max_vel, max_vel)
             pt.velocities = v.tolist()
-            # Second central-difference acceleration: a_i = (q[i+1] - 2*q[i] + q[i-1]) / dt^2
-            a = (states_arr[i + 1] - 2.0 * states_arr[i] + states_arr[i - 1]) / (dt * dt)
-            a = np.clip(a, -max_acc, max_acc)
-            pt.accelerations = a.tolist()
+            # Accelerations only for analytically-consistent paths (S-curve).
+            # Do NOT set for cuRobo paths: cuRobo's ~10 rad/s² peaks get clipped
+            # to max_acc, making (pos, vel, acc) inconsistent → quintic spline jerk.
+            if include_acc:
+                a = (states_arr[i + 1] - 2.0 * states_arr[i] + states_arr[i - 1]) / (dt * dt)
+                a = np.clip(a, -max_acc, max_acc)
+                pt.accelerations = a.tolist()
         pt.time_from_start.sec = int(t)
         pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
         msg.points.append(pt)

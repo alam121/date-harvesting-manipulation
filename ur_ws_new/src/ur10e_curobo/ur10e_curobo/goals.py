@@ -419,7 +419,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             stop_flag=lambda: node.stop_requested,
                             max_vel=planner.max_joint_velocity * 0.5,
                             max_acc=planner.max_joint_acceleration * 0.3,
-                            ramp_points=0)
+                            ramp_points=0, include_acc=True)
     if node.stop_requested:
         node.stop_requested = False; return False
 
@@ -859,6 +859,20 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
         candidate_seeds: list of [x,y,z,...] alternate candidates (optional)
         timeout: max wait time (default 1.5s, reduced from 3s)
     """
+    # Switch vision to lightweight mode: no heatmap, no trunk, no viz
+    if hasattr(node, 'set_vision_mode'):
+        node.set_vision_mode("reacquire")
+
+    try:
+        return _reacquire_goal_pose_impl(
+            node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance)
+    finally:
+        # Always restore full mode so the next approach cycle works normally
+        if hasattr(node, 'set_vision_mode'):
+            node.set_vision_mode("full")
+
+
+def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
     # Build seed list: primary first, then candidates
     seeds = [seed_xyz[:3]]
     if candidate_seeds:
@@ -1713,6 +1727,7 @@ def plan_and_execute(node):
         if reacq:
             x,y,z = reacq
             publish_goal_marker(node, [x,y,z])
+            node.get_logger().info(f"Reacquired goal: [{x:.3f}, {y:.3f}, {z:.3f}]")
         else:
             node.get_logger().warn("No reacquire after nudge — falling back to original seed.")
             x, y, z = seed
@@ -1764,8 +1779,10 @@ def plan_and_execute(node):
         log_path_deviation(node, "FINAL")
 
         if _check_stop(): break
-        node.control_gripper("CLOSE"); time.sleep(0.5)
-        if _check_stop(): break
+        node.control_gripper("CLOSE")
+        time.sleep(0.5)
+        if _check_stop(): 
+            break
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
