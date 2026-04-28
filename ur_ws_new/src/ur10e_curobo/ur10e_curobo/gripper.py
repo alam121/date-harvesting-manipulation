@@ -7,8 +7,8 @@ from ur_msgs.srv import SetIO
 import time
 
 # Gripper aperture constants (meters)
-GRIPPER_MAX_APERTURE = 0.080   # 80mm total opening at full open
-APERTURE_MARGIN = 0.025        # 15mm extra clearance beyond fruit diameter
+GRIPPER_MAX_APERTURE = 0.070   # 80mm total opening at full open
+APERTURE_MARGIN = 0.020        # 15mm extra clearance beyond fruit diameter
 
 
 # ============================================================

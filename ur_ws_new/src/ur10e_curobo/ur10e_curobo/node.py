@@ -478,6 +478,10 @@ class UR10eCuroboMoveIt(Node):
             "motion_phase": self.motion_phase,
             "grasp_history": list(self.grasp_history),
             "reacquire_result": self.reacquire_result,
+            "gripper_stopped_early": getattr(getattr(self, 'gripper_controller', None), 'closure_stopped_early', False),
+            "gripper_first_contact": getattr(getattr(self, 'gripper_controller', None), 'closure_first_contact_step', -1),
+            "gripper_steps": getattr(getattr(self, 'gripper_controller', None), 'steps', 10),
+            "gripper_closure_step": getattr(getattr(self, 'gripper_controller', None), 'closure_step_stopped', -1),
         }
         msg = String()
         msg.data = json.dumps(msg_data)

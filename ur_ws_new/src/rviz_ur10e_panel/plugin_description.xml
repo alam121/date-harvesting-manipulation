@@ -9,4 +9,9 @@
          base_class_type="rviz_common::Panel">
     <description>ROS log output panel (filtered)</description>
   </class>
+  <class name="rviz_ur10e_panel/GripperPanel"
+         type="rviz_ur10e_panel::GripperPanel"
+         base_class_type="rviz_common::Panel">
+    <description>Visual gripper state — finger contact, forces, phase</description>
+  </class>
 </library>

@@ -427,7 +427,7 @@ class VisionNode:
         display_resolution = sl.Resolution(disp_w, disp_h)
         image_left_ocv = np.full((disp_h, disp_w, 4), [245, 239, 239, 255], np.uint8)
         image_scale = [disp_w / cam_w, disp_h / cam_h]
-        display_scale = 1.0
+        display_scale = 0.5
         image_left = sl.Mat()
         runtime_params = sl.RuntimeParameters()
         obj_runtime_param = sl.CustomObjectDetectionRuntimeParameters() if not use_mono_depth else None
@@ -456,6 +456,7 @@ class VisionNode:
                     continue
                 img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps, viz_only, uv_lidar, pts_lidar = frame_data
                 try:
+                    _vt0 = time()
                     display_image = self.visualizer.render_frame(
                         img_ocv, tgts, rej_tgts,
                         b_idx, net_fps, l_fps,
@@ -463,13 +464,26 @@ class VisionNode:
                         lidar_uv=uv_lidar,
                         lidar_pts_cam=pts_lidar,
                     )
+                    _vt1 = time()
                     if len(display_image.shape) == 3 and display_image.shape[2] == 4:
                         pub_image = cv2.cvtColor(display_image, cv2.COLOR_BGRA2BGR)
                     else:
                         pub_image = display_image
+                    _vt2 = time()
                     img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
+                    _vt3 = time()
                     img_msg.header.stamp = self.node.get_clock().now().to_msg()
                     self.image_pub.publish(img_msg)
+                    _vt4 = time()
+                    _viz_count = getattr(self, '_viz_perf_count', 0) + 1
+                    self._viz_perf_count = _viz_count
+                    if _viz_count % 20 == 0:
+                        print(f"[VIZ_PERF] render={(_vt1-_vt0)*1000:.0f}ms  "
+                              f"cvt={(_vt2-_vt1)*1000:.0f}ms  "
+                              f"encode={(_vt3-_vt2)*1000:.0f}ms  "
+                              f"publish={(_vt4-_vt3)*1000:.0f}ms  "
+                              f"total={(_vt4-_vt0)*1000:.0f}ms  "
+                              f"img={pub_image.shape[1]}x{pub_image.shape[0]}")
                 except Exception as e:
                     if not getattr(self, '_img_pub_err_logged', False):
                         print(f"[WARN] Failed to publish vision image: {e}")
@@ -484,6 +498,8 @@ class VisionNode:
             trunk_boxes  = []
             bunch_boxes  = []
             _YOLO_STALE_DRIFT = 0.003  # 3 mm — discard cached dets if camera drifted this far
+            _last_raw_viz_t = 0.0      # wall time of last raw-frame viz enqueue
+            _RAW_VIZ_MIN_INTERVAL = 0.066  # max ~15fps raw frames (~1 camera frame)
 
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
@@ -554,7 +570,16 @@ class VisionNode:
                     # Record where the camera was when this result was accepted
                     self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
                 elif current_dets is None:
-                    continue  # no cached dets yet — wait for first YOLO result
+                    # No YOLO result yet — publish raw frame so display stays live.
+                    _now = time()
+                    if _now - _last_raw_viz_t >= _RAW_VIZ_MIN_INTERVAL:
+                        try:
+                            _viz_queue.put_nowait((image_left_ocv.copy(), [], [], None,
+                                                   self.yolo_thread.net_fps, loop_fps, [], None, None))
+                            _last_raw_viz_t = _now
+                        except queue.Full:
+                            pass
+                    continue
                 else:
                     # Cumulative-drift check: discard cached dets if camera has drifted
                     # since the last accepted YOLO result (handles slow/incremental moves
@@ -562,6 +587,15 @@ class VisionNode:
                     if (_cur_t_now is not None and self._yolo_accepted_cam_t is not None and
                             float(np.linalg.norm(_cur_t_now - self._yolo_accepted_cam_t)) > _YOLO_STALE_DRIFT):
                         current_dets = None
+                        # Camera has moved — publish raw frame so display stays live during motion.
+                        _now = time()
+                        if _now - _last_raw_viz_t >= _RAW_VIZ_MIN_INTERVAL:
+                            try:
+                                _viz_queue.put_nowait((image_left_ocv.copy(), [], [], None,
+                                                       self.yolo_thread.net_fps, loop_fps, [], None, None))
+                                _last_raw_viz_t = _now
+                            except queue.Full:
+                                pass
                         continue
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 

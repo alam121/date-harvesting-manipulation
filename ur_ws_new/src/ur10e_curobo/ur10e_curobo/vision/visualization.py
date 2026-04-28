@@ -21,6 +21,27 @@ class VisionVisualizer:
         self.intrinsics = intrinsics
         self.image_scale = image_scale
         self.display_scale = display_scale
+        self._s = 1.0  # active draw scale, set per-frame in render_frame
+
+    # ------------------------------------------------------------------
+    # Helpers that respect the active draw scale
+    # ------------------------------------------------------------------
+
+    def _thick(self, base: int) -> int:
+        """Scale a line/border thickness."""
+        return max(1, round(base * self._s))
+
+    def _font(self, base: float) -> float:
+        """Scale a putText fontScale."""
+        return max(0.25, base * self._s)
+
+    def _radius(self, base: int) -> int:
+        """Scale a circle radius."""
+        return max(1, round(base * self._s))
+
+    def _len(self, base: float) -> float:
+        """Scale a pixel length (arrow, offset, etc.)."""
+        return base * self._s
 
     def draw_rejected_targets(
         self,
@@ -38,16 +59,16 @@ class VisionVisualizer:
                 if roi.size:
                     gray_patch = np.full_like(roi, 128)
                     image[y1:y2, x1:x2] = cv2.addWeighted(gray_patch, 0.45, roi, 0.55, 0.0)
-            cv2.rectangle(image, (x1, y1), (x2, y2), (150, 150, 150, 255), 2)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (150, 150, 150, 255), self._thick(2))
             if rej.get("reason"):
                 cv2.putText(
                     image,
                     f"REJECT: {rej['reason']}",
-                    (x1 + 6, y1 + 18),
+                    (x1 + 6, y1 + round(self._len(18))),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    self._font(0.5),
                     (180, 180, 180, 255),
-                    1,
+                    self._thick(1),
                     cv2.LINE_AA,
                 )
 
@@ -72,12 +93,10 @@ class VisionVisualizer:
             other_centroid = np.array([t["Xc"], t["Yc"], t["Zc"]])
             x1o, y1o, x2o, y2o = t["bb"]
 
-            # Check if this fruit blocks the approach path
             is_blocking = False
             if approach_dir is not None:
                 to_other = other_centroid - best_centroid
                 dist_to_other = np.linalg.norm(to_other)
-
                 if dist_to_other > 0.01:
                     proj_dist = np.dot(to_other, approach_dir)
                     if proj_dist > 0 and proj_dist < APPROACH_CHECK_DIST:
@@ -87,32 +106,30 @@ class VisionVisualizer:
                         if perp_dist < other_radius * 2:
                             is_blocking = True
 
-            # Apply transparent overlay based on blocking status
             if x2o > x1o and y2o > y1o:
                 roi = image[y1o:y2o, x1o:x2o]
                 if roi.size:
                     h_roi, w_roi = roi.shape[:2]
                     if is_blocking:
                         red_overlay = np.zeros((h_roi, w_roi, 4), dtype=np.uint8)
-                        red_overlay[:, :, 2] = 180  # Red channel
-                        red_overlay[:, :, 3] = 100  # Alpha
+                        red_overlay[:, :, 2] = 180
+                        red_overlay[:, :, 3] = 100
                         blended = cv2.addWeighted(red_overlay, 0.4, roi, 0.6, 0.0)
                         image[y1o:y2o, x1o:x2o] = blended
 
-                        # Draw line from best fruit to blocking fruit
                         best_2d = project_point_to_image(best_centroid, self.intrinsics, self.image_scale)
                         other_2d = project_point_to_image(other_centroid, self.intrinsics, self.image_scale)
                         if best_2d and other_2d:
-                            cv2.line(image, best_2d, other_2d, (0, 0, 200, 255), 2, cv2.LINE_AA)
+                            cv2.line(image, best_2d, other_2d, (0, 0, 200, 255), self._thick(2), cv2.LINE_AA)
 
                         cv2.putText(
                             image,
                             "BLOCKED",
-                            (x1o + 5, y1o + 15),
+                            (x1o + round(self._len(5)), y1o + round(self._len(15))),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4,
+                            self._font(0.4),
                             (0, 0, 255, 255),
-                            1,
+                            self._thick(1),
                             cv2.LINE_AA,
                         )
 
@@ -126,8 +143,6 @@ class VisionVisualizer:
         """Draw a single target with mask, bbox, and annotations."""
         x1, y1, x2, y2 = target["bb"]
         mask_resized = target["mask_resized"]
-        Xc = target["Xc"]
-        Yc = target["Yc"]
         Zc = target["Zc"]
 
         # Overlay mask
@@ -141,7 +156,7 @@ class VisionVisualizer:
             blended = cv2.addWeighted(colored_mask, 0.45, roi, 0.55, 0.0)
             image[y1:y2, x1:x2] = blended
 
-            # LiDAR depth dot overlay (when lidar mode active)
+            # LiDAR depth dot overlay
             lidar_depth_uv = target.get("lidar_depth_uv")
             lidar_depths = target.get("lidar_depths")
             if lidar_depth_uv is not None and lidar_depths is not None and len(lidar_depths) > 0:
@@ -153,11 +168,10 @@ class VisionVisualizer:
                     py = int(round(uy)) + y1
                     if 0 <= px < image.shape[1] and 0 <= py < image.shape[0]:
                         t = float(np.clip((z - z_near) / z_range, 0.0, 1.0))
-                        # Jet-like: close=red, mid=green, far=blue
                         r = int(255 * max(0.0, 1.0 - 2 * t))
                         g = int(255 * (1.0 - abs(2 * t - 1.0)))
                         b = int(255 * max(0.0, 2 * t - 1.0))
-                        cv2.circle(image, (px, py), 4, (b, g, r, 255), -1)
+                        cv2.circle(image, (px, py), self._radius(4), (b, g, r, 255), -1)
 
             # Heatmap overlay for BEST target
             if is_best:
@@ -179,47 +193,42 @@ class VisionVisualizer:
         except Exception as e:
             print(f"[WARN] Mask overlay failed: {e}")
 
-        # Draw bounding box
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0, 255), 2)
+        # Bounding box
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0, 255), self._thick(2))
 
-        # 2D centroid
+        # 2D centroid dot
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
 
-        # Color: best = BLUE, top-3 candidates = YELLOW, others = RED
         candidate_rank = target.get("candidate_rank")
         if is_best:
-            color = (255, 0, 0, 255)  # blue
-            radius = 7
+            color = (255, 0, 0, 255)
+            radius = self._radius(7)
         elif candidate_rank is not None:
-            color = (0, 255, 255, 255)  # yellow for top-3 candidates
-            radius = 6
+            color = (0, 255, 255, 255)
+            radius = self._radius(6)
         else:
-            color = (0, 0, 255, 255)  # red
-            radius = 5
+            color = (0, 0, 255, 255)
+            radius = self._radius(5)
 
         cv2.circle(image, (cx, cy), radius, color, -1)
 
-        # Draw rank label for top-3 candidates
         if candidate_rank is not None:
             rank_color = (255, 0, 0, 255) if is_best else (0, 255, 255, 255)
             cv2.putText(
                 image,
                 f"#{candidate_rank}",
-                (cx - 15, cy - 15),
+                (cx - round(self._len(15)), cy - round(self._len(15))),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                self._font(0.6),
                 rank_color,
-                2,
+                self._thick(2),
                 cv2.LINE_AA,
             )
 
-        # Draw approach axis for best target
         if is_best:
             self._draw_approach_arrows(image, target, cx, cy, x1, y1, w_roi, h_roi)
 
-
-        # Draw labels
         self._draw_target_labels(image, target, cx, cy, is_best, idx)
 
     def _draw_approach_arrows(
@@ -241,17 +250,16 @@ class VisionVisualizer:
                 vx /= n
                 vy /= n
 
-            L = 60
+            L = self._len(60)
             ax2 = int(cx + vx * L)
             ay2 = int(cy + vy * L)
             ax1 = int(cx - vx * L)
             ay1 = int(cy - vy * L)
 
             axis_color = (0, 255, 255, 255)
-            cv2.arrowedLine(image, (cx, cy), (ax2, ay2), axis_color, 2, tipLength=0.25)
-            cv2.line(image, (cx, cy), (ax1, ay1), axis_color, 2)
+            cv2.arrowedLine(image, (cx, cy), (ax2, ay2), axis_color, self._thick(2), tipLength=0.25)
+            cv2.line(image, (cx, cy), (ax1, ay1), axis_color, self._thick(2))
 
-        # Show best heatmap peak direction (orange)
         peak_pt = target.get("best_point2d_smooth")
         if peak_pt is None:
             peak_pt = target.get("best_point2d")
@@ -269,29 +277,25 @@ class VisionVisualizer:
             dx /= n
             dy /= n
 
-            L_out = max(w_roi, h_roi) + 10.0
+            L_out = max(w_roi, h_roi) + self._len(10)
             start_x = int(round(dest_x - dx * L_out))
             start_y = int(round(dest_y - dy * L_out))
             start_x = max(0, min(start_x, image.shape[1] - 1))
             start_y = max(0, min(start_y, image.shape[0] - 1))
-            axis_color = (0, 165, 255, 255)  # orange
-            cv2.arrowedLine(image, (start_x, start_y), (dest_x, dest_y), axis_color, 2, tipLength=0.25)
+            cv2.arrowedLine(image, (start_x, start_y), (dest_x, dest_y),
+                            (0, 165, 255, 255), self._thick(2), tipLength=0.25)
 
-        # Draw raw surface normal arrow (cyan, thin)
-        # Origin is always bbox center (cx,cy) — avoids frame mismatch when
-        # Xc/Yc/Zc are in ZED Mini frame but intrinsics are ZED One.
         surface_normal = target.get("surface_normal")
         if surface_normal is not None:
             Zc = target["Zc"]
             if Zc > 0:
                 fx, fy = self.intrinsics["fx"], self.intrinsics["fy"]
                 sx, sy = self.image_scale
-                du = int(fx * surface_normal[0] / Zc * 0.06 * sx)
-                dv = int(fy * surface_normal[1] / Zc * 0.06 * sy)
-                sn_end_2d = (cx + du, cy + dv)
-                cv2.arrowedLine(image, (cx, cy), sn_end_2d, (255, 255, 0, 255), 1, tipLength=0.3)
+                du = int(fx * surface_normal[0] / Zc * 0.06 * sx * self._s)
+                dv = int(fy * surface_normal[1] / Zc * 0.06 * sy * self._s)
+                cv2.arrowedLine(image, (cx, cy), (cx + du, cy + dv),
+                                (255, 255, 0, 255), self._thick(1), tipLength=0.3)
 
-        # Draw 3D approach direction arrow (magenta, thick)
         approach_dir_cam = target.get("approach_dir_cam")
         if approach_dir_cam is not None:
             Zc = target["Zc"]
@@ -299,12 +303,11 @@ class VisionVisualizer:
                 fx, fy = self.intrinsics["fx"], self.intrinsics["fy"]
                 sx, sy = self.image_scale
                 arrow_len_3d = 0.10
-                du = int(fx * approach_dir_cam[0] / Zc * arrow_len_3d * sx)
-                dv = int(fy * approach_dir_cam[1] / Zc * arrow_len_3d * sy)
-                dir_end_2d = (cx + du, cy + dv)
-                cv2.arrowedLine(image, (cx, cy), dir_end_2d, (255, 0, 255, 255), 3, tipLength=0.25)
+                du = int(fx * approach_dir_cam[0] / Zc * arrow_len_3d * sx * self._s)
+                dv = int(fy * approach_dir_cam[1] / Zc * arrow_len_3d * sy * self._s)
+                cv2.arrowedLine(image, (cx, cy), (cx + du, cy + dv),
+                                (255, 0, 255, 255), self._thick(3), tipLength=0.25)
 
-                # Show clearance info
                 clearance = target.get("clearance", float('inf'))
                 is_clear = target.get("is_collision_free", True)
                 if clearance < float('inf'):
@@ -313,11 +316,11 @@ class VisionVisualizer:
                     cv2.putText(
                         image,
                         clr_text,
-                        (target["bb"][0], target["bb"][1] - 10),
+                        (target["bb"][0], target["bb"][1] - round(self._len(10))),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
+                        self._font(0.4),
                         clr_color,
-                        2 if not is_clear else 1,
+                        self._thick(2) if not is_clear else self._thick(1),
                         cv2.LINE_AA,
                     )
 
@@ -332,65 +335,54 @@ class VisionVisualizer:
         """Draw labels and stats for a target."""
         if idx >= 0:
             x1, y1 = target["bb"][0], target["bb"][1]
-            cv2.putText(image, str(idx), (x1 + 4, y1 + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 0, 255), 3, cv2.LINE_AA)
+            cv2.putText(image, str(idx), (x1 + round(self._len(4)), y1 + round(self._len(40))),
+                        cv2.FONT_HERSHEY_SIMPLEX, self._font(1.6), (255, 255, 0, 255),
+                        self._thick(3), cv2.LINE_AA)
         if is_best:
             cv2.putText(
                 image,
                 "BEST",
-                (cx + 10, cy - 10),
+                (cx + round(self._len(10)), cy - round(self._len(10))),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.8,
+                self._font(1.8),
                 (255, 0, 0, 255),
-                3,
+                self._thick(3),
                 cv2.LINE_AA,
             )
-            dist_grip = target.get("dist", 0.0)
-            total_score = target.get("score", 0.0)
-            cv2.putText(
-                image,
-                f"D:{dist_grip:.2f}m S:{total_score:.2f}",
-                (cx + 10, cy + 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.3,
-                (0, 255, 0, 255),
-                3,
-                cv2.LINE_AA,
-            )
-        else:
-            dist_grip = target.get("dist", 0.0)
-            total_score = target.get("score", 0.0)
-            cv2.putText(
-                image,
-                f"D:{dist_grip:.2f}m S:{total_score:.2f}",
-                (cx + 10, cy + 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.3,
-                (200, 200, 200, 255),
-                3,
-                cv2.LINE_AA,
-            )
+        dist_grip = target.get("dist", 0.0)
+        total_score = target.get("score", 0.0)
+        color = (0, 255, 0, 255) if is_best else (200, 200, 200, 255)
+        cv2.putText(
+            image,
+            f"D:{dist_grip:.2f}m S:{total_score:.2f}",
+            (cx + round(self._len(10)), cy + round(self._len(40))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            self._font(1.3),
+            color,
+            self._thick(3),
+            cv2.LINE_AA,
+        )
 
     def draw_hud(self, image: np.ndarray, net_fps: float, loop_fps: float) -> None:
         """Draw heads-up display with FPS info."""
         cv2.putText(
             image,
             f"YOLO FPS: {net_fps:.1f}",
-            (12, 55),
+            (12, round(self._len(55))),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.7,
+            self._font(1.7),
             (0, 255, 0, 255),
-            3,
+            self._thick(3),
             cv2.LINE_AA,
         )
         cv2.putText(
             image,
             f"Loop FPS: {loop_fps:.1f}",
-            (12, 110),
+            (12, round(self._len(110))),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.7,
+            self._font(1.7),
             (0, 200, 255, 255),
-            3,
+            self._thick(3),
             cv2.LINE_AA,
         )
 
@@ -399,8 +391,8 @@ class VisionVisualizer:
         trunk  → orange bounding box
         bunch  → purple semi-transparent mask fill + contour outline
         """
-        TRUNK_COLOR = (0, 165, 255, 255)   # orange
-        BUNCH_COLOR = (220, 0, 255, 255)   # purple/violet
+        TRUNK_COLOR = (0, 165, 255, 255)
+        BUNCH_COLOR = (220, 0, 255, 255)
 
         for v in viz_only:
             x1, y1, x2, y2 = v["bb"]
@@ -412,31 +404,31 @@ class VisionVisualizer:
                 if polygon is not None and len(polygon) > 2:
                     try:
                         pts = polygon.reshape((-1, 1, 2))
-                        # Semi-transparent purple fill via overlay blend
                         overlay = image.copy()
                         cv2.fillPoly(overlay, [pts], BUNCH_COLOR)
                         cv2.addWeighted(overlay, 0.01, image, 0.8, 0, image)
-                        # Solid purple contour on top
-                        cv2.polylines(image, [pts], isClosed=True, color=BUNCH_COLOR, thickness=2)
+                        cv2.polylines(image, [pts], isClosed=True, color=BUNCH_COLOR,
+                                      thickness=self._thick(2))
                     except Exception:
-                        cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, 2)
+                        cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, self._thick(2))
                 else:
-                    cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, 2)
-                label = f"bunch {conf:.0%}"
-                cv2.putText(image, label, (x1 + 4, y1 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, BUNCH_COLOR, 2, cv2.LINE_AA)
+                    cv2.rectangle(image, (x1, y1), (x2, y2), BUNCH_COLOR, self._thick(2))
+                cv2.putText(image, f"bunch {conf:.0%}",
+                            (x1 + round(self._len(4)), y1 + round(self._len(18))),
+                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55),
+                            BUNCH_COLOR, self._thick(2), cv2.LINE_AA)
             else:
-                # Trunk: orange bounding box
-                cv2.rectangle(image, (x1, y1), (x2, y2), TRUNK_COLOR, 2)
-                label = f"{cls} {conf:.0%}"
-                cv2.putText(image, label, (x1 + 4, y1 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, TRUNK_COLOR, 2, cv2.LINE_AA)
+                cv2.rectangle(image, (x1, y1), (x2, y2), TRUNK_COLOR, self._thick(2))
+                cv2.putText(image, f"{cls} {conf:.0%}",
+                            (x1 + round(self._len(4)), y1 + round(self._len(18))),
+                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55),
+                            TRUNK_COLOR, self._thick(2), cv2.LINE_AA)
 
     def draw_lidar_points(
         self,
         image: np.ndarray,
-        uv: np.ndarray,       # (N,2) projected pixel coords at display resolution
-        pts_cam: np.ndarray,  # (N,3) points in camera frame (Z = depth)
+        uv: np.ndarray,
+        pts_cam: np.ndarray,
         z_min: float = 0.1,
         z_max: float = 5.0,
     ) -> None:
@@ -446,16 +438,15 @@ class VisionVisualizer:
         h, w = image.shape[:2]
         zs = pts_cam[:, 2]
         t = np.clip((zs - z_min) / max(z_max - z_min, 1e-3), 0.0, 1.0)
-        # Map t → BGR: 0=red (close), 0.5=green, 1=blue (far)
-        r = np.clip(255 * (1.0 - 2 * t),       0, 255).astype(np.uint8)
+        r = np.clip(255 * (1.0 - 2 * t),        0, 255).astype(np.uint8)
         g = np.clip(255 * (1.0 - abs(2*t-1.0)), 0, 255).astype(np.uint8)
-        b = np.clip(255 * (2 * t - 1.0),        0, 255).astype(np.uint8)
+        b = np.clip(255 * (2 * t - 1.0),         0, 255).astype(np.uint8)
         xs = uv[:, 0].astype(np.int32)
         ys = uv[:, 1].astype(np.int32)
         valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        dot_r = self._radius(2)
         for i in np.where(valid)[0]:
-            color = (int(b[i]), int(g[i]), int(r[i]), 255)
-            cv2.circle(image, (xs[i], ys[i]), 2, color, -1)
+            cv2.circle(image, (xs[i], ys[i]), dot_r, (int(b[i]), int(g[i]), int(r[i]), 255), -1)
 
     def render_frame(
         self,
@@ -473,8 +464,38 @@ class VisionVisualizer:
         if SKIP_DRAW:
             return image
 
+        # Set active draw scale so all helper methods scale proportionally.
+        self._s = self.display_scale
+
+        # Resize first so all drawing happens on the smaller display image.
+        if self.display_scale != 1.0:
+            image = cv2.resize(
+                image,
+                (int(image.shape[1] * self.display_scale), int(image.shape[0] * self.display_scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+            s = self.display_scale
+            def _scale_target(t):
+                t = dict(t)
+                x1, y1, x2, y2 = t["bb"]
+                nx1, ny1, nx2, ny2 = int(x1*s), int(y1*s), int(x2*s), int(y2*s)
+                t["bb"] = (nx1, ny1, nx2, ny2)
+                if t.get("mask_resized") is not None:
+                    new_w = max(1, nx2 - nx1)
+                    new_h = max(1, ny2 - ny1)
+                    t["mask_resized"] = cv2.resize(
+                        t["mask_resized"], (new_w, new_h), interpolation=cv2.INTER_NEAREST
+                    )
+                if t.get("polygon") is not None:
+                    t["polygon"] = (t["polygon"] * s).astype(np.int32)
+                return t
+            targets = [_scale_target(t) for t in targets]
+            rejected_targets = [_scale_target(t) for t in rejected_targets]
+            if viz_only:
+                viz_only = [_scale_target(t) for t in viz_only]
+
         if lidar_uv is not None and lidar_pts_cam is not None:
-            self.draw_lidar_points(image, lidar_uv, lidar_pts_cam)
+            self.draw_lidar_points(image, lidar_uv * self.display_scale, lidar_pts_cam)
         self.draw_rejected_targets(image, rejected_targets)
         if viz_only:
             self.draw_viz_only(image, viz_only)
@@ -487,10 +508,4 @@ class VisionVisualizer:
 
         self.draw_hud(image, net_fps, loop_fps)
 
-        # Resize for display
-        display_image = cv2.resize(
-            image,
-            (int(image.shape[1] * self.display_scale), int(image.shape[0] * self.display_scale)),
-            interpolation=cv2.INTER_AREA,
-        )
-        return display_image
+        return image

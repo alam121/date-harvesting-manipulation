@@ -18,8 +18,10 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets)
 add_library(${PROJECT_NAME} SHARED
   src/ur10e_panel.cpp
   src/log_panel.cpp
+  src/gripper_panel.cpp
   include/rviz_ur10e_panel/ur10e_panel.hpp
   include/rviz_ur10e_panel/log_panel.hpp
+  include/rviz_ur10e_panel/gripper_panel.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC

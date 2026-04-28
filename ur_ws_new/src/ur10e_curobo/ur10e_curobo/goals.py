@@ -480,16 +480,42 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                         f"[DIRECT] {label}: Cartesian IK failed at step {_k}/{_N_CART}")
                     break
             if _cart_ok:
-                _wp_js.append(best_js)
-                _steps_per = max(3, num_steps // len(_wp_js))
+                # Re-solve final endpoint seeded from last intermediate waypoint
+                _pos_final = torch.tensor([target_pose_list[:3]], dtype=torch.float32, device=_dev)
+                _seed_final = torch.tensor([_prev_js], dtype=torch.float32, device=_dev).unsqueeze(0)
+                _ret_final  = torch.tensor([_prev_js], dtype=torch.float32, device=_dev)
+                _r_final = node.motion_gen.ik_solver.solve_single(
+                    Pose(position=_pos_final, quaternion=_quat_t),
+                    seed_config=_seed_final, retract_config=_ret_final)
+                if _r_final.success.item():
+                    _final_js = nearest_joint_config(
+                        _prev_js, _r_final.js_solution.position.squeeze().cpu().tolist())
+                    _final_delta = max(abs(g - c) for g, c in zip(_final_js, _prev_js))
+                    node.get_logger().info(
+                        f"[DIRECT] {label}: final-seg re-solve delta={_final_delta*57.3:.1f}deg")
+                    _wp_js.append(_final_js)
+                else:
+                    _final_delta = max(abs(g - c) for g, c in zip(best_js, _prev_js))
+                    node.get_logger().warn(
+                        f"[DIRECT] {label}: final-seg re-solve failed, using best_js "
+                        f"(delta={_final_delta*57.3:.1f}deg)")
+                    if _final_delta > 1.05:
+                        node.get_logger().warn(
+                            f"[DIRECT] {label}: final segment too large ({_final_delta*57.3:.1f}deg) — aborting")
+                        _cart_ok = False
+                    else:
+                        _wp_js.append(best_js)
+            if _cart_ok:
+                # Linear interpolation — build_trajectory central-difference gives
+                # one smooth continuous velocity profile across all waypoints.
+                # Minimum 10 steps per segment for smooth central-difference velocities.
+                _steps_per = max(10, num_steps // max(len(_wp_js) - 1, 1))
                 for _si in range(len(_wp_js) - 1):
                     _s0, _s1 = _wp_js[_si], _wp_js[_si + 1]
-                    _is_last = (_si == len(_wp_js) - 2)
-                    _n = _steps_per
-                    for _i in range(_n + 1):
+                    for _i in range(_steps_per + 1):
                         if _i == 0 and _si > 0:
                             continue  # avoid duplicate at segment boundary
-                        _t = (1.0 - math.cos(math.pi * _i / _n)) / 2.0
+                        _t = _i / _steps_per
                         states.append([_s0[j] + _t * (_s1[j] - _s0[j]) for j in range(len(_s0))])
                 _states_built = True
                 node.get_logger().info(
@@ -520,7 +546,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             stop_flag=lambda: node.stop_requested,
                             max_vel=planner.max_joint_velocity * 0.5,
                             max_acc=planner.max_joint_acceleration * 0.3,
-                            ramp_points=0, include_acc=True)
+                            ramp_points=0, include_acc=False)
     if node.stop_requested:
         node.stop_requested = False; return False
 
@@ -930,20 +956,18 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
 
     planner = node.cfg.planner
     base_dt = getattr(planner, "base_dt", 0.02)
-    scale = getattr(planner, "speed_predropoff", 1.0) * getattr(planner, "global_speed_multiplier", 1.0)
-    dt = base_dt / max(scale, 1e-6)
-    dt = min(max(dt, getattr(planner, "min_dt", 0.012)), getattr(planner, "max_dt", 0.03))
-    base_vel = 0.08
-    vel = min(base_vel * scale, getattr(planner, "max_traj_velocity", 0.25))
+    # Reverse uses a slow dedicated scale — do NOT use speed_predropoff (full speed).
+    # global_speed_multiplier is intentionally NOT applied to max_vel here to avoid
+    # 10 rad/s peaks that cause jerk at the start of the reverse motion.
+    dt = getattr(planner, "min_dt", 0.012) * 1.5
 
     traj = build_trajectory(
         node.joint_order,
         partial,
-        vel=vel,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
-        max_vel=getattr(planner, "max_joint_velocity", 2.0) * getattr(planner, "global_speed_multiplier", 1.0),
-        max_acc=getattr(planner, "max_joint_acceleration", 1.0),
+        max_vel=getattr(planner, "max_joint_velocity", 2.0) * 0.7,
+        max_acc=getattr(planner, "max_joint_acceleration", 1.0) * 0.7,
         ramp_points=0,
     )
 
@@ -961,7 +985,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.15, z_tolerance=0.08):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -985,7 +1009,7 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
             node.set_vision_mode("full")
 
 
-def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.15, z_tolerance=0.08):
+def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
     # Build seed list: primary first, then candidates
     seeds = [seed_xyz[:3]]
     if candidate_seeds:
@@ -995,12 +1019,18 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 seeds.append(list(xyz))
 
     multi = len(seeds) > 1
-    stable_needed = 1 if multi else 2
+    stable_needed = 4
 
     stable_count = 0
     matched_seed = None
     start = time.time()
     prev_pose_tuple = None
+
+    # Let depth settle before starting to match — ZED stereo depth needs a few
+    # frames to stabilize after the arm stops moving at the approach position.
+    DEPTH_SETTLE_S = 1.0
+    while time.time() - start < DEPTH_SETTLE_S:
+        time.sleep(0.05)
 
     while time.time() - start < timeout:
         # Check best fruit first, then fall back to all visible fruits.
@@ -1030,10 +1060,19 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 d_xy = math.hypot(cx - s[0], cy - s[1])
                 d_z = abs(cz - s[2])
                 d = math.dist(candidate, s)
-                if d_xy <= radius and d_z <= z_tolerance and d < best_dist:
-                    best_dist = d
+                # XY-only match for corner cases: depth is unreliable at image edges
+                # but XY projection is accurate — if XY is tight, accept and keep
+                # the seed Z (don't trust the noisy close-range depth for Z).
+                xy_only_match = d_xy <= 0.04
+                full_match = d_xy <= radius and d_z <= z_tolerance
+                if (full_match or xy_only_match) and d_xy < best_dist:
+                    best_dist = d_xy
                     best_seed = s
-                    pose = candidate
+                    if xy_only_match and not full_match:
+                        # Use detected XY but keep seed Z — depth unreliable
+                        pose = [cx, cy, s[2]]
+                    else:
+                        pose = candidate
                 elif d < _closest_miss_d:
                     _closest_miss_d = d
                     _closest_miss = (candidate, s, d_xy, d_z)
@@ -1589,12 +1628,6 @@ def plan_and_execute(node):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def _safe_return_home():
-        """Return to center HOME via predropoff to avoid the lower-arm/tool-flange
-        clamping error that occurs on the direct approach→home path."""
-        node.motion_phase = "HOME"
-        move_to_predropoff_position(node)
-        move_to_home_position(node)
 
     def _check_stop():
         """Check if stop was requested; if so, halt robot and clear goals."""
@@ -1885,23 +1918,30 @@ def plan_and_execute(node):
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.015  # small downward adjustment during grasp
-        y_offset = 0.005  # no lateral adjustment
-        # Pull back along the approach direction by 1× estimated fruit radius.
-        # This adapts to fruit size and approach angle rather than a fixed Y offset,
-        # preventing overshoot when depth is measured at the centroid vs near-surface.
+        z_offset = 0.025  # small downward adjustment during grasp
+        y_offset = -0.01  # no lateral adjustment
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
-        _sm_dir = getattr(getattr(node, 'state_manager', None), 'fruit_direction', None)
-        approach_dir = list(_sm_dir) if _sm_dir is not None else None  # [dx,dy,dz] unit vec in base_link
-        if approach_dir is not None and len(approach_dir) == 3:
-            # Move the grasp point back by 1 radius along the approach direction
-            pullback = float(fruit_radius)
-            gx = x - approach_dir[0] * pullback
-            gy = y - approach_dir[1] * pullback + y_offset  # add fixed Y offset on top of directional pullback
-            gz = z - approach_dir[2] * pullback + z_offset
-        else:
-            # Fallback: fixed Y pullback
-            gx, gy, gz = x, y + fruit_radius, z + z_offset
+        # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
+        # This ensures the approach vector is accurate after the arm has settled at standoff.
+        _cur_ee = node.get_end_effector_pose()
+        approach_dir = None
+        if _cur_ee is not None:
+            _dx = x - _cur_ee[0]; _dy = y - _cur_ee[1]; _dz = z - _cur_ee[2]
+            _dist = math.sqrt(_dx**2 + _dy**2 + _dz**2)
+            if _dist > 0.01:
+                approach_dir = [_dx/_dist, _dy/_dist, _dz/_dist]
+                node.get_logger().info(
+                    f"FINAL approach_dir recomputed from EE→fruit: "
+                    f"[{approach_dir[0]:.3f},{approach_dir[1]:.3f},{approach_dir[2]:.3f}] dist={_dist:.3f}m"
+                )
+        if approach_dir is None:
+            _sm_dir = getattr(getattr(node, 'state_manager', None), 'fruit_direction', None)
+            approach_dir = list(_sm_dir) if _sm_dir is not None else None
+        # Place TCP at the fruit centroid (no radius pullback).
+        # Pulling back by fruit_radius leaves the fruit at the gripper entrance — easy to slip.
+        # With TCP at the centroid, the fruit sits deep inside the three-finger cup.
+        # approach_dir is retained for logging/debug but no longer shifts the target.
+        gx, gy, gz = x, y - y_offset, z + z_offset
         final_target = [gx, gy, gz, *orientation]
         node.motion_phase = "FINAL"
         # Suppress heatmap/scoring during final grasp — target is locked, no new selection needed
@@ -2002,8 +2042,10 @@ def plan_and_execute(node):
                     cur[2] + vertical_correction,
                     *cur[3:]
                 ]
-                exec_pose(node, closer_target)
-                wait_until_xyz(node, closer_target[:3], tol=0.01, timeout=3.0)
+                # Use _direct_ik_move — stays on the same kinematic branch.
+                # exec_pose (full cuRobo planner) can plan a wild arc for a tiny correction.
+                _direct_ik_move(node, closer_target, label="REGRIP",
+                                motion_type="final", store_trajectory=False)
             node.control_gripper("CLOSE"); time.sleep(0.1)
             # Re-read after re-grip
             first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
@@ -2045,13 +2087,14 @@ def plan_and_execute(node):
         # - Center approach: try direct dropoff, fall back to center HOME only if planning fails
         if is_side_approach:
             node.get_logger().info("Side approach — returning to center HOME before dropoff")
-            _safe_return_home()
+            node.motion_phase = "HOME"
+            move_to_home_position(node)
 
         node.motion_phase = "DROPOFF"
         if not move_to_dropoff_position(node):
             node.get_logger().info("Direct dropoff failed, going to center HOME first")
             node.motion_phase = "HOME"
-            _safe_return_home()
+            move_to_home_position(node)
             node.motion_phase = "DROPOFF"
             move_to_dropoff_position(node)
         time.sleep(0.2)
@@ -2110,13 +2153,17 @@ def plan_and_execute(node):
                     else:
                         node.get_logger().info(
                             f"Direct path to next goal BLOCKED — going HOME first")
-                        _safe_return_home()
+                        node.motion_phase = "HOME"
+                        move_to_home_position(node)
                 else:
-                    _safe_return_home()
+                    node.motion_phase = "HOME"
+                    move_to_home_position(node)
             else:
-                _safe_return_home()
+                node.motion_phase = "HOME"
+                move_to_home_position(node)
         else:
-            _safe_return_home()
+            node.motion_phase = "HOME"
+            move_to_home_position(node)
 
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
         if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
