@@ -290,7 +290,7 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
         eps = 1e-4
         damping = 1e-3
 
-        for iteration in range(max_iters):
+        for _ in range(max_iters):
             q_t = torch.tensor([q.tolist()], dtype=torch.float32, device=device)
             with torch.no_grad():
                 ee_pos, _, _, _, _, _, _ = kin.forward(q_t)
@@ -552,13 +552,20 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     # 5) Visualize & send
     cart_path = forward_kinematics_batch(node, states)
+    node._planned_cartesian_path = cart_path  # keep PATH_DEV in sync with this motion
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
 
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
-    wait_until_xyz(node, target_pose_list[:3], tol=0.008, timeout=8.0, target_quat=target_quat)
+    reached = wait_until_xyz(node, target_pose_list[:3], tol=0.008, timeout=8.0, target_quat=target_quat)
     blend_motion(node)
+
+    # Abort goal if robot has stalled twice — something is obstructing or IK is wrong
+    if not reached and getattr(node, '_goal_stall_count', 0) >= 2:
+        node.get_logger().warn(
+            f"[DIRECT] {label}: stall count={node._goal_stall_count} — aborting goal.")
+        return False
 
     # Reject stall-acceptance far from target — prevents gripper close from wrong position
     cur_pose = node.get_end_effector_pose()
@@ -929,25 +936,56 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     else:
         gx, gy, gz = grasp_fk.x, grasp_fk.y, grasp_fk.z
         partial = [reversed_states[0]]
+        _clearance_reached = False
         for wp in reversed_states[1:]:
             partial.append(wp)
             fk = forward_kinematics(node, wp)
             if fk:
                 dist = math.sqrt((fk.x - gx)**2 + (fk.y - gy)**2 + (fk.z - gz)**2)
                 if dist >= clearance_m:
+                    _clearance_reached = True
                     break
+        # If all waypoints were consumed without reaching clearance, the reverse
+        # goes all the way back to the approach start (home area). cuRobo's plan
+        # can front-load wrist rotation at the beginning of the approach; reversed,
+        # this becomes a concentrated wrist snap at the END of the reverse — the jerk.
+        # In this case truncate the last 15% of waypoints (the jerky wrist portion)
+        # and let cuRobo re-plan the remainder smoothly after the reverse.
+        if not _clearance_reached:
+            keep = max(10, int(len(partial) * 0.85))
+            partial = partial[:keep]
+            node.get_logger().info(
+                f"Partial reverse: all waypoints consumed — truncating to {keep} "
+                f"(dropping last 15% to avoid wrist-snap near home)"
+            )
 
-    # Prepend actual current joint positions so the trajectory starts exactly where
-    # the robot is now. Any gap between stored final waypoint and actual position
-    # (position error, gripper micro-jolt, etc.) would otherwise cause a jerk at t=0.
+    # Bridge any gap between actual current position and the first reversed waypoint.
+    # A single prepended point covers the gap in one dt (~18ms) → jerk.
+    # Instead: if the gap is significant, send a dedicated slow bridge trajectory first.
     if node.current_joint_positions is not None:
         current_pos = list(node.current_joint_positions)
         max_diff = max(abs(c - f) for c, f in zip(current_pos, partial[0]))
         if max_diff > 0.002:
             node.get_logger().info(
-                f"Partial reverse: bridging {max_diff*57.3:.2f}° gap from actual position"
+                f"Partial reverse: bridging {max_diff*57.3:.2f}° gap with slow bridge trajectory"
             )
-            partial = [current_pos] + partial
+            bridge_traj = build_trajectory(
+                node.joint_order,
+                [current_pos, partial[0]],
+                dt=0.04,
+                stop_flag=lambda: node.stop_requested,
+                max_vel=0.3,
+                max_acc=0.2,
+                ramp_points=0,
+            )
+            node.trajectory_pub.publish(bridge_traj)
+            time.sleep(0.2)
+            timeout_start = time.time()
+            while time.time() - timeout_start < 5.0:
+                if not is_robot_moving(node, velocity_threshold=0.005):
+                    break
+                time.sleep(0.05)
+            time.sleep(0.05)
 
     node.get_logger().info(
         f"Partial reverse: {len(partial)}/{len(reversed_states)} waypoints "
@@ -961,6 +999,14 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     # 10 rad/s peaks that cause jerk at the start of the reverse motion.
     dt = getattr(planner, "min_dt", 0.012) * 1.5
 
+    # Append deceleration tail: duplicate the last waypoint several times so the
+    # controller has multiple dt steps to decelerate the wrist to zero velocity.
+    # Without this, build_trajectory sets velocity=0 only at the final point while
+    # the second-to-last still carries full central-difference velocity — the
+    # controller must stop in one dt (~18ms), causing a wrist jerk.
+    DECEL_TAIL = 8
+    partial = partial + [partial[-1]] * DECEL_TAIL
+
     traj = build_trajectory(
         node.joint_order,
         partial,
@@ -973,19 +1019,21 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
 
     node.trajectory_pub.publish(traj)
 
-    # Wait for partial reverse to complete
+    # Wait for partial reverse to complete naturally — do NOT send a new trajectory
+    # (blend_motion) while the controller is still decelerating; that preemption
+    # causes a jerk at the last waypoint.  Instead: wait until fully stopped, then
+    # hold an additional 0.3s so the controller settles before the next trajectory.
     time.sleep(0.3)
     timeout_start = time.time()
     while time.time() - timeout_start < 10.0:
         if not is_robot_moving(node, velocity_threshold=0.005):
             break
         time.sleep(0.1)
-
-    blend_motion(node)
+    time.sleep(0.3)  # extra settle before next trajectory
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -994,7 +1042,8 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
     Args:
         seed_xyz: primary seed [x,y,z]
         candidate_seeds: list of [x,y,z,...] alternate candidates (optional)
-        timeout: max wait time (default 1.5s, reduced from 3s)
+        timeout: max wait time including settle period
+        depth_settle_s: how long to wait for depth to stabilise (reduce for small nudges)
     """
     # Switch vision to lightweight mode: no heatmap, no trunk, no viz
     if hasattr(node, 'set_vision_mode'):
@@ -1002,14 +1051,15 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
 
     try:
         return _reacquire_goal_pose_impl(
-            node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance)
+            node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance, depth_settle_s)
     finally:
         # Always restore full mode so the next approach cycle works normally
         if hasattr(node, 'set_vision_mode'):
             node.set_vision_mode("full")
 
 
-def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.08, z_tolerance=0.05):
+def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0):
+    import numpy as _np
     # Build seed list: primary first, then candidates
     seeds = [seed_xyz[:3]]
     if candidate_seeds:
@@ -1019,18 +1069,28 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 seeds.append(list(xyz))
 
     multi = len(seeds) > 1
-    stable_needed = 4
+    stable_needed = 5          # readings that must match before accepting
+    Z_STABLE_THRESH = 0.012    # max std of Z across stable readings (12 mm)
 
     stable_count = 0
     matched_seed = None
     start = time.time()
     prev_pose_tuple = None
+    recent_zs = []             # Z values of the last stable_needed matched readings
 
     # Let depth settle before starting to match — ZED stereo depth needs a few
     # frames to stabilize after the arm stops moving at the approach position.
-    DEPTH_SETTLE_S = 1.0
+    DEPTH_SETTLE_S = depth_settle_s
+    search_s = max(timeout - DEPTH_SETTLE_S, 1.0)
+    node.get_logger().info(
+        f"[REACQ] Settling {DEPTH_SETTLE_S:.1f}s | "
+        f"seeds={len(seeds)} primary=[{seeds[0][0]:.3f},{seeds[0][1]:.3f},{seeds[0][2]:.3f}] | "
+        f"search budget={search_s:.1f}s")
     while time.time() - start < DEPTH_SETTLE_S:
         time.sleep(0.05)
+    node.get_logger().info(f"[REACQ] Settle done — searching ({search_s:.1f}s remaining)")
+
+    _last_progress_log = 0.0   # throttle per-frame progress to once/sec
 
     while time.time() - start < timeout:
         # Check best fruit first, then fall back to all visible fruits.
@@ -1050,6 +1110,7 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
         best_seed = None
         best_dist = float('inf')
         pose = None
+        _used_xy_only = False
         _closest_miss = None   # for diagnostics
         _closest_miss_d = float('inf')
         for candidate in candidate_poses:
@@ -1060,15 +1121,25 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 d_xy = math.hypot(cx - s[0], cy - s[1])
                 d_z = abs(cz - s[2])
                 d = math.dist(candidate, s)
-                # XY-only match for corner cases: depth is unreliable at image edges
-                # but XY projection is accurate — if XY is tight, accept and keep
-                # the seed Z (don't trust the noisy close-range depth for Z).
-                xy_only_match = d_xy <= 0.04
+                # XY-only match: only when we have enough readings AND they are
+                # genuinely noisy (high Z std). Do NOT open this gate early just
+                # because stable_count is low — that allows neighbouring fruits
+                # at 4-5cm to be accepted before we have evidence of depth noise.
+                depth_unstable = (
+                    len(recent_zs) >= stable_needed and
+                    float(_np.std(recent_zs)) > Z_STABLE_THRESH
+                )
+                xy_only_match = depth_unstable and d_xy <= 0.05
                 full_match = d_xy <= radius and d_z <= z_tolerance
                 if (full_match or xy_only_match) and d_xy < best_dist:
                     best_dist = d_xy
                     best_seed = s
-                    if xy_only_match and not full_match:
+                    _used_xy_only = xy_only_match and not full_match
+                    node.get_logger().debug(
+                        f"[REACQ] match: [{cx:.3f},{cy:.3f},{cz:.3f}] → seed [{s[0]:.3f},{s[1]:.3f},{s[2]:.3f}] "
+                        f"dxy={d_xy*100:.1f}cm dz={d_z*100:.1f}cm "
+                        f"{'XY-only' if _used_xy_only else 'full'}")
+                    if _used_xy_only:
                         # Use detected XY but keep seed Z — depth unreliable
                         pose = [cx, cy, s[2]]
                     else:
@@ -1111,20 +1182,79 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
         if matched_seed != best_seed:
             stable_count = 0
             matched_seed = best_seed
+            recent_zs.clear()
 
         stable_count += 1
+        recent_zs.append(z)
+        if len(recent_zs) > stable_needed:
+            recent_zs.pop(0)
+
+        z_std = float(_np.std(recent_zs)) if len(recent_zs) >= 2 else float('nan')
+
+        # Throttled progress log — once per second
+        _now = time.time()
+        if _now - _last_progress_log >= 1.0:
+            _last_progress_log = _now
+            elapsed = _now - start - DEPTH_SETTLE_S
+            node.get_logger().info(
+                f"[REACQ] t={elapsed:.1f}s | stable={stable_count}/{stable_needed} "
+                f"Z_std={z_std*1000:.1f}mm | pos=[{x:.3f},{y:.3f},{z:.3f}] | "
+                f"visible={len(candidate_poses)} fruits")
 
         if stable_count >= stable_needed:
-            node.get_logger().info(
-                f"Reacquire stable ({stable_count}): "
-                f"[{x:.3f},{y:.3f},{z:.3f}] near seed "
-                f"[{matched_seed[0]:.3f},{matched_seed[1]:.3f},{matched_seed[2]:.3f}]")
+            if z_std > Z_STABLE_THRESH:
+                # Depth still fluctuating — keep collecting, don't reset count
+                node.get_logger().info(
+                    f"[REACQ] Waiting for depth: Z_std={z_std*1000:.1f}mm > {Z_STABLE_THRESH*1000:.0f}mm "
+                    f"(stable_count={stable_count})")
+                time.sleep(0.001)
+                continue
+            match_type = "XY-only (depth unstable)" if _used_xy_only else "full 3D"
+            dx = (x - matched_seed[0]) * 1000
+            dy = (y - matched_seed[1]) * 1000
+            dz = (z - matched_seed[2]) * 1000
+            drift_xy = math.hypot(dx, dy)
+            _accept_msg = (
+                f"[REACQ] ACCEPTED ({match_type}) after {time.time()-start-DEPTH_SETTLE_S:.1f}s | "
+                f"count={stable_count} Z_std={z_std*1000:.1f}mm | "
+                f"[{x:.3f},{y:.3f},{z:.3f}] | seed=[{matched_seed[0]:.3f},{matched_seed[1]:.3f},{matched_seed[2]:.3f}] | "
+                f"drift=({dx:.0f},{dy:.0f},{dz:.0f})mm XY={drift_xy:.0f}mm"
+            )
+            if drift_xy > 25:
+                node.get_logger().warn(_accept_msg + " ← LARGE DRIFT, verify correct fruit")
+            else:
+                node.get_logger().info(_accept_msg)
             return (x, y, z)
 
         time.sleep(0.001)
 
-    # Timeout — no stable detection found
-    node.get_logger().warn("Reacquire timeout — using primary seed")
+    # Timeout — soft-accept if we have ≥3 stable readings with good Z
+    elapsed = time.time() - start - DEPTH_SETTLE_S
+    if stable_count >= 3 and matched_seed is not None and len(recent_zs) >= 2:
+        z_std = float(_np.std(recent_zs))
+        if z_std <= Z_STABLE_THRESH and prev_pose_tuple is not None:
+            x, y, z = prev_pose_tuple
+            dx = (x - matched_seed[0]) * 1000
+            dy = (y - matched_seed[1]) * 1000
+            dz = (z - matched_seed[2]) * 1000
+            drift_xy = math.hypot(dx, dy)
+            node.get_logger().warn(
+                f"[REACQ] SOFT-ACCEPT at timeout | stable={stable_count}/{stable_needed} "
+                f"Z_std={z_std*1000:.1f}mm | [{x:.3f},{y:.3f},{z:.3f}] | "
+                f"drift=({dx:.0f},{dy:.0f},{dz:.0f})mm XY={drift_xy:.0f}mm")
+            return (x, y, z)
+
+    # Hard timeout — nothing usable
+    if _closest_miss is not None:
+        _cm, _cs, _dxy, _dz = _closest_miss
+        node.get_logger().warn(
+            f"[REACQ] TIMEOUT after {elapsed:.1f}s | stable={stable_count}/{stable_needed} | "
+            f"closest was [{_cm[0]:.3f},{_cm[1]:.3f},{_cm[2]:.3f}] "
+            f"dxy={_dxy*100:.1f}cm dz={_dz*100:.1f}cm (need xy<{radius*100:.0f}cm z<{z_tolerance*100:.0f}cm)")
+    else:
+        node.get_logger().warn(
+            f"[REACQ] TIMEOUT after {elapsed:.1f}s | stable={stable_count}/{stable_needed} | "
+            f"no fruits visible in {len(seeds)} seed windows")
     return None
 
 
@@ -1758,7 +1888,7 @@ def plan_and_execute(node):
         if cur_pose is not None:
             ee_dist = math.sqrt((cur_pose[0] - x)**2 + (cur_pose[1] - y)**2 + (cur_pose[2] - z)**2)
             node.get_logger().info(f"EE-to-goal distance: {ee_dist*100:.1f}cm")
-            if ee_dist < 0.1:  # within 15cm — skip approach, go straight to final
+            if ee_dist < 0.15:  # within 15cm of fruit — skip approach, go straight to final
                 node.get_logger().info("EE already close to goal — skipping approach, going direct to final.")
                 orientation = minimize_rotation_orientation(cur_quat, target_quat)
                 skip_approach = True
@@ -1840,20 +1970,41 @@ def plan_and_execute(node):
                 unlock_target(node)
                 continue
 
+        node._goal_stall_count = 0  # reset stall counter for each new goal
+
         if not skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
             node.motion_phase = "APPROACH"
-            if not plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True):
+
+            _ap_dist = math.sqrt(sum((cur_pose[i] - approach[i])**2 for i in range(3))) if cur_pose else 999.0
+            _skip_approach_wait = False
+            node.get_logger().info(f"EE-to-approach distance: {_ap_dist*100:.1f}cm")
+            if _ap_dist < 0.20:
+                node.get_logger().info("Approach standoff close — using direct IK (skipping cuRobo plan)")
+                _approach_ok = _direct_ik_move(node, approach, label="APPROACH", motion_type="approach", store_trajectory=True)
+                if not _approach_ok:
+                    # Branch mismatch — arm is already close enough, skip approach entirely
+                    # and go straight to FINAL. Re-homing first (even if at home) resets
+                    # the joint config so cuRobo IK succeeds on the next attempt.
+                    node.get_logger().info("Direct IK failed (branch mismatch) — re-homing then skipping to FINAL")
+                    move_to_home_position(node)
+                    if _check_stop(): break
+                    _approach_ok = True   # arm is close — proceed directly to FINAL
+                    _skip_approach_wait = True
+            else:
+                _approach_ok = plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True)
+            if not _approach_ok:
                 unlock_target(node)
                 continue
             # Open gripper during approach motion (arm is already moving)
             if not gripper_opened:
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
                 gripper_opened = True
-            wait_until_xyz(node, approach[:3])
-            if _check_stop(): break
-            log_path_deviation(node, "APPROACH")
-            blend_motion(node)
+            if not _skip_approach_wait:
+                wait_until_xyz(node, approach[:3])
+                if _check_stop(): break
+                log_path_deviation(node, "APPROACH")
+                blend_motion(node)
 
             # Wait for joint state to be available after approach
             for _ in range(20):
@@ -1878,14 +2029,23 @@ def plan_and_execute(node):
         if _check_stop(): break
 
         # 2. Reacquire — check primary + all candidate seeds for fastest lock-on
-        node.motion_phase = "REACQUIRE"
-        node.reacquire_result = "SEARCH"   # show live state: searching
-        node._publish_goal_info()          # push immediately — timer blocked during long waits
+        # TEST: reacquire disabled — using original seed directly
+        REACQUIRE_ENABLED = False
         seed = [x,y,z]
         candidates = getattr(node, 'candidate_goals', [])
-        reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
+        reacq = None
+        if REACQUIRE_ENABLED:
+            node.motion_phase = "REACQUIRE"
+            node.reacquire_result = "SEARCH"   # show live state: searching
+            node._publish_goal_info()          # push immediately — timer blocked during long waits
+            reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
 
-        if reacq is None:
+        if not REACQUIRE_ENABLED:
+            x, y, z = seed
+            node.get_logger().info(f"[REACQ] Disabled — using seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+            node.reacquire_result = "DISABLED"
+            node._publish_goal_info()
+        elif reacq is None:
             # Nudge EE down a few cm and retry — fruit may be just below FOV
             node.get_logger().warn("Reacquire timed out — nudging down to search for detection.")
             node.reacquire_result = "NUDGING"  # show live state: nudging
@@ -1895,7 +2055,7 @@ def plan_and_execute(node):
                 nudge = [cur[0], cur[1], cur[2] - 0.02, *cur[3:]]
                 _direct_ik_move(node, nudge, label="REACQ_NUDGE",
                                 motion_type="final", store_trajectory=False)
-                reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0)
+                reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0, depth_settle_s=0.5)
             if reacq:
                 x,y,z = reacq
                 publish_goal_marker(node, [x,y,z])
@@ -1914,12 +2074,22 @@ def plan_and_execute(node):
             
         if _check_stop(): break
 
+        # If reacquired position drifted too far from seed, fall back to seed.
+        # Large drift means a neighbouring fruit was matched or depth was unreliable.
+        _drift_xy = math.hypot(x - seed[0], y - seed[1]) * 1000  # mm
+        _drift_z  = abs(z - seed[2]) * 1000                       # mm
+        if _drift_xy > 35.0 or _drift_z > 20.0:
+            node.get_logger().warn(
+                f"[REACQ] Large drift (XY={_drift_xy:.0f}mm Z={_drift_z:.0f}mm) — reverting to original seed "
+                f"[{seed[0]:.3f},{seed[1]:.3f},{seed[2]:.3f}]")
+            x, y, z = seed[0], seed[1], seed[2]
+
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         #    _direct_ik_move handles wait + blend internally
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
         z_offset = 0.025  # small downward adjustment during grasp
-        y_offset = -0.01  # no lateral adjustment
+        y_offset = -0.025  # no lateral adjustment
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
         # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
         # This ensures the approach vector is accurate after the arm has settled at standoff.
@@ -1995,8 +2165,12 @@ def plan_and_execute(node):
             action = learner.suggest_action(first_contact, gc.steps, stopped_early)
             node.get_logger().info(f"[LEARNER] prediction={prediction}, action={action}, first_contact={first_contact}/{gc.steps}")
         else:
-            # Fallback: early contact or stopped_early = PROCEED
-            if stopped_early or first_contact < gc.steps - 2:
+            # Sensor-driven: target contact at ~40% closure (step 4/10).
+            # Too late  (>60%) = fruit at entrance → move forward.
+            # Too early (<20%) = gripper overshot fruit → pull back.
+            # Stopped early counts as proper regardless of contact step.
+            contact_ratio = first_contact / max(gc.steps, 1)
+            if stopped_early or (0.20 <= contact_ratio <= 0.60):
                 prediction = "PROPER"
                 action = "PROCEED"
             else:
@@ -2017,11 +2191,12 @@ def plan_and_execute(node):
                 lateral_correction = -float(lateral_imbalance) * 0.008  # ~8mm per 1N imbalance
                 lateral_correction = max(-0.02, min(0.02, lateral_correction))  # clamp ±20mm
 
-                # Forward correction: late contact = gripper too far from fruit → move forward
-                # first_contact close to gc.steps = near fully closed before touching
+                # Depth correction: target contact_ratio = 0.40 (step 4/10).
+                # Negative = move forward (toward fruit), positive = pull back (away from fruit).
+                # Both directions allowed: late contact → forward, early contact → back.
                 contact_ratio = first_contact / max(gc.steps, 1)
-                forward_correction = -(contact_ratio - 0.5) * 0.04  # up to 20mm forward if late
-                forward_correction = max(-0.025, min(0.0, forward_correction))  # clamp, never pull back
+                forward_correction = -(contact_ratio - 0.40) * 0.04  # 16mm range each direction
+                forward_correction = max(-0.025, min(0.015, forward_correction))  # clamp ±
 
                 # Vertical correction: if center (F1) much weaker than sides → fruit is below center
                 center_vs_sides = f1 - (f0 + f2) / 2.0

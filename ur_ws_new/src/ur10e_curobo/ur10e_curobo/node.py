@@ -379,44 +379,65 @@ class UR10eCuroboMoveIt(Node):
 
         pub("RUNNING — collecting trunk samples for 5s, keep arm still...")
 
-        # Collect trunk_xyz samples over 5 seconds
-        samples = []
+        from geometry_msgs.msg import PointStamped as _PointStamped
+        samples_base = []   # trunk in base_link (full chain: ZED Mini + T_CAM_ZEDMINI + hand-eye)
+        samples_cam  = []   # trunk in ZED One cam frame (ZED Mini + T_CAM_ZEDMINI only)
+
+        _cam_sub_data = []
+        def _cam_cb(msg):
+            _cam_sub_data.append((msg.point.x, msg.point.y, msg.point.z))
+
+        _cam_sub = self.create_subscription(
+            _PointStamped, "/trunk_position_cam", _cam_cb, 10
+        )
+
         t_end = time.time() + 5.0
         while time.time() < t_end:
             xyz = self.trunk_xyz
             if xyz is not None:
-                samples.append(xyz)
+                samples_base.append(xyz)
+            if _cam_sub_data:
+                samples_cam.append(_cam_sub_data[-1])
             time.sleep(0.1)
 
-        if len(samples) < 5:
-            pub("FAIL — trunk not detected. Is the trunk visible and vision node running?")
-            return
+        self.destroy_subscription(_cam_sub)
 
-        arr = np.array(samples)  # (N, 3)
+        def _report(samples, label):
+            if len(samples) < 5:
+                return None, f"{label}: FAIL — not enough samples ({len(samples)})"
+            arr = np.array(samples)
+            mean_xyz = arr.mean(axis=0)
+            dists = np.linalg.norm(arr - mean_xyz, axis=1) * 1000
+            rms_err = float(np.sqrt(np.mean(dists**2)))
+            max_err = float(dists.max())
+            if rms_err < 5.0:
+                quality = "GOOD"
+            elif rms_err < 15.0:
+                quality = "ACCEPTABLE"
+            else:
+                quality = "POOR"
+            return rms_err, (
+                f"{label}: {quality} | "
+                f"({mean_xyz[0]:.3f}, {mean_xyz[1]:.3f}, {mean_xyz[2]:.3f}) m | "
+                f"RMS={rms_err:.1f}mm  max={max_err:.1f}mm  n={len(samples)}"
+            )
 
-        mean_xyz = arr.mean(axis=0)
-        std_xyz  = arr.std(axis=0)
-        rms_std  = float(np.linalg.norm(std_xyz)) * 1000  # mm
+        rms_cam,  msg_cam  = _report(samples_cam,  "[ZED Mini+T_CAM_ZEDMINI]")
+        rms_base, msg_base = _report(samples_base, "[Full chain/hand-eye]   ")
 
-        # Per-sample distance from mean
-        dists = np.linalg.norm(arr - mean_xyz, axis=1) * 1000  # mm
-        max_err = float(dists.max())
-        rms_err = float(np.sqrt(np.mean(dists**2)))
+        pub(msg_cam  or "[ZED Mini+T_CAM_ZEDMINI]: no /trunk_position_cam — vision node updated?")
+        pub(msg_base or "[Full chain/hand-eye]: no /trunk_position — is vision node running?")
 
-        # Verdict
-        if rms_err < 5.0:
-            quality = "GOOD"
-        elif rms_err < 15.0:
-            quality = "ACCEPTABLE"
-        else:
-            quality = "POOR — consider recalibrating"
-
-        result = (
-            f"{quality} | "
-            f"trunk=({mean_xyz[0]:.3f}, {mean_xyz[1]:.3f}, {mean_xyz[2]:.3f}) m | "
-            f"RMS={rms_err:.1f}mm  max={max_err:.1f}mm  n={len(samples)}"
-        )
-        pub(result)
+        # Diagnosis
+        if rms_cam is not None and rms_base is not None:
+            if rms_cam < 5.0 and rms_base < 5.0:
+                pub("DIAGNOSIS: Both cameras and hand-eye calibration are good.")
+            elif rms_cam < 5.0 and rms_base >= 5.0:
+                pub("DIAGNOSIS: T_CAM_ZEDMINI OK — hand-eye calibration has drifted. Redo checkerboard calibration.")
+            elif rms_cam >= 5.0 and rms_base < 5.0:
+                pub("DIAGNOSIS: Hand-eye OK — T_CAM_ZEDMINI or ZED Mini depth is unstable.")
+            else:
+                pub("DIAGNOSIS: POOR on both — check trunk visibility, ZED Mini depth, and both calibrations.")
 
     def _update_voxel_snapshot(self):
         """Update voxel obstacles from latest depth data (triggered by 'u' key).

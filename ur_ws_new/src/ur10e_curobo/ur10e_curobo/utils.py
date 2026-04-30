@@ -99,6 +99,7 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     from .motions import publish_stop_trajectory
     last_dist = None
     stall_start = None
+    stalled = False
     STALL_TIMEOUT = 2.0  # only timeout if robot not moving for 2s
 
     try:
@@ -150,6 +151,7 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 elif time.time() - stall_start > STALL_TIMEOUT:
                     node.get_logger().warn(
                         f"Robot not moving (dist={dist*100:.1f}cm from target, stalled {STALL_TIMEOUT}s) — accepting.")
+                    stalled = True
                     break
             else:
                 stall_start = None
@@ -162,6 +164,12 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     except Exception as e:
         node.get_logger().error(f"Error during wait_until_xyz: {e}")
         publish_stop_trajectory(node)
+
+    # Track stall count on the node — reset at start of each goal, abort after 2
+    if stalled:
+        node._goal_stall_count = getattr(node, '_goal_stall_count', 0) + 1
+
+    return not stalled
 
 def quat_to_rot_matrix(q):
     """

@@ -167,7 +167,8 @@ class VisionNode:
         goal_pub = self.node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
         dir_pub = self.node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
         depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", 10)
-        trunk_pub = self.node.create_publisher(PointStamped, "/trunk_position", 10)
+        trunk_pub     = self.node.create_publisher(PointStamped, "/trunk_position",     10)
+        trunk_cam_pub = self.node.create_publisher(PointStamped, "/trunk_position_cam", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
@@ -673,6 +674,7 @@ class VisionNode:
                     self._publish_trunk_position(
                         trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                         pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
+                        trunk_cam_pub=trunk_cam_pub,
                     )
                 _tp2 = time()
 
@@ -925,7 +927,7 @@ class VisionNode:
             pass
 
     def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
-                                pts_cam=None, uv=None, use_lidar=False) -> None:
+                                pts_cam=None, uv=None, use_lidar=False, trunk_cam_pub=None) -> None:
         """Publish detected trunk position in base_link for pole obstacle update.
         Uses only the first (largest/most confident) trunk detection."""
         if not trunk_boxes:
@@ -976,6 +978,14 @@ class VisionNode:
             float(np.mean(pts_front[:, 1])),
             float(np.mean(pts_front[:, 2])),
         ], dtype=np.float64)
+        if trunk_cam_pub is not None:
+            cam_msg = PointStamped()
+            cam_msg.header.frame_id = CAM_FRAME
+            cam_msg.header.stamp = rclpyTime().to_msg()
+            cam_msg.point.x = float(_trunk_xyz_cam[0])
+            cam_msg.point.y = float(_trunk_xyz_cam[1])
+            cam_msg.point.z = float(_trunk_xyz_cam[2])
+            trunk_cam_pub.publish(cam_msg)
         try:
             if self._cached_tf_base is not None:
                 _R_b, _t_b = self._cached_tf_base
