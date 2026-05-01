@@ -190,24 +190,20 @@ def plan_execute_js(
     # ------------------------------
     lock = getattr(node, '_planning_lock', None)
     res = None
-    for _attempt in range(3):
-        if lock: lock.acquire()
-        try:
-            res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
-        except Exception as e:
-            msg = str(e)
-            if "CUDA error" in msg or "illegal memory access" in msg:
-                node._cuda_faulted = True
-            node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
-            return False
-        finally:
-            if lock: lock.release()
-        if res.success:
-            break
-        status = getattr(res, 'status', 'unknown')
-        node.get_logger().warn(
-            f"Joint-space plan to {label} failed (attempt {_attempt+1}/3). status={status}")
+    if lock: lock.acquire()
+    try:
+        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+    except Exception as e:
+        msg = str(e)
+        if "CUDA error" in msg or "illegal memory access" in msg:
+            node._cuda_faulted = True
+        node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
+        return False
+    finally:
+        if lock: lock.release()
     if res is None or not res.success:
+        status = getattr(res, 'status', 'unknown') if res is not None else 'None'
+        node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
         return False
 
     # ------------------------------

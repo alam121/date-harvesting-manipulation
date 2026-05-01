@@ -456,14 +456,21 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if _cur_ee is not None and not getattr(node, "_cuda_faulted", False):
         try:
             _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            _quat_t = torch.tensor([target_pose_list[3:]], dtype=torch.float32, device=_dev)
+            _start_quat = list(_cur_ee[3:]) if len(_cur_ee) > 3 else [1.0, 0.0, 0.0, 0.0]
+            _target_quat = list(target_pose_list[3:])
             _wp_js = [start_js]
             _prev_js = start_js
             _cart_ok = True
             for _k in range(1, _N_CART + 1):
                 _a = _k / (_N_CART + 1)
                 _wp_xyz = [_cur_ee[i] + _a * (target_pose_list[i] - _cur_ee[i]) for i in range(3)]
+                # Slerp orientation from current to target so wrist rotates gradually —
+                # using fixed target orientation for all waypoints forces an immediate wrist
+                # snap at the first IK point, which can create a tool-flange/lower-arm
+                # proximity violation in the interpolated states between waypoints.
+                _wp_quat = quat_slerp(_start_quat, _target_quat, _a)
                 _pos_t   = torch.tensor([_wp_xyz],  dtype=torch.float32, device=_dev)
+                _quat_t  = torch.tensor([_wp_quat], dtype=torch.float32, device=_dev)
                 _seed_t  = torch.tensor([_prev_js], dtype=torch.float32, device=_dev).unsqueeze(0)
                 _ret_t   = torch.tensor([_prev_js], dtype=torch.float32, device=_dev)
                 _r = node.motion_gen.ik_solver.solve_single(
@@ -472,6 +479,17 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                 if _r.success.item():
                     _wj = nearest_joint_config(
                         _prev_js, _r.js_solution.position.squeeze().cpu().tolist())
+                    # Reject if this waypoint jumps to a different kinematic branch.
+                    # nearest_joint_config only fixes ±2π wrapping — a branch jump
+                    # still shows up as a large per-joint delta, which causes a jerk
+                    # in the trajectory and a zig-zag in the RViz path visualization.
+                    _wp_delta = max(abs(a - b) for a, b in zip(_wj, _prev_js))
+                    if _wp_delta > 0.52:  # ~30° — branch jumped, abort Cartesian path
+                        _cart_ok = False
+                        node.get_logger().warn(
+                            f"[DIRECT] {label}: Cartesian waypoint {_k} jumped "
+                            f"{_wp_delta*57.3:.1f}deg — aborting (branch switch)")
+                        break
                     _wp_js.append(_wj)
                     _prev_js = _wj
                 else:
@@ -705,6 +723,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         path_len, straight = _sampled_path_len(states)
         if path_len is not None and straight is not None:
             ratio = path_len / max(straight, 0.001)
+            node._last_plan_ratio = ratio  # expose to caller for retry decisions
             node.get_logger().info(
                 f"[PATH] {label}: path_len={path_len*100:.1f}cm, straight={straight*100:.1f}cm, ratio={ratio:.1f}x"
             )
@@ -959,33 +978,30 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
                 f"(dropping last 15% to avoid wrist-snap near home)"
             )
 
-    # Bridge any gap between actual current position and the first reversed waypoint.
-    # A single prepended point covers the gap in one dt (~18ms) → jerk.
-    # Instead: if the gap is significant, send a dedicated slow bridge trajectory first.
+    # Wait for the arm to fully stop before publishing the reverse trajectory.
+    # A fixed sleep isn't reliable — poll velocities until settled or timeout.
+    _vel_tol = 0.05   # rad/s — joint considered stopped below this
+    _settle_timeout = 1.0
+    _t0 = time.time()
+    while (time.time() - _t0) < _settle_timeout:
+        vels = node.current_joint_velocities
+        if vels is not None and all(abs(v) < _vel_tol for v in vels):
+            break
+        time.sleep(0.02)
+    else:
+        node.get_logger().warn("Partial reverse: arm did not settle within 1s — publishing anyway")
+
+    # Prepend current position to bridge any gap (e.g. after depth correction nudge)
+    # as part of the single reverse trajectory — no separate bridge + stop needed,
+    # which avoids the stop→restart jerk at the transition.
     if node.current_joint_positions is not None:
         current_pos = list(node.current_joint_positions)
         max_diff = max(abs(c - f) for c, f in zip(current_pos, partial[0]))
         if max_diff > 0.002:
             node.get_logger().info(
-                f"Partial reverse: bridging {max_diff*57.3:.2f}° gap with slow bridge trajectory"
+                f"Partial reverse: prepending current pos ({max_diff*57.3:.2f}° gap)"
             )
-            bridge_traj = build_trajectory(
-                node.joint_order,
-                [current_pos, partial[0]],
-                dt=0.04,
-                stop_flag=lambda: node.stop_requested,
-                max_vel=0.3,
-                max_acc=0.2,
-                ramp_points=0,
-            )
-            node.trajectory_pub.publish(bridge_traj)
-            time.sleep(0.2)
-            timeout_start = time.time()
-            while time.time() - timeout_start < 5.0:
-                if not is_robot_moving(node, velocity_threshold=0.005):
-                    break
-                time.sleep(0.05)
-            time.sleep(0.05)
+            partial = [current_pos] + partial
 
     node.get_logger().info(
         f"Partial reverse: {len(partial)}/{len(reversed_states)} waypoints "
@@ -1420,7 +1436,10 @@ def subscribe_to_goal_pose(node):
             node.get_logger().info(
                 f"Primary goal accepted: {height_type} | {lateral_type} "
                 f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f})")
-            node.obstacles.update_pose("fruit_obstacle", new_xyz)
+            try:
+                node.obstacles.update_pose("fruit_obstacle", new_xyz)
+            except Exception as _e:
+                node.get_logger().warn(f"obstacle update_pose failed (CUDA faulted?): {_e}")
 
     # Subscribe to /external_goal_pose with VOLATILE QoS
     # VOLATILE = don't receive old buffered messages, only fresh ones
@@ -1888,10 +1907,6 @@ def plan_and_execute(node):
         if cur_pose is not None:
             ee_dist = math.sqrt((cur_pose[0] - x)**2 + (cur_pose[1] - y)**2 + (cur_pose[2] - z)**2)
             node.get_logger().info(f"EE-to-goal distance: {ee_dist*100:.1f}cm")
-            if ee_dist < 0.15:  # within 15cm of fruit — skip approach, go straight to final
-                node.get_logger().info("EE already close to goal — skipping approach, going direct to final.")
-                orientation = minimize_rotation_orientation(cur_quat, target_quat)
-                skip_approach = True
 
         # 2-finger mode: detect between-branches scenario from vision depth analysis
         between_branches = getattr(node, 'fruit_between_branches', False)
@@ -1914,11 +1929,13 @@ def plan_and_execute(node):
 
 
         elif is_low:
-            side_blend = 0.25
+            is_low_lateral = abs(x - trunk_x) > LATERAL_THRESH
+            side_blend = 0.10 if is_low_lateral else 0.25
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
             approach = [ax, ay + 0.07, az - 0.09, *orientation]
             node.get_logger().info(
-                f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}")
+                f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, "
+                f"is_low_lateral={is_low_lateral}, blend={side_blend:.2f}")
         else:
             side_blend =0.0
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
@@ -1983,13 +2000,28 @@ def plan_and_execute(node):
                 node.get_logger().info("Approach standoff close — using direct IK (skipping cuRobo plan)")
                 _approach_ok = _direct_ik_move(node, approach, label="APPROACH", motion_type="approach", store_trajectory=True)
                 if not _approach_ok:
-                    # Branch mismatch — arm is already close enough, skip approach entirely
-                    # and go straight to FINAL. Re-homing first (even if at home) resets
-                    # the joint config so cuRobo IK succeeds on the next attempt.
-                    node.get_logger().info("Direct IK failed (branch mismatch) — re-homing then skipping to FINAL")
+                    # IK failed (branch mismatch) — cuRobo handles branch switching via TRAJOPT.
+                    # Path will be a detour but gets the arm to the correct approach position.
+                    node.get_logger().info(
+                        f"IK failed — cuRobo plan to approach {[round(v,3) for v in approach[:3]]}"
+                    )
+                    _start_after_ik_fail = JointState.from_position(
+                        torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                        joint_names=node.joint_order,
+                    )
+                    _approach_ok = plan_and_send(
+                        node, _start_after_ik_fail,
+                        Pose.from_list(approach),
+                        label="APPROACH",
+                        motion_type="approach",
+                        goal_xyz=approach[:3],
+                        store_trajectory=True,
+                    )
+                if not _approach_ok:
+                    node.get_logger().info("All approach attempts failed — re-homing then skipping to FINAL")
                     move_to_home_position(node)
                     if _check_stop(): break
-                    _approach_ok = True   # arm is close — proceed directly to FINAL
+                    _approach_ok = True
                     _skip_approach_wait = True
             else:
                 _approach_ok = plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True)
@@ -2089,7 +2121,7 @@ def plan_and_execute(node):
         # Reuse orientation from APPROACH step — all orientation changes happen during approach only
         node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
         z_offset = 0.025  # small downward adjustment during grasp
-        y_offset = -0.025  # no lateral adjustment
+        y_offset = -0.032  # no lateral adjustment
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
         # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
         # This ensures the approach vector is accurate after the arm has settled at standoff.
@@ -2120,20 +2152,21 @@ def plan_and_execute(node):
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
-            # IK too far — pull back a few cm and retry from a different config
-            node.get_logger().warn("FINAL IK failed — pulling back and retrying...")
-            cur = node.get_end_effector_pose()
-            if cur:
-                # Move 5cm back (away from fruit, along -Y in base frame)
-                retreat = [cur[0], cur[1] + 0.05, cur[2], *cur[3:]]
-                _direct_ik_move(node, retreat, label="FINAL_RETREAT",
-                                motion_type="final", store_trajectory=False)
-
-            # Retry FINAL from new position
+            # IK branch mismatch — redo approach with blend_weight=0.0 (keep current orientation,
+            # no target blend) to find a different IK branch, then retry FINAL.
+            node.get_logger().warn("FINAL IK failed — redoing approach with blend_weight=0.0...")
+            _cur_quat_now = node.get_end_effector_pose()
+            _cur_quat_now = _cur_quat_now[3:] if _cur_quat_now else orientation
+            _orient_zero = minimize_rotation_orientation(_cur_quat_now, target_quat, blend_weight=0.0)
+            _approach_reorient = list(approach[:3]) + list(_orient_zero)
+            node.get_logger().info(
+                f"FINAL retry: approach with blend_weight=0.0 → {[round(v,3) for v in _approach_reorient[:3]]}"
+            )
+            _direct_ik_move(node, _approach_reorient, label="APPROACH_REORIENT",
+                            motion_type="approach", store_trajectory=False)
             final_ok = _direct_ik_move(node, final_target, label="FINAL_RETRY",
-                                       motion_type="final", store_trajectory=False)
+                                       motion_type="final", store_trajectory=True)
         if not final_ok:
-            # Both attempts failed — skip this goal
             node.get_logger().warn("FINAL IK retry also failed — skipping goal.")
             if hasattr(node, 'set_vision_mode'):
                 node.set_vision_mode("full")
@@ -2170,9 +2203,17 @@ def plan_and_execute(node):
             # Too early (<20%) = gripper overshot fruit → pull back.
             # Stopped early counts as proper regardless of contact step.
             contact_ratio = first_contact / max(gc.steps, 1)
-            if stopped_early or (0.20 <= contact_ratio <= 0.60):
+            # Force confirmation: if ≥2 fingers show meaningful contact force,
+            # the grip is physically real — don't disturb it even if timing is off.
+            _force_confirmed = sum(1 for d in deltas if d > 1.5) >= 2
+            if stopped_early or (0.20 <= contact_ratio <= 0.60) or _force_confirmed:
                 prediction = "PROPER"
                 action = "PROCEED"
+                if _force_confirmed and not (stopped_early or (0.20 <= contact_ratio <= 0.60)):
+                    node.get_logger().info(
+                        f"Grip timing off ({contact_ratio:.0%}) but force confirms contact "
+                        f"(deltas={[f'{d:.2f}' for d in deltas]}N) — skipping regrip"
+                    )
             else:
                 prediction = "NO_CONTACT"
                 action = "REGRIP"
@@ -2232,6 +2273,29 @@ def plan_and_execute(node):
             else:
                 prediction = "PROPER" if (stopped_early or first_contact < gc.steps - 2) else "NO_CONTACT"
             node.get_logger().info(f"Re-grip result: {prediction}, first_contact={first_contact}/{gc.steps}")
+
+        # Depth correction: nudge gripper forward (gripper closed) to bring contact
+        # ratio closer to ideal 0.40. Only applied when grip is accepted (no regrip
+        # needed) but fruit is shallower than ideal (ratio > 0.40).
+        # Gripper stays closed — this deepens the cup around the fruit without releasing.
+        contact_ratio_now = first_contact / max(gc.steps, 1)
+        _depth_correction = -(contact_ratio_now - 0.40) * 0.04  # same formula as REGRIP
+        _depth_correction = max(-0.020, min(0.0, _depth_correction))  # forward only, ≤20mm
+        if abs(_depth_correction) > 0.003:  # only move if correction > 3mm
+            _cur_for_depth = node.get_end_effector_pose()
+            if _cur_for_depth:
+                _depth_target = [
+                    _cur_for_depth[0],
+                    _cur_for_depth[1] + _depth_correction,
+                    _cur_for_depth[2],
+                    *_cur_for_depth[3:]
+                ]
+                node.get_logger().info(
+                    f"[DEPTH] contact_ratio={contact_ratio_now:.0%} → nudging "
+                    f"{_depth_correction*1000:+.1f}mm forward to deepen grip"
+                )
+                _direct_ik_move(node, _depth_target, label="DEPTH_CORRECT",
+                                motion_type="final", store_trajectory=False)
 
         # Log grasp attempt for learning (success filled in by user feedback later)
         if learner:

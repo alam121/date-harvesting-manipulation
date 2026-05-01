@@ -8,7 +8,7 @@ import time
 
 # Gripper aperture constants (meters)
 GRIPPER_MAX_APERTURE = 0.070   # 80mm total opening at full open
-APERTURE_MARGIN = 0.015        # 15mm extra clearance beyond fruit diameter
+APERTURE_MARGIN = 0.010        # 15mm extra clearance beyond fruit diameter
 
 
 # ============================================================

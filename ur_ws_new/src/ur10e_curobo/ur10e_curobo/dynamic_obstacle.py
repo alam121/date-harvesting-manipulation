@@ -18,10 +18,20 @@ class DynamicObstacleManager:
     # ------------------------------
     # Add Sphere
     # ------------------------------
+    def _try_update_world(self):
+        if getattr(self.node, "_cuda_faulted", False):
+            return
+        try:
+            self.motion_gen.update_world(self.world_model)
+        except Exception as e:
+            self.node.get_logger().warn(f"[DynamicObstacleManager] update_world failed: {e}")
+            if "CUDA error" in str(e) or "illegal memory access" in str(e):
+                self.node._cuda_faulted = True
+
     def add_sphere(self, name, radius=0.1, initial_pose=[0,0,-10,1,0,0,0]):
         sphere = Sphere(name=name, pose=initial_pose, radius=radius)
         self.world_model.sphere.append(sphere)
-        self.motion_gen.update_world(self.world_model)
+        self._try_update_world()
         self.node.get_logger().info(f"[DynamicObstacleManager] Added sphere '{name}'")
 
     # ------------------------------
@@ -30,7 +40,7 @@ class DynamicObstacleManager:
     def add_cuboid(self, name, dims, initial_pose=[0,0,-10,1,0,0,0]):
         cube = Cuboid(name=name, pose=initial_pose, dims=dims)
         self.world_model.cuboid.append(cube)
-        self.motion_gen.update_world(self.world_model)
+        self._try_update_world()
         self.node.get_logger().info(f"[DynamicObstacleManager] Added cuboid '{name}'")
 
     # ------------------------------
@@ -52,7 +62,7 @@ class DynamicObstacleManager:
                 updated = True
 
         if updated:
-            self.motion_gen.update_world(self.world_model)
+            self._try_update_world()
         else:
             self.node.get_logger().warn(f"[DynamicObstacleManager] Obstacle '{name}' not found!")
 
