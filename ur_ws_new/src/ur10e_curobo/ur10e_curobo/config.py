@@ -20,7 +20,7 @@ JOINT_ORDER = [
 ]
 
 # Height threshold (m) that classifies targets as LOW vs MID/HIGH.
-LOW_Z_THRESH = 0.99
+LOW_Z_THRESH = 0.94
 
 # Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
 LATERAL_THRESH = 0.03
@@ -105,10 +105,17 @@ class JointsPreset:
     predropoff: List[float] = field(default_factory=lambda: [-1.5009062925921839, -1.7099877796568812, 2.0609028975116175, -4.172773023644918, 4.572351932525635, 0.05295269936323166]
 )
     # Side home positions for laterally distant fruits
-    home_left: List[float] = field(default_factory=lambda:   [-0.7984879652606409, -1.2919612687877198, 1.7527521292315882, -4.203655859033102, 3.8313863277435303, -0.41989452043642217]
+    home_left: List[float] = field(default_factory=lambda:  [-0.7986648718463343, -1.370279149418213, 1.5869911352740687, -3.958400150338644, 3.832206964492798, -0.4182942549334925]
+
 
 )
-    home_right: List[float] = field(default_factory=lambda: [-2.1765440146075647, -1.531268910770752, 2.0052130858050745, -4.843977590600485, 5.513174057006836, 1.2792410850524902]
+    home_right: List[float] = field(default_factory=lambda:  [-2.1769216696368616, -1.6072222195067347, 1.8494580427752894, -4.613555570641989, 5.513333320617676, 1.2812821865081787]
+
+
+)
+    home_right_low: List[float] = field(default_factory=lambda: [-1.9339564482318323, -1.6063157520689906, 2.2498558203326624, -4.5144740543761195, 4.918370246887207, 0.31434082984924316]
+)
+    home_left_low: List[float] = field(default_factory=lambda: [-0.9872930685626429, -1.384446458225586, 2.0082204977618616, -4.594993253747457, 4.218744277954102, -0.3455312887774866]
 
 )
 

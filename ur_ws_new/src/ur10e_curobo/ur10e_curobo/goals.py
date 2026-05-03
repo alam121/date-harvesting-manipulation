@@ -1049,7 +1049,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -1067,14 +1067,15 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
 
     try:
         return _reacquire_goal_pose_impl(
-            node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance, depth_settle_s)
+            node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance, depth_settle_s,
+            stable_needed=stable_needed)
     finally:
         # Always restore full mode so the next approach cycle works normally
         if hasattr(node, 'set_vision_mode'):
             node.set_vision_mode("full")
 
 
-def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0):
+def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
     import numpy as _np
     # Build seed list: primary first, then candidates
     seeds = [seed_xyz[:3]]
@@ -1084,8 +1085,8 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
             if all(math.dist(xyz, s) > 0.03 for s in seeds):
                 seeds.append(list(xyz))
 
-    multi = len(seeds) > 1
-    stable_needed = 5          # readings that must match before accepting
+    if stable_needed is None:
+        stable_needed = 5      # readings that must match before accepting
     Z_STABLE_THRESH = 0.012    # max std of Z across stable readings (12 mm)
 
     stable_count = 0
@@ -1822,7 +1823,7 @@ def plan_and_execute(node):
         # Height-based approach strategy
         is_low = z < LOW_Z_THRESH
 
-        standoff = 0.25  # standoff distance from fruit for approach pose
+        standoff = 0.10  # standoff distance from fruit for approach pose
         d_blend = blend_approach_direction(node, x, y, z)
 
         if is_low:
@@ -1834,14 +1835,17 @@ def plan_and_execute(node):
                 f"LOW approach (z={z:.2f} < {LOW_Z_THRESH}): "
                 f"fruit=[{x:.3f},{y:.3f},{z:.3f}]")
         else:
-            # Mid/high: d_blend direction-driven approach from front
-            ax = x - standoff
-            ay = y + standoff  # ALWAYS toward robot
-            az = z - standoff
+            # Mid/high: standoff directly behind fruit in Y only — same X and Z as fruit
+            # Right-side fruits get a larger standoff to improve approach angle
+            _is_right = x < (node.trunk_x or 0.16)
+            _midhi_standoff = 0.12 if _is_right else standoff
+            ax = x
+            ay = y + _midhi_standoff
+            az = z
             node.get_logger().info(
                 f"MID/HIGH approach (z={z:.2f} >= {LOW_Z_THRESH}): "
                 f"fruit=[{x:.3f},{y:.3f},{z:.3f}] standoff=[{ax:.3f},{ay:.3f},{az:.3f}] "
-                f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+                f"standoff_dist={_midhi_standoff:.2f} right={_is_right}")
 
         # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
@@ -1859,13 +1863,14 @@ def plan_and_execute(node):
             dx_ee_to_fruit = abs(x - trunk_x)
             node.get_logger().info(
                 f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}")
-            if dx_ee_to_fruit > LATERAL_THRESH and not is_low:   # skip side HOME for low fruits
+            LOW_SIDE_HOME_THRESH = 0.07  # only trigger side HOME for LOW when >7cm lateral
+            if dx_ee_to_fruit > (LOW_SIDE_HOME_THRESH if is_low else LATERAL_THRESH):
                 if x > trunk_x:
-                    side_joints = node.home_left_joints
-                    side_label = "HOME_LEFT"
+                    side_joints = node.home_left_low_joints if is_low else node.home_left_joints
+                    side_label = "HOME_LEFT_LOW" if is_low else "HOME_LEFT"
                 else:
-                    side_joints = node.home_right_joints
-                    side_label = "HOME_RIGHT"
+                    side_joints = node.home_right_low_joints if is_low else node.home_right_joints
+                    side_label = "HOME_RIGHT_LOW" if is_low else "HOME_RIGHT"
                 node.get_logger().info(
                     f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
                 if node.current_joint_positions is not None:
@@ -1879,26 +1884,6 @@ def plan_and_execute(node):
                     torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
                     joint_names=node.joint_order,
                 )
-                # Reacquire goal after side HOME — target may have shifted during the move
-                candidates = getattr(node, 'candidate_goals', [])
-                reacq = reacquire_goal_pose(node, seed_xyz=[x, y, z], candidate_seeds=candidates, timeout=10.0)
-                if reacq:
-                    x, y, z = reacq
-                    node.get_logger().info(
-                        f"Reacquired after {side_label}: [{x:.3f}, {y:.3f}, {z:.3f}]")
-                    publish_goal_marker(node, [x, y, z])
-                    # Recompute approach standoff with updated position
-                    is_low = z < LOW_Z_THRESH
-                    d_blend = blend_approach_direction(node, x, y, z)
-                    if is_low:
-                        ax, ay, az = x, y, z
-                    else:
-                        ax = x - standoff
-                        ay = y + standoff
-                        az = z - standoff
-                else:
-                    node.get_logger().warn(
-                        f"Reacquire after {side_label} failed — using original goal position")
             else:
                 node.get_logger().info("Fruit near center; using default HOME without side move.")
 
@@ -1930,7 +1915,7 @@ def plan_and_execute(node):
 
         elif is_low:
             is_low_lateral = abs(x - trunk_x) > LATERAL_THRESH
-            side_blend = 0.10 if is_low_lateral else 0.25
+            side_blend = 0.25 if (is_low_lateral and is_side_approach) else (0.10 if is_low_lateral else 0.25)
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
             approach = [ax, ay + 0.07, az - 0.09, *orientation]
             node.get_logger().info(
@@ -2060,49 +2045,33 @@ def plan_and_execute(node):
 
         if _check_stop(): break
 
-        # 2. Reacquire — check primary + all candidate seeds for fastest lock-on
-        # TEST: reacquire disabled — using original seed directly
-        REACQUIRE_ENABLED = False
-        seed = [x,y,z]
-        candidates = getattr(node, 'candidate_goals', [])
-        reacq = None
-        if REACQUIRE_ENABLED:
-            node.motion_phase = "REACQUIRE"
-            node.reacquire_result = "SEARCH"   # show live state: searching
-            node._publish_goal_info()          # push immediately — timer blocked during long waits
-            reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates)
-
-        if not REACQUIRE_ENABLED:
-            x, y, z = seed
-            node.get_logger().info(f"[REACQ] Disabled — using seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
-            node.reacquire_result = "DISABLED"
-            node._publish_goal_info()
-        elif reacq is None:
-            # Nudge EE down a few cm and retry — fruit may be just below FOV
-            node.get_logger().warn("Reacquire timed out — nudging down to search for detection.")
-            node.reacquire_result = "NUDGING"  # show live state: nudging
-            node._publish_goal_info()          # push immediately
-            cur = node.get_end_effector_pose()
-            if cur and not _check_stop():
-                nudge = [cur[0], cur[1], cur[2] - 0.02, *cur[3:]]
-                _direct_ik_move(node, nudge, label="REACQ_NUDGE",
-                                motion_type="final", store_trajectory=False)
-                reacq = reacquire_goal_pose(node, seed_xyz=seed, candidate_seeds=candidates, timeout=4.0, depth_settle_s=0.5)
-            if reacq:
-                x,y,z = reacq
-                publish_goal_marker(node, [x,y,z])
-                node.get_logger().info(f"Reacquired after nudge: [{x:.3f}, {y:.3f}, {z:.3f}]")
-                node.reacquire_result = "NUDGE OK"
-            else:
-                node.get_logger().warn("No reacquire after nudge — falling back to original seed.")
-                x, y, z = seed
-                node.reacquire_result = "NUDGE FAIL"
-            node._publish_goal_info()      # push final nudge result immediately
-        else:
-            x,y,z = reacq
-            publish_goal_marker(node, [x,y,z])
-            node.get_logger().info(f"Reacquired goal: [{x:.3f}, {y:.3f}, {z:.3f}]")
+        # 2. Soft reacquire — quick confirmation within tight radius of original seed.
+        # Initial detection is accurate enough; this just refines the position slightly.
+        # Falls back to seed immediately if no match found — no nudge, no failure.
+        seed = [x, y, z]
+        node.motion_phase = "REACQUIRE"
+        node.reacquire_result = "SEARCH"
+        node._publish_goal_info()
+        reacq = reacquire_goal_pose(
+            node,
+            seed_xyz=seed,
+            candidate_seeds=[],   # tight to seed only — no roaming
+            timeout=3.0,
+            radius=0.03,          # 3cm — tighter than default 4cm
+            z_tolerance=0.002,    # 2mm
+            depth_settle_s=1.2,
+            stable_needed=2,
+        )
+        if reacq:
+            x, y, z = reacq
+            publish_goal_marker(node, [x, y, z])
+            node.get_logger().info(f"[REACQ] Refined: [{x:.3f}, {y:.3f}, {z:.3f}]")
             node.reacquire_result = "OK"
+        else:
+            x, y, z = seed
+            node.get_logger().info(f"[REACQ] No match — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+            node.reacquire_result = "SEED"
+        node._publish_goal_info()
             
         if _check_stop(): break
 
@@ -2321,6 +2290,16 @@ def plan_and_execute(node):
         node.motion_phase = "REVERSING"
         execute_partial_reverse(node, clearance_m=0.28)
 
+        # Flush any async CUDA errors that accumulated during FINAL IK/planning.
+        # They surface at the next CUDA op — force them here so DROP-OFF gets a clean state.
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            node._cuda_faulted = True
+        if getattr(node, "_cuda_faulted", False):
+            try_cuda_recovery(node)
+
         # After partial reverse, return to the correct home position:
         # - Side approach: go back to home_left or home_right (arm is near trunk, needs to clear)
         # - Center approach: try direct dropoff, fall back to center HOME only if planning fails
@@ -2359,9 +2338,9 @@ def plan_and_execute(node):
                 if next_is_low:
                     nax, nay, naz = nx, ny - 0.01, nz - 0.12
                 else:
-                    nax = nx - next_d_blend[0] * next_standoff
-                    nay = ny + abs(next_d_blend[1]) * next_standoff
-                    naz = nz - next_d_blend[2] * next_standoff
+                    nax = nx
+                    nay = ny + next_standoff
+                    naz = nz
 
                 # Try planning from current (dropoff) position to next approach
                 cur_joints = node.current_joint_positions

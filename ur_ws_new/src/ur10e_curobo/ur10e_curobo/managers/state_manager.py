@@ -2,7 +2,6 @@
 """Robot state management for UR10e cuRobo node."""
 
 import threading
-import time
 from typing import Optional, List, Tuple, TYPE_CHECKING
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
@@ -28,13 +27,6 @@ class StateManager:
         self._current_joint_positions: Optional[List[float]] = None
         self._current_joint_velocities: Optional[List[float]] = None
 
-        # Jerk detection
-        self._jerk_prev_vel: Optional[List[float]] = None
-        self._jerk_prev_acc: Optional[List[float]] = None
-        self._jerk_prev_time: float = 0.0
-        self._jerk_threshold: float = 800.0   # rad/s³ — normal motion peaks ~150-360, real jerks >800
-        self._jerk_log_cooldown: float = 0.5  # seconds between consecutive warnings
-        self._jerk_last_log: float = 0.0
 
         # TF
         self.tf_buffer: Buffer = Buffer()
@@ -208,36 +200,6 @@ class StateManager:
             self._current_joint_velocities = [
                 vm.get(j, 0.0) for j in self._config.joint_order
             ]
-
-        self._detect_jerk(self._current_joint_velocities)
-
-    def _detect_jerk(self, velocities: Optional[List[float]]) -> None:
-        if velocities is None:
-            return
-        now = time.monotonic()
-        dt = now - self._jerk_prev_time
-        if self._jerk_prev_vel is None or dt < 1e-4:
-            self._jerk_prev_vel = list(velocities)
-            self._jerk_prev_time = now
-            return
-
-        acc = [(velocities[i] - self._jerk_prev_vel[i]) / dt for i in range(len(velocities))]
-
-        if self._jerk_prev_acc is not None:
-            jerk = [(acc[i] - self._jerk_prev_acc[i]) / dt for i in range(len(acc))]
-            max_j = max(abs(j) for j in jerk)
-            if max_j > self._jerk_threshold:
-                if (now - self._jerk_last_log) > self._jerk_log_cooldown:
-                    worst = max(range(len(jerk)), key=lambda i: abs(jerk[i]))
-                    self._node.get_logger().warn(
-                        f"[JERK] {max_j:.1f} rad/s³ on joint {worst} "
-                        f"(threshold={self._jerk_threshold:.0f})"
-                    )
-                    self._jerk_last_log = now
-
-        self._jerk_prev_acc = acc
-        self._jerk_prev_vel = list(velocities)
-        self._jerk_prev_time = now
 
     def _robot_running_cb(self, msg: Bool) -> None:
         """Track robot program running state."""

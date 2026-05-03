@@ -884,6 +884,14 @@ class UR10eCuroboMoveIt(Node):
         return self._config_mgr.home_left_joints
 
     @property
+    def home_left_low_joints(self) -> list:
+        return self._config_mgr.home_left_low_joints
+
+    @property
+    def home_right_low_joints(self) -> list:
+        return self._config_mgr.home_right_low_joints
+
+    @property
     def home_right_joints(self) -> list:
         return self._config_mgr.home_right_joints
 

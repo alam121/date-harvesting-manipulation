@@ -120,8 +120,10 @@ class VisionNode:
         # pts_one: ZED One (CAM_FRAME) coordinates — used for centroid so TF to base_link is correct.
         # pts_mini: ZED Mini frame — kept for depth_map visualisation only.
         # Used by _extract_target_3d for direct point queries — avoids scatter/fill artefacts.
-        self._latest_mini_pts: Optional[tuple] = None  # (pts_one Nx3, uv_one Nx2)
+        self._mini_pts_buffer: list = []           # ring buffer: [(pts_one, uv_one, ts), ...]
         self._mini_pts_lock = Lock()
+        self._mini_pts_buffer_size: int = 5       # keep last 5 Mini depth frames
+        self._latest_zed_one_ts: float = 0.0      # wall-clock time of last ZED One grab
 
         # ZED X One image from ROS topic (used when --use_lidar)
         self._latest_ros_image: Optional[np.ndarray] = None
@@ -394,7 +396,9 @@ class VisionNode:
                             self._latest_depth_map = depth_map
                             self._latest_depth_map_orig = orig_valid
                         with self._mini_pts_lock:
-                            self._latest_mini_pts = (_raw_mini_pts, _raw_mini_uv)
+                            self._mini_pts_buffer.append((_raw_mini_pts, _raw_mini_uv, time()))
+                            if len(self._mini_pts_buffer) > self._mini_pts_buffer_size:
+                                self._mini_pts_buffer.pop(0)
                 _pending_depth_thread = _zed_mini_depth_thread
         else:
             # ── ZED stereo path ─────────────────────────────────────────────
@@ -509,6 +513,7 @@ class VisionNode:
                     break
 
                 t_now = time()
+                self._latest_zed_one_ts = t_now
                 loop_fps = 1.0 / (t_now - t_prev) if (t_now - t_prev) > 0 else 0.0
                 t_prev = t_now
 
@@ -1163,13 +1168,24 @@ class VisionNode:
             # Query raw projected points by UV — avoids scatter/fill bleed-in
             # at depth discontinuities (fruit edge vs background).
             with self._mini_pts_lock:
-                mini_pts_data = self._latest_mini_pts
+                buf = list(self._mini_pts_buffer)
 
-            if mini_pts_data is None or mini_pts_data[0].shape[0] == 0:
+            if not buf:
                 mark_reject("No depth data")
                 return None
 
-            pts_all, uv_all = mini_pts_data  # pts: ZED Mini frame, uv: ZED One pixels
+            # Pick the buffered frame closest in time to the current ZED One frame
+            zed_one_ts = self._latest_zed_one_ts
+            best = min(buf, key=lambda f: abs(f[2] - zed_one_ts))
+            pts_all, uv_all, mini_ts = best
+            if pts_all.shape[0] == 0:
+                mark_reject("No depth data")
+                return None
+            _depth_age = abs(zed_one_ts - mini_ts)
+            if _depth_age > 0.15:
+                self.node.get_logger().debug(
+                    f"[DEPTH] best match age {_depth_age*1000:.0f}ms — Mini may be falling behind"
+                )
 
             # Filter to bbox
             u = uv_all[:, 0]
