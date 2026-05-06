@@ -72,7 +72,7 @@ class VisionNode:
         self.prev_heat_point: Optional[np.ndarray] = None
         self.prev_direction_base: Optional[np.ndarray] = None
         self.direction_history = deque(maxlen=5)
-        self.best_history = deque(maxlen=3)
+        self.best_history = deque(maxlen=5)
 
         # Heatmap throttling — only recompute every N frames
         self._heatmap_frame_count = 0
@@ -122,7 +122,7 @@ class VisionNode:
         # Used by _extract_target_3d for direct point queries — avoids scatter/fill artefacts.
         self._mini_pts_buffer: list = []           # ring buffer: [(pts_one, uv_one, ts), ...]
         self._mini_pts_lock = Lock()
-        self._mini_pts_buffer_size: int = 5       # keep last 5 Mini depth frames
+        self._mini_pts_buffer_size: int = 7       # keep last 7 Mini depth frames
         self._latest_zed_one_ts: float = 0.0      # wall-clock time of last ZED One grab
 
         # ZED X One image from ROS topic (used when --use_lidar)
@@ -232,7 +232,7 @@ class VisionNode:
         from std_msgs.msg import String as _String
         def _mode_cb(msg):
             mode = msg.data.strip()
-            if mode in ("full", "reacquire"):
+            if mode in ("full", "reacquire", "paused"):
                 self.detection_mode = mode
         self.node.create_subscription(_String, "/vision/mode", _mode_cb, 10)
 
@@ -527,12 +527,14 @@ class VisionNode:
                     zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU,
                                        sl.Resolution(disp_w, disp_h))
                 np.copyto(image_left_ocv, image_left.get_data())
-                # In reacquire mode send frames to YOLO only every 3rd iteration —
-                # we only need position confirmation, not rapid scene updates.
-                _reacquire = self.detection_mode == "reacquire"
-                self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
-                if not _reacquire or self._reacquire_frame_skip == 0:
-                    self.yolo_thread.set_image(image_left.get_data())
+                # "paused" mode: no inference at all (arm is moving, GPU needed for cuRobo).
+                # "reacquire" mode: every 3rd frame only.
+                # "full" mode: every frame.
+                if self.detection_mode != "paused":
+                    _reacquire = self.detection_mode == "reacquire"
+                    self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
+                    if not _reacquire or self._reacquire_frame_skip == 0:
+                        self.yolo_thread.set_image(image_left.get_data())
                 _t1 = time()
 
                 # Refresh per-frame TF cache — one lookup per frame instead of

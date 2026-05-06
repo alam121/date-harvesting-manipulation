@@ -2,6 +2,7 @@
 
 from typing import List
 
+import cv2
 import numpy as np
 import pyzed.sl as sl
 
@@ -82,6 +83,10 @@ def detections_to_custom_masks(dets, trunk_class_ids=None, bunch_class_ids=None)
         if dets.masks is not None and dets.masks.data is not None:
             m = dets.masks.data[di].cpu().numpy()
             mask_bin = (m * 255).astype(np.uint8)
+            # retina_masks=False returns masks at model resolution, not image resolution.
+            # Resize to image dims so bbox coords (in image space) align correctly.
+            if mask_bin.shape[0] != H or mask_bin.shape[1] != W:
+                mask_bin = cv2.resize(mask_bin, (W, H), interpolation=cv2.INTER_NEAREST)
             x_min = int(abcd[0, 0])
             y_min = int(abcd[0, 1])
             x_max = int(abcd[2, 0])

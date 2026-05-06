@@ -24,6 +24,10 @@ class YoloThread:
         self.run_event = Event()
         self.dets_ready = Event()
         self.stopped = Event()  # set when run() loop exits
+        # Held during active GPU inference — cuRobo acquires this before planning
+        # to prevent concurrent CUDA ops that corrupt shared GPU memory on Jetson.
+        self.inference_lock = Lock()
+        self.paused = False   # when True, set_image() drops frames — YOLO idles
         self.exit_signal = False
 
         self.image_net: Optional[np.ndarray] = None
@@ -84,20 +88,21 @@ class YoloThread:
                 #     classes=self._detect_class_ids if self._detect_class_ids else None,
                 # )[0]
 
-                det = self._model.track(
-                     img,
-                     save=False,
-                     retina_masks=True,
-                     imgsz=self.img_size,
-                     conf=self.conf_thres,
-                     iou=0.3,       # lower NMS IoU so overlapping bunches aren't suppressed
-                     max_det=50,    # allow more detections per frame
-                     device=device,
-                     verbose=False,
-                     tracker="bytetrack.yaml",
-                     classes=self._detect_class_ids if self._detect_class_ids else None,
-                 )[0]
-                
+                with self.inference_lock:
+                    det = self._model.track(
+                         img,
+                         save=False,
+                         retina_masks=True,
+                         imgsz=self.img_size,
+                         conf=self.conf_thres,
+                         iou=0.3,
+                         max_det=50,
+                         device=device,
+                         verbose=False,
+                         tracker="bytetrack.yaml",
+                         classes=self._detect_class_ids if self._detect_class_ids else None,
+                     )[0]
+
                 dt = time() - t0
                 self.net_fps = (1.0 / dt) if dt > 0 else 0.0
 
@@ -118,7 +123,9 @@ class YoloThread:
         self.stopped.set()  # signal that the loop has fully exited
 
     def set_image(self, image: np.ndarray) -> None:
-        """Set new image for inference."""
+        """Set new image for inference. Dropped silently when paused."""
+        if self.paused:
+            return
         with self.lock:
             self.image_net = image
             self.run_event.set()

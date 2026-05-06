@@ -338,7 +338,12 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
     if node.current_joint_positions is None:
-        node.get_logger().warn(f"[DIRECT] {label}: no joint state"); return False
+        for _ in range(20):
+            time.sleep(0.05)
+            if node.current_joint_positions is not None:
+                break
+        if node.current_joint_positions is None:
+            node.get_logger().warn(f"[DIRECT] {label}: no joint state"); return False
 
     start_js = list(node.current_joint_positions)
 
@@ -604,14 +609,19 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
 
-    # 1) Plan with cuRobo
+    # 1) Plan with cuRobo — hold YOLO inference_lock so YOLO and cuRobo
+    # never run CUDA kernels concurrently on the shared Jetson GPU.
     plan_cfg = PLAN_CFG_DEFAULT
     lock = getattr(node, '_planning_lock', None)
+    _yolo = getattr(node, 'yolo_thread', None)
+    _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    if _yolo_lock: _yolo_lock.acquire()
     if lock: lock.acquire()
     try:
         res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
     finally:
         if lock: lock.release()
+        if _yolo_lock: _yolo_lock.release()
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
@@ -1049,7 +1059,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.28):
     return True
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None, restore_mode="full"):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -1060,6 +1070,8 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
         candidate_seeds: list of [x,y,z,...] alternate candidates (optional)
         timeout: max wait time including settle period
         depth_settle_s: how long to wait for depth to stabilise (reduce for small nudges)
+        restore_mode: vision mode to restore on exit ("full" or "paused").
+                      Pass "paused" for slip check so YOLO stays off during dropoff planning.
     """
     # Switch vision to lightweight mode: no heatmap, no trunk, no viz
     if hasattr(node, 'set_vision_mode'):
@@ -1070,9 +1082,9 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
             node, seed_xyz, candidate_seeds, timeout, radius, z_tolerance, depth_settle_s,
             stable_needed=stable_needed)
     finally:
-        # Always restore full mode so the next approach cycle works normally
+        # Restore to requested mode (full for normal reacquire, paused for slip check)
         if hasattr(node, 'set_vision_mode'):
-            node.set_vision_mode("full")
+            node.set_vision_mode(restore_mode)
 
 
 def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
@@ -1109,6 +1121,7 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
 
     _last_progress_log = 0.0   # throttle per-frame progress to once/sec
 
+    _grace_extended = False
     while time.time() - start < timeout:
         # Check best fruit first, then fall back to all visible fruits.
         # This allows reacquire to find the target even when it isn't best-ranked
@@ -1148,15 +1161,24 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 )
                 xy_only_match = depth_unstable and d_xy <= 0.05
                 full_match = d_xy <= radius and d_z <= z_tolerance
-                if (full_match or xy_only_match) and d_xy < best_dist:
+                # One-dim-close: if either dxy<2cm or dz<2cm the fruit is very close in that
+                # dimension — accept it but fall back to original seed xyz (safest position).
+                one_dim_close = (d_xy < 0.02 or d_z < 0.02) and (d_xy < radius or d_z < z_tolerance)
+                if (full_match or xy_only_match or one_dim_close) and d_xy < best_dist:
                     best_dist = d_xy
                     best_seed = s
                     _used_xy_only = xy_only_match and not full_match
+                    _match_type = "one-dim-close" if (one_dim_close and not full_match and not xy_only_match) else ("XY-only" if _used_xy_only else "full")
                     node.get_logger().debug(
                         f"[REACQ] match: [{cx:.3f},{cy:.3f},{cz:.3f}] → seed [{s[0]:.3f},{s[1]:.3f},{s[2]:.3f}] "
-                        f"dxy={d_xy*100:.1f}cm dz={d_z*100:.1f}cm "
-                        f"{'XY-only' if _used_xy_only else 'full'}")
-                    if _used_xy_only:
+                        f"dxy={d_xy*100:.1f}cm dz={d_z*100:.1f}cm ({_match_type})")
+                    if one_dim_close and not full_match and not xy_only_match:
+                        # Use whichever dimension is close from candidate, keep seed for the other
+                        nx = cx if d_xy < 0.02 else s[0]
+                        ny = cy if d_xy < 0.02 else s[1]
+                        nz = cz if d_z < 0.02 else s[2]
+                        pose = [nx, ny, nz]
+                    elif _used_xy_only:
                         # Use detected XY but keep seed Z — depth unreliable
                         pose = [cx, cy, s[2]]
                     else:
@@ -1243,6 +1265,13 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 node.get_logger().info(_accept_msg)
             return (x, y, z)
 
+        # Grace period: if we have stable=1 and are about to time out, extend by 1s
+        if (not _grace_extended and stable_count >= 1
+                and time.time() - start >= timeout - 0.05):
+            timeout += 1.0
+            _grace_extended = True
+            node.get_logger().info(
+                f"[REACQ] Grace +1s: stable={stable_count}/{stable_needed} — waiting for one more reading")
         time.sleep(0.001)
 
     # Timeout — soft-accept if we have ≥3 stable readings with good Z
@@ -1741,26 +1770,27 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
     n_blend = np.linalg.norm(d)
     d_norm = d / n_blend if n_blend > 1e-9 else d_vis.copy()
 
+    # Determine if this is a new direction or same as last time
+    _prev = getattr(node, "_prev_blend_dir", None)
+    if _prev is None:
+        _status = "NEW (first reading)"
+    elif fruit_dir is None:
+        _status = "FALLBACK (no fruit_direction from vision — using camera-ray)"
+    else:
+        _delta = float(np.linalg.norm(d_norm - np.array(_prev, dtype=float)))
+        if _delta < 0.05:
+            _status = f"SAME (delta={_delta:.3f})"
+        else:
+            _status = f"NEW (delta={_delta:.3f})"
+
     node._prev_blend_dir = d_norm.tolist()
 
-    # Quick log to verify sign convention (throttled).
-    now = time.time()
-    last = getattr(node, "_last_dir_log", 0.0)
-    if now - last > 1.0:
-        node._last_dir_log = now
-        if fruit_dir is None:
-            fruit_repr = "None"
-            prev_repr = "None"
-            dot_repr = "n/a"
-        else:
-            fruit_repr = np.round(np.array(fruit_dir, dtype=float), 3)
-            prev_repr = "None" if d_prev is None else np.round(d_prev, 3)
-            dot_repr = "n/a" if prev_dot is None else f"{prev_dot:.3f}"
-        node.get_logger().info(
-            f"dir dbg: fruit_direction={fruit_repr} d_vis={np.round(d_vis, 3)} "
-            f"d_dir_aligned={np.round(d_dir, 3)} prev_dir={prev_repr} prev_dot={dot_repr} "
-            f"d_blend={np.round(d_norm, 3)}"
-        )
+    node.get_logger().info(
+        f"[DIR] {_status} | "
+        f"source={'fruit_direction' if fruit_dir is not None else 'camera-ray'} | "
+        f"d_blend=[{d_norm[0]:.3f},{d_norm[1]:.3f},{d_norm[2]:.3f}]"
+        + (f" | prev_dot={prev_dot:.3f}" if prev_dot is not None else "")
+    )
 
     return d_norm
 
@@ -1777,7 +1807,15 @@ def plan_and_execute(node):
         node.get_logger().error("Robot program OFF; may fail.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    _yolo = getattr(node, 'yolo_thread', None)  # local inference_lock only (same process)
+    # Vision mode helpers — these publish to /vision/mode to control the separate vision process.
+    # _vision_pause() sleeps 120ms after publishing: ROS2 topic latency (~20ms) + worst-case
+    # YOLO inference time at 640px on Jetson (~50ms) + margin. Without this gap, YOLO TRT
+    # and cuRobo CUDA kernels overlap on the shared GPU and trigger device-side asserts.
+    def _vision_pause():
+        node.set_vision_mode("paused")
+        time.sleep(0.12)
+    def _vision_resume(): node.set_vision_mode("full")
 
     def _check_stop():
         """Check if stop was requested; if so, halt robot and clear goals."""
@@ -1812,6 +1850,10 @@ def plan_and_execute(node):
 
         # Lock vision onto this target (prevents switching to different "best" during approach)
         lock_target(node, goal[:3])
+
+        # Pause YOLO — goal is committed; no new detections needed until reacquire at standoff.
+        # Frees GPU fully for cuRobo planning and arm motion.
+        _vision_pause()
 
         # Clear stored trajectory for partial reverse after grasp
         node.stored_trajectory_states = []
@@ -1863,20 +1905,26 @@ def plan_and_execute(node):
             dx_ee_to_fruit = abs(x - trunk_x)
             node.get_logger().info(
                 f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}")
-            LOW_SIDE_HOME_THRESH = 0.07  # only trigger side HOME for LOW when >7cm lateral
-            if dx_ee_to_fruit > (LOW_SIDE_HOME_THRESH if is_low else LATERAL_THRESH):
+            if dx_ee_to_fruit > LATERAL_THRESH:
                 if x > trunk_x:
                     side_joints = node.home_left_low_joints if is_low else node.home_left_joints
                     side_label = "HOME_LEFT_LOW" if is_low else "HOME_LEFT"
                 else:
-                    side_joints = node.home_right_low_joints if is_low else node.home_right_joints
-                    side_label = "HOME_RIGHT_LOW" if is_low else "HOME_RIGHT"
-                node.get_logger().info(
-                    f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
-                if node.current_joint_positions is not None:
-                    side_joints = nearest_joint_config(node.current_joint_positions, side_joints)
-                plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
-                is_side_approach = True
+                    if not is_low:
+                        # MID/HIGH RIGHT: skip side HOME, use center approach
+                        node.get_logger().info("MID/HIGH RIGHT: skipping side HOME, using center approach")
+                        side_joints = None
+                        side_label = None
+                    else:
+                        side_joints = node.home_right_low_joints
+                        side_label = "HOME_RIGHT_LOW"
+                if side_joints is not None:
+                    node.get_logger().info(
+                        f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
+                    if node.current_joint_positions is not None:
+                        side_joints = nearest_joint_config(node.current_joint_positions, side_joints)
+                    plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
+                    is_side_approach = True
                 # Update start state and cur_pose after side HOME
                 cur_pose = node.get_end_effector_pose()
                 cur_quat = cur_pose[3:] if cur_pose else cur_quat
@@ -1884,6 +1932,17 @@ def plan_and_execute(node):
                     torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
                     joint_names=node.joint_order,
                 )
+                # Camera is fixed — its surface normal won't change with arm position.
+                # Use the geometric direction from the current EE (at side home) toward the fruit.
+                # This correctly reflects the side approach angle rather than the camera's frontal view.
+                if cur_pose is not None:
+                    ee_to_fruit = np.array([x - cur_pose[0], y - cur_pose[1], z - cur_pose[2]], dtype=float)
+                    n = np.linalg.norm(ee_to_fruit)
+                    if n > 1e-6:
+                        d_blend = ee_to_fruit / n
+                        node.get_logger().info(
+                            f"[DIR] NEW (geometric from EE at {side_label}) | "
+                            f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
             else:
                 node.get_logger().info("Fruit near center; using default HOME without side move.")
 
@@ -1912,15 +1971,36 @@ def plan_and_execute(node):
             node.reacquire_result = ""  # reset at start of each attempt
             pass  # jump straight to reacquire + final below
 
+        elif getattr(node, '_slip_retry_approach', None) is not None:
+            # Slip retry: recompute approach XYZ from current fruit position (fruit may have shifted
+            # after slip reacquire), but keep orientation from the stored approach.
+            _stored_approach = node._slip_retry_approach
+            orientation = _stored_approach[3:]
+            node._slip_retry_approach = None
+            node._slip_retry_fruit_radius = None
+            # fruit_radius already set from node.latest_fruit_radius at line 1847
+            # — same source as the first attempt, so gripper opens to the same width
+            # Recompute standoff using current x, y, z (same formula as is_low / MID/HIGH)
+            if is_low:
+                _x_off = 0.05 * (1 if x > trunk_x else -1) if abs(x - trunk_x) > LATERAL_THRESH else 0.0
+                approach = [ax + _x_off, ay + 0.07, az - 0.07, *orientation]
+            else:
+                approach = [ax, ay, az, *orientation]
+            node.get_logger().info(
+                f"Slip retry: stored approach was {[round(v,3) for v in _stored_approach[:3]]}, "
+                f"recomputed from current fruit → {[round(v,3) for v in approach[:3]]} "
+                f"fruit_radius={fruit_radius}")
 
         elif is_low:
             is_low_lateral = abs(x - trunk_x) > LATERAL_THRESH
-            side_blend = 0.25 if (is_low_lateral and is_side_approach) else (0.10 if is_low_lateral else 0.25)
+            side_blend = 0.30 if (is_low_lateral and is_side_approach) else (0.10 if is_low_lateral else 0.25)
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            approach = [ax, ay + 0.07, az - 0.09, *orientation]
+            # X offset: approach from the side for lateral fruits (away from trunk center)
+            _x_offset = 0.05 * (1 if x > trunk_x else -1) if is_low_lateral else 0.0
+            approach = [ax + _x_offset, ay + 0.07, az - 0.07, *orientation]
             node.get_logger().info(
                 f"LOW approach pose: {approach[:3]}, is_side={is_side_approach}, "
-                f"is_low_lateral={is_low_lateral}, blend={side_blend:.2f}")
+                f"is_low_lateral={is_low_lateral}, x_offset={_x_offset:+.3f}, blend={side_blend:.2f}")
         else:
             side_blend =0.0
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
@@ -1977,6 +2057,10 @@ def plan_and_execute(node):
         if not skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
             node.motion_phase = "APPROACH"
+            # Clear depth-camera voxels — stale noise from previous pick blocks approach paths.
+            if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+                try: node.voxel_obstacles.clear()
+                except Exception: pass
 
             _ap_dist = math.sqrt(sum((cur_pose[i] - approach[i])**2 for i in range(3))) if cur_pose else 999.0
             _skip_approach_wait = False
@@ -2010,7 +2094,13 @@ def plan_and_execute(node):
                     _skip_approach_wait = True
             else:
                 _approach_ok = plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True)
+                if not _approach_ok:
+                    # Fallback: direct IK move (different solver, handles cases plan_single can't)
+                    node.get_logger().warn("APPROACH plan failed — retrying with direct IK...")
+                    _approach_ok = _direct_ik_move(node, approach, label="APPROACH_IK",
+                                                   motion_type="approach", store_trajectory=True)
             if not _approach_ok:
+                node.get_logger().warn("All APPROACH attempts failed — skipping goal.")
                 unlock_target(node)
                 continue
             # Open gripper during approach motion (arm is already moving)
@@ -2018,8 +2108,21 @@ def plan_and_execute(node):
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
                 gripper_opened = True
             if not _skip_approach_wait:
-                wait_until_xyz(node, approach[:3])
+                _approach_reached = wait_until_xyz(node, approach[:3])
                 if _check_stop(): break
+                if not _approach_reached:
+                    # Distinguish: arm never moved vs arm moved but stalled near target.
+                    _cur_after = node.get_end_effector_pose()
+                    _dist_to_approach = math.dist(_cur_after[:3], approach[:3]) if _cur_after else float('inf')
+                    if _dist_to_approach > 0.10:
+                        node.get_logger().warn(
+                            f"Approach did not execute (arm {_dist_to_approach*100:.0f}cm from target) — aborting goal, returning HOME.")
+                        _vision_resume()
+                        unlock_target(node)
+                        move_to_home_position(node)
+                        break
+                    node.get_logger().info(
+                        f"Approach stalled {_dist_to_approach*100:.1f}cm from target — close enough, continuing.")
                 log_path_deviation(node, "APPROACH")
                 blend_motion(node)
 
@@ -2045,32 +2148,38 @@ def plan_and_execute(node):
 
         if _check_stop(): break
 
-        # 2. Soft reacquire — quick confirmation within tight radius of original seed.
-        # Initial detection is accurate enough; this just refines the position slightly.
-        # Falls back to seed immediately if no match found — no nudge, no failure.
+        # 2. Soft reacquire — re-detection at approach standoff for accurate final position.
+        # Resume YOLO now (was paused since target lock) for this focused snapshot.
+        _vision_resume()
         seed = [x, y, z]
         node.motion_phase = "REACQUIRE"
-        node.reacquire_result = "SEARCH"
-        node._publish_goal_info()
-        reacq = reacquire_goal_pose(
-            node,
-            seed_xyz=seed,
-            candidate_seeds=[],   # tight to seed only — no roaming
-            timeout=3.0,
-            radius=0.03,          # 3cm — tighter than default 4cm
-            z_tolerance=0.002,    # 2mm
-            depth_settle_s=1.2,
-            stable_needed=2,
-        )
-        if reacq:
-            x, y, z = reacq
-            publish_goal_marker(node, [x, y, z])
-            node.get_logger().info(f"[REACQ] Refined: [{x:.3f}, {y:.3f}, {z:.3f}]")
-            node.reacquire_result = "OK"
+        if node.cfg.planner.reacquire_after_approach:
+            node.reacquire_result = "SEARCH"
+            node._publish_goal_info()
+            reacq = reacquire_goal_pose(
+                node,
+                seed_xyz=seed,
+                candidate_seeds=[],   # tight to seed only — no roaming
+                timeout=3.0,
+                radius=0.03,          # 3cm — tighter than default 4cm
+                z_tolerance=0.002,    # 2mm
+                depth_settle_s=0.6,
+                stable_needed=2,
+            )
+            if reacq:
+                x, y, z = reacq
+                publish_goal_marker(node, [x, y, z])
+                node.get_logger().info(f"[REACQ] Refined: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                node.reacquire_result = "OK"
+            else:
+                x, y, z = seed
+                node.get_logger().info(f"[REACQ] No match — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                node.reacquire_result = "SEED"
         else:
-            x, y, z = seed
-            node.get_logger().info(f"[REACQ] No match — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
             node.reacquire_result = "SEED"
+            node.get_logger().info(f"[REACQ] Skipped — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+        # Pause YOLO again — final move and grasp need full GPU for IK.
+        _vision_pause()
         node._publish_goal_info()
             
         if _check_stop(): break
@@ -2086,11 +2195,18 @@ def plan_and_execute(node):
             x, y, z = seed[0], seed[1], seed[2]
 
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
-        #    _direct_ik_move handles wait + blend internally
-        # Reuse orientation from APPROACH step — all orientation changes happen during approach only
-        node.get_logger().info(f"FINAL orientation: reusing APPROACH orientation (is_low={is_low})")
-        z_offset = 0.025  # small downward adjustment during grasp
-        y_offset = -0.032  # no lateral adjustment
+        # Recompute orientation from current EE at standoff — avoids large wrist jumps when the
+        # stale approach orientation diverges from the actual arm configuration after motion.
+        _cur_ee_at_standoff = node.get_end_effector_pose()
+        if _cur_ee_at_standoff is not None:
+            orientation = minimize_rotation_orientation(
+                _cur_ee_at_standoff[3:], list(target_quat), blend_weight=0.3)
+            node.get_logger().info(f"FINAL orientation: recomputed from EE at standoff (is_low={is_low})")
+        else:
+            node.get_logger().info(f"FINAL orientation: using approach orientation (is_low={is_low})")
+        _is_slip_retry = getattr(node, "_slip_retry_count", 0) > 0
+        z_offset = 0.02 if _is_slip_retry else 0.03
+        y_offset = 0.000  # no lateral adjustment
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
         # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
         # This ensures the approach vector is accurate after the arm has settled at standoff.
@@ -2115,32 +2231,25 @@ def plan_and_execute(node):
         gx, gy, gz = x, y - y_offset, z + z_offset
         final_target = [gx, gy, gz, *orientation]
         node.motion_phase = "FINAL"
-        # Suppress heatmap/scoring during final grasp — target is locked, no new selection needed
-        if hasattr(node, 'set_vision_mode'):
-            node.set_vision_mode("reacquire")
+        # Vision is already "paused" from _vision_pause() — keep it that way for final move.
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
         if not final_ok:
-            # IK branch mismatch — redo approach with blend_weight=0.0 (keep current orientation,
-            # no target blend) to find a different IK branch, then retry FINAL.
-            node.get_logger().warn("FINAL IK failed — redoing approach with blend_weight=0.0...")
-            _cur_quat_now = node.get_end_effector_pose()
-            _cur_quat_now = _cur_quat_now[3:] if _cur_quat_now else orientation
-            _orient_zero = minimize_rotation_orientation(_cur_quat_now, target_quat, blend_weight=0.0)
-            _approach_reorient = list(approach[:3]) + list(_orient_zero)
-            node.get_logger().info(
-                f"FINAL retry: approach with blend_weight=0.0 → {[round(v,3) for v in _approach_reorient[:3]]}"
-            )
-            _direct_ik_move(node, _approach_reorient, label="APPROACH_REORIENT",
-                            motion_type="approach", store_trajectory=False)
-            final_ok = _direct_ik_move(node, final_target, label="FINAL_RETRY",
-                                       motion_type="final", store_trajectory=True)
-        if not final_ok:
-            node.get_logger().warn("FINAL IK retry also failed — skipping goal.")
-            if hasattr(node, 'set_vision_mode'):
-                node.set_vision_mode("full")
-            unlock_target(node)
-            continue
+            # Fallback: full cuRobo plan_and_send (handles branch changes, no IK restriction)
+            node.get_logger().warn("FINAL IK failed — trying plan_and_send as fallback...")
+            if node.current_joint_positions is not None:
+                _final_start = JointState.from_position(
+                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                    joint_names=node.joint_order,
+                )
+                final_ok = plan_and_send(node, _final_start, Pose.from_list(final_target),
+                    label="FINAL_PLAN", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True)
+                if final_ok:
+                    wait_until_xyz(node, final_target[:3], tol=0.008)
+            if not final_ok:
+                node.get_logger().warn("All FINAL attempts failed — skipping goal.")
+                unlock_target(node)
+                continue
         log_path_deviation(node, "FINAL")
 
         if _check_stop(): break
@@ -2148,9 +2257,6 @@ def plan_and_execute(node):
         time.sleep(0.5)
         if _check_stop():
             break
-        # Restore full vision mode now that the grasp is done
-        if hasattr(node, 'set_vision_mode'):
-            node.set_vision_mode("full")
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, final_target[:3])
 
@@ -2187,7 +2293,7 @@ def plan_and_execute(node):
                 prediction = "NO_CONTACT"
                 action = "REGRIP"
 
-        if action == "REGRIP":
+        if action == "REGRIP" and node.cfg.planner.regrip_after_slip:
             node.get_logger().warn(f"Weak grip ({prediction}) — re-gripping...")
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius); time.sleep(0.1)
             cur = node.get_end_effector_pose()
@@ -2230,7 +2336,7 @@ def plan_and_execute(node):
                 # Use _direct_ik_move — stays on the same kinematic branch.
                 # exec_pose (full cuRobo planner) can plan a wild arc for a tiny correction.
                 _direct_ik_move(node, closer_target, label="REGRIP",
-                                motion_type="final", store_trajectory=False)
+                                motion_type="final", store_trajectory=True)
             node.control_gripper("CLOSE"); time.sleep(0.1)
             # Re-read after re-grip
             first_contact = getattr(gc, 'closure_first_contact_step', gc.steps)
@@ -2264,7 +2370,7 @@ def plan_and_execute(node):
                     f"{_depth_correction*1000:+.1f}mm forward to deepen grip"
                 )
                 _direct_ik_move(node, _depth_target, label="DEPTH_CORRECT",
-                                motion_type="final", store_trajectory=False)
+                                motion_type="final", store_trajectory=True)
 
         # Log grasp attempt for learning (success filled in by user feedback later)
         if learner:
@@ -2277,10 +2383,19 @@ def plan_and_execute(node):
                 delta_f0=deltas[0], delta_f1=deltas[1], delta_f2=deltas[2],
             )
 
+        # Store approach + fruit_radius for potential slip retry
+        node._slip_retry_approach = approach
+        node._slip_retry_fruit_radius = fruit_radius
+
         # 4. Drop-off and return
-        if _check_stop(): 
+        if _check_stop():
             break
         time.sleep(0.2)
+
+        # Wrist rotation to detach fruit from stem
+        node.get_logger().info("Post-grip wrist rotation (90°) to detach stem")
+        rotate_wrist(node, degrees=90, rotate_time=0.6, hold_time=0.1, return_time=1.0)
+        time.sleep(1.9)  # rotate_time(0.6) + hold_time(0.1) + return_time(1.0) + margin
 
         # Attempt CUDA recovery before dropoff/home planning
         if getattr(node, "_cuda_faulted", False):
@@ -2289,6 +2404,45 @@ def plan_and_execute(node):
         # Reverse along the stored approach path (28cm clearance from fruit).
         node.motion_phase = "REVERSING"
         execute_partial_reverse(node, clearance_m=0.28)
+
+        # Slip check: actively query depth camera for fruit still at the grasp position.
+        # goal_poses queue is unreliable here (vision may not have re-published yet),
+        # so use reacquire_goal_pose which directly reads the depth frame.
+        _MAX_SLIP_RETRIES = 2
+        _slip_retry_count = getattr(node, "_slip_retry_count", 0)
+        node.get_logger().info(f"Slip check: querying depth at grasp=[{x:.3f},{y:.3f},{z:.3f}]")
+        _slip_reacq = reacquire_goal_pose(
+            node,
+            seed_xyz=[x, y, z],
+            candidate_seeds=[],
+            timeout=3.0,
+            radius=0.04,       # 4cm xy
+            z_tolerance=0.15,  # 15cm z — loose enough for arm movement, excludes bunch neighbors
+            depth_settle_s=2.0,
+            stable_needed=3,
+            restore_mode="paused",  # keep YOLO off after slip check — dropoff needs GPU for cuRobo
+        )
+        _slip_detected = _slip_reacq is not None
+        node.get_logger().info(
+            f"Slip check: {'SLIP at ' + str([round(v,3) for v in _slip_reacq]) if _slip_detected else 'OK — no fruit at grasp position'}")
+
+        if _slip_detected and _slip_retry_count < _MAX_SLIP_RETRIES:
+            node._slip_retry_count = _slip_retry_count + 1
+            node.get_logger().warn(
+                f"SLIP DETECTED: fruit still at [{x:.3f},{y:.3f},{z:.3f}] after grasp "
+                f"(retry {node._slip_retry_count}/{_MAX_SLIP_RETRIES}) — retrying from reverse position")
+            unlock_target(node)
+            if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles:
+                node.voxel_obstacles.clear()
+            # Re-insert original x,y,z — approach was computed for this seed and will be reused
+            _retry_goal = [x, y, z] + list(goal[3:])
+            node.goal_poses.append(_retry_goal)
+            # _slip_retry_approach already set above — reused in next iteration for approach step
+            continue
+        else:
+            node._slip_retry_count = 0
+            if _slip_detected:
+                node.get_logger().warn("Slip detected but max retries reached — proceeding to dropoff")
 
         # Flush any async CUDA errors that accumulated during FINAL IK/planning.
         # They surface at the next CUDA op — force them here so DROP-OFF gets a clean state.
@@ -2300,17 +2454,18 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # After partial reverse, return to the correct home position:
-        # - Side approach: go back to home_left or home_right (arm is near trunk, needs to clear)
-        # - Center approach: try direct dropoff, fall back to center HOME only if planning fails
-        if is_side_approach:
-            node.get_logger().info("Side approach — returning to center HOME before dropoff")
-            node.motion_phase = "HOME"
-            move_to_home_position(node)
+        # Clear voxel obstacles before dropoff planning — after reverse the arm has left the
+        # fruit zone but the depth-based voxel grid still shows the bunch as obstacles,
+        # causing INVALID_START_STATE_WORLD_COLLISION on every plan attempt.
+        if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
+            node.voxel_obstacles.clear()
+            node.get_logger().info("Voxel obstacles cleared before dropoff planning")
 
+        # Try direct dropoff for both center and side approaches.
+        # Only go to center HOME first if dropoff planning fails (trunk in path).
         node.motion_phase = "DROPOFF"
         if not move_to_dropoff_position(node):
-            node.get_logger().info("Direct dropoff failed, going to center HOME first")
+            node.get_logger().info("Direct dropoff failed — going to center HOME first to clear trunk")
             node.motion_phase = "HOME"
             move_to_home_position(node)
             node.motion_phase = "DROPOFF"
@@ -2332,8 +2487,6 @@ def plan_and_execute(node):
                 next_quat = next_goal[3:]
                 next_is_low = nz < LOW_Z_THRESH
 
-                # Compute approach pose for next goal
-                next_d_blend = blend_approach_direction(node, nx, ny, nz)
                 next_standoff = 0.12
                 if next_is_low:
                     nax, nay, naz = nx, ny - 0.01, nz - 0.12
@@ -2383,6 +2536,9 @@ def plan_and_execute(node):
             node.motion_phase = "HOME"
             move_to_home_position(node)
 
+        # Back at home — resume YOLO so it can detect the next fruit.
+        _vision_resume()
+
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
         if node.cfg.grasp.learning_enabled and hasattr(node, 'pending_grasp_record') and node.pending_grasp_record is not None:
             node._grasp_feedback = None  # reset
@@ -2415,6 +2571,10 @@ def plan_and_execute(node):
             node.get_logger().info("All goals completed; returned HOME.")
         else:
             node.get_logger().info("Preparing for next goal...")
+
+    # Always resume YOLO when the grasp loop exits — break, stop, or normal completion.
+    _vision_resume()
+    node.get_logger().info("Done.")
 
 
 def quaternion_from_approach(node, direction_xyz=None, pitch_deg=None, world=False):

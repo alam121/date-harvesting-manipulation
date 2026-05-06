@@ -227,6 +227,7 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().warn("Motion already in progress, ignoring HOME command")
                 return
             try:
+                self.stop_requested = False  # clear any prior stop before homing
                 motions_mod.move_to_home_position(self)
             finally:
                 self._motion_lock.release()
@@ -725,11 +726,20 @@ class UR10eCuroboMoveIt(Node):
         variance = np.var(self.last_frames, axis=0).sum()
 
         # ------------------------------------------------------
-        # 5. NEW Scoring: smaller distance & smaller noise is better
+        # 5. Scoring: smaller distance & smaller noise is better.
+        # Require at least 3 frames before committing — with fewer
+        # frames variance=0 is meaningless (single-sample artifact).
+        # Also gate on variance threshold: sum of per-axis variances
+        # < 0.0003 ≈ 10mm std per axis with the dual-camera setup.
+        # This makes commitment quick when stable, patient when noisy.
         # ------------------------------------------------------
-        score = dist + variance * 3.0   # POSITIVE penalty
+        if len(self.last_frames) < 3:
+            return
+        if variance > 0.0003:
+            return
 
-        # Lower score = better (changed sign logic!)
+        score = dist + variance * 3.0
+
         if score < self.best_goal_score - 0.002:
             self.best_goal_score = score
             self.best_goal_xyz = [x, y, z]

@@ -85,7 +85,7 @@ def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
         kin = _get_kin_model(node)
         with torch.no_grad():
             ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
-        pos = ee_pos.squeeze().cpu().tolist()
+        pos = ee_pos.reshape(-1).cpu().tolist()
         return Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
     except Exception as e:
         node.get_logger().warn(f"CuRobo FK failed: {e}")

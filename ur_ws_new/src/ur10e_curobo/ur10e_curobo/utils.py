@@ -100,10 +100,20 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     last_dist = None
     stall_start = None
     stalled = False
+    _at_tol_since = None
     STALL_TIMEOUT = 2.0  # only timeout if robot not moving for 2s
 
     try:
         node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
+        # Capture starting position — wait until the arm has moved at least 1cm before
+        # checking arrival, to avoid false-positive when start and target have same XYZ.
+        _start_pose = node.get_end_effector_pose()
+        _start_xyz = _start_pose[:3] if _start_pose else None
+        # If already at target before arm starts moving, skip departure check
+        _already_there = (_start_xyz is not None and
+                          math.dist(_start_xyz, target_xyz) < tol * 2)
+        _departed = _already_there
+        _departure_deadline = time.time() + 15.0  # if arm hasn't moved in 15s, give up
         while getattr(node, "running", True):
             # Safety exit: stop signal
             if getattr(node, "stop_requested", False):
@@ -126,6 +136,28 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
 
             dist = math.dist(cur[:3], target_xyz)
 
+            # If robot program is off, pause all timers and wait for user to restart.
+            if not getattr(node, 'robot_running', True):
+                node.get_logger().info(
+                    "Robot program is NOT running — waiting for user to turn on the program.")
+                _departure_deadline = time.time() + 15.0  # reset deadline while program is off
+                stall_start = None
+                last_dist = None
+                time.sleep(0.5)
+                continue
+
+            # Don't check arrival until arm has moved at least 1cm from start
+            if not _departed and _start_xyz is not None:
+                if math.dist(cur[:3], _start_xyz) > 0.01:
+                    _departed = True
+                elif time.time() > _departure_deadline:
+                    node.get_logger().warn(
+                        "Arm has not moved 1cm in 15s — trajectory likely not executed. Giving up.")
+                    return False
+            if not _departed:
+                time.sleep(0.05)
+                continue
+
             # Check distance to goal
             if dist < tol:
                 # Orientation check (if requested)
@@ -135,14 +167,21 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                         time.sleep(0.05)
                         continue
 
-                # Velocity check — ensure robot is settling, not just passing through
+                # Velocity check — ensure robot is settling, not just passing through.
+                # Track how long we've been within tol; accept after 1s even if still oscillating.
                 vels = getattr(node, 'current_joint_velocities', None)
                 if vels and max(abs(v) for v in vels) > 0.01:
-                    time.sleep(0.05)
-                    continue
+                    if _at_tol_since is None:
+                        _at_tol_since = time.time()
+                    elif time.time() - _at_tol_since < 1.0:
+                        time.sleep(0.05)
+                        continue
+                    # else: been within tol for 1s, accept despite residual velocity
 
                 node.get_logger().info(f"End-effector reached target. dist={dist*100:.1f}cm")
                 break
+            else:
+                _at_tol_since = None
 
             # Stall detection: only timeout if robot has stopped moving
             if last_dist is not None and abs(dist - last_dist) < 0.001:
@@ -159,11 +198,8 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
 
             time.sleep(0.05)
 
-            time.sleep(0.05)
-
     except Exception as e:
         node.get_logger().error(f"Error during wait_until_xyz: {e}")
-        publish_stop_trajectory(node)
 
     # Track stall count on the node — reset at start of each goal, abort after 2
     if stalled:

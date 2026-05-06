@@ -85,7 +85,7 @@ joint_trajectory_controller:
       $(var tf_prefix)elbow_joint: { trajectory: 0.2, goal: 0.1 }
       $(var tf_prefix)wrist_1_joint: { trajectory: 0.2, goal: 0.1 }
       $(var tf_prefix)wrist_2_joint: { trajectory: 0.2, goal: 0.1 }
-      $(var tf_prefix)wrist_3_joint: { trajectory: 0.2, goal: 0.1 }
+      $(var tf_prefix)wrist_3_joint: { trajectory: 0.5, goal: 0.1 }
 
 
 scaled_joint_trajectory_controller:
@@ -113,7 +113,7 @@ scaled_joint_trajectory_controller:
       $(var tf_prefix)elbow_joint: { trajectory: 0.2, goal: 0.1 }
       $(var tf_prefix)wrist_1_joint: { trajectory: 0.2, goal: 0.1 }
       $(var tf_prefix)wrist_2_joint: { trajectory: 0.2, goal: 0.1 }
-      $(var tf_prefix)wrist_3_joint: { trajectory: 0.2, goal: 0.1 }
+      $(var tf_prefix)wrist_3_joint: { trajectory: 0.5, goal: 0.1 }
     speed_scaling_interface_name: $(var tf_prefix)speed_scaling/speed_scaling_factor
 
 passthrough_trajectory_controller:

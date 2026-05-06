@@ -82,6 +82,7 @@ class UIManager:
                 self._node.get_logger().warn("Motion already in progress, ignoring HOME command")
                 return
             try:
+                self._node.stop_requested = False  # clear any prior stop before homing
                 motions_mod.move_to_home_position(self._node)
             finally:
                 self._motion._motion_lock.release()

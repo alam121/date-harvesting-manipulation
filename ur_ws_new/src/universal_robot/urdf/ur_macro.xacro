@@ -540,7 +540,7 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin xyz="0.034102 -0.153032 0.079616" rpy="-0.172164 0.008484 0.204048"/><!-- hand-eye calibrated (DANIILIDIS, 2.05mm error, 32 samples, 2026-04-26) -->
+    <origin xyz="0.042550 -0.150154 0.074587" rpy="-0.166668 0.013504 0.252667"/><!-- hand-eye calibrated (DANIILIDIS, 4.02mm error, 36 samples, updated 2026-05-03 21:59:45) -->
   </joint>
 
     

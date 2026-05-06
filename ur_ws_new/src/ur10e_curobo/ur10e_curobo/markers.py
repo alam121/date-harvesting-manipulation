@@ -275,7 +275,10 @@ def track_robot_path(node):
         tf = node.tf_buffer.lookup_transform(
             "base_link", "gripper_tip", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
         )
-        p = Point(x=tf.transform.translation.x, y=tf.transform.translation.y, z=tf.transform.translation.z)
+        p = Point()
+        p.x = float(tf.transform.translation.x)
+        p.y = float(tf.transform.translation.y)
+        p.z = float(tf.transform.translation.z)
         if not node.path_points or (p.x != node.path_points[-1].x or p.y != node.path_points[-1].y or p.z != node.path_points[-1].z):
             node.path_points.append(p); publish_path_marker(node)
             if not node.tf_printed:

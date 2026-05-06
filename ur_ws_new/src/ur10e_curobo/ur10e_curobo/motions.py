@@ -6,7 +6,7 @@ from curobo.types.robot import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from .config import PLAN_CFG_DEFAULT, PLAN_CFG_JS, VOXEL_CONFIG
+from .config import PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_NO_FINETUNE, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
 from .fk import forward_kinematics
 
@@ -120,7 +120,8 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         max_acc=planner.max_joint_acceleration,
         ramp_points=0,
     )
-    node.trajectory_pub.publish(traj)
+    if traj.points:
+        node.trajectory_pub.publish(traj)
 
 
 # Plans and executes a joint-space motion to reach a specified set of joint angles.
@@ -190,21 +191,43 @@ def plan_execute_js(
     # ------------------------------
     lock = getattr(node, '_planning_lock', None)
     res = None
-    if lock: lock.acquire()
+    _yolo = getattr(node, 'yolo_thread', None)
+    _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    if _yolo_lock: _yolo_lock.acquire()
     try:
-        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
-    except Exception as e:
-        msg = str(e)
-        if "CUDA error" in msg or "illegal memory access" in msg:
-            node._cuda_faulted = True
-        node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
-        return False
+        if lock: lock.acquire()
+        try:
+            res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+        except Exception as e:
+            msg = str(e)
+            if "CUDA error" in msg or "illegal memory access" in msg:
+                node._cuda_faulted = True
+            node.get_logger().warn(f"Joint-space plan to {label} exception: {e}")
+            return False
+        finally:
+            if lock: lock.release()
+
+        if res is None or not res.success:
+            status = getattr(res, 'status', 'unknown') if res is not None else 'None'
+            # FINETUNE_TRAJOPT_FAIL means the base trajectory was found but fine-tune
+            # smoothing failed. Retry without finetune to still get a valid trajectory.
+            if res is not None and "FINETUNE" in str(status):
+                node.get_logger().info(
+                    f"Joint-space plan to {label}: finetune failed, retrying without finetune")
+                if lock: lock.acquire()
+                try:
+                    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS_NO_FINETUNE)
+                except Exception as e:
+                    node.get_logger().warn(f"Joint-space retry to {label} exception: {e}")
+                    return False
+                finally:
+                    if lock: lock.release()
+        if res is None or not res.success:
+            status = getattr(res, 'status', 'unknown') if res is not None else 'None'
+            node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
+            return False
     finally:
-        if lock: lock.release()
-    if res is None or not res.success:
-        status = getattr(res, 'status', 'unknown') if res is not None else 'None'
-        node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
-        return False
+        if _yolo_lock: _yolo_lock.release()
 
     # ------------------------------
     # 4. Interpolate (older cuRobo API)
@@ -214,7 +237,7 @@ def plan_execute_js(
     curobo_dt = get_curobo_dt(res)
 
     dt = curobo_dt / max(scale, 1e-6)
-    dt = min(max(dt, curobo_dt), planner.max_dt)
+    dt = min(max(dt, planner.min_dt), planner.max_dt)
 
     traj = build_trajectory(
         node.joint_order,
@@ -225,14 +248,32 @@ def plan_execute_js(
     )
 
     node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
-    node.trajectory_pub.publish(traj)
+    if traj.points:
+        node.trajectory_pub.publish(traj)
+    else:
+        node.get_logger().warn(f"Skipping publish for {label} — empty trajectory (stop requested?)")
+        return False
 
     # ------------------------------
     # 8. Wait for the robot, then blend to avoid abrupt stop
     # ------------------------------
-    fk = forward_kinematics(node, states[-1])
+    target_joints = states[-1]
+    fk = forward_kinematics(node, target_joints)
     if fk:
         wait_until_xyz(node, [fk.x, fk.y, fk.z])
+    # Secondary joint-space check: if EE arrived instantly (different IK branch),
+    # wait until joints actually converge to the target configuration.
+    _joint_tol = 0.05  # rad (~3°)
+    _joint_deadline = time.time() + 15.0
+    while time.time() < _joint_deadline and getattr(node, 'running', True):
+        if getattr(node, 'stop_requested', False):
+            break
+        cur_joints = node.current_joint_positions
+        if cur_joints is not None:
+            max_err = max(abs(c - t) for c, t in zip(cur_joints, target_joints))
+            if max_err < _joint_tol:
+                break
+        time.sleep(0.05)
     blend_motion(node)
     return True
 
@@ -253,7 +294,18 @@ def nearest_joint_config(current: List[float], target: List[float]) -> List[floa
     return out
 
 
+def _clear_voxels(node):
+    """Clear voxel obstacle world so depth-camera noise doesn't block return paths."""
+    vo = getattr(node, 'voxel_obstacles', None)
+    if vo is not None:
+        try:
+            vo.clear()
+        except Exception:
+            pass
+
+
 def move_to_home_position(node):
+    _clear_voxels(node)
     target = node.home_joints
     if node.current_joint_positions is not None:
         target = nearest_joint_config(node.current_joint_positions, target)
@@ -261,6 +313,7 @@ def move_to_home_position(node):
 
 
 def move_to_dropoff_position(node):
+    _clear_voxels(node)
     target = node.dropoff_joints
     if node.current_joint_positions is not None:
         target = nearest_joint_config(node.current_joint_positions, target)
@@ -377,5 +430,6 @@ def blend_motion(node, pause=0.1):
         dt=0.02,
         stop_flag=lambda: node.stop_requested,
     )
-    node.trajectory_pub.publish(traj)
+    if traj.points:
+        node.trajectory_pub.publish(traj)
     time.sleep(pause)

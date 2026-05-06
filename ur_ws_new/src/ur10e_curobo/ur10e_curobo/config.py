@@ -75,6 +75,16 @@ PLAN_CFG_JS = MotionGenPlanConfig(
     enable_graph_attempt=None,
 )
 
+# Fallback for when finetune trajopt fails (FINETUNE_TRAJOPT_FAIL).
+# Used as a second attempt in plan_execute_js — skips fine-tune smoothing
+# but still produces a valid collision-free trajectory.
+PLAN_CFG_JS_NO_FINETUNE = MotionGenPlanConfig(
+    max_attempts=20,
+    enable_finetune_trajopt=False,
+    enable_graph=False,
+    enable_graph_attempt=None,
+)
+
 # ---------- Runtime parameters (override via ROS params / env) ----------
 @dataclass
 class Topics:
@@ -113,7 +123,8 @@ class JointsPreset:
 
 
 )
-    home_right_low: List[float] = field(default_factory=lambda: [-1.9339564482318323, -1.6063157520689906, 2.2498558203326624, -4.5144740543761195, 4.918370246887207, 0.31434082984924316]
+    home_right_low: List[float] = field(default_factory=lambda:  [-2.0225699583636683, -1.5956303081908167, 2.210489575062887, -4.641205211678976, 5.276980876922607, 0.710979700088501]
+
 )
     home_left_low: List[float] = field(default_factory=lambda: [-0.9872930685626429, -1.384446458225586, 2.0082204977618616, -4.594993253747457, 4.218744277954102, -0.3455312887774866]
 
@@ -145,12 +156,16 @@ class Planner:
 
     # === TRAJECTORY LIMITS ===
     # These control how fast trajectories can actually execute
-    min_dt: float = 0.005                # minimum timestep (lower = faster, but may cause instability)
+    min_dt: float = 0.010                # minimum timestep — keep ≥0.010 to avoid UR joint velocity limit faults
     max_dt: float = 0.05                 # maximum timestep
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff
+
+    # === REACQUIRE ===
+    reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
+    regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
 
     # === DEBUG ===
     debug_plan_preview: bool = True    # show full plan and wait for confirmation before executing
