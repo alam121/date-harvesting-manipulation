@@ -78,17 +78,8 @@ class MotionExecutor:
         world_config = self._wait_for_trunk_and_build_world(timeout=40.0)
 
         # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
-        from ..static_obstacles import StaticObstacleSpec
-        self.static_obstacles = [
-            StaticObstacleSpec(
-                marker_id=i,
-                position=(float(obs["pose"][0]), float(obs["pose"][1]), float(obs["pose"][2])),
-                scale=(float(obs["dims"][0]), float(obs["dims"][1]), float(obs["dims"][2])),
-                color=obs["color"],
-                orientation=(float(obs["pose"][4]), float(obs["pose"][5]), float(obs["pose"][6]), float(obs["pose"][3])),
-            )
-            for i, obs in enumerate(STATIC_OBSTACLES)
-        ]
+        from ..static_obstacles import _obs_to_spec
+        self.static_obstacles = [_obs_to_spec(i, obs) for i, obs in enumerate(STATIC_OBSTACLES)]
 
         # cuRobo setup
         self._node.get_logger().info("Loading cuRobo configuration...")
@@ -175,20 +166,19 @@ class MotionExecutor:
             tx = float(np.median(arr[:, 0]))
             ty = float(np.median(arr[:, 1]))
             self._node.get_logger().info(
-                f"Trunk detected! {len(samples)} samples → pole at x={tx:.3f}, y={ty:.3f}"
+                f"Trunk detected! {len(samples)} samples → trunk at x={tx:.3f}, y={ty:.3f}"
             )
-            if "pole" in world_config["cuboid"]:
-                pole = world_config["cuboid"]["pole"]
-                pole["pose"][0] = tx
-                pole["pose"][1] = ty
+            if "cuboid" in world_config and "trunk" in world_config["cuboid"]:
+                world_config["cuboid"]["trunk"]["pose"][0] = tx
+                world_config["cuboid"]["trunk"]["pose"][1] = ty
             # Also update static obstacles for RViz
             for obs in STATIC_OBSTACLES:
-                if obs["name"] == "pole":
+                if obs["name"] == "trunk":
                     obs["pose"][0] = tx
                     obs["pose"][1] = ty
         else:
             self._node.get_logger().warn(
-                "No trunk detected — using default pole position from config"
+                "No trunk detected — using default trunk position from config"
             )
 
         return world_config

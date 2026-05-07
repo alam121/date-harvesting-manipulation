@@ -101,74 +101,89 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     stall_start = None
     stalled = False
     _at_tol_since = None
-    STALL_TIMEOUT = 2.0  # only timeout if robot not moving for 2s
+    STALL_TIMEOUT = 2.0
+    _deadline = time.time() + timeout
+    _min_dist_seen = float('inf')
+    _prog_was_off = False
 
     try:
         node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
-        # Capture starting position — wait until the arm has moved at least 1cm before
-        # checking arrival, to avoid false-positive when start and target have same XYZ.
         _start_pose = node.get_end_effector_pose()
         _start_xyz = _start_pose[:3] if _start_pose else None
-        # If already at target before arm starts moving, skip departure check
-        _already_there = (_start_xyz is not None and
-                          math.dist(_start_xyz, target_xyz) < tol * 2)
-        _departed = _already_there
-        _departure_deadline = time.time() + 15.0  # if arm hasn't moved in 15s, give up
+        if _start_xyz is None:
+            # FK unavailable at start — skip departure check, check arrival directly
+            _departed = True
+        else:
+            _already_there = math.dist(_start_xyz, target_xyz) < tol * 2
+            _departed = _already_there
+        _departure_deadline = time.time() + 15.0
+
         while getattr(node, "running", True):
-            # Safety exit: stop signal
+
+            # Hard timeout — accept if arm got close enough, otherwise stall
+            if time.time() > _deadline:
+                if _min_dist_seen < tol * 2:
+                    node.get_logger().info(
+                        f"Timeout — closest was {_min_dist_seen*100:.1f}cm, accepting.")
+                    break
+                node.get_logger().warn(
+                    f"Timeout — arm never reached target (closest={_min_dist_seen*100:.1f}cm).")
+                stalled = True
+                break
+
+            # E-stop
             if getattr(node, "stop_requested", False):
                 node.get_logger().warn("Stop requested during wait; holding.")
                 publish_stop_trajectory(node)
                 node.stop_requested = False
+                node._stop_was_requested = True
                 break
 
-            # Try to get current pose (catch FK/TF errors)
+            # Robot program off — wait silently
+            if not getattr(node, 'robot_running', True):
+                if not _prog_was_off:
+                    node.get_logger().info("Robot program OFF — waiting for restart.")
+                    _prog_was_off = True
+                _departure_deadline = time.time() + 15.0
+                stall_start = None
+                last_dist = None
+                time.sleep(0.5)
+                continue
+            if _prog_was_off:
+                node.get_logger().info("Robot program back ON — resuming.")
+                _prog_was_off = False
+
             try:
                 cur = node.get_end_effector_pose()
             except Exception as e:
-                node.get_logger().warn(f"FK/TF error in wait loop: {e}")
+                node.get_logger().warn(f"FK error: {e}")
                 cur = None
 
-            # Skip if no valid FK
             if not cur or any(math.isnan(v) for v in cur[:3]):
                 time.sleep(0.05)
                 continue
 
             dist = math.dist(cur[:3], target_xyz)
+            _min_dist_seen = min(_min_dist_seen, dist)
 
-            # If robot program is off, pause all timers and wait for user to restart.
-            if not getattr(node, 'robot_running', True):
-                node.get_logger().info(
-                    "Robot program is NOT running — waiting for user to turn on the program.")
-                _departure_deadline = time.time() + 15.0  # reset deadline while program is off
-                stall_start = None
-                last_dist = None
-                time.sleep(0.5)
-                continue
-
-            # Don't check arrival until arm has moved at least 1cm from start
+            # Departure check
             if not _departed and _start_xyz is not None:
                 if math.dist(cur[:3], _start_xyz) > 0.01:
                     _departed = True
                 elif time.time() > _departure_deadline:
-                    node.get_logger().warn(
-                        "Arm has not moved 1cm in 15s — trajectory likely not executed. Giving up.")
+                    node.get_logger().warn("Arm has not moved 1cm in 15s — giving up.")
                     return False
             if not _departed:
                 time.sleep(0.05)
                 continue
 
-            # Check distance to goal
+            # Arrival check
             if dist < tol:
-                # Orientation check (if requested)
                 if target_quat and len(cur) >= 7:
                     dot = abs(sum(a * b for a, b in zip(cur[3:7], target_quat[:4])))
                     if dot < quat_tol:
                         time.sleep(0.05)
                         continue
-
-                # Velocity check — ensure robot is settling, not just passing through.
-                # Track how long we've been within tol; accept after 1s even if still oscillating.
                 vels = getattr(node, 'current_joint_velocities', None)
                 if vels and max(abs(v) for v in vels) > 0.01:
                     if _at_tol_since is None:
@@ -176,8 +191,6 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                     elif time.time() - _at_tol_since < 1.0:
                         time.sleep(0.05)
                         continue
-                    # else: been within tol for 1s, accept despite residual velocity
-
                 node.get_logger().info(f"End-effector reached target. dist={dist*100:.1f}cm")
                 break
             else:

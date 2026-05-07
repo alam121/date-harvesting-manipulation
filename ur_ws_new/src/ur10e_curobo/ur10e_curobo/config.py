@@ -30,24 +30,33 @@ LATERAL_THRESH = 0.03
 STATIC_OBSTACLES = [
     {
         "name": "table",
+        "type": "cuboid",
         "dims": [5.0, 5.0, 0.2],
         "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
         "color": (1.0, 0.0, 0.0, 1.0),  # Red
     },
     {
-        "name": "pole",
-        "dims": [0.03, 0.03, 1.0],
-        "pose": [0.16, -1.00, 0.5, 1, 0, 0, 0],
-        "color": (0.0, 1.0, 0.0, 1.0),  # Green
+        "name": "trunk",
+        "type": "cylinder",
+        "radius": 0.02,    # 7cm radius = 14cm diameter trunk
+        "height": 1.2,     # 1.2m visible trunk section
+        "pose": [0.16, -1.00, 0.6, 1, 0, 0, 0],  # center at 0.6m height
+        "color": (0.55, 0.27, 0.07, 1.0),  # Brown
     },
 ]
 
-# Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES
+# Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES.
+# cuRobo's OBB collision checker only reads "cuboid" — cylinders are not loaded.
+# Cylinders are converted to their bounding cuboid (2r × 2r × h) for collision avoidance.
+# RViz visualization uses the original cylinder type separately.
+def _to_curobo_cuboid(obs: dict) -> dict:
+    if obs.get("type") == "cylinder":
+        d = obs["radius"] * 2
+        return {"dims": [d, d, obs["height"]], "pose": obs["pose"]}
+    return {"dims": obs["dims"], "pose": obs["pose"]}
+
 WORLD_CONFIG = {
-    "cuboid": {
-        obs["name"]: {"dims": obs["dims"], "pose": obs["pose"]}
-        for obs in STATIC_OBSTACLES
-    }
+    "cuboid": {obs["name"]: _to_curobo_cuboid(obs) for obs in STATIC_OBSTACLES}
 }
 
 # Voxel grid configuration for depth-based obstacle avoidance
@@ -165,6 +174,7 @@ class Planner:
 
     # === REACQUIRE ===
     reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
+    slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
 
     # === DEBUG ===

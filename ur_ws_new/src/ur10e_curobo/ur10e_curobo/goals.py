@@ -1085,6 +1085,8 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
         # Restore to requested mode (full for normal reacquire, paused for slip check)
         if hasattr(node, 'set_vision_mode'):
             node.set_vision_mode(restore_mode)
+            if restore_mode == "paused":
+                time.sleep(0.12)  # wait for any in-flight YOLO inference to finish
 
 
 def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
@@ -1819,11 +1821,12 @@ def plan_and_execute(node):
 
     def _check_stop():
         """Check if stop was requested; if so, halt robot and clear goals."""
-        if getattr(node, "stop_requested", False):
+        if getattr(node, "stop_requested", False) or getattr(node, "_stop_was_requested", False):
             node.get_logger().warn("STOP requested — aborting immediately.")
             publish_stop_trajectory(node)
             node.goal_poses.clear()
             node.stop_requested = False
+            node._stop_was_requested = False
             unlock_target(node)
             return True
         return False
@@ -1934,7 +1937,6 @@ def plan_and_execute(node):
                 )
                 # Camera is fixed — its surface normal won't change with arm position.
                 # Use the geometric direction from the current EE (at side home) toward the fruit.
-                # This correctly reflects the side approach angle rather than the camera's frontal view.
                 if cur_pose is not None:
                     ee_to_fruit = np.array([x - cur_pose[0], y - cur_pose[1], z - cur_pose[2]], dtype=float)
                     n = np.linalg.norm(ee_to_fruit)
@@ -1993,9 +1995,8 @@ def plan_and_execute(node):
 
         elif is_low:
             is_low_lateral = abs(x - trunk_x) > LATERAL_THRESH
-            side_blend = 0.30 if (is_low_lateral and is_side_approach) else (0.10 if is_low_lateral else 0.25)
+            side_blend = 0.0 if (is_low_lateral and is_side_approach) else (0.10 if is_low_lateral else 0.25)
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-            # X offset: approach from the side for lateral fruits (away from trunk center)
             _x_offset = 0.05 * (1 if x > trunk_x else -1) if is_low_lateral else 0.0
             approach = [ax + _x_offset, ay + 0.07, az - 0.07, *orientation]
             node.get_logger().info(
@@ -2195,15 +2196,9 @@ def plan_and_execute(node):
             x, y, z = seed[0], seed[1], seed[2]
 
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
-        # Recompute orientation from current EE at standoff — avoids large wrist jumps when the
-        # stale approach orientation diverges from the actual arm configuration after motion.
-        _cur_ee_at_standoff = node.get_end_effector_pose()
-        if _cur_ee_at_standoff is not None:
-            orientation = minimize_rotation_orientation(
-                _cur_ee_at_standoff[3:], list(target_quat), blend_weight=0.3)
-            node.get_logger().info(f"FINAL orientation: recomputed from EE at standoff (is_low={is_low})")
-        else:
-            node.get_logger().info(f"FINAL orientation: using approach orientation (is_low={is_low})")
+        # Reuse approach orientation — approach and final must be consistent to avoid wrist flips.
+        # A large orientation change between standoff and final forces IK through singularities.
+        node.get_logger().info(f"FINAL orientation: reusing approach orientation (is_low={is_low})")
         _is_slip_retry = getattr(node, "_slip_retry_count", 0) > 0
         z_offset = 0.02 if _is_slip_retry else 0.03
         y_offset = 0.000  # no lateral adjustment
@@ -2251,6 +2246,20 @@ def plan_and_execute(node):
                 unlock_target(node)
                 continue
         log_path_deviation(node, "FINAL")
+
+        # If stop was requested but arm is already at the final target, proceed with grasp.
+        # E-stop during the wait does not mean the arm failed — check actual EE position.
+        if getattr(node, '_stop_was_requested', False):
+            _cur_ee = node.get_end_effector_pose()
+            _dist_to_final = math.dist(_cur_ee[:3], final_target[:3]) if _cur_ee else float('inf')
+            if _dist_to_final < 0.015:  # within 15mm — arm is at the goal, safe to grasp
+                node.get_logger().info(
+                    f"Stop was requested but arm is at final target ({_dist_to_final*100:.1f}cm) — proceeding with grasp.")
+                node._stop_was_requested = False
+            else:
+                node.get_logger().warn(
+                    f"Stop requested and arm is {_dist_to_final*100:.1f}cm from final target — aborting.")
+                break
 
         if _check_stop(): break
         node.control_gripper("CLOSE")
@@ -2393,9 +2402,9 @@ def plan_and_execute(node):
         time.sleep(0.2)
 
         # Wrist rotation to detach fruit from stem
-        node.get_logger().info("Post-grip wrist rotation (90°) to detach stem")
-        rotate_wrist(node, degrees=90, rotate_time=0.6, hold_time=0.1, return_time=1.0)
-        time.sleep(1.9)  # rotate_time(0.6) + hold_time(0.1) + return_time(1.0) + margin
+        node.get_logger().info("Post-grip wrist rotation DISABLED for testing")
+        # rotate_wrist(node, degrees=90, rotate_time=0.6, hold_time=0.1, return_time=1.5)
+        # time.sleep(2.4)
 
         # Attempt CUDA recovery before dropoff/home planning
         if getattr(node, "_cuda_faulted", False):
@@ -2405,26 +2414,27 @@ def plan_and_execute(node):
         node.motion_phase = "REVERSING"
         execute_partial_reverse(node, clearance_m=0.28)
 
-        # Slip check: actively query depth camera for fruit still at the grasp position.
-        # goal_poses queue is unreliable here (vision may not have re-published yet),
-        # so use reacquire_goal_pose which directly reads the depth frame.
         _MAX_SLIP_RETRIES = 2
         _slip_retry_count = getattr(node, "_slip_retry_count", 0)
-        node.get_logger().info(f"Slip check: querying depth at grasp=[{x:.3f},{y:.3f},{z:.3f}]")
-        _slip_reacq = reacquire_goal_pose(
-            node,
-            seed_xyz=[x, y, z],
-            candidate_seeds=[],
-            timeout=3.0,
-            radius=0.04,       # 4cm xy
-            z_tolerance=0.15,  # 15cm z — loose enough for arm movement, excludes bunch neighbors
-            depth_settle_s=2.0,
-            stable_needed=3,
-            restore_mode="paused",  # keep YOLO off after slip check — dropoff needs GPU for cuRobo
-        )
-        _slip_detected = _slip_reacq is not None
-        node.get_logger().info(
-            f"Slip check: {'SLIP at ' + str([round(v,3) for v in _slip_reacq]) if _slip_detected else 'OK — no fruit at grasp position'}")
+        _slip_detected = False
+        if node.cfg.planner.slip_check_reacquire:
+            node.get_logger().info(f"Slip check: querying depth at grasp=[{x:.3f},{y:.3f},{z:.3f}]")
+            _slip_reacq = reacquire_goal_pose(
+                node,
+                seed_xyz=[x, y, z],
+                candidate_seeds=[],
+                timeout=3.0,
+                radius=0.04,
+                z_tolerance=0.15,
+                depth_settle_s=2.0,
+                stable_needed=3,
+                restore_mode="paused",
+            )
+            _slip_detected = _slip_reacq is not None
+            node.get_logger().info(
+                f"Slip check: {'SLIP at ' + str([round(v,3) for v in _slip_reacq]) if _slip_detected else 'OK — no fruit at grasp position'}")
+        else:
+            node.get_logger().info("Slip check disabled.")
 
         if _slip_detected and _slip_retry_count < _MAX_SLIP_RETRIES:
             node._slip_retry_count = _slip_retry_count + 1

@@ -20,7 +20,7 @@
     script_command_port:=50004
     trajectory_port:=50003
     non_blocking_read:=true
-    keep_alive_count:=2
+    keep_alive_count:=50
     ">
 
     <ros2_control name="${name}" type="system">
