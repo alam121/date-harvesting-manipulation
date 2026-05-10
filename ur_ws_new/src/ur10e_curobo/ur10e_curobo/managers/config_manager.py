@@ -84,6 +84,17 @@ class ConfigManager:
         self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
         self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
         self._node.declare_parameter("planner.max_traj_velocity", self.cfg.planner.max_traj_velocity)
+        self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
+        self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
+        self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
+        self._node.declare_parameter("planner.low_side_standoff_x", self.cfg.planner.low_side_standoff_x)
+        self._node.declare_parameter("planner.low_side_standoff_y", self.cfg.planner.low_side_standoff_y)
+        self._node.declare_parameter("planner.low_side_standoff_z", self.cfg.planner.low_side_standoff_z)
+        self._node.declare_parameter("planner.low_side_final_y_offset", self.cfg.planner.low_side_final_y_offset)
+        self._node.declare_parameter("planner.low_side_final_z_offset", self.cfg.planner.low_side_final_z_offset)
+        self._node.declare_parameter("planner.low_side_final_front_tilt_deg", self.cfg.planner.low_side_final_front_tilt_deg)
+        self._node.declare_parameter("planner.final_overshoot_threshold", self.cfg.planner.final_overshoot_threshold)
+        self._node.declare_parameter("planner.final_overshoot_max_backoff", self.cfg.planner.final_overshoot_max_backoff)
         self._node.declare_parameter("planner.debug_plan_preview", self.cfg.planner.debug_plan_preview)
 
         # Grasp learning params
@@ -141,6 +152,17 @@ class ConfigManager:
         self.cfg.planner.min_dt = float(self._node.get_parameter("planner.min_dt").value)
         self.cfg.planner.max_dt = float(self._node.get_parameter("planner.max_dt").value)
         self.cfg.planner.max_traj_velocity = float(self._node.get_parameter("planner.max_traj_velocity").value)
+        self.cfg.planner.direct_branch_retry_min_dist = float(self._node.get_parameter("planner.direct_branch_retry_min_dist").value)
+        self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
+        self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
+        self.cfg.planner.low_side_standoff_x = float(self._node.get_parameter("planner.low_side_standoff_x").value)
+        self.cfg.planner.low_side_standoff_y = float(self._node.get_parameter("planner.low_side_standoff_y").value)
+        self.cfg.planner.low_side_standoff_z = float(self._node.get_parameter("planner.low_side_standoff_z").value)
+        self.cfg.planner.low_side_final_y_offset = float(self._node.get_parameter("planner.low_side_final_y_offset").value)
+        self.cfg.planner.low_side_final_z_offset = float(self._node.get_parameter("planner.low_side_final_z_offset").value)
+        self.cfg.planner.low_side_final_front_tilt_deg = float(self._node.get_parameter("planner.low_side_final_front_tilt_deg").value)
+        self.cfg.planner.final_overshoot_threshold = float(self._node.get_parameter("planner.final_overshoot_threshold").value)
+        self.cfg.planner.final_overshoot_max_backoff = float(self._node.get_parameter("planner.final_overshoot_max_backoff").value)
         self.cfg.planner.debug_plan_preview = bool(self._node.get_parameter("planner.debug_plan_preview").value)
 
         # Grasp learning
@@ -216,6 +238,17 @@ class ConfigManager:
             "planner.min_dt": (self.cfg.planner, "min_dt", float),
             "planner.max_dt": (self.cfg.planner, "max_dt", float),
             "planner.max_traj_velocity": (self.cfg.planner, "max_traj_velocity", float),
+            "planner.direct_branch_retry_min_dist": (self.cfg.planner, "direct_branch_retry_min_dist", float),
+            "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
+            "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
+            "planner.low_side_standoff_x": (self.cfg.planner, "low_side_standoff_x", float),
+            "planner.low_side_standoff_y": (self.cfg.planner, "low_side_standoff_y", float),
+            "planner.low_side_standoff_z": (self.cfg.planner, "low_side_standoff_z", float),
+            "planner.low_side_final_y_offset": (self.cfg.planner, "low_side_final_y_offset", float),
+            "planner.low_side_final_z_offset": (self.cfg.planner, "low_side_final_z_offset", float),
+            "planner.low_side_final_front_tilt_deg": (self.cfg.planner, "low_side_final_front_tilt_deg", float),
+            "planner.final_overshoot_threshold": (self.cfg.planner, "final_overshoot_threshold", float),
+            "planner.final_overshoot_max_backoff": (self.cfg.planner, "final_overshoot_max_backoff", float),
             "planner.debug_plan_preview": (self.cfg.planner, "debug_plan_preview", bool),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),

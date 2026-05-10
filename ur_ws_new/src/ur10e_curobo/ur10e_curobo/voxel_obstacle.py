@@ -222,8 +222,7 @@ class VoxelObstacleManager:
                     feature_dtype=torch.float32,
                 )
 
-                # Update motion planner world
-                self._update_motion_gen_world()
+                # self._update_motion_gen_world()  # voxels visualization-only
 
                 self._last_update_time = now
                 self._initialized = True
@@ -322,8 +321,7 @@ class VoxelObstacleManager:
                     feature_dtype=torch.float32,
                 )
 
-                # 6. Update motion planner world
-                self._update_motion_gen_world()
+                # 6. self._update_motion_gen_world()  # voxels visualization-only
 
                 self._last_update_time = now
                 self._initialized = True

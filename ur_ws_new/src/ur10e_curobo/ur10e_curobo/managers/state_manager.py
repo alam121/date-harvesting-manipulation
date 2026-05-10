@@ -54,6 +54,10 @@ class StateManager:
         self.fruit_between_branches: bool = False
         self.fruit_gap_angle: float = 0.0
 
+        # Normalised image-space bounding-box centre of best fruit [cx_norm, cy_norm]
+        # cx_norm: 0=left, 1=right  |  cy_norm: 0=top, 1=bottom
+        self.fruit_image_norm: Optional[Tuple[float, float]] = None
+
         # Trunk position from vision (updated continuously)
         self._trunk_x: Optional[float] = None
         self._trunk_xyz: Optional[Tuple[float, float, float]] = None  # full XYZ in base_link
@@ -116,6 +120,14 @@ class StateManager:
             Float32MultiArray,
             "/datefruit_gap_info",
             self._gap_info_cb,
+            10
+        )
+
+        # Normalised image bbox centre from vision (for image-based classification)
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/fruit_image_bbox_norm",
+            self._fruit_image_norm_cb,
             10
         )
 
@@ -235,6 +247,10 @@ class StateManager:
         if len(msg.data) >= 2:
             self.fruit_between_branches = msg.data[0] > 0.5
             self.fruit_gap_angle = float(msg.data[1])
+
+    def _fruit_image_norm_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) >= 2:
+            self.fruit_image_norm = (float(msg.data[0]), float(msg.data[1]))
 
     def _trunk_position_cb(self, msg: PointStamped) -> None:
         """Update trunk position from vision."""

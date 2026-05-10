@@ -38,7 +38,7 @@ STATIC_OBSTACLES = [
     {
         "name": "trunk",
         "type": "cylinder",
-        "radius": 0.02,    # 7cm radius = 14cm diameter trunk
+        "radius": 0.02,    # 2cm radius = 4cm diameter trunk
         "height": 1.2,     # 1.2m visible trunk section
         "pose": [0.16, -1.00, 0.6, 1, 0, 0, 0],  # center at 0.6m height
         "color": (0.55, 0.27, 0.07, 1.0),  # Brown
@@ -110,7 +110,7 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [-1.5052250067340296, -1.5662608889727672, 2.234070126210348, -4.524454017678732, 4.594364166259766, 0.031742095947265625]
+    home: List[float] = field(default_factory=lambda: [4.985577583312988, -1.6374036274352015, 2.2965741793261927, 1.622551603908203, 4.465203285217285, -0.12867910066713506]
 
 
 
@@ -155,7 +155,7 @@ class Planner:
     speed_dropoff: float = 0.15   # for move_to_dropoff_position
     speed_predropoff: float = 0.2  # for pre-dropoff reverse
     speed_approach: float = 1.0    # for approach motion
-    speed_final: float = 0.2       # for precise grasp (slow & gentle)
+    speed_final: float = 0.15      # for precise grasp (slow & gentle)
 
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions
@@ -168,6 +168,23 @@ class Planner:
     min_dt: float = 0.010                # minimum timestep — keep ≥0.010 to avoid UR joint velocity limit faults
     max_dt: float = 0.05                 # maximum timestep
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
+
+    # === DIRECT IK TUNING ===
+    direct_branch_retry_min_dist: float = 0.15  # m; skip expensive branch search for close moves
+    direct_branch_retry_seeds: int = 8          # extra perturbed IK seeds when branch retry is needed
+    direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
+    very_low_center_cy_thresh: float = 0.90     # image cy; force center-home handling for very low fruit
+    very_low_center_approach_y_offset: float = 0.07
+    very_low_center_approach_z_offset: float = -0.035
+    low_side_standoff_x: float = 0.12           # m; side-low standoff left/right of fruit
+    low_side_standoff_y: float = 0.065          # m; keep side-low slightly back like low-center
+    low_side_standoff_z: float = -0.055         # m; keep side-low slightly below like low-center
+
+    low_side_final_y_offset: float = 0.0        # m; keep side-low final motion lateral
+    low_side_final_z_offset: float = 0.020        # m; keep side-low final motion lateral
+    low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
+    final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
+    final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff

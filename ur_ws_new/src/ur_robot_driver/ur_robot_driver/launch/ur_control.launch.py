@@ -238,6 +238,7 @@ def launch_setup(context, *args, **kwargs):
     ur_control_node = Node(
         package="ur_robot_driver",
         executable="ur_ros2_control_node",
+        prefix="chrt -f 80",
         parameters=[
             robot_description,
             update_rate_config_file,

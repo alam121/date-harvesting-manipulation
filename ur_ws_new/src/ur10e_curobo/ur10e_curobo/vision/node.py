@@ -173,14 +173,13 @@ class VisionNode:
         trunk_cam_pub = self.node.create_publisher(PointStamped, "/trunk_position_cam", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
+        self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
         from std_msgs.msg import String as _Str
         self.score_pub = self.node.create_publisher(_Str, "/vision/fruit_score", 10)
         self.cv_bridge = CvBridge()
-
-        depth_frame_count = [0]
 
         # Timer-based publishing callback (50Hz)
         def publish_timer_cb():
@@ -429,6 +428,8 @@ class VisionNode:
 
         disp_w = cam_w
         disp_h = cam_h
+        self._disp_w = disp_w
+        self._disp_h = disp_h
         display_resolution = sl.Resolution(disp_w, disp_h)
         image_left_ocv = np.full((disp_h, disp_w, 4), [245, 239, 239, 255], np.uint8)
         image_scale = [disp_w / cam_w, disp_h / cam_h]
@@ -502,9 +503,11 @@ class VisionNode:
             current_dets = None
             trunk_boxes  = []
             bunch_boxes  = []
-            _YOLO_STALE_DRIFT = 0.003  # 3 mm — discard cached dets if camera drifted this far
+            _YOLO_STALE_DRIFT = 0.008  # 8 mm — discard cached dets if camera drifted this far
             _last_raw_viz_t = 0.0      # wall time of last raw-frame viz enqueue
             _RAW_VIZ_MIN_INTERVAL = 0.066  # max ~15fps raw frames (~1 camera frame)
+            _initial_voxel_cloud_sent = False
+            _initial_voxel_cloud_burst_remaining = 3
 
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
@@ -607,6 +610,7 @@ class VisionNode:
                         continue
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
+                pc_np_orig = None
                 if use_zed_mini:
                     # ── ZED Mini dense depth path ─────────────────────────
                     # Dense HxW depth map at ZED One display resolution —
@@ -618,9 +622,6 @@ class VisionNode:
                     with self._depth_map_lock:
                         pc_np = self._latest_depth_map
                         pc_np_orig = self._latest_depth_map_orig
-                    depth_frame_count[0] += 1
-                    if pc_np is not None and depth_frame_count[0] % 5 == 0:
-                        self._publish_depth_cloud(pc_np, depth_pub, orig_mask=pc_np_orig)
                 elif use_lidar:
                     # ── LiDAR sparse depth path ───────────────────────────
                     pc_np = None
@@ -648,9 +649,6 @@ class VisionNode:
                     zed.retrieve_measure(point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
                                         sl.Resolution(disp_w, disp_h))
                     pc_np = point_cloud.get_data()[:, :, :3]
-                    depth_frame_count[0] += 1
-                    if depth_frame_count[0] % 5 == 0:
-                        self._publish_depth_cloud(pc_np, depth_pub)
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
@@ -677,12 +675,25 @@ class VisionNode:
                 # "reacquire"  : fruit positions only — skip trunk, heatmap direction, viz
 
                 # Publish trunk position every 5 frames — skip in reacquire mode
+                trunk_published = False
                 if not _reacquire and self._heatmap_frame_count % 5 == 0:
-                    self._publish_trunk_position(
+                    trunk_published = self._publish_trunk_position(
                         trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                         pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
                         trunk_cam_pub=trunk_cam_pub,
                     )
+                if (trunk_published and not _initial_voxel_cloud_sent and
+                        _initial_voxel_cloud_burst_remaining > 0 and pc_np is not None):
+                    self._publish_depth_cloud(
+                        pc_np, depth_pub,
+                        orig_mask=pc_np_orig if use_zed_mini else None,
+                    )
+                    _initial_voxel_cloud_burst_remaining -= 1
+                    if _initial_voxel_cloud_burst_remaining <= 0:
+                        _initial_voxel_cloud_sent = True
+                        self.node.get_logger().info(
+                            "Initial voxel depth-cloud burst complete; disabling continuous depth cloud publish."
+                        )
                 _tp2 = time()
 
                 # Select best fruit
@@ -852,7 +863,7 @@ class VisionNode:
                 init_mini.camera_resolution = sl.RESOLUTION.HD1080
                 init_mini.camera_fps = ZEDMINI_DEPTH_FPS
                 init_mini.coordinate_units = sl.UNIT.METER
-                init_mini.depth_mode = sl.DEPTH_MODE.NEURAL  # higher accuracy than NEURAL_LIGHT
+                init_mini.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT  # higher accuracy than NEURAL_LIGHT
                 init_mini.depth_minimum_distance = ZEDMINI_DEPTH_Z_MIN
                 init_mini.depth_maximum_distance = ZEDMINI_DEPTH_Z_MAX
                 init_mini.sdk_verbose = 1
@@ -934,11 +945,11 @@ class VisionNode:
             pass
 
     def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
-                                pts_cam=None, uv=None, use_lidar=False, trunk_cam_pub=None) -> None:
+                                pts_cam=None, uv=None, use_lidar=False, trunk_cam_pub=None) -> bool:
         """Publish detected trunk position in base_link for pole obstacle update.
         Uses only the first (largest/most confident) trunk detection."""
         if not trunk_boxes:
-            return
+            return False
         # Use first trunk box only
         bx1, by1, bx2, by2 = trunk_boxes[0]
         # Scale to display resolution
@@ -951,7 +962,7 @@ class VisionNode:
         y1 = max(0, min(y1, image_left_ocv.shape[0] - 1))
         y2 = max(0, min(y2, image_left_ocv.shape[0]))
         if x2 <= x1 or y2 <= y1:
-            return
+            return False
 
         if use_lidar and pts_cam is not None and pts_cam.shape[0] > 0:
             # LiDAR path: filter projected points to trunk bounding box
@@ -960,7 +971,7 @@ class VisionNode:
                 (uv[:, 1] >= y1) & (uv[:, 1] < y2)
             )
             if not in_bbox.any():
-                return
+                return False
             pts_trunk = pts_cam[in_bbox]
             zs = pts_trunk[:, 2]
             idx = np.argsort(zs)
@@ -969,11 +980,11 @@ class VisionNode:
         else:
             # ZED depth path
             if pc_np is None:
-                return
+                return False
             roi_xyz = pc_np[y1:y2, x1:x2, :]
             valid_z = np.isfinite(roi_xyz[:, :, 2]) & (roi_xyz[:, :, 2] > 0.1)
             if np.count_nonzero(valid_z) < 10:
-                return
+                return False
             pts = roi_xyz[valid_z]
             zs = pts[:, 2]
             idx = np.argsort(zs)
@@ -985,6 +996,14 @@ class VisionNode:
             float(np.mean(pts_front[:, 1])),
             float(np.mean(pts_front[:, 2])),
         ], dtype=np.float64)
+        # Detection gives the front surface facing the camera. Offset by trunk radius
+        # along the camera→surface direction (in camera frame, camera is at origin)
+        # to get the true centroid before transforming to base_link.
+        from ..config import STATIC_OBSTACLES as _SO
+        _trunk_radius = next((o["radius"] for o in _SO if o["name"] == "trunk"), 0.02)
+        _cam_dist = float(np.linalg.norm(_trunk_xyz_cam))
+        if _cam_dist > 1e-6:
+            _trunk_xyz_cam = _trunk_xyz_cam + _trunk_radius * (_trunk_xyz_cam / _cam_dist)
         if trunk_cam_pub is not None:
             cam_msg = PointStamped()
             cam_msg.header.frame_id = CAM_FRAME
@@ -1014,8 +1033,9 @@ class VisionNode:
                     point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
                 pt_base.point.y += TRUNK_Y_OFFSET
             trunk_pub.publish(pt_base)
+            return True
         except Exception:
-            pass
+            return False
 
     def _process_objects(
         self,
@@ -1940,6 +1960,20 @@ class VisionNode:
             radius_msg = Float32()
             radius_msg.data = float(radius)
             self.radius_pub.publish(radius_msg)
+
+            # Publish normalised bounding-box centre [cx_norm, cy_norm] in [0,1].
+            # cx_norm: 0=left edge, 1=right edge of image
+            # cy_norm: 0=top edge,  1=bottom edge of image
+            # Used by main node to classify approach direction from image-space position.
+            _bx1, _by1, _bx2, _by2 = t_best["bb"]
+            _iw = float(getattr(self, '_disp_w', 0))
+            _ih = float(getattr(self, '_disp_h', 0))
+            if _iw > 0 and _ih > 0:
+                _cx_norm = ((_bx1 + _bx2) / 2.0) / _iw
+                _cy_norm = ((_by1 + _by2) / 2.0) / _ih
+                _bbox_msg = Float32MultiArray()
+                _bbox_msg.data = [float(_cx_norm), float(_cy_norm)]
+                self.bbox_norm_pub.publish(_bbox_msg)
 
             # Publish branch gap info for 2-finger mode
             between_branches = t_best.get("between_branches", False)

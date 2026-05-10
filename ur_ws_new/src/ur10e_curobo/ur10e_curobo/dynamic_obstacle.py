@@ -21,12 +21,17 @@ class DynamicObstacleManager:
     def _try_update_world(self):
         if getattr(self.node, "_cuda_faulted", False):
             return
+        _yolo = getattr(self.node, 'yolo_thread', None)
+        _yolo_lock = getattr(_yolo, 'inference_lock', None)
+        if _yolo_lock: _yolo_lock.acquire()
         try:
             self.motion_gen.update_world(self.world_model)
         except Exception as e:
             self.node.get_logger().warn(f"[DynamicObstacleManager] update_world failed: {e}")
             if "CUDA error" in str(e) or "illegal memory access" in str(e):
                 self.node._cuda_faulted = True
+        finally:
+            if _yolo_lock: _yolo_lock.release()
 
     def add_sphere(self, name, radius=0.1, initial_pose=[0,0,-10,1,0,0,0]):
         sphere = Sphere(name=name, pose=initial_pose, radius=radius)

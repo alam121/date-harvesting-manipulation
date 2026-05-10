@@ -69,7 +69,7 @@ MAX_FRAMES_TO_KEEP = 0        # Keep fruit for N frames after last seen (persist
 TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
-DRAW_ONLY_BEST = False
+DRAW_ONLY_BEST = True
 SHOW_REJECTED = True
 SKIP_DRAW = False
 

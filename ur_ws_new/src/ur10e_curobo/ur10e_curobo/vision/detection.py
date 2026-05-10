@@ -80,18 +80,21 @@ def detections_to_custom_masks(dets, trunk_class_ids=None, bunch_class_ids=None)
         obj.probability = float(dets.boxes.conf[di].item())
         obj.is_grounded = False
 
-        if dets.masks is not None and dets.masks.data is not None:
-            m = dets.masks.data[di].cpu().numpy()
-            mask_bin = (m * 255).astype(np.uint8)
-            # retina_masks=False returns masks at model resolution, not image resolution.
-            # Resize to image dims so bbox coords (in image space) align correctly.
-            if mask_bin.shape[0] != H or mask_bin.shape[1] != W:
-                mask_bin = cv2.resize(mask_bin, (W, H), interpolation=cv2.INTER_NEAREST)
+        if dets.masks is not None and dets.masks.xy is not None:
+            xy = dets.masks.xy[di]
             x_min = int(abcd[0, 0])
             y_min = int(abcd[0, 1])
             x_max = int(abcd[2, 0])
             y_max = int(abcd[2, 1])
-            mask_roi = mask_bin[y_min: y_max + 1, x_min: x_max + 1]
+            roi_h = max(1, y_max - y_min + 1)
+            roi_w = max(1, x_max - x_min + 1)
+            # fillPoly on bbox ROI only (fast) with contour translated to local coords
+            mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+            if len(xy) >= 3:
+                xy_local = xy.copy()
+                xy_local[:, 0] -= x_min
+                xy_local[:, 1] -= y_min
+                cv2.fillPoly(mask_roi, [xy_local.astype(np.int32).reshape(-1, 1, 2)], 255)
             if not mask_roi.flags.c_contiguous:
                 mask_roi = np.ascontiguousarray(mask_roi)
             sl_mat = sl.Mat(

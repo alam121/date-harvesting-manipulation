@@ -75,31 +75,17 @@ class YoloThread:
                     img = cv2.cvtColor(self.image_net, cv2.COLOR_RGBA2RGB)
 
                 t0 = time()
-                # det = self._model.predict(
-                #     img,
-                #     save=False,
-                #     retina_masks=True,
-                #     imgsz=self.img_size,
-                #     conf=self.conf_thres,
-                #     iou=0.3,       # lower NMS IoU so overlapping bunches aren't suppressed
-                #     max_det=50,    # allow more detections per frame
-                #     device=device,
-                #     verbose=False,
-                #     classes=self._detect_class_ids if self._detect_class_ids else None,
-                # )[0]
-
                 with self.inference_lock:
-                    det = self._model.track(
+                    det = self._model.predict(
                          img,
                          save=False,
-                         retina_masks=True,
+                         retina_masks=False,
                          imgsz=self.img_size,
                          conf=self.conf_thres,
                          iou=0.3,
-                         max_det=50,
+                         max_det=25,
                          device=device,
                          verbose=False,
-                         tracker="bytetrack.yaml",
                          classes=self._detect_class_ids if self._detect_class_ids else None,
                      )[0]
 

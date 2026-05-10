@@ -76,6 +76,22 @@ def get_end_effector_pose(node) -> Optional[list]:
         return None
 
 
+def pose_from_joints(node, joint_positions: List[float]) -> Optional[list]:
+    """Return [x, y, z, qw, qx, qy, qz] for an arbitrary joint configuration."""
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        q = torch.tensor([joint_positions], dtype=torch.float32, device=device)
+        kin = _get_kin_model(node)
+        with torch.no_grad():
+            ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
+        pos = ee_pos[0].cpu().tolist()
+        quat = ee_quat[0].cpu().tolist()
+        return pos + quat
+    except Exception as e:
+        node.get_logger().warn(f"FK pose failed: {e}")
+        return None
+
+
 def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
     """Single-waypoint FK using CudaRobotModel.forward() directly.
     Does NOT touch rollout_fn or collision state."""

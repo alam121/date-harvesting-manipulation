@@ -1059,6 +1059,10 @@ class UR10eCuroboMoveIt(Node):
     def fruit_direction(self, value):
         self._state_mgr.fruit_direction = value
 
+    @property
+    def fruit_image_norm(self):
+        return self._state_mgr.fruit_image_norm
+
     # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 3: MotionExecutor) ============
 
     @property
