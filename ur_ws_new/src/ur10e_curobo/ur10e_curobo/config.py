@@ -224,6 +224,26 @@ class Grasp:
     default_contact_step_threshold: int = 7
 
 @dataclass
+class LidarScan:
+    # Directory where bag files are saved (~ is expanded)
+    bag_dir: str = "~/lidar_scans"
+    # Speed factor multiplied into plan_execute_js (lower = slower = denser scan)
+    speed_factor: float = 0.08
+    # Joint-space waypoints defining the half-circle arc around the tree.
+    # Default: home_left → home → home_right  (calibrate to your setup)
+    scan_waypoints: List[List[float]] = field(default_factory=lambda: [
+        # home_left — left side of tree
+        [-0.7986648718463343, -1.370279149418213, 1.5869911352740687,
+         -3.958400150338644, 3.832206964492798, -0.4182942549334925],
+        # home — front center of tree
+        [4.985577583312988, -1.6374036274352015, 2.2965741793261927,
+         1.622551603908203, 4.465203285217285, -0.12867910066713506],
+        # home_right — right side of tree
+        [-2.1769216696368616, -1.6072222195067347, 1.8494580427752894,
+         -4.613555570641989, 5.513333320617676, 1.2812821865081787],
+    ])
+
+@dataclass
 class AppConfig:
     topics: Topics = field(default_factory=Topics)
     joints: JointsPreset = field(default_factory=JointsPreset)
@@ -231,6 +251,7 @@ class AppConfig:
     perception: Perception = field(default_factory=Perception)
     gripper: Gripper = field(default_factory=Gripper)
     grasp: Grasp = field(default_factory=Grasp)
+    lidar_scan: LidarScan = field(default_factory=LidarScan)
 
     @staticmethod
     def from_env(cfg: "AppConfig") -> "AppConfig":

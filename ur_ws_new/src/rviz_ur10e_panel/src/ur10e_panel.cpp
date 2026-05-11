@@ -283,6 +283,20 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   layout->addWidget(capture_group);
 
+  // Lidar Scan
+  auto * lidar_group = new QGroupBox("Lidar Scan");
+  auto * lidar_layout = new QHBoxLayout(lidar_group);
+  auto * lidar_scan_btn = new QPushButton("Lidar Scan");
+  lidar_scan_btn->setStyleSheet(
+    "background-color: #00796b; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 6px;");
+  lidar_scan_btn->setToolTip(
+    "Sweep arm around tree (half-circle) and record /livox/lidar + /livox/imu to bag.\n"
+    "Bag saved to ~/lidar_scans/. Waypoints configured in config.py LidarScan.");
+  connect(lidar_scan_btn, &QPushButton::clicked, this, &UR10ePanel::onLidarScan);
+  lidar_layout->addWidget(lidar_scan_btn);
+  layout->addWidget(lidar_group);
+
   // Grasp Feedback
   auto * grasp_group = new QGroupBox("Grasp Feedback");
   auto * grasp_layout = new QHBoxLayout(grasp_group);
@@ -715,6 +729,7 @@ void UR10ePanel::onGraspSuccess() { publishCmd("grasp_success"); }
 void UR10ePanel::onGraspFail() { publishCmd("grasp_fail"); }
 void UR10ePanel::onPlanConfirm() { publishCmd("plan_confirm"); }
 void UR10ePanel::onPlanCancel() { publishCmd("plan_cancel"); }
+void UR10ePanel::onLidarScan() { publishCmd("lidar_scan"); }
 
 void UR10ePanel::onDebugPreviewChanged(int state)
 {
@@ -767,12 +782,13 @@ void UR10ePanel::updateDisplay()
   // Motion phase badge
   {
     const char * bg = "#455a64", * fg = "#eceff1";
-    if      (motion_phase_ == "APPROACH")  { bg = "#1565c0"; fg = "#e3f2fd"; }
-    else if (motion_phase_ == "REACQUIRE") { bg = "#6a1b9a"; fg = "#f3e5f5"; }
-    else if (motion_phase_ == "FINAL")     { bg = "#e65100"; fg = "#fff3e0"; }
-    else if (motion_phase_ == "REVERSING") { bg = "#558b2f"; fg = "#f1f8e9"; }
-    else if (motion_phase_ == "DROPOFF")   { bg = "#00838f"; fg = "#e0f7fa"; }
-    else if (motion_phase_ == "HOME")      { bg = "#2e7d32"; fg = "#e8f5e9"; }
+    if      (motion_phase_ == "APPROACH")    { bg = "#1565c0"; fg = "#e3f2fd"; }
+    else if (motion_phase_ == "REACQUIRE")  { bg = "#6a1b9a"; fg = "#f3e5f5"; }
+    else if (motion_phase_ == "FINAL")      { bg = "#e65100"; fg = "#fff3e0"; }
+    else if (motion_phase_ == "REVERSING")  { bg = "#558b2f"; fg = "#f1f8e9"; }
+    else if (motion_phase_ == "DROPOFF")    { bg = "#00838f"; fg = "#e0f7fa"; }
+    else if (motion_phase_ == "HOME")       { bg = "#2e7d32"; fg = "#e8f5e9"; }
+    else if (motion_phase_ == "LIDAR_SCAN") { bg = "#00796b"; fg = "#e0f2f1"; }
     phase_label_->setText(QString::fromStdString(motion_phase_.empty() ? "IDLE" : motion_phase_));
     phase_label_->setStyleSheet(QString(
       "background: %1; color: %2; padding: 6px; border-radius: 6px; "

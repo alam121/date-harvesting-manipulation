@@ -350,6 +350,17 @@ class UR10eCuroboMoveIt(Node):
             self.debug_print_world()
         elif cmd == "check_calibration":
             threading.Thread(target=self._run_calib_check, daemon=True).start()
+        elif cmd == "lidar_scan":
+            def run_lidar_scan_cmd():
+                if not self._motion_lock.acquire(blocking=False):
+                    self.get_logger().warn("Motion already in progress, ignoring LIDAR_SCAN command")
+                    return
+                try:
+                    from . import lidar_scan as lidar_scan_mod
+                    lidar_scan_mod.run_lidar_scan(self)
+                finally:
+                    self._motion_lock.release()
+            threading.Thread(target=run_lidar_scan_cmd, daemon=True).start()
         else:
             self.get_logger().warn(f"Unknown UI command: {cmd}")
 
