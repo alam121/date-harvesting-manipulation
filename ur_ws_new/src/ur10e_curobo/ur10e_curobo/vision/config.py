@@ -20,7 +20,7 @@ DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_nano_3_5_26.engine")
 
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_large_5_5_26.engine")
 # YOLO inference parameters
-DEFAULT_CONF_THRES = 0.5          # confidence threshold (lower = more detections)
+DEFAULT_CONF_THRES = 0.4          # confidence threshold (lower = more detections)
 DEFAULT_IMG_SIZE = 640             # must match compiled TRT engine exactly
 
 # Scoring System Weights (tune these for your application)
@@ -63,13 +63,14 @@ MAX_FRUIT_ATTEMPTS = 3        # max grasp attempts before blacklisting
 
 # Temporal stabilization (reduce flickering)
 MIN_FRAMES_TO_SHOW = 1        # Fruit must appear in N consecutive frames before showing
-MAX_FRAMES_TO_KEEP = 0        # Keep fruit for N frames after last seen (persistence)
+MAX_FRAMES_TO_KEEP = 2        # Keep fruit for N frames after last seen (persistence)
 
 # Target lock state
 TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
-DRAW_ONLY_BEST = True
+DRAW_ONLY_BEST = False
+DRAW_TOP_N = 5
 SHOW_REJECTED = True
 SKIP_DRAW = False
 

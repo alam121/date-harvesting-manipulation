@@ -9,8 +9,8 @@ echo risc | sudo -S systemctl restart nvargus-daemon
 sleep 8
 
 # Set ROS domain ID
-export ROS_DOMAIN_ID=5
-echo "ROS_DOMAIN_ID set to 5"
+export ROS_DOMAIN_ID=6
+echo "ROS_DOMAIN_ID set to 6"
 
 # Flush ENO1 IPs
 echo "Flushing IP addresses on eno1..."

@@ -104,8 +104,8 @@ class UR10eCuroboMoveIt(Node):
             10
         )
 
-        # Subscribe to all visible fruit positions — used by reacquire so it can
-        # find the target fruit even when it isn't ranked as the best detection.
+        # Subscribe to all visible fruit positions, score-sorted by vision.
+        # Reacquire searches all entries; goal multi queues the top entries.
         # Format: flat [x0,y0,z0, x1,y1,z1, ...] in base_link frame.
         def _all_fruits_cb(msg):
             data = msg.data
@@ -307,10 +307,16 @@ class UR10eCuroboMoveIt(Node):
             goals_mod.subscribe_to_goal_pose(self)
             self.goal_capture_active = False
             self.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
-        elif cmd == "subscribe_multi":
-            goals_mod.subscribe_multi_goals(self)
+        elif cmd.startswith("subscribe_multi"):
+            try:
+                parts = cmd.split()
+                max_goals = int(parts[1]) if len(parts) > 1 else 3
+                max_goals = max(1, min(max_goals, 10))
+            except (ValueError, IndexError):
+                max_goals = 3
+            goals_mod.subscribe_multi_goals(self, max_goals=max_goals)
             self.goal_capture_active = False
-            self.get_logger().info("Subscribe multi: collecting up to 3 goals in 10s")
+            self.get_logger().info(f"Subscribe multi: collecting up to {max_goals} goals in 10s")
         elif cmd == "update_voxel":
             self._update_voxel_snapshot()
         elif cmd == "grasp_success":

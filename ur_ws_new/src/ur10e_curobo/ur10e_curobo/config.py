@@ -110,7 +110,8 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [4.985577583312988, -1.6374036274352015, 2.2965741793261927, 1.622551603908203, 4.465203285217285, -0.12867910066713506]
+    home: List[float] = field(default_factory=lambda: [4.946733474731445, -1.6187120876707972, 2.180723492299215, 1.726618929500244, 4.490667343139648, -0.09821635881532842]
+
 
 
 
@@ -173,9 +174,13 @@ class Planner:
     direct_branch_retry_min_dist: float = 0.15  # m; skip expensive branch search for close moves
     direct_branch_retry_seeds: int = 8          # extra perturbed IK seeds when branch retry is needed
     direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
-    very_low_center_cy_thresh: float = 0.90     # image cy; force center-home handling for very low fruit
+
+    very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
+    low_center_approach_y_offset: float = 0.07
+    low_center_approach_z_offset: float = -0.07
     very_low_center_approach_y_offset: float = 0.07
     very_low_center_approach_z_offset: float = -0.035
+
     low_side_standoff_x: float = 0.12           # m; side-low standoff left/right of fruit
     low_side_standoff_y: float = 0.065          # m; keep side-low slightly back like low-center
     low_side_standoff_z: float = -0.055         # m; keep side-low slightly below like low-center
@@ -183,6 +188,10 @@ class Planner:
     low_side_final_y_offset: float = 0.0        # m; keep side-low final motion lateral
     low_side_final_z_offset: float = 0.020        # m; keep side-low final motion lateral
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
+
+    low_center_final_y_offset: float = -0.02    # m; small pull toward camera for low-center final
+    low_center_final_z_offset: float = 0.025    # m; gripper center offset above low-center fruit
+
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
 
@@ -190,7 +199,7 @@ class Planner:
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff
 
     # === REACQUIRE ===
-    reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
+    reacquire_after_approach: bool = True   # re-detect fruit position after reaching approach standoff
     slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
 

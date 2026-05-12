@@ -8,8 +8,10 @@ from pathlib import Path
 
 WS = str(Path(__file__).resolve().parent)
 REPO_ROOT = str(Path(WS).parent)
+ROS_DOMAIN_ID = os.environ.get("ROS_DOMAIN_ID", "6")
+ROS_DOMAIN_CMD = f"export ROS_DOMAIN_ID={ROS_DOMAIN_ID}"
 FASTDDS_CFG = f"export FASTRTPS_DEFAULT_PROFILES_FILE={WS}/fastdds_config.xml"
-SOURCE = f"{FASTDDS_CFG} && source {WS}/install/setup.bash"
+SOURCE = f"{ROS_DOMAIN_CMD} && {FASTDDS_CFG} && source {WS}/install/setup.bash"
 CONFIG_PATH = os.path.expanduser("~/.config/terminator/config")
 UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
 
@@ -296,7 +298,7 @@ def update_config(nodes, fake_hardware=False, use_panel=False, use_lidar=False, 
         f.writelines(final_lines)
 
 def main():
-    valid = ["main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye"]
+    valid = ["bringup", "ur", "main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye"]
     args = sys.argv[1:]
 
     # Extract modifier flags
@@ -305,15 +307,17 @@ def main():
     use_zed_mini  = "zed_mini" in args
     args = [a for a in args if a not in ("fake", "lidar", "zed_mini")]
 
-    nodes = [arg for arg in args if arg in valid]
+    bringup_only = any(arg in ("bringup", "ur") for arg in args)
+    nodes = [arg for arg in args if arg in valid and arg not in ("bringup", "ur")]
 
-    if not nodes:
-        print("Usage: launch_ur10e [fake] [lidar|zed_mini] [main] [vision] [teleop] [gui] [calibrate]")
+    if not nodes and not bringup_only:
+        print("Usage: launch_ur10e [fake] [lidar|zed_mini] [bringup|main] [vision] [teleop] [gui] [calibrate]")
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
         print("  lidar     - Use Livox Mid-70 LiDAR for depth (adds LiDAR pane, passes --use_lidar to vision)")
         print("  zed_mini  - Use ZED X Mini for depth + ZED One Mono for detection (passes --use_zed_mini to vision)")
+        print("  bringup   - UR driver bringup only")
         print("  main      - Main control node (RViz includes control panel)")
         print("  vision    - Vision node")
         print("  teleop    - Teleop node")
@@ -323,6 +327,7 @@ def main():
         print("  hand_eye  - Hand-eye camera calibration")
         print()
         print("Examples:")
+        print("  launch_ur10e bringup                 # Real robot bringup only")
         print("  launch_ur10e main                    # Real robot + main + RViz with panel")
         print("  launch_ur10e main vision             # Real robot + main + vision (ZED stereo)")
         print("  launch_ur10e main vision zed_mini    # Real robot + main + vision (ZED Mini depth)")

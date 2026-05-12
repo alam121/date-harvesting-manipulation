@@ -159,18 +159,27 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(sub_multi_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribeMulti);
   motion_layout->addWidget(sub_multi_btn, 3, 1);
 
+  auto * multi_goal_label = new QLabel("Multi goals");
+  multi_goal_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  multi_goal_count_spin_ = new QSpinBox();
+  multi_goal_count_spin_->setRange(1, 10);
+  multi_goal_count_spin_->setValue(3);
+  multi_goal_count_spin_->setToolTip("Number of top-scored goals to queue with Sub Multi");
+  motion_layout->addWidget(multi_goal_label, 4, 0);
+  motion_layout->addWidget(multi_goal_count_spin_, 4, 1);
+
   calib_result_label_ = new QLabel("—");
   calib_result_label_->setWordWrap(true);
   calib_result_label_->setStyleSheet(
     "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;");
-  motion_layout->addWidget(calib_result_label_, 4, 0, 1, 2);
+  motion_layout->addWidget(calib_result_label_, 5, 0, 1, 2);
 
   debug_preview_cb_ = new QCheckBox("Debug Plan Preview");
   debug_preview_cb_->setChecked(true);
   debug_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
   debug_preview_cb_->setToolTip("Show full plan in RViz before executing");
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
-  motion_layout->addWidget(debug_preview_cb_, 5, 0, 1, 2);
+  motion_layout->addWidget(debug_preview_cb_, 6, 0, 1, 2);
 
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
@@ -178,7 +187,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 6, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 7, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -186,7 +195,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 6, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 7, 1);
 
   layout->addWidget(motion_group);
 
@@ -690,7 +699,11 @@ void UR10ePanel::onGripperClose() { publishCmd("close"); }
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
-void UR10ePanel::onSubscribeMulti() { publishCmd("subscribe_multi"); }
+void UR10ePanel::onSubscribeMulti()
+{
+  const int count = multi_goal_count_spin_ ? multi_goal_count_spin_->value() : 3;
+  publishCmd("subscribe_multi " + std::to_string(count));
+}
 void UR10ePanel::onUpdateVoxel() { publishCmd("update_voxel"); }
 void UR10ePanel::onExit()
 {

@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QCheckBox>
+#include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QKeyEvent>
@@ -117,6 +118,7 @@ private:
   QLabel * force_labels_[3];
   QLineEdit * x_in_, * y_in_, * z_in_;
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
+  QSpinBox * multi_goal_count_spin_;
   QCheckBox * debug_preview_cb_;
   QPushButton * plan_confirm_btn_;
   QPushButton * plan_cancel_btn_;

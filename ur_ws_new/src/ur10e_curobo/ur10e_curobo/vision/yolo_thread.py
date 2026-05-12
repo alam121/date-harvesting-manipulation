@@ -83,7 +83,7 @@ class YoloThread:
                          imgsz=self.img_size,
                          conf=self.conf_thres,
                          iou=0.3,
-                         max_det=25,
+                         max_det=10,
                          device=device,
                          verbose=False,
                          classes=self._detect_class_ids if self._detect_class_ids else None,

@@ -1425,15 +1425,10 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
 
 
 def subscribe_to_goal_pose(node):
-    """Subscribe to /external_goal_pose and collect up to 3 candidate goals.
+    """Subscribe to /external_goal_pose and accept one stable goal.
 
-    Accepts first stable goal immediately, then keeps listening briefly
-    to collect additional distinct candidates (>5cm apart). All candidates
-    are stored for fast reacquire during approach.
+    Multi-goal queuing is handled only by subscribe_multi_goals().
     """
-
-    MAX_CANDIDATES = 3
-    COLLECT_WINDOW = 0.8  # seconds to keep listening after first accept
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):
@@ -1469,7 +1464,6 @@ def subscribe_to_goal_pose(node):
     goal_history = {
         "poses": [], "stable_count": 0,
         "accepted": False, "accept_time": 0.0,
-        "collecting": False,
     }
 
     def _destroy_sub():
@@ -1490,34 +1484,6 @@ def subscribe_to_goal_pose(node):
         # ---- ALWAYS STORE LATEST GOAL POSE ----
         node.latest_goal_pose = [*new_xyz, *new_quat]
         node.latest_goal_time = time.time()
-
-        # Phase 2: collecting additional candidates after first accept
-        if goal_history["collecting"]:
-            elapsed = time.time() - goal_history["accept_time"]
-            if elapsed > COLLECT_WINDOW or len(node.candidate_goals) >= MAX_CANDIDATES:
-                goal_history["collecting"] = False
-                n = len(node.candidate_goals)
-                node.get_logger().info(f"Collected {n} candidate goal(s)")
-                _destroy_sub()
-                return
-
-            # Add if distinct from all existing candidates (>5cm apart)
-            g = [*new_xyz, *new_quat]
-            is_distinct = all(
-                math.dist(new_xyz, c[:3]) > 0.05
-                for c in node.candidate_goals
-            )
-            if is_distinct:
-                node.candidate_goals.append(g)
-                publish_goal_marker(node, new_xyz)
-                h_type = "LOW" if new_xyz[2] < LOW_Z_THRESH else "MID/HIGH"
-                _trunk = getattr(node, 'trunk_x', None) or 0.16
-                _dx = abs(new_xyz[0] - _trunk)
-                l_type = ("LEFT" if new_xyz[0] > _trunk else "RIGHT") if _dx > LATERAL_THRESH else "CENTER"
-                node.get_logger().info(
-                    f"Candidate #{len(node.candidate_goals)}: {h_type} | {l_type} "
-                    f"(z={new_xyz[2]:.2f}m) [{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]")
-            return
 
         # Phase 1: waiting for first stable goal
         if goal_history["accepted"]:
@@ -1545,7 +1511,6 @@ def subscribe_to_goal_pose(node):
         if goal_history["stable_count"] >= 2 or len(goal_history["poses"]) >= 5:
             goal_history["accepted"] = True
             goal_history["accept_time"] = time.time()
-            goal_history["collecting"] = True  # start collecting more candidates
             node.goal_received = True
 
             # Stop idle timer
@@ -1562,9 +1527,9 @@ def subscribe_to_goal_pose(node):
             node.best_goal_xyz = new_xyz
             node.best_goal_score = float("inf")
 
+            # Single subscribe stores exactly one goal. Use Sub Multi for
+            # score-ordered multi-goal execution.
             g = [*new_xyz, *new_quat]
-
-            # First candidate = primary goal
             node.candidate_goals = [g]
             node.goal_poses.append(g)
             publish_goal_marker(node, new_xyz)
@@ -1611,6 +1576,10 @@ def subscribe_to_goal_pose(node):
                 node.obstacles.update_pose("fruit_obstacle", new_xyz)
             except Exception as _e:
                 node.get_logger().warn(f"obstacle update_pose failed (CUDA faulted?): {_e}")
+
+            node.get_logger().info("Collected 1 single goal")
+            _destroy_sub()
+            return
 
     # Subscribe to /external_goal_pose with VOLATILE QoS
     # VOLATILE = don't receive old buffered messages, only fresh ones
@@ -1668,12 +1637,15 @@ def subscribe_to_goal_pose(node):
 
 
 def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
-    """Subscribe to /external_goal_pose and collect up to max_goals distinct goals within timeout seconds.
+    """Queue top-scored visible fruits, with /external_goal_pose collection as fallback.
 
-    Each goal must be stable (2 readings <2cm) and distinct (>8cm from all previously accepted goals).
+    Vision publishes /vision/all_fruit_poses in score order, so goal multi normally
+    queues the first distinct entries from that list for sequential execution.
+    If no list is available yet, it falls back to the older live subscription path:
+    each goal must be stable (2 readings <2cm) and distinct from accepted goals.
     Goals are queued in node.goal_poses for sequential execution.
     """
-    DISTINCT_DIST = 0.02  # 8cm apart to count as a separate goal
+    DISTINCT_DIST = 0.05  # 5cm apart to count as a separate goal
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):
@@ -1711,6 +1683,40 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
         node.exclude_pub.publish(msg)
 
     _publish_exclusions([])  # clear any previous exclusions
+
+    cur = node.get_end_effector_pose()
+    current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
+
+    visible = list(getattr(node, 'all_fruit_poses', []) or [])
+    if visible:
+        queued_xyz = []
+        for xyz in visible:
+            if len(xyz) < 3 or any(v is None for v in xyz[:3]):
+                continue
+            xyz = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+            if any(math.dist(xyz, prev) < DISTINCT_DIST for prev in queued_xyz):
+                continue
+            queued_xyz.append(xyz)
+            if len(queued_xyz) >= max_goals:
+                break
+
+        if queued_xyz:
+            for rank, xyz in enumerate(queued_xyz, start=1):
+                g = [*xyz, *current_orientation]
+                node.goal_poses.append(g)
+                node.candidate_goals.append(g)
+                publish_goal_marker(node, xyz)
+                goal_type = "LOW" if xyz[2] < LOW_Z_THRESH else "MID/HIGH"
+                node.get_logger().info(
+                    f"Multi top-score goal #{rank}/{max_goals}: {goal_type} "
+                    f"(z={xyz[2]:.2f}m) [{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}]")
+
+            first_xyz = queued_xyz[0]
+            node.best_goal_xyz = first_xyz
+            node.goal_seed_xy = [first_xyz[0], first_xyz[1]]
+            node.goal_received = True
+            node.get_logger().info(f"Subscribe multi: queued {len(queued_xyz)}/{max_goals} top-scored goals")
+            return
 
     state = {
         "poses": [],
@@ -1940,7 +1946,20 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
 
-    if node.current_joint_positions is None:
+    def _valid_joint_positions(wait_s: float = 1.0):
+        deadline = time.time() + wait_s
+        expected = len(getattr(node, "joint_order", []) or [])
+        while time.time() <= deadline:
+            joints = getattr(node, "current_joint_positions", None)
+            if (joints is not None and
+                    (expected == 0 or len(joints) == expected) and
+                    all(j is not None and math.isfinite(float(j)) for j in joints)):
+                return list(joints)
+            time.sleep(0.05)
+        return None
+
+    _start_joints = _valid_joint_positions()
+    if _start_joints is None:
         node.get_logger().warn("No joint state yet."); return
     if not node.goal_poses:
         node.get_logger().warn("No stored goals."); return
@@ -1974,8 +1993,13 @@ def plan_and_execute(node):
         if _check_stop():
             break
         
+        _start_joints = _valid_joint_positions()
+        if _start_joints is None:
+            node.get_logger().warn("Incomplete joint state before goal; skipping remaining goals.")
+            break
+
         start = JointState.from_position(
-            torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+            torch.tensor([_start_joints], dtype=torch.float32, device=device),
             joint_names=node.joint_order,
         )
         
@@ -2055,6 +2079,7 @@ def plan_and_execute(node):
 
         # Side HOME: use predefined home_left / home_right based on fruit vs trunk position
         is_side_approach = False
+        side_home_reacquired = False
         trunk_x = node.trunk_x  # live trunk x from /trunk_position topic
         if trunk_x is None:
             trunk_x = 0.16  # fallback if vision hasn't published yet
@@ -2108,15 +2133,21 @@ def plan_and_execute(node):
                 if side_joints is not None:
                     node.get_logger().info(
                         f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
-                    if node.current_joint_positions is not None:
-                        side_joints = nearest_joint_config(node.current_joint_positions, side_joints)
+                    _side_start_joints = _valid_joint_positions()
+                    if _side_start_joints is not None:
+                        side_joints = nearest_joint_config(_side_start_joints, side_joints)
                     plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
                     is_side_approach = True
                 # Update start state and cur_pose after side HOME
                 cur_pose = node.get_end_effector_pose()
                 cur_quat = cur_pose[3:] if cur_pose else cur_quat
+                _post_side_joints = _valid_joint_positions()
+                if _post_side_joints is None:
+                    node.get_logger().warn("Incomplete joint state after side HOME; skipping goal.")
+                    unlock_target(node)
+                    continue
                 start = JointState.from_position(
-                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                    torch.tensor([_post_side_joints], dtype=torch.float32, device=device),
                     joint_names=node.joint_order,
                 )
                 # Camera is fixed — its surface normal won't change with arm position.
@@ -2129,6 +2160,47 @@ def plan_and_execute(node):
                         node.get_logger().info(
                             f"[DIR] NEW (geometric from EE at {side_label}) | "
                             f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+                if is_side_approach and node.cfg.planner.reacquire_after_approach:
+                    seed = [x, y, z]
+                    node.motion_phase = "REACQUIRE"
+                    node.reacquire_result = "SEARCH"
+                    node._publish_goal_info()
+                    node.get_logger().info(
+                        f"[REACQ_SIDE_HOME] Searching from {side_label} before approach")
+                    reacq = reacquire_goal_pose(
+                        node,
+                        seed_xyz=seed,
+                        candidate_seeds=[],
+                        timeout=3.0,
+                        radius=0.03,
+                        z_tolerance=0.002,
+                        depth_settle_s=0.6,
+                        stable_needed=2,
+                        restore_mode="paused",
+                    )
+                    if reacq:
+                        x, y, z = reacq
+                        goal[:3] = [x, y, z]
+                        lock_target(node, [x, y, z])
+                        publish_goal_marker(node, [x, y, z])
+                        node.reacquire_result = "OK"
+                        side_home_reacquired = True
+                        node.get_logger().info(
+                            f"[REACQ_SIDE_HOME] Refined: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                    else:
+                        x, y, z = seed
+                        node.reacquire_result = "SEED"
+                        side_home_reacquired = True
+                        node.get_logger().info(
+                            f"[REACQ_SIDE_HOME] No match — using original seed: "
+                            f"[{x:.3f}, {y:.3f}, {z:.3f}]")
+
+                    if is_low:
+                        ax, ay, az = x, y, z
+                    else:
+                        _is_right = x < (node.trunk_x or trunk_x or 0.16)
+                        _midhi_standoff = 0.12 if _is_right else standoff
+                        ax, ay, az = x, y + _midhi_standoff, z
             else:
                 node.get_logger().info("Fruit near center; using default HOME without side move.")
 
@@ -2186,11 +2258,13 @@ def plan_and_execute(node):
                         f"Side-low wrist yaw correction: {_yaw_delta*57.3:+.1f}deg")
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
                 else:
-                    _x_off = 0.05 * (1 if x > trunk_x else -1) if _is_lat else 0.0
+                    _x_off = 0.0
                     _y_off = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.07)
-                              if is_very_low_center else 0.07)
+                              if is_very_low_center
+                              else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
                     _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", -0.025)
-                              if is_very_low_center else -0.07)
+                              if is_very_low_center
+                              else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
             else:
                 approach = [ax, ay, az, *orientation]
@@ -2217,15 +2291,18 @@ def plan_and_execute(node):
             else:
                 side_blend = 0.10 if is_low_lateral else 0.25
                 orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-                _x_offset = 0.05 * (1 if x > trunk_x else -1) if is_low_lateral else 0.0
+                _x_offset = 0.0
                 _y_offset = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.07)
-                             if is_very_low_center else 0.07)
+                             if is_very_low_center
+                             else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
                 _z_offset = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", -0.025)
-                             if is_very_low_center else -0.07)
+                             if is_very_low_center
+                             else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
                 approach = [ax + _x_offset, ay + _y_offset, az + _z_offset, *orientation]
             node.get_logger().info(
                 f"{'VERY LOW' if is_very_low_center else 'LOW'} approach pose: {approach[:3]}, is_side={is_side_approach}, "
-                f"is_low_lateral={is_low_lateral}, x_offset={_x_offset:+.3f}"
+                f"is_low_lateral={is_low_lateral}, x_offset={_x_offset:+.3f}, "
+                f"y_offset={_y_offset:+.3f}, z_offset={_z_offset:+.3f}"
                 + (f", side_dir=[{low_side_dir[0]:.3f},{low_side_dir[1]:.3f},{low_side_dir[2]:.3f}]" if low_side_dir is not None else ""))
         else:
             side_blend =0.0
@@ -2234,6 +2311,22 @@ def plan_and_execute(node):
             node.get_logger().info(
                 f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
                 f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+
+        def _final_offsets(is_slip_retry=False):
+            if is_low and is_side_approach:
+                return (
+                    getattr(node.cfg.planner, "low_side_final_y_offset", 0.0),
+                    getattr(node.cfg.planner, "low_side_final_z_offset", 0.0),
+                )
+            if is_low:
+                _z = getattr(node.cfg.planner, "low_center_final_z_offset", 0.025)
+                if is_slip_retry:
+                    _z = min(_z, 0.02)
+                return (
+                    getattr(node.cfg.planner, "low_center_final_y_offset", 0.004),
+                    _z,
+                )
+            return (0.008, 0.02 if is_slip_retry else 0.03)
 
         # === DEBUG PLAN PREVIEW (RViz visualization) ===
         if node.cfg.planner.debug_plan_preview:
@@ -2249,12 +2342,7 @@ def plan_and_execute(node):
             if not skip_approach:
                 preview_steps.append({"label": "APPROACH", "position": approach[:3]})
             # 3. Final
-            if is_low and is_side_approach:
-                _preview_y_offset = getattr(node.cfg.planner, "low_side_final_y_offset", 0.0)
-                _preview_z_offset = getattr(node.cfg.planner, "low_side_final_z_offset", 0.0)
-            else:
-                _preview_y_offset = 0.008
-                _preview_z_offset = 0.03
+            _preview_y_offset, _preview_z_offset = _final_offsets(is_slip_retry=False)
             preview_steps.append({"label": "FINAL", "position": [x, y - _preview_y_offset, z + _preview_z_offset]})
             # 4. Dropoff
             preview_steps.append({"label": "DROPOFF", "joints": node.dropoff_joints})
@@ -2324,8 +2412,13 @@ def plan_and_execute(node):
                     node.get_logger().info(
                         f"IK failed — cuRobo plan to approach {[round(v,3) for v in approach[:3]]}"
                     )
+                    _ik_fail_joints = _valid_joint_positions()
+                    if _ik_fail_joints is None:
+                        node.get_logger().warn("Incomplete joint state before approach fallback; skipping goal.")
+                        unlock_target(node)
+                        continue
                     _start_after_ik_fail = JointState.from_position(
-                        torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                        torch.tensor([_ik_fail_joints], dtype=torch.float32, device=device),
                         joint_names=node.joint_order,
                     )
                     _approach_ok = plan_and_send(
@@ -2377,17 +2470,14 @@ def plan_and_execute(node):
                 blend_motion(node)
 
             # Wait for joint state to be available after approach
-            for _ in range(20):
-                if node.current_joint_positions is not None:
-                    break
-                time.sleep(0.05)
-            if node.current_joint_positions is None:
+            _post_approach_joints = _valid_joint_positions()
+            if _post_approach_joints is None:
                 node.get_logger().warn("No joint state after approach; skipping goal.")
                 unlock_target(node)
                 continue
 
             start = JointState.from_position(
-                torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                torch.tensor([_post_approach_joints], dtype=torch.float32, device=device),
                 joint_names=node.joint_order,
             )
 
@@ -2398,12 +2488,14 @@ def plan_and_execute(node):
 
         if _check_stop(): break
 
-        # 2. Soft reacquire — re-detection at approach standoff for accurate final position.
-        # Resume YOLO now (was paused since target lock) for this focused snapshot.
-        _vision_resume()
+        # 2. Soft reacquire — re-detection for accurate final position.
+        # Side-home targets reacquire before approach from the side-home camera view,
+        # so don't repeat it after moving to the side approach standoff.
+        if not side_home_reacquired:
+            _vision_resume()
         seed = [x, y, z]
         node.motion_phase = "REACQUIRE"
-        if node.cfg.planner.reacquire_after_approach:
+        if node.cfg.planner.reacquire_after_approach and not side_home_reacquired:
             node.reacquire_result = "SEARCH"
             node._publish_goal_info()
             reacq = reacquire_goal_pose(
@@ -2426,8 +2518,13 @@ def plan_and_execute(node):
                 node.get_logger().info(f"[REACQ] No match — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
                 node.reacquire_result = "SEED"
         else:
-            node.reacquire_result = "SEED"
-            node.get_logger().info(f"[REACQ] Skipped — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+            if side_home_reacquired:
+                node.get_logger().info(
+                    f"[REACQ] Skipped after approach — already reacquired at side HOME: "
+                    f"[{x:.3f}, {y:.3f}, {z:.3f}]")
+            else:
+                node.reacquire_result = "SEED"
+                node.get_logger().info(f"[REACQ] Skipped — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
         # Pause YOLO again — final move and grasp need full GPU for IK.
         _vision_pause()
         node._publish_goal_info()
@@ -2449,12 +2546,7 @@ def plan_and_execute(node):
         # A large orientation change between standoff and final forces IK through singularities.
         node.get_logger().info(f"FINAL orientation: reusing approach orientation (is_low={is_low})")
         _is_slip_retry = getattr(node, "_slip_retry_count", 0) > 0
-        if is_low and is_side_approach:
-            z_offset = getattr(node.cfg.planner, "low_side_final_z_offset", 0.0)
-            y_offset = getattr(node.cfg.planner, "low_side_final_y_offset", 0.0)
-        else:
-            z_offset = 0.02 if _is_slip_retry else 0.03
-            y_offset = 0.008  # no lateral adjustment
+        y_offset, z_offset = _final_offsets(is_slip_retry=_is_slip_retry)
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
         # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
         # This ensures the approach vector is accurate after the arm has settled at standoff.
@@ -2485,6 +2577,9 @@ def plan_and_execute(node):
 
         gx, gy, gz = x, y - y_offset, z + z_offset
         final_target = [gx, gy, gz, *orientation]
+        node.get_logger().info(
+            f"FINAL target offsets: y=-{y_offset:.3f} z=+{z_offset:.3f} "
+            f"target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
         node.motion_phase = "FINAL"
         # Vision is already "paused" from _vision_pause() — keep it that way for final move.
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
@@ -2502,9 +2597,10 @@ def plan_and_execute(node):
         if not final_ok:
             # Fallback: full cuRobo plan_and_send (handles branch changes, no IK restriction)
             node.get_logger().warn("FINAL IK failed — trying plan_and_send as fallback...")
-            if node.current_joint_positions is not None:
+            _final_joints = _valid_joint_positions()
+            if _final_joints is not None:
                 _final_start = JointState.from_position(
-                    torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device),
+                    torch.tensor([_final_joints], dtype=torch.float32, device=device),
                     joint_names=node.joint_order,
                 )
                 final_ok = plan_and_send(node, _final_start, Pose.from_list(final_target),
@@ -2702,6 +2798,51 @@ def plan_and_execute(node):
         node.motion_phase = "REVERSING"
         execute_partial_reverse(node, clearance_m=0.35)
 
+        # Check whether the fruit is still held after reversing away from the bunch.
+        # If the fruit was only touched or slipped out during reverse, force deltas
+        # usually drop back near the close baseline.
+        try:
+            _hold_base = list(gc.baseline_force[:3])
+            time.sleep(0.2)  # let vibration from reverse settle
+            _samples = []
+            _sample_deadline = time.time() + 0.6
+            while time.time() < _sample_deadline:
+                _hold_force = list(gc.force_data[:3])
+                _samples.append([
+                    abs(float(_hold_force[i]) - float(_hold_base[i])) for i in range(3)
+                ])
+                time.sleep(0.05)
+            if _samples:
+                _hold_deltas = np.median(np.array(_samples, dtype=float), axis=0).tolist()
+            else:
+                _hold_deltas = [0.0, 0.0, 0.0]
+            _hold_fingers = sum(1 for d in _hold_deltas if d > 1.5)
+            _hold_max = max(_hold_deltas) if _hold_deltas else 0.0
+            _hold_sum = sum(_hold_deltas)
+            # After reverse the fruit can settle against one finger/cup wall, so
+            # 2-finger contact is ideal but not required. Accept one strong,
+            # persistent contact or enough total force as "held".
+            _hold_ok = (
+                _hold_fingers >= 2 or
+                _hold_max >= 2.3 or
+                _hold_sum >= 3.0
+            )
+            node.fruit_held_after_reverse = _hold_ok
+            node.get_logger().info(
+                f"[HOLD_CHECK] after reverse: "
+                f"{'HELD' if _hold_ok else 'NOT_HELD'} | "
+                f"deltas=[{_hold_deltas[0]:.2f},{_hold_deltas[1]:.2f},{_hold_deltas[2]:.2f}]N "
+                f"fingers={_hold_fingers}/3 max={_hold_max:.2f}N sum={_hold_sum:.2f}N "
+                f"samples={len(_samples)}"
+            )
+            if not _hold_ok:
+                node.get_logger().warn(
+                    "[HOLD_CHECK] Fruit likely not inside gripper after reverse "
+                    "(force dropped below hold threshold)."
+                )
+        except Exception as _e:
+            node.get_logger().warn(f"[HOLD_CHECK] after reverse failed: {_e}")
+
         _MAX_SLIP_RETRIES = 2
         _slip_retry_count = getattr(node, "_slip_retry_count", 0)
         _slip_detected = False
@@ -2802,7 +2943,7 @@ def plan_and_execute(node):
                     naz = nz
 
                 # Try planning from current (dropoff) position to next approach
-                cur_joints = node.current_joint_positions
+                cur_joints = _valid_joint_positions()
                 if cur_joints is not None:
                     next_start = JointState.from_position(
                         torch.tensor([cur_joints], dtype=torch.float32, device=device),

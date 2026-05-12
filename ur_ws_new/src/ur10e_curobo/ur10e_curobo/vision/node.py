@@ -463,6 +463,17 @@ class VisionNode:
                 img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps, viz_only, uv_lidar, pts_lidar = frame_data
                 try:
                     _vt0 = time()
+                    if not getattr(self, "_printed_bottom_pixel_pre_render", False):
+                        _bottom = img_ocv[-12:, :, :3]
+                        print(
+                            "bottom_pre_render mean",
+                            np.round(_bottom.mean(axis=(0, 1)), 1).tolist(),
+                            "min",
+                            _bottom.min(axis=(0, 1)).tolist(),
+                            "max",
+                            _bottom.max(axis=(0, 1)).tolist(),
+                        )
+                        self._printed_bottom_pixel_pre_render = True
                     display_image = self.visualizer.render_frame(
                         img_ocv, tgts, rej_tgts,
                         b_idx, net_fps, l_fps,
@@ -471,11 +482,33 @@ class VisionNode:
                         lidar_pts_cam=pts_lidar,
                     )
                     _vt1 = time()
+                    if not getattr(self, "_printed_bottom_pixel_post_render", False):
+                        _bottom = display_image[-12:, :, :3]
+                        print(
+                            "bottom_post_render mean",
+                            np.round(_bottom.mean(axis=(0, 1)), 1).tolist(),
+                            "min",
+                            _bottom.min(axis=(0, 1)).tolist(),
+                            "max",
+                            _bottom.max(axis=(0, 1)).tolist(),
+                        )
+                        self._printed_bottom_pixel_post_render = True
                     if len(display_image.shape) == 3 and display_image.shape[2] == 4:
                         pub_image = cv2.cvtColor(display_image, cv2.COLOR_BGRA2BGR)
                     else:
                         pub_image = display_image
                     _vt2 = time()
+                    if not getattr(self, "_printed_bottom_pixel_pub_image", False):
+                        _bottom = pub_image[-12:, :, :3]
+                        print(
+                            "bottom_pub_image mean",
+                            np.round(_bottom.mean(axis=(0, 1)), 1).tolist(),
+                            "min",
+                            _bottom.min(axis=(0, 1)).tolist(),
+                            "max",
+                            _bottom.max(axis=(0, 1)).tolist(),
+                        )
+                        self._printed_bottom_pixel_pub_image = True
                     img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
                     _vt3 = time()
                     img_msg.header.stamp = self.node.get_clock().now().to_msg()
@@ -509,6 +542,20 @@ class VisionNode:
             _initial_voxel_cloud_sent = False
             _initial_voxel_cloud_burst_remaining = 3
 
+            def _enqueue_raw_viz_frame():
+                nonlocal _last_raw_viz_t
+                _now = time()
+                if _now - _last_raw_viz_t < _RAW_VIZ_MIN_INTERVAL:
+                    return
+                try:
+                    _viz_queue.put_nowait((
+                        image_left_ocv.copy(), [], [], None,
+                        self.yolo_thread.net_fps, loop_fps, [], None, None
+                    ))
+                    _last_raw_viz_t = _now
+                except queue.Full:
+                    pass
+
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
                 if grab_status != sl.ERROR_CODE.SUCCESS:
@@ -529,12 +576,23 @@ class VisionNode:
                 else:
                     zed.retrieve_image(image_left, sl.VIEW.LEFT, sl.MEM.CPU,
                                        sl.Resolution(disp_w, disp_h))
+                if not getattr(self, "_printed_zed_buffer_shape", False):
+                    print("buffer", image_left_ocv.shape, "zed", image_left.get_data().shape)
+                    self._printed_zed_buffer_shape = True
                 np.copyto(image_left_ocv, image_left.get_data())
                 # "paused" mode: no inference at all (arm is moving, GPU needed for cuRobo).
                 # "reacquire" mode: every 3rd frame only.
                 # "full" mode: every frame.
-                if self.detection_mode != "paused":
-                    _reacquire = self.detection_mode == "reacquire"
+                _mode = self.detection_mode
+                _paused = _mode == "paused"
+                _reacquire = _mode == "reacquire"
+                if _paused:
+                    # Keep the display live during robot motion, but skip stale
+                    # detections/depth/heatmap work so cuRobo keeps the GPU.
+                    current_dets = None
+                    _enqueue_raw_viz_frame()
+                    continue
+                else:
                     self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
                     if not _reacquire or self._reacquire_frame_skip == 0:
                         self.yolo_thread.set_image(image_left.get_data())
@@ -582,14 +640,7 @@ class VisionNode:
                     self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
                 elif current_dets is None:
                     # No YOLO result yet — publish raw frame so display stays live.
-                    _now = time()
-                    if _now - _last_raw_viz_t >= _RAW_VIZ_MIN_INTERVAL:
-                        try:
-                            _viz_queue.put_nowait((image_left_ocv.copy(), [], [], None,
-                                                   self.yolo_thread.net_fps, loop_fps, [], None, None))
-                            _last_raw_viz_t = _now
-                        except queue.Full:
-                            pass
+                    _enqueue_raw_viz_frame()
                     continue
                 else:
                     # Cumulative-drift check: discard cached dets if camera has drifted
@@ -599,14 +650,7 @@ class VisionNode:
                             float(np.linalg.norm(_cur_t_now - self._yolo_accepted_cam_t)) > _YOLO_STALE_DRIFT):
                         current_dets = None
                         # Camera has moved — publish raw frame so display stays live during motion.
-                        _now = time()
-                        if _now - _last_raw_viz_t >= _RAW_VIZ_MIN_INTERVAL:
-                            try:
-                                _viz_queue.put_nowait((image_left_ocv.copy(), [], [], None,
-                                                       self.yolo_thread.net_fps, loop_fps, [], None, None))
-                                _last_raw_viz_t = _now
-                            except queue.Full:
-                                pass
+                        _enqueue_raw_viz_frame()
                         continue
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
@@ -705,11 +749,17 @@ class VisionNode:
                     self._process_best_target(targets, best_idx, intrinsics)
                 _tp4 = time()
 
-                # Publish ALL visible fruit positions so reacquire can find the
-                # target fruit even when it isn't ranked as best.
+                # Publish visible fruit positions sorted by score, highest first.
+                # Reacquire can still search all visible fruits, and goal multi can
+                # queue top-scoring dates deterministically.
                 # Format: [x0,y0,z0, x1,y1,z1, ...] in base_link frame.
                 _all_flat = []
-                for _t in targets:
+                _targets_by_score = sorted(
+                    targets,
+                    key=lambda _t: float(_t.get("score", 0.0)),
+                    reverse=True,
+                )
+                for _t in _targets_by_score:
                     _pb = _t.get("pt_base")
                     if _pb is not None:
                         _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])

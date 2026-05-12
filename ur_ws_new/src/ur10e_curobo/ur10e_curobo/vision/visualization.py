@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from .config import (
-    DRAW_ONLY_BEST, SHOW_REJECTED, SKIP_DRAW,
+    DRAW_ONLY_BEST, DRAW_TOP_N, SHOW_REJECTED, SKIP_DRAW,
     APPROACH_CHECK_DIST,
 )
 from .math_utils import project_point_to_image
@@ -501,8 +501,21 @@ class VisionVisualizer:
             self.draw_viz_only(image, viz_only)
         self.draw_blocking_fruits(image, targets, best_idx)
 
+        draw_indices = set(range(len(targets)))
+        if not DRAW_ONLY_BEST and DRAW_TOP_N is not None and DRAW_TOP_N > 0:
+            scored = sorted(
+                ((i, t.get("score", 0.0)) for i, t in enumerate(targets)),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            draw_indices = {i for i, _ in scored[:DRAW_TOP_N]}
+            if best_idx is not None:
+                draw_indices.add(best_idx)
+
         for i, t in enumerate(targets):
             if DRAW_ONLY_BEST and (best_idx is not None) and i != best_idx:
+                continue
+            if not DRAW_ONLY_BEST and i not in draw_indices:
                 continue
             self.draw_target(image, t, is_best=(i == best_idx), idx=i)
 
