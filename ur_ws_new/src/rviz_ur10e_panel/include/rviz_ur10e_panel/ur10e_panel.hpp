@@ -62,6 +62,7 @@ private Q_SLOTS:
   void onDebugPreviewChanged(int state);
   void onPlanConfirm();
   void onPlanCancel();
+  void onLidarScan();
   void updateDisplay();
 
 private:
