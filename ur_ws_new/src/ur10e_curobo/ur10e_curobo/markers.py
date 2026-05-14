@@ -33,7 +33,8 @@ def publish_planned_path(node, joint_states, label="planned", cartesian_points=N
     m.points = points
     m.lifetime.sec = 0  # Persist until cleared
     node.path_marker_pub.publish(m)
-    node.get_logger().info(f"Published planned path ({len(points)} points) for {label}")
+    if getattr(node.cfg.planner, "log_path_publish", False):
+        node.get_logger().info(f"Published planned path ({len(points)} points) for {label}")
 
 
 def clear_path_markers(node):
@@ -244,7 +245,8 @@ def publish_plan_preview(node, steps):
         prev_pt = cur_pt
 
     labels = [s["label"] for s in steps]
-    node.get_logger().info(f"Published plan preview with {len(steps)} steps in RViz: {labels}")
+    if getattr(node.cfg.planner, "log_path_publish", False):
+        node.get_logger().info(f"Published plan preview with {len(steps)} steps in RViz: {labels}")
 
 
 def clear_plan_preview(node):
@@ -283,7 +285,7 @@ def track_robot_path(node):
             node.path_points.append(p); publish_path_marker(node)
             if not node.tf_printed:
                 node.tf_printed = True
-                node.get_logger().info("Tracked robot path point. TF READY.")
+                node.get_logger().debug("Tracked robot path point. TF READY.")
 
             
     except (LookupException, ConnectivityException, ExtrapolationException) as e:

@@ -150,6 +150,8 @@ class UIManager:
             self._handle_set_debug_preview(cmd)
         elif cmd == "update_voxel":
             self._node._update_voxel_snapshot()
+        elif cmd == "set_home_current":
+            self._node._set_current_as_home()
         elif cmd in ("grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera"):
             pass  # handled by node.py's _ui_command_cb
         elif cmd == "debug_world":

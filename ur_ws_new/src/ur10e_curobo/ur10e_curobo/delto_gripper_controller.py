@@ -36,10 +36,10 @@ class DeltoGripperController:
         # ----------------------------------------------------
         if self.suction:
             self.finger_joint_idx = {0: 2, 1: 7, 2: 10}  # Version A
-            self.node.get_logger().info("Delto Gripper: SUCTION MODE (center joint=7)")
+            self.node.get_logger().debug("Delto Gripper: SUCTION MODE (center joint=7)")
         else:
             self.finger_joint_idx = {0: 2, 1: 6, 2: 10}  # Version B
-            self.node.get_logger().info("Delto Gripper: NON-SUCTION MODE (center joint=6)")
+            self.node.get_logger().debug("Delto Gripper: NON-SUCTION MODE (center joint=6)")
 
         # Positions (shared)
         self.open_position = [
@@ -76,8 +76,8 @@ class DeltoGripperController:
             time.sleep(1.0)  # Wait for force data to start flowing
             if self.force_data != [0.0, 0.0, 0.0]:
                 self.baseline_force = self.force_data.copy()
-                self.node.get_logger().info(
-                    f"✅ Gripper initialized (baseline=[{self.baseline_force[0]:.2f}, "
+                self.node.get_logger().debug(
+                    f"Gripper initialized (baseline=[{self.baseline_force[0]:.2f}, "
                     f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
                 )
             else:
@@ -105,7 +105,7 @@ class DeltoGripperController:
         if self.frozen_fingers:
             prev = sorted(list(self.frozen_fingers))
             self.frozen_fingers.clear()
-            self.node.get_logger().info(f"🧊→🔥 Unfroze fingers: {prev}")
+            self.node.get_logger().debug(f"Unfroze fingers: {prev}")
         self.first_contact_index = None
 
     def force_callback(self, msg):
@@ -209,11 +209,12 @@ class DeltoGripperController:
         # ALWAYS capture baseline from current force before closing
         # This ensures we use the actual open state, not stale values
         self.baseline_force = self.force_data.copy()
-        self.node.get_logger().info(
-            f"🔒 Closing gripper (baseline=[{self.baseline_force[0]:.2f}, "
-            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N, "
-            f"threshold={self.force_threshold}N)"
-        )
+        if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):
+            self.node.get_logger().info(
+                f"🔒 Closing gripper (baseline=[{self.baseline_force[0]:.2f}, "
+                f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N, "
+                f"threshold={self.force_threshold}N)"
+            )
 
         # Track closure result for learning
         self.closure_stopped_early = False
@@ -235,14 +236,14 @@ class DeltoGripperController:
                 self.closure_first_contact_step = i
                 break
 
-        # Log the profile summary
-        profile_str = " | ".join(
-            f"s{i}:[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}]"
-            for i, d in enumerate(self.closure_force_profile)
-        )
-        self.node.get_logger().info(f"🔒 Force profile: {profile_str}")
+        if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):
+            profile_str = " | ".join(
+                f"s{i}:[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}]"
+                for i, d in enumerate(self.closure_force_profile)
+            )
+            self.node.get_logger().info(f"🔒 Force profile: {profile_str}")
         self.node.get_logger().info(
-            f"🔒 First contact at step {self.closure_first_contact_step}/{len(self.closure_force_profile)}"
+            f"🔒 First contact: {self.closure_first_contact_step}/{len(self.closure_force_profile)}"
         )
 
     # --------------------------------------------------------
@@ -264,10 +265,11 @@ class DeltoGripperController:
         # Capture baseline force when gripper is fully open
         self.baseline_force = self.force_data.copy()
 
-        self.node.get_logger().info(
-            f"Gripper opened fully (baseline=[{self.baseline_force[0]:.2f}, "
-            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
-        )
+        if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):
+            self.node.get_logger().info(
+                f"Gripper opened fully (baseline=[{self.baseline_force[0]:.2f}, "
+                f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+            )
 
         # Debounce window after open
         self.ignore_contacts_until = time.time() + 0.25
@@ -301,10 +303,11 @@ class DeltoGripperController:
         time.sleep(0.3)
         self.baseline_force = self.force_data.copy()
 
-        self.node.get_logger().info(
-            f"Gripper opened to alpha={alpha:.2f} (baseline=[{self.baseline_force[0]:.2f}, "
-            f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
-        )
+        if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):
+            self.node.get_logger().info(
+                f"Gripper opened to alpha={alpha:.2f} (baseline=[{self.baseline_force[0]:.2f}, "
+                f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+            )
 
         self.ignore_contacts_until = time.time() + 0.25
         self.need_rearm = True

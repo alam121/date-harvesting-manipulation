@@ -247,7 +247,8 @@ def plan_execute_js(
         max_vel=math.pi,  # UR10e physical joint limit; prevents clipping cuRobo's natural velocities
     )
 
-    node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
+    if getattr(node.cfg.planner, "log_phase_timings", False):
+        node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
     if traj.points:
         node.trajectory_pub.publish(traj)
     else:

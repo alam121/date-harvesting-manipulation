@@ -11,7 +11,7 @@ def apply_zed_one_settings(zed):
     #zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, 7)   # 0-8
     zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, 5)     # 0-8
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SATURATION, 7)   # 0-8  (richer colour with HDR)
-    zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 6)    # 0-8
+    zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 4)    # 0-8
     # zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 7)        # 1-9
 
     # Lock manual exposure so image doesn't go dark when robot moves

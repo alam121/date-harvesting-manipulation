@@ -14,14 +14,14 @@ DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
+DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_nano_3_5_26.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_nano_3_5_26.engine")
 
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_large_5_5_26.engine")
 # YOLO inference parameters
-DEFAULT_CONF_THRES = 0.4          # confidence threshold (lower = more detections)
-DEFAULT_IMG_SIZE = 640             # must match compiled TRT engine exactly
+DEFAULT_CONF_THRES = 0.5          # confidence threshold (lower = more detections)
+DEFAULT_IMG_SIZE = 1248             # must match compiled TRT engine exactly
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {

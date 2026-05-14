@@ -39,6 +39,7 @@ public:
 private Q_SLOTS:
   void onStop();
   void onHome();
+  void onSetHomeCurrent();
   void onDropoff();
   void onExecute();
   void onClear();

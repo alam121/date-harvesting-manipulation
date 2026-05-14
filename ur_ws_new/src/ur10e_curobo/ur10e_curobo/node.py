@@ -319,6 +319,8 @@ class UR10eCuroboMoveIt(Node):
             self.get_logger().info(f"Subscribe multi: collecting up to {max_goals} goals in 10s")
         elif cmd == "update_voxel":
             self._update_voxel_snapshot()
+        elif cmd == "set_home_current":
+            self._set_current_as_home()
         elif cmd == "grasp_success":
             self._grasp_feedback = True
             self.get_logger().info("Grasp feedback: SUCCESS")
@@ -466,7 +468,15 @@ class UR10eCuroboMoveIt(Node):
             return
         vo = self.voxel_obstacles
         if vo._latest_points is None:
-            self.get_logger().warn("No depth data available yet for voxel update. Is /zed_depth_pointcloud publishing?")
+            try:
+                sub_count = vo._depth_sub.get_publisher_count()
+            except Exception:
+                sub_count = -1
+            self.get_logger().warn(
+                "No depth data available yet for voxel update. "
+                f"/zed_depth_pointcloud publishers={sub_count}. "
+                "Start/restart the vision node and wait for the initial depth-cloud burst."
+            )
             return
         try:
             if vo.snapshot():
@@ -476,6 +486,18 @@ class UR10eCuroboMoveIt(Node):
         except Exception as e:
             self.get_logger().warn(f"Voxel update failed: {e}")
 
+    def _set_current_as_home(self):
+        """Set the active HOME joint preset to the latest measured joint state."""
+        joints = self.current_joint_positions
+        if joints is None or len(joints) != len(self.joint_order):
+            self.get_logger().warn(
+                "Cannot set HOME: current joint state is incomplete or unavailable.")
+            return
+        self._config_mgr.set_home_joints(joints)
+        joints_str = ", ".join(f"{v:.6f}" for v in joints)
+        self.get_logger().info(
+            f"HOME updated from current joints: [{joints_str}] "
+            "(runtime/ROS parameter only; edit config.py to make it permanent)")
 
     def _publish_goal_info(self):
         """Publish goal information for GUI consumption."""
@@ -833,7 +855,6 @@ class UR10eCuroboMoveIt(Node):
             
         self.get_logger().info("Executing stored goals…")
         goals_mod.plan_and_execute(self)
-        self.get_logger().info("Done.")
 
     # expose some helpers for external callers
     def control_gripper(self, action: str, fruit_radius: float = None):
@@ -1079,6 +1100,14 @@ class UR10eCuroboMoveIt(Node):
     @property
     def fruit_image_norm(self):
         return self._state_mgr.fruit_image_norm
+
+    @property
+    def fruit_bunch_rel_x(self):
+        return self._state_mgr.fruit_bunch_rel_x
+
+    @property
+    def fruit_bunch_rel_y(self):
+        return self._state_mgr.fruit_bunch_rel_y
 
     # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 3: MotionExecutor) ============
 

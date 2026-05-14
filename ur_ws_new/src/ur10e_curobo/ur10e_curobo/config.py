@@ -110,11 +110,7 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [4.946733474731445, -1.6187120876707972, 2.180723492299215, 1.726618929500244, 4.490667343139648, -0.09821635881532842]
-
-
-
-
+    home: List[float] = field(default_factory=lambda: [4.941936492919922, -1.6112495861449183, 2.1890562216388147, 1.7179061609455566, 4.491253852844238, -0.09996301332582647]
 
 
 )
@@ -176,24 +172,49 @@ class Planner:
     direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
 
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
+
+
     low_center_approach_y_offset: float = 0.07
     low_center_approach_z_offset: float = -0.07
+
+
     very_low_center_approach_y_offset: float = 0.07
     very_low_center_approach_z_offset: float = -0.035
 
-    low_side_standoff_x: float = 0.12           # m; side-low standoff left/right of fruit
-    low_side_standoff_y: float = 0.065          # m; keep side-low slightly back like low-center
-    low_side_standoff_z: float = -0.055         # m; keep side-low slightly below like low-center
+    mid_center_approach_y_offset: float = 0.10
+    mid_center_approach_z_offset: float = -0.05
+    bunch_edge_side_band: float = 0.20        # rel-x within outer 20% of bunch is forced LEFT/RIGHT
+    bunch_lower_center_band: float = 0.80     # rel-y >= this is forced VERY LOW/CENTER
+
+    low_left_standoff_x: float = 0.12           # m; left side-low lateral standoff
+    low_left_standoff_y: float = 0.065          # m; left side-low back standoff
+    low_left_standoff_z: float = -0.055         # m; left side-low vertical standoff
+
+    low_right_standoff_x: float = 0.08          # m; right side-low lateral standoff
+    low_right_standoff_y: float = 0.050         # m; right side-low back standoff
+    low_right_standoff_z: float = -0.025        # m; avoid large upward push on right-side final
 
     low_side_final_y_offset: float = 0.0        # m; keep side-low final motion lateral
-    low_side_final_z_offset: float = 0.020        # m; keep side-low final motion lateral
+    low_left_final_z_offset: float = 0.020      # m; left side-low gripper center offset
+    low_right_final_z_offset: float = 0.010     # m; right side-low gripper center offset
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
+
+    mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
     low_center_final_y_offset: float = -0.02    # m; small pull toward camera for low-center final
     low_center_final_z_offset: float = 0.025    # m; gripper center offset above low-center fruit
 
+    mid_center_final_y_offset: float = 0.008    # m; small pull toward camera/robot for MID/HIGH center final
+    mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
+    mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
+
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
+    reverse_initial_wait: float = 0.15          # s; minimum wait after publishing partial reverse
+    reverse_final_settle: float = 0.05          # s; settle after reverse stops before hold check
+    hold_check_settle_s: float = 0.05           # s; force settle before post-reverse hold samples
+    hold_check_window_s: float = 0.30           # s; median force sample window after reverse
+    hold_check_sample_dt: float = 0.04          # s; post-reverse force sample period
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
     pre_dropoff_y_offset: float = 0.25  # m back from dropoff
@@ -205,6 +226,10 @@ class Planner:
 
     # === DEBUG ===
     debug_plan_preview: bool = True    # show full plan and wait for confirmation before executing
+    log_cycle_start: bool = False      # verbose per-goal start/decision metadata
+    log_phase_timings: bool = False    # per-phase timing lines; cycle summary always includes timings
+    log_path_publish: bool = False     # RViz path marker publish messages
+    log_gripper_force_profile: bool = False  # full per-step closure force profile
 
 @dataclass
 class Perception:

@@ -133,31 +133,37 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(drop_btn, &QPushButton::clicked, this, &UR10ePanel::onDropoff);
   motion_layout->addWidget(drop_btn, 0, 1);
 
+  auto * set_home_btn = new QPushButton("Set Home = Current");
+  set_home_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
+  set_home_btn->setToolTip("Save the current robot joint position as the active HOME preset");
+  connect(set_home_btn, &QPushButton::clicked, this, &UR10ePanel::onSetHomeCurrent);
+  motion_layout->addWidget(set_home_btn, 1, 0, 1, 2);
+
   auto * exec_btn = new QPushButton("Execute");
   exec_btn->setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;");
   connect(exec_btn, &QPushButton::clicked, this, &UR10ePanel::onExecute);
-  motion_layout->addWidget(exec_btn, 1, 0);
+  motion_layout->addWidget(exec_btn, 2, 0);
 
   auto * clear_btn = new QPushButton("Clear");
   clear_btn->setStyleSheet("background-color: #9e9e9e; color: white;");
   connect(clear_btn, &QPushButton::clicked, this, &UR10ePanel::onClear);
-  motion_layout->addWidget(clear_btn, 1, 1);
+  motion_layout->addWidget(clear_btn, 2, 1);
 
   auto * check_calib_btn = new QPushButton("Check Calibration (trunk)");
   check_calib_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
   check_calib_btn->setToolTip("Check hand-eye calibration using the detected trunk as the reference");
   connect(check_calib_btn, &QPushButton::clicked, this, &UR10ePanel::onCheckCalibration);
-  motion_layout->addWidget(check_calib_btn, 2, 0, 1, 2);
+  motion_layout->addWidget(check_calib_btn, 3, 0, 1, 2);
 
   auto * sub_btn = new QPushButton("Subscribe (S)");
   sub_btn->setStyleSheet("background-color: #7b1fa2; color: white; font-weight: bold;");
   connect(sub_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribe);
-  motion_layout->addWidget(sub_btn, 3, 0);
+  motion_layout->addWidget(sub_btn, 4, 0);
 
   auto * sub_multi_btn = new QPushButton("Sub Multi (M)");
   sub_multi_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
   connect(sub_multi_btn, &QPushButton::clicked, this, &UR10ePanel::onSubscribeMulti);
-  motion_layout->addWidget(sub_multi_btn, 3, 1);
+  motion_layout->addWidget(sub_multi_btn, 4, 1);
 
   auto * multi_goal_label = new QLabel("Multi goals");
   multi_goal_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -165,21 +171,21 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   multi_goal_count_spin_->setRange(1, 10);
   multi_goal_count_spin_->setValue(3);
   multi_goal_count_spin_->setToolTip("Number of top-scored goals to queue with Sub Multi");
-  motion_layout->addWidget(multi_goal_label, 4, 0);
-  motion_layout->addWidget(multi_goal_count_spin_, 4, 1);
+  motion_layout->addWidget(multi_goal_label, 5, 0);
+  motion_layout->addWidget(multi_goal_count_spin_, 5, 1);
 
   calib_result_label_ = new QLabel("—");
   calib_result_label_->setWordWrap(true);
   calib_result_label_->setStyleSheet(
     "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;");
-  motion_layout->addWidget(calib_result_label_, 5, 0, 1, 2);
+  motion_layout->addWidget(calib_result_label_, 6, 0, 1, 2);
 
   debug_preview_cb_ = new QCheckBox("Debug Plan Preview");
   debug_preview_cb_->setChecked(true);
   debug_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
   debug_preview_cb_->setToolTip("Show full plan in RViz before executing");
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
-  motion_layout->addWidget(debug_preview_cb_, 6, 0, 1, 2);
+  motion_layout->addWidget(debug_preview_cb_, 7, 0, 1, 2);
 
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
@@ -187,7 +193,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 7, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 8, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -195,7 +201,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 7, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 8, 1);
 
   layout->addWidget(motion_group);
 
@@ -704,6 +710,18 @@ void UR10ePanel::publishGoal(double x, double y, double z,
 
 void UR10ePanel::onStop() { publishStop(); }
 void UR10ePanel::onHome() { publishCmd("home"); }
+void UR10ePanel::onSetHomeCurrent()
+{
+  auto reply = QMessageBox::question(
+    this,
+    "Set Home",
+    "Use the robot's current joint position as the new HOME for this running node?",
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (reply == QMessageBox::Yes) {
+    publishCmd("set_home_current");
+  }
+}
 void UR10ePanel::onDropoff() { publishCmd("dropoff"); }
 void UR10ePanel::onExecute() { publishCmd("execute"); }
 void UR10ePanel::onClear() { publishCmd("clear"); }

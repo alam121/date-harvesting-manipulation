@@ -726,13 +726,19 @@ class VisionNode:
                         pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
                         trunk_cam_pub=trunk_cam_pub,
                     )
-                if (trunk_published and not _initial_voxel_cloud_sent and
+                if (not _reacquire and not _initial_voxel_cloud_sent and
                         _initial_voxel_cloud_burst_remaining > 0 and pc_np is not None):
-                    self._publish_depth_cloud(
-                        pc_np, depth_pub,
-                        orig_mask=pc_np_orig if use_zed_mini else None,
-                    )
-                    _initial_voxel_cloud_burst_remaining -= 1
+                    # Do not spend the one-shot burst before the motion node has
+                    # subscribed; otherwise manual voxel updates have no cached depth.
+                    _has_depth_sub = depth_pub.get_subscription_count() > 0
+                    _published_depth = False
+                    if _has_depth_sub:
+                        _published_depth = self._publish_depth_cloud(
+                            pc_np, depth_pub,
+                            orig_mask=pc_np_orig if use_zed_mini else None,
+                        )
+                    if _published_depth:
+                        _initial_voxel_cloud_burst_remaining -= 1
                     if _initial_voxel_cloud_burst_remaining <= 0:
                         _initial_voxel_cloud_sent = True
                         self.node.get_logger().info(
@@ -746,7 +752,7 @@ class VisionNode:
 
                 # Compute approach direction and publish — skip in reacquire mode
                 if best_idx is not None and not _reacquire:
-                    self._process_best_target(targets, best_idx, intrinsics)
+                    self._process_best_target(targets, best_idx, intrinsics, bunch_boxes)
                 _tp4 = time()
 
                 # Publish visible fruit positions sorted by score, highest first.
@@ -969,7 +975,7 @@ class VisionNode:
         return zed
 
     def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub,
-                             orig_mask: Optional[np.ndarray] = None) -> None:
+                             orig_mask: Optional[np.ndarray] = None) -> bool:
         """Publish depth point cloud for voxel obstacle avoidance.
         orig_mask: if provided (ZED Mini mode), only publish originally projected
         pixels — skips EDT-filled pixels which cause scattered artefacts in RViz."""
@@ -991,8 +997,10 @@ class VisionNode:
                     self.node.get_clock().now().to_msg()
                 )
                 depth_pub.publish(pc_msg)
+                return True
         except Exception:
             pass
+        return False
 
     def _publish_trunk_position(self, trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                                 pts_cam=None, uv=None, use_lidar=False, trunk_cam_pub=None) -> bool:
@@ -1835,7 +1843,8 @@ class VisionNode:
         self,
         targets: List[Dict[str, Any]],
         best_idx: int,
-        intrinsics: Dict[str, float]
+        intrinsics: Dict[str, float],
+        bunch_boxes: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Process the best target and publish goal."""
         t_best = targets[best_idx]
@@ -2021,8 +2030,28 @@ class VisionNode:
             if _iw > 0 and _ih > 0:
                 _cx_norm = ((_bx1 + _bx2) / 2.0) / _iw
                 _cy_norm = ((_by1 + _by2) / 2.0) / _ih
+                _bunch_rel_x = -1.0
+                _bunch_rel_y = -1.0
+                if bunch_boxes:
+                    _b = bunch_boxes[0]
+                    _poly = _b.get("polygon")
+                    if _poly is not None and len(_poly) > 2:
+                        _poly_np = np.asarray(_poly, dtype=np.float32)
+                        _bxs = _poly_np[:, 0]
+                        _bys = _poly_np[:, 1]
+                        _b_x1, _b_x2 = float(np.min(_bxs)), float(np.max(_bxs))
+                        _b_y1, _b_y2 = float(np.min(_bys)), float(np.max(_bys))
+                    else:
+                        _b_x1, _b_y1, _b_x2, _b_y2 = _b["bb"]
+                        _b_x1, _b_y1, _b_x2, _b_y2 = float(_b_x1), float(_b_y1), float(_b_x2), float(_b_y2)
+                    _fruit_cx = float((_bx1 + _bx2) / 2.0)
+                    _fruit_cy = float((_by1 + _by2) / 2.0)
+                    if _b_x2 > _b_x1 + 1.0:
+                        _bunch_rel_x = float(np.clip((_fruit_cx - _b_x1) / (_b_x2 - _b_x1), 0.0, 1.0))
+                    if _b_y2 > _b_y1 + 1.0:
+                        _bunch_rel_y = float(np.clip((_fruit_cy - _b_y1) / (_b_y2 - _b_y1), 0.0, 1.0))
                 _bbox_msg = Float32MultiArray()
-                _bbox_msg.data = [float(_cx_norm), float(_cy_norm)]
+                _bbox_msg.data = [float(_cx_norm), float(_cy_norm), float(_bunch_rel_x), float(_bunch_rel_y)]
                 self.bbox_norm_pub.publish(_bbox_msg)
 
             # Publish branch gap info for 2-finger mode

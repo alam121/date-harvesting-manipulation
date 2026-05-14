@@ -4,6 +4,7 @@
 from typing import List, TYPE_CHECKING
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER
@@ -87,15 +88,24 @@ class ConfigManager:
         self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
         self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
-        self._node.declare_parameter("planner.low_side_standoff_x", self.cfg.planner.low_side_standoff_x)
-        self._node.declare_parameter("planner.low_side_standoff_y", self.cfg.planner.low_side_standoff_y)
-        self._node.declare_parameter("planner.low_side_standoff_z", self.cfg.planner.low_side_standoff_z)
+        self._node.declare_parameter("planner.low_left_standoff_x", self.cfg.planner.low_left_standoff_x)
+        self._node.declare_parameter("planner.low_left_standoff_y", self.cfg.planner.low_left_standoff_y)
+        self._node.declare_parameter("planner.low_left_standoff_z", self.cfg.planner.low_left_standoff_z)
+        self._node.declare_parameter("planner.low_right_standoff_x", self.cfg.planner.low_right_standoff_x)
+        self._node.declare_parameter("planner.low_right_standoff_y", self.cfg.planner.low_right_standoff_y)
+        self._node.declare_parameter("planner.low_right_standoff_z", self.cfg.planner.low_right_standoff_z)
         self._node.declare_parameter("planner.low_side_final_y_offset", self.cfg.planner.low_side_final_y_offset)
-        self._node.declare_parameter("planner.low_side_final_z_offset", self.cfg.planner.low_side_final_z_offset)
+        self._node.declare_parameter("planner.low_left_final_z_offset", self.cfg.planner.low_left_final_z_offset)
+        self._node.declare_parameter("planner.low_right_final_z_offset", self.cfg.planner.low_right_final_z_offset)
         self._node.declare_parameter("planner.low_side_final_front_tilt_deg", self.cfg.planner.low_side_final_front_tilt_deg)
+        self._node.declare_parameter("planner.bunch_lower_center_band", self.cfg.planner.bunch_lower_center_band)
         self._node.declare_parameter("planner.final_overshoot_threshold", self.cfg.planner.final_overshoot_threshold)
         self._node.declare_parameter("planner.final_overshoot_max_backoff", self.cfg.planner.final_overshoot_max_backoff)
         self._node.declare_parameter("planner.debug_plan_preview", self.cfg.planner.debug_plan_preview)
+        self._node.declare_parameter("planner.log_cycle_start", self.cfg.planner.log_cycle_start)
+        self._node.declare_parameter("planner.log_phase_timings", self.cfg.planner.log_phase_timings)
+        self._node.declare_parameter("planner.log_path_publish", self.cfg.planner.log_path_publish)
+        self._node.declare_parameter("planner.log_gripper_force_profile", self.cfg.planner.log_gripper_force_profile)
 
         # Grasp learning params
         self._node.declare_parameter("grasp.learning_enabled", self.cfg.grasp.learning_enabled)
@@ -155,15 +165,24 @@ class ConfigManager:
         self.cfg.planner.direct_branch_retry_min_dist = float(self._node.get_parameter("planner.direct_branch_retry_min_dist").value)
         self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
         self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
-        self.cfg.planner.low_side_standoff_x = float(self._node.get_parameter("planner.low_side_standoff_x").value)
-        self.cfg.planner.low_side_standoff_y = float(self._node.get_parameter("planner.low_side_standoff_y").value)
-        self.cfg.planner.low_side_standoff_z = float(self._node.get_parameter("planner.low_side_standoff_z").value)
+        self.cfg.planner.low_left_standoff_x = float(self._node.get_parameter("planner.low_left_standoff_x").value)
+        self.cfg.planner.low_left_standoff_y = float(self._node.get_parameter("planner.low_left_standoff_y").value)
+        self.cfg.planner.low_left_standoff_z = float(self._node.get_parameter("planner.low_left_standoff_z").value)
+        self.cfg.planner.low_right_standoff_x = float(self._node.get_parameter("planner.low_right_standoff_x").value)
+        self.cfg.planner.low_right_standoff_y = float(self._node.get_parameter("planner.low_right_standoff_y").value)
+        self.cfg.planner.low_right_standoff_z = float(self._node.get_parameter("planner.low_right_standoff_z").value)
         self.cfg.planner.low_side_final_y_offset = float(self._node.get_parameter("planner.low_side_final_y_offset").value)
-        self.cfg.planner.low_side_final_z_offset = float(self._node.get_parameter("planner.low_side_final_z_offset").value)
+        self.cfg.planner.low_left_final_z_offset = float(self._node.get_parameter("planner.low_left_final_z_offset").value)
+        self.cfg.planner.low_right_final_z_offset = float(self._node.get_parameter("planner.low_right_final_z_offset").value)
         self.cfg.planner.low_side_final_front_tilt_deg = float(self._node.get_parameter("planner.low_side_final_front_tilt_deg").value)
+        self.cfg.planner.bunch_lower_center_band = float(self._node.get_parameter("planner.bunch_lower_center_band").value)
         self.cfg.planner.final_overshoot_threshold = float(self._node.get_parameter("planner.final_overshoot_threshold").value)
         self.cfg.planner.final_overshoot_max_backoff = float(self._node.get_parameter("planner.final_overshoot_max_backoff").value)
         self.cfg.planner.debug_plan_preview = bool(self._node.get_parameter("planner.debug_plan_preview").value)
+        self.cfg.planner.log_cycle_start = bool(self._node.get_parameter("planner.log_cycle_start").value)
+        self.cfg.planner.log_phase_timings = bool(self._node.get_parameter("planner.log_phase_timings").value)
+        self.cfg.planner.log_path_publish = bool(self._node.get_parameter("planner.log_path_publish").value)
+        self.cfg.planner.log_gripper_force_profile = bool(self._node.get_parameter("planner.log_gripper_force_profile").value)
 
         # Grasp learning
         self.cfg.grasp.learning_enabled = bool(self._node.get_parameter("grasp.learning_enabled").value)
@@ -220,6 +239,19 @@ class ConfigManager:
         self.goal_marker_topic = self.cfg.topics.goal_marker
         self.path_marker_topic = self.cfg.topics.path_marker
 
+    def set_home_joints(self, joints: List[float]) -> None:
+        """Update active HOME joint preset for the running node."""
+        home = [float(v) for v in joints]
+        self.cfg.joints.home = home
+        self.home_joints = self.cfg.joints.home
+        try:
+            self._node.set_parameters([
+                Parameter("joints.home", Parameter.Type.DOUBLE_ARRAY, home)
+            ])
+        except Exception as exc:
+            self._node.get_logger().warn(
+                f"Updated HOME in memory, but failed to update ROS parameter joints.home: {exc}")
+
     def _on_parameter_change(self, params) -> SetParametersResult:
         """Handle runtime parameter changes via ros2 param set."""
         # Map ROS param names to (config_obj, attr_name, type_cast)
@@ -241,15 +273,24 @@ class ConfigManager:
             "planner.direct_branch_retry_min_dist": (self.cfg.planner, "direct_branch_retry_min_dist", float),
             "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
             "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
-            "planner.low_side_standoff_x": (self.cfg.planner, "low_side_standoff_x", float),
-            "planner.low_side_standoff_y": (self.cfg.planner, "low_side_standoff_y", float),
-            "planner.low_side_standoff_z": (self.cfg.planner, "low_side_standoff_z", float),
+            "planner.low_left_standoff_x": (self.cfg.planner, "low_left_standoff_x", float),
+            "planner.low_left_standoff_y": (self.cfg.planner, "low_left_standoff_y", float),
+            "planner.low_left_standoff_z": (self.cfg.planner, "low_left_standoff_z", float),
+            "planner.low_right_standoff_x": (self.cfg.planner, "low_right_standoff_x", float),
+            "planner.low_right_standoff_y": (self.cfg.planner, "low_right_standoff_y", float),
+            "planner.low_right_standoff_z": (self.cfg.planner, "low_right_standoff_z", float),
             "planner.low_side_final_y_offset": (self.cfg.planner, "low_side_final_y_offset", float),
-            "planner.low_side_final_z_offset": (self.cfg.planner, "low_side_final_z_offset", float),
+            "planner.low_left_final_z_offset": (self.cfg.planner, "low_left_final_z_offset", float),
+            "planner.low_right_final_z_offset": (self.cfg.planner, "low_right_final_z_offset", float),
             "planner.low_side_final_front_tilt_deg": (self.cfg.planner, "low_side_final_front_tilt_deg", float),
+            "planner.bunch_lower_center_band": (self.cfg.planner, "bunch_lower_center_band", float),
             "planner.final_overshoot_threshold": (self.cfg.planner, "final_overshoot_threshold", float),
             "planner.final_overshoot_max_backoff": (self.cfg.planner, "final_overshoot_max_backoff", float),
             "planner.debug_plan_preview": (self.cfg.planner, "debug_plan_preview", bool),
+            "planner.log_cycle_start": (self.cfg.planner, "log_cycle_start", bool),
+            "planner.log_phase_timings": (self.cfg.planner, "log_phase_timings", bool),
+            "planner.log_path_publish": (self.cfg.planner, "log_path_publish", bool),
+            "planner.log_gripper_force_profile": (self.cfg.planner, "log_gripper_force_profile", bool),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
             "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),

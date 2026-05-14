@@ -57,6 +57,8 @@ class StateManager:
         # Normalised image-space bounding-box centre of best fruit [cx_norm, cy_norm]
         # cx_norm: 0=left, 1=right  |  cy_norm: 0=top, 1=bottom
         self.fruit_image_norm: Optional[Tuple[float, float]] = None
+        self.fruit_bunch_rel_x: Optional[float] = None
+        self.fruit_bunch_rel_y: Optional[float] = None
 
         # Trunk position from vision (updated continuously)
         self._trunk_x: Optional[float] = None
@@ -251,6 +253,12 @@ class StateManager:
     def _fruit_image_norm_cb(self, msg: Float32MultiArray) -> None:
         if len(msg.data) >= 2:
             self.fruit_image_norm = (float(msg.data[0]), float(msg.data[1]))
+        if len(msg.data) >= 3:
+            rel_x = float(msg.data[2])
+            self.fruit_bunch_rel_x = rel_x if 0.0 <= rel_x <= 1.0 else None
+        if len(msg.data) >= 4:
+            rel_y = float(msg.data[3])
+            self.fruit_bunch_rel_y = rel_y if 0.0 <= rel_y <= 1.0 else None
 
     def _trunk_position_cb(self, msg: PointStamped) -> None:
         """Update trunk position from vision."""
