@@ -12,14 +12,25 @@
 #include <QVBoxLayout>
 #include <QKeyEvent>
 
+#include <array>
+#include <chrono>
+#include <deque>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <string>
+
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/panel.hpp>
+#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 namespace rviz_ur10e_panel
 {
@@ -61,21 +72,57 @@ private Q_SLOTS:
   void onGraspSuccess();
   void onGraspFail();
   void onDebugPreviewChanged(int state);
+  void onZoneOverlayToggle();
   void onPlanConfirm();
   void onPlanCancel();
   void onLidarScan();
+  void onStabilityRecord();
   void updateDisplay();
 
 private:
+  struct StabilitySample
+  {
+    double elapsed_s = 0.0;
+    std::array<double, 6> positions{};
+    std::array<double, 6> velocities{};
+    std::array<double, 6> tracking_errors{};
+    std::array<double, 6> wrench{};
+  };
+
+  struct StabilityResult
+  {
+    double score = 0.0;
+    double velocity_rms = std::numeric_limits<double>::quiet_NaN();
+    double position_jitter_rms = std::numeric_limits<double>::quiet_NaN();
+    double tracking_error_rms = std::numeric_limits<double>::quiet_NaN();
+    double force_noise_rms = std::numeric_limits<double>::quiet_NaN();
+    double torque_noise_rms = std::numeric_limits<double>::quiet_NaN();
+    size_t sample_count = 0;
+    bool valid = false;
+  };
+
   void publishCmd(const std::string & cmd);
+  void publishOverlayCmd(const std::string & cmd);
   void publishStop();
   void publishGoal(double x, double y, double z,
                    double qw, double qx, double qy, double qz);
   void setupRos();
+  void startStabilityRecording();
+  void stopStabilityRecording();
+  void appendStabilitySampleLocked(
+    const std::chrono::steady_clock::time_point & now);
+  void writeComputedTrajectoryLocked(
+    const trajectory_msgs::msg::JointTrajectory & msg,
+    const std::chrono::steady_clock::time_point & now);
+  void writeFollowedTrajectoryLocked(
+    const control_msgs::msg::JointTrajectoryControllerState & msg,
+    const std::chrono::steady_clock::time_point & now);
+  StabilityResult calculateStabilityLocked() const;
 
   // ROS
   rclcpp::Node::SharedPtr node_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr overlay_cmd_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
 
@@ -85,11 +132,21 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_info_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_scale_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr calib_check_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    controller_state_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr
+    trajectory_command_sub_;
 
   // Data
   std::mutex data_mutex_;
   double joint_positions_[6] = {};
+  double joint_velocities_[6] = {};
+  double tracking_errors_[6] = {};
+  double tcp_wrench_[6] = {};
   double gripper_forces_[3] = {};
+  bool have_tracking_error_ = false;
+  bool have_wrench_ = false;
   bool robot_running_ = false;
   double velocity_scale_ = 5.0;
   int goal_count_ = 0;
@@ -105,6 +162,17 @@ private:
   int grab_count_ = 0;
   int slip_count_ = 0;
   int miss_count_ = 0;
+
+  // Stability recording
+  bool stability_recording_ = false;
+  std::chrono::steady_clock::time_point stability_start_time_;
+  std::deque<StabilitySample> stability_window_;
+  std::ofstream stability_csv_;
+  std::ofstream trajectory_csv_;
+  std::string stability_csv_path_;
+  std::string trajectory_csv_path_;
+  size_t stability_sample_count_ = 0;
+  size_t trajectory_id_ = 0;
 
   // UI
   QLabel * status_label_;
@@ -122,6 +190,7 @@ private:
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
   QSpinBox * multi_goal_count_spin_;
   QCheckBox * debug_preview_cb_;
+  QPushButton * zone_overlay_btn_;
   QPushButton * plan_confirm_btn_;
   QPushButton * plan_cancel_btn_;
   QTimer * update_timer_;
@@ -132,6 +201,8 @@ private:
   QLabel * slip_count_label_;
   QLabel * miss_count_label_;
   QLabel * total_count_label_;
+  QPushButton * stability_record_btn_;
+  QLabel * stability_result_label_;
 };
 
 }  // namespace rviz_ur10e_panel

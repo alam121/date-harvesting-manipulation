@@ -4,7 +4,6 @@ from typing import List
 from curobo.types.math import Pose
 from curobo.types.robot import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from trajectory_msgs.msg import JointTrajectoryPoint
 
 from .config import PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_NO_FINETUNE, VOXEL_CONFIG
 from .utils import build_trajectory, wait_until_xyz
@@ -130,6 +129,97 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         # dt: Time step for trajectory interpolation.
         
 # Publishes /joint_trajectory_controller/joint_trajectory.
+def _wait_for_joint_target(node, target_joints, timeout: float = 15.0, tol: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline and getattr(node, 'running', True):
+        if getattr(node, 'stop_requested', False):
+            return False
+        current = node.current_joint_positions
+        if current is not None:
+            max_err = max(abs(c - t) for c, t in zip(current, target_joints))
+            if max_err < tol:
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def _execute_home_direct_fallback(node, target_joints, scale: float) -> bool:
+    """Use a short, clearance-checked S-curve when HOME trajopt cannot converge."""
+    current = node.current_joint_positions
+    if current is None or len(current) != len(target_joints):
+        return False
+
+    planner = node.cfg.planner
+    max_delta = max(abs(t - c) for c, t in zip(current, target_joints))
+    limit = math.radians(float(
+        getattr(planner, "home_direct_fallback_max_delta_deg", 20.0)))
+    if max_delta > limit:
+        node.get_logger().warn(
+            f"[HOME_FALLBACK] rejected: max joint change "
+            f"{math.degrees(max_delta):.1f}deg exceeds {math.degrees(limit):.1f}deg")
+        return False
+
+    steps = max(12, int(math.ceil(max_delta / math.radians(1.0))))
+    states = []
+    for i in range(steps + 1):
+        alpha = i / steps
+        smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+        states.append([c + smooth * (t - c) for c, t in zip(current, target_joints)])
+
+    planning_lock = getattr(node, '_planning_lock', None)
+    yolo = getattr(node, 'yolo_thread', None)
+    yolo_lock = getattr(yolo, 'inference_lock', None)
+    if yolo_lock:
+        yolo_lock.acquire()
+    try:
+        if planning_lock:
+            planning_lock.acquire()
+        try:
+            from .goals import _log_forearm_flange_clearance
+            min_mm, _, destination_mm = _log_forearm_flange_clearance(
+                node, states, "HOME_FALLBACK")
+        finally:
+            if planning_lock:
+                planning_lock.release()
+    except Exception as e:
+        node.get_logger().error(f"[HOME_FALLBACK] clearance check failed: {e}")
+        return False
+    finally:
+        if yolo_lock:
+            yolo_lock.release()
+
+    required_mm = float(getattr(planner, "clamp_safety_threshold_mm", 35.0))
+    if min_mm < required_mm or destination_mm < required_mm:
+        node.get_logger().error(
+            f"[HOME_FALLBACK] rejected: clearance min={min_mm:.1f}mm "
+            f"destination={destination_mm:.1f}mm required={required_mm:.1f}mm")
+        return False
+
+    dt = min(max(planner.base_dt / max(scale, 1e-6), planner.min_dt), planner.max_dt)
+    traj = build_trajectory(
+        node.joint_order,
+        states,
+        dt=dt,
+        stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * 0.5,
+        max_acc=planner.max_joint_acceleration * 0.5,
+        ramp_points=0,
+        include_acc=False,
+    )
+    if not traj.points:
+        return False
+
+    node.get_logger().warn(
+        f"[HOME_FALLBACK] publishing guarded direct HOME "
+        f"(max_delta={math.degrees(max_delta):.1f}deg, points={len(states)})")
+    node.trajectory_pub.publish(traj)
+    reached = _wait_for_joint_target(node, target_joints)
+    blend_motion(node)
+    if not reached:
+        node.get_logger().warn("[HOME_FALLBACK] HOME trajectory did not reach target")
+    return reached
+
+
 def plan_execute_js(
     node,
     target_joints: List[float],
@@ -186,6 +276,16 @@ def plan_execute_js(
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
     scale *= max(speed_factor, 1e-6)
 
+    if label == "HOME":
+        home_tol = math.radians(float(
+            getattr(planner, "home_reached_tolerance_deg", 3.0)))
+        max_err = max(
+            abs(c - t) for c, t in zip(node.current_joint_positions, target_joints))
+        if max_err < home_tol:
+            node.get_logger().info(
+                f"HOME: already at target (max error={math.degrees(max_err):.1f}deg)")
+            return True
+
     # ------------------------------
     # 3. cuRobo plan (hold lock to prevent concurrent CUDA ops)
     # ------------------------------
@@ -209,11 +309,13 @@ def plan_execute_js(
 
         if res is None or not res.success:
             status = getattr(res, 'status', 'unknown') if res is not None else 'None'
-            # FINETUNE_TRAJOPT_FAIL means the base trajectory was found but fine-tune
-            # smoothing failed. Retry without finetune to still get a valid trajectory.
-            if res is not None and "FINETUNE" in str(status):
+            # The no-finetune pass can recover both a failed smoothing pass and
+            # some plain trajopt failures without enabling graph-buffer resizing.
+            if res is not None and (
+                "FINETUNE" in str(status) or "TRAJOPT" in str(status)
+            ):
                 node.get_logger().info(
-                    f"Joint-space plan to {label}: finetune failed, retrying without finetune")
+                    f"Joint-space plan to {label}: {status}, retrying without finetune")
                 if lock: lock.acquire()
                 try:
                     res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS_NO_FINETUNE)
@@ -225,9 +327,13 @@ def plan_execute_js(
         if res is None or not res.success:
             status = getattr(res, 'status', 'unknown') if res is not None else 'None'
             node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
-            return False
     finally:
         if _yolo_lock: _yolo_lock.release()
+
+    if res is None or not res.success:
+        if label == "HOME":
+            return _execute_home_direct_fallback(node, target_joints, scale)
+        return False
 
     # ------------------------------
     # 4. Interpolate (older cuRobo API)
@@ -264,19 +370,11 @@ def plan_execute_js(
         wait_until_xyz(node, [fk.x, fk.y, fk.z])
     # Secondary joint-space check: if EE arrived instantly (different IK branch),
     # wait until joints actually converge to the target configuration.
-    _joint_tol = 0.05  # rad (~3°)
-    _joint_deadline = time.time() + 15.0
-    while time.time() < _joint_deadline and getattr(node, 'running', True):
-        if getattr(node, 'stop_requested', False):
-            break
-        cur_joints = node.current_joint_positions
-        if cur_joints is not None:
-            max_err = max(abs(c - t) for c, t in zip(cur_joints, target_joints))
-            if max_err < _joint_tol:
-                break
-        time.sleep(0.05)
+    reached = _wait_for_joint_target(node, target_joints)
     blend_motion(node)
-    return True
+    if not reached:
+        node.get_logger().warn(f"Joint-space move to {label} did not reach target")
+    return reached
 
 
 
@@ -335,11 +433,17 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         joint_names=node.joint_order,
     )
     lock = getattr(node, '_planning_lock', None)
-    if lock: lock.acquire()
+    _yolo = getattr(node, 'yolo_thread', None)
+    _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    if _yolo_lock: _yolo_lock.acquire()
     try:
-        res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+        if lock: lock.acquire()
+        try:
+            res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+        finally:
+            if lock: lock.release()
     finally:
-        if lock: lock.release()
+        if _yolo_lock: _yolo_lock.release()
     if not res.success:
         return None
     states = interpolated_positions(res)
@@ -358,7 +462,49 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         stop_flag=lambda: node.stop_requested,
     )
     return traj, states
- 
+
+
+def execute_preplan(node, traj, states, label: str) -> bool:
+    """Publish a pre-planned JointTrajectory and wait for completion.
+    Drop-in replacement for the publish+wait portion of plan_execute_js."""
+    if not traj or not traj.points:
+        node.get_logger().warn(f"[PREPLAN] {label}: empty trajectory, skipping")
+        return False
+    current = node.current_joint_positions
+    if current is None or not states:
+        node.get_logger().warn(f"[PREPLAN] {label}: missing current/start joint state")
+        return False
+    start_error = max(abs(c - s) for c, s in zip(current, states[0]))
+    if start_error > 0.10:
+        node.get_logger().warn(
+            f"[PREPLAN] {label}: stale start state "
+            f"({math.degrees(start_error):.1f}deg mismatch); replanning required")
+        return False
+    node.get_logger().info(f"[PREPLAN] {label}: publishing pre-planned trajectory ({len(traj.points)} pts)")
+    node.trajectory_pub.publish(traj)
+
+    target_joints = states[-1]
+    fk = forward_kinematics(node, target_joints)
+    if fk:
+        wait_until_xyz(node, [fk.x, fk.y, fk.z])
+
+    _joint_tol = 0.05
+    _deadline = time.time() + 15.0
+    converged = False
+    while time.time() < _deadline and getattr(node, 'running', True):
+        if getattr(node, 'stop_requested', False):
+            break
+        cur = node.current_joint_positions
+        if cur is not None:
+            if max(abs(c - t) for c, t in zip(cur, target_joints)) < _joint_tol:
+                converged = True
+                break
+        time.sleep(0.05)
+    blend_motion(node)
+    if not converged:
+        node.get_logger().warn(f"[PREPLAN] {label}: trajectory did not reach target")
+    return converged
+
 
 def move_to_predropoff_position(node):
     target = node.predropoff_joints

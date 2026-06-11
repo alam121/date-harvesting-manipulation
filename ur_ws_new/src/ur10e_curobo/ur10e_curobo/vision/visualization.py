@@ -8,7 +8,8 @@ import numpy as np
 
 from .config import (
     DRAW_ONLY_BEST, DRAW_TOP_N, SHOW_REJECTED, SKIP_DRAW,
-    APPROACH_CHECK_DIST,
+    SHOW_CLASSIFICATION_ZONES, CLASS_ZONE_MID_LEFT_THRESH, CLASS_ZONE_MID_RIGHT_THRESH,
+    CLASS_ZONE_LOW_LEFT_THRESH, CLASS_ZONE_LOW_RIGHT_THRESH, APPROACH_CHECK_DIST,
 )
 from .math_utils import project_point_to_image
 from .scoring import estimate_fruit_radius
@@ -21,6 +22,7 @@ class VisionVisualizer:
         self.intrinsics = intrinsics
         self.image_scale = image_scale
         self.display_scale = display_scale
+        self.show_classification_zones = SHOW_CLASSIFICATION_ZONES
         self._s = 1.0  # active draw scale, set per-frame in render_frame
 
     # ------------------------------------------------------------------
@@ -71,6 +73,108 @@ class VisionVisualizer:
                     self._thick(1),
                     cv2.LINE_AA,
                 )
+
+    def draw_classification_zones(self, image: np.ndarray, viz_only: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Visualize image and bunch zones used by motion-side LEFT/CENTER/RIGHT logic."""
+        if not self.show_classification_zones:
+            return
+
+        h, w = image.shape[:2]
+        overlay = image.copy()
+
+        bunch = None
+        if viz_only:
+            for obj in viz_only:
+                if obj.get("class") == "bunch":
+                    x1, y1, x2, y2 = obj["bb"]
+                    if x2 > x1 and y2 > y1:
+                        bunch = (x1, y1, x2, y2, obj.get("polygon"))
+                        break
+
+        low_y = int(0.60 * h)
+        very_low_y = int(0.88 * h)
+        mid_left_color = (255, 90, 40, 255)    # blue
+        low_left_color = (255, 0, 200, 255)     # purple
+        center_color = (80, 220, 80, 255)       # green
+        mid_right_color = (60, 60, 255, 255)    # red
+        low_right_color = (0, 165, 255, 255)    # orange
+
+        cv2.line(overlay, (0, low_y), (w, low_y), (0, 255, 255, 255), self._thick(1), cv2.LINE_AA)
+        cv2.line(overlay, (0, very_low_y), (w, very_low_y), (0, 180, 255, 255), self._thick(2), cv2.LINE_AA)
+
+        if bunch is None:
+            low_left = int(CLASS_ZONE_LOW_LEFT_THRESH * w)
+            low_right = int(CLASS_ZONE_LOW_RIGHT_THRESH * w)
+            mid_left = int(CLASS_ZONE_MID_LEFT_THRESH * w)
+            mid_right = int(CLASS_ZONE_MID_RIGHT_THRESH * w)
+            cv2.rectangle(overlay, (0, 0), (mid_left, low_y), mid_left_color, -1)
+            cv2.rectangle(overlay, (mid_left, 0), (mid_right, low_y), center_color, -1)
+            cv2.rectangle(overlay, (mid_right, 0), (w, low_y), mid_right_color, -1)
+            cv2.rectangle(overlay, (0, low_y), (low_left, h), low_left_color, -1)
+            cv2.rectangle(overlay, (low_left, low_y), (low_right, h), center_color, -1)
+            cv2.rectangle(overlay, (low_right, low_y), (w, h), low_right_color, -1)
+            cv2.line(overlay, (mid_left, 0), (mid_left, low_y), mid_left_color, self._thick(2), cv2.LINE_AA)
+            cv2.line(overlay, (mid_right, 0), (mid_right, low_y), mid_right_color, self._thick(2), cv2.LINE_AA)
+            cv2.line(overlay, (low_left, low_y), (low_left, h), low_left_color, self._thick(2), cv2.LINE_AA)
+            cv2.line(overlay, (low_right, low_y), (low_right, h), low_right_color, self._thick(2), cv2.LINE_AA)
+            image[:] = cv2.addWeighted(overlay, 0.14, image, 0.86, 0.0)
+            cv2.putText(image, "fallback image zones", (self._radius(10), self._radius(24)),
+                        cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55), (255, 255, 255, 255), self._thick(1), cv2.LINE_AA)
+            return
+
+        x1, y1, x2, y2, polygon = bunch
+        bw = x2 - x1
+        bh = y2 - y1
+        low_left = x1 + int(CLASS_ZONE_LOW_LEFT_THRESH * bw)
+        low_right = x1 + int(CLASS_ZONE_LOW_RIGHT_THRESH * bw)
+        mid_left = x1 + int(CLASS_ZONE_MID_LEFT_THRESH * bw)
+        mid_right = x1 + int(CLASS_ZONE_MID_RIGHT_THRESH * bw)
+        bottom_y = y1 + int(0.80 * bh)
+        mid_top = y1
+        mid_bottom = min(max(low_y, y1), y2)
+        low_top = max(low_y, y1)
+
+        zone_overlay = image.copy()
+        if mid_bottom > mid_top:
+            cv2.rectangle(zone_overlay, (x1, mid_top), (mid_left, mid_bottom), mid_left_color, -1)
+            cv2.rectangle(zone_overlay, (mid_left, mid_top), (mid_right, mid_bottom), center_color, -1)
+            cv2.rectangle(zone_overlay, (mid_right, mid_top), (x2, mid_bottom), mid_right_color, -1)
+            cv2.line(zone_overlay, (mid_left, mid_top), (mid_left, mid_bottom), mid_left_color, self._thick(2), cv2.LINE_AA)
+            cv2.line(zone_overlay, (mid_right, mid_top), (mid_right, mid_bottom), mid_right_color, self._thick(2), cv2.LINE_AA)
+        if y2 > low_top:
+            cv2.rectangle(zone_overlay, (x1, low_top), (low_left, y2), low_left_color, -1)
+            cv2.rectangle(zone_overlay, (low_left, low_top), (low_right, y2), center_color, -1)
+            cv2.rectangle(zone_overlay, (low_right, low_top), (x2, y2), low_right_color, -1)
+            cv2.line(zone_overlay, (low_left, low_top), (low_left, y2), low_left_color, self._thick(2), cv2.LINE_AA)
+            cv2.line(zone_overlay, (low_right, low_top), (low_right, y2), low_right_color, self._thick(2), cv2.LINE_AA)
+
+        cv2.rectangle(zone_overlay, (x1, bottom_y), (x2, y2), center_color, -1)
+
+        zone_mask = np.zeros((h, w), dtype=np.uint8)
+        if polygon is not None and len(polygon) > 2:
+            pts = polygon.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.fillPoly(zone_mask, [pts], 255)
+        else:
+            cv2.rectangle(zone_mask, (x1, y1), (x2, y2), 255, -1)
+        blended = cv2.addWeighted(zone_overlay, 0.25, image, 0.75, 0.0)
+        image[zone_mask > 0] = blended[zone_mask > 0]
+
+        if polygon is not None and len(polygon) > 2:
+            pts = polygon.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(image, [pts], isClosed=True, color=(255, 255, 255, 255), thickness=self._thick(1))
+        else:
+            cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255, 255), self._thick(1))
+        cv2.line(image, (x1, bottom_y), (x2, bottom_y), (0, 255, 255, 255), self._thick(2), cv2.LINE_AA)
+
+        cv2.putText(image, "bunch-relative zones", (x1 + self._radius(4), max(self._radius(22), y1 - self._radius(8))),
+                    cv2.FONT_HERSHEY_SIMPLEX, self._font(0.5), (255, 255, 255, 255), self._thick(1), cv2.LINE_AA)
+        cv2.putText(image, "MID/HIGH", (x1 + self._radius(4), mid_top + self._radius(18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45), (255, 255, 255, 255), self._thick(1), cv2.LINE_AA)
+        if y2 > low_top:
+            cv2.putText(image, "LOW", (x1 + self._radius(4), low_top + self._radius(18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45), (255, 255, 255, 255), self._thick(1), cv2.LINE_AA)
+        cv2.putText(image, "bottom => CENTER", (x1 + self._radius(4), bottom_y + self._radius(18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45), (255, 255, 255, 255), self._thick(1), cv2.LINE_AA)
 
     def draw_blocking_fruits(
         self,
@@ -496,6 +600,7 @@ class VisionVisualizer:
 
         if lidar_uv is not None and lidar_pts_cam is not None:
             self.draw_lidar_points(image, lidar_uv * self.display_scale, lidar_pts_cam)
+        self.draw_classification_zones(image, viz_only)
         self.draw_rejected_targets(image, rejected_targets)
         if viz_only:
             self.draw_viz_only(image, viz_only)

@@ -31,6 +31,7 @@ from .config import (
     ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
+    SHOW_CLASSIFICATION_ZONES,
 )
 from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
@@ -136,6 +137,7 @@ class VisionNode:
         self.tracker = FruitTracker()
         self.yolo_thread: Optional[YoloThread] = None
         self.visualizer: Optional[VisionVisualizer] = None
+        self._show_classification_zones = SHOW_CLASSIFICATION_ZONES
 
         # ROS2
         self.node = None
@@ -234,6 +236,22 @@ class VisionNode:
             if mode in ("full", "reacquire", "paused"):
                 self.detection_mode = mode
         self.node.create_subscription(_String, "/vision/mode", _mode_cb, 10)
+
+        # Runtime visualization overlays. Kept separate from /vision/mode so
+        # debugging UI does not change detection behavior.
+        def _overlay_cb(msg):
+            cmd = msg.data.strip().lower()
+            if cmd in ("classification_zones true", "zones true", "on", "true"):
+                self._show_classification_zones = True
+                if self.visualizer is not None:
+                    self.visualizer.show_classification_zones = True
+                self.node.get_logger().info("[vision] classification zone overlay ON")
+            elif cmd in ("classification_zones false", "zones false", "off", "false"):
+                self._show_classification_zones = False
+                if self.visualizer is not None:
+                    self.visualizer.show_classification_zones = False
+                self.node.get_logger().info("[vision] classification zone overlay OFF")
+        self.node.create_subscription(_String, "/vision/overlay_command", _overlay_cb, 10)
 
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
@@ -441,6 +459,7 @@ class VisionNode:
         point_cloud = sl.Mat() if not use_mono_depth else None
 
         self.visualizer = VisionVisualizer(intrinsics, image_scale, display_scale)
+        self.visualizer.show_classification_zones = self._show_classification_zones
 
         # Start ZED Mini depth warp thread now that all closure variables are defined
         if _pending_depth_thread is not None:
@@ -537,24 +556,35 @@ class VisionNode:
             trunk_boxes  = []
             bunch_boxes  = []
             _YOLO_STALE_DRIFT = 0.008  # 8 mm — discard cached dets if camera drifted this far
-            _last_raw_viz_t = 0.0      # wall time of last raw-frame viz enqueue
-            _RAW_VIZ_MIN_INTERVAL = 0.066  # max ~15fps raw frames (~1 camera frame)
+            _last_viz_t = 0.0          # wall time of last visualization enqueue
+            _VIZ_MIN_INTERVAL = 0.066  # max ~15fps annotated images (~1 camera frame)
             _initial_voxel_cloud_sent = False
             _initial_voxel_cloud_burst_remaining = 3
 
-            def _enqueue_raw_viz_frame():
-                nonlocal _last_raw_viz_t
+            def _enqueue_viz_frame(targets, rejected_targets, best_idx, viz_only,
+                                   uv_lidar=None, pts_lidar=None):
+                """Queue one visualization frame without blocking the perception loop."""
+                nonlocal _last_viz_t
                 _now = time()
-                if _now - _last_raw_viz_t < _RAW_VIZ_MIN_INTERVAL:
+                if _now - _last_viz_t < _VIZ_MIN_INTERVAL or _viz_queue.full():
                     return
                 try:
                     _viz_queue.put_nowait((
-                        image_left_ocv.copy(), [], [], None,
-                        self.yolo_thread.net_fps, loop_fps, [], None, None
+                        image_left_ocv.copy(),
+                        targets, rejected_targets,
+                        best_idx,
+                        self.yolo_thread.net_fps,
+                        loop_fps,
+                        viz_only,
+                        uv_lidar,
+                        pts_lidar,
                     ))
-                    _last_raw_viz_t = _now
+                    _last_viz_t = _now
                 except queue.Full:
                     pass
+
+            def _enqueue_raw_viz_frame():
+                _enqueue_viz_frame([], [], None, [], None, None)
 
             while not self.exit_signal:
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
@@ -791,19 +821,13 @@ class VisionNode:
                         {k: v for k, v in t.items() if k not in _HEATMAP_KEYS}
                         for t in targets
                     ]
-                    try:
-                        _viz_queue.put_nowait((
-                            image_left_ocv.copy(),
-                            _tgts_lite, rejected_targets,
-                            best_idx,
-                            self.yolo_thread.net_fps,
-                            loop_fps,
-                            [],   # no trunk/bunch polygon overlays in reacquire mode
-                            uv_l if use_lidar else None,
-                            pts_cam_l if use_lidar else None,
-                        ))
-                    except queue.Full:
-                        pass
+                    _enqueue_viz_frame(
+                        _tgts_lite, rejected_targets,
+                        best_idx,
+                        [],   # no trunk/bunch polygon overlays in reacquire mode
+                        uv_l if use_lidar else None,
+                        pts_cam_l if use_lidar else None,
+                    )
                     continue
 
                 trunk_viz = []
@@ -836,20 +860,14 @@ class VisionNode:
                 self._perf_count = getattr(self, '_perf_count', 0) + 1
 
                 # Enqueue a frame for the background viz thread.
-                # Non-blocking: if the worker is still rendering the previous frame, skip.
-                try:
-                    _viz_queue.put_nowait((
-                        image_left_ocv.copy(),
-                        targets, rejected_targets,
-                        best_idx,
-                        self.yolo_thread.net_fps,
-                        loop_fps,
-                        trunk_viz,
-                        uv_l if use_lidar else None,
-                        pts_cam_l if use_lidar else None,
-                    ))
-                except queue.Full:
-                    pass  # worker busy — drop frame, keep main loop running
+                # Non-blocking: if the worker is busy, skip before copying the image.
+                _enqueue_viz_frame(
+                    targets, rejected_targets,
+                    best_idx,
+                    trunk_viz,
+                    uv_l if use_lidar else None,
+                    pts_cam_l if use_lidar else None,
+                )
 
         perception_thread = Thread(target=perception_loop, daemon=True)
         perception_thread.start()
@@ -1224,9 +1242,9 @@ class VisionNode:
                 return None
             # Front 20% of points by depth
             zs_l = in_mask_pts[:, 2]
-            idx_l = np.argsort(zs_l)
-            k_l = max(5, int(0.2 * len(idx_l)))
-            pts_front = in_mask_pts[idx_l[:k_l]]
+            k_l = max(5, int(0.2 * len(zs_l)))
+            idx_l = np.argpartition(zs_l, k_l - 1)[:k_l]
+            pts_front = in_mask_pts[idx_l]
             Xc = float(np.median(pts_front[:, 0]))
             Yc = float(np.median(pts_front[:, 1]))
             Zc = float(np.median(pts_front[:, 2]))
@@ -1283,6 +1301,7 @@ class VisionNode:
             v_rel = np.clip((uv_bbox[:, 1] - y1).astype(np.int32), 0, mask_bool.shape[0] - 1)
             in_mask = mask_bool[v_rel, u_rel]
             pts = pts_bbox[in_mask]
+            uv_in_mask = uv_bbox[in_mask]
 
             if pts.shape[0] < 10:
                 mark_reject("Too few depth pts")
@@ -1295,19 +1314,25 @@ class VisionNode:
             zs  = pts[:, 2]
             z_min_anchor = float(np.percentile(zs, 5))
             in_fruit = zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)
-            pts_front = pts[in_fruit] if in_fruit.sum() >= 10 else pts[np.argsort(zs)[:max(10, int(0.2 * len(zs)))]]
+            if in_fruit.sum() >= 10:
+                pts_front = pts[in_fruit]
+                uv_front = uv_in_mask[in_fruit]
+            else:
+                k_front = max(10, int(0.2 * len(zs)))
+                front_idx = np.argpartition(zs, k_front - 1)[:k_front]
+                pts_front = pts[front_idx]
+                uv_front = uv_in_mask[front_idx]
 
             depth_std = float(np.std(pts_front[:, 2]))
             # Don't hard-reject — let depth_quality score handle noisy early frames.
 
             Zc = float(np.median(pts_front[:, 2]))
 
-            # X,Y: reproject from the mask centroid in image space using ZED One intrinsics.
-            # Avoids T_cam_lidar rotation errors which amplify for off-axis (bottom-edge) fruit —
-            # the ZED One's own camera model is exact for X,Y given a known Z.
-            mask_ys, mask_xs = np.where(mask_bool)
-            u_c = float(np.mean(mask_xs)) + x1  # full-image coordinates
-            v_c = float(np.mean(mask_ys)) + y1
+            # X,Y: reproject from the front-depth pixels, not the full mask
+            # centroid. This prevents bunch/background mask leakage from pulling
+            # the goal inside the bunch when the date is directly in front.
+            u_c = float(np.median(uv_front[:, 0]))
+            v_c = float(np.median(uv_front[:, 1]))
             fx_ = intrinsics["fx"]; fy_ = intrinsics["fy"]
             cx_ = intrinsics["cx"]; cy_ = intrinsics["cy"]
             Xc = (u_c - cx_) * Zc / fx_
@@ -1360,7 +1385,11 @@ class VisionNode:
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
-            self._detect_branch_gap(pc_np, gap_target)
+            if self.target_lock_active:
+                self._detect_branch_gap(pc_np, gap_target)
+            else:
+                gap_target["between_branches"] = False
+                gap_target["gap_angle_cam"] = 0.0
 
             in_mask_uv = None
             obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
@@ -1410,9 +1439,9 @@ class VisionNode:
 
             pts = roi_xyz[valid]
             zs = pts[:, 2]
-            idx = np.argsort(zs)
-            k = max(10, int(0.2 * len(idx)))
-            pts_front = pts[idx[:k]]
+            k = max(10, int(0.2 * len(zs)))
+            idx = np.argpartition(zs, k - 1)[:k]
+            pts_front = pts[idx]
 
             depth_std = np.std(pts_front[:, 2])
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
@@ -1432,7 +1461,11 @@ class VisionNode:
 
             # Branch gap detection (depth ring sampling around fruit)
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
-            self._detect_branch_gap(pc_np, gap_target)
+            if self.target_lock_active:
+                self._detect_branch_gap(pc_np, gap_target)
+            else:
+                gap_target["between_branches"] = False
+                gap_target["gap_angle_cam"] = 0.0
 
             obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
 
@@ -1612,7 +1645,7 @@ class VisionNode:
         t_angle = None
 
         try:
-            contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 cnt = max(contours, key=cv2.contourArea)
                 if len(cnt) >= 20:

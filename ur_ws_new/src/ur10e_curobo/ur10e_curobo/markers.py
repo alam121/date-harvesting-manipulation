@@ -262,12 +262,12 @@ def clear_plan_preview(node):
 
 
 def publish_path_marker(node):
-    
+
     m = Marker(); m.header.frame_id = "base_link"; m.header.stamp = node.get_clock().now().to_msg()
     m.ns = "robot_path"; m.id = 0
     m.type = Marker.LINE_STRIP; m.action = Marker.ADD
     m.scale.x = 0.01; m.color.a = 1.0; m.color.g = 1.0
-    m.points = node.path_points
+    m.points = list(node.path_points)  # snapshot — prevents concurrent clear() from freeing Points during C++ serialization
     node.path_marker_pub.publish(m)
 
 
@@ -277,10 +277,11 @@ def track_robot_path(node):
         tf = node.tf_buffer.lookup_transform(
             "base_link", "gripper_tip", rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0)
         )
-        p = Point()
-        p.x = float(tf.transform.translation.x)
-        p.y = float(tf.transform.translation.y)
-        p.z = float(tf.transform.translation.z)
+        p = Point(
+            x=float(tf.transform.translation.x),
+            y=float(tf.transform.translation.y),
+            z=float(tf.transform.translation.z),
+        )
         if not node.path_points or (p.x != node.path_points[-1].x or p.y != node.path_points[-1].y or p.z != node.path_points[-1].z):
             node.path_points.append(p); publish_path_marker(node)
             if not node.tf_printed:

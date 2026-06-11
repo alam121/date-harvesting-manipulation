@@ -88,6 +88,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
         self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
+        self._node.declare_parameter("planner.direct_final_joint_fallback_max_delta_deg", self.cfg.planner.direct_final_joint_fallback_max_delta_deg)
         self._node.declare_parameter("planner.low_left_standoff_x", self.cfg.planner.low_left_standoff_x)
         self._node.declare_parameter("planner.low_left_standoff_y", self.cfg.planner.low_left_standoff_y)
         self._node.declare_parameter("planner.low_left_standoff_z", self.cfg.planner.low_left_standoff_z)
@@ -106,6 +107,10 @@ class ConfigManager:
         self._node.declare_parameter("planner.log_phase_timings", self.cfg.planner.log_phase_timings)
         self._node.declare_parameter("planner.log_path_publish", self.cfg.planner.log_path_publish)
         self._node.declare_parameter("planner.log_gripper_force_profile", self.cfg.planner.log_gripper_force_profile)
+        self._node.declare_parameter("planner.subscribe_goal_min_settle_s", self.cfg.planner.subscribe_goal_min_settle_s)
+        self._node.declare_parameter("planner.subscribe_goal_max_wait_s", self.cfg.planner.subscribe_goal_max_wait_s)
+        self._node.declare_parameter("planner.subscribe_goal_stable_tol", self.cfg.planner.subscribe_goal_stable_tol)
+        self._node.declare_parameter("planner.subscribe_goal_median_window", self.cfg.planner.subscribe_goal_median_window)
 
         # Grasp learning params
         self._node.declare_parameter("grasp.learning_enabled", self.cfg.grasp.learning_enabled)
@@ -165,6 +170,7 @@ class ConfigManager:
         self.cfg.planner.direct_branch_retry_min_dist = float(self._node.get_parameter("planner.direct_branch_retry_min_dist").value)
         self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
         self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
+        self.cfg.planner.direct_final_joint_fallback_max_delta_deg = float(self._node.get_parameter("planner.direct_final_joint_fallback_max_delta_deg").value)
         self.cfg.planner.low_left_standoff_x = float(self._node.get_parameter("planner.low_left_standoff_x").value)
         self.cfg.planner.low_left_standoff_y = float(self._node.get_parameter("planner.low_left_standoff_y").value)
         self.cfg.planner.low_left_standoff_z = float(self._node.get_parameter("planner.low_left_standoff_z").value)
@@ -183,6 +189,10 @@ class ConfigManager:
         self.cfg.planner.log_phase_timings = bool(self._node.get_parameter("planner.log_phase_timings").value)
         self.cfg.planner.log_path_publish = bool(self._node.get_parameter("planner.log_path_publish").value)
         self.cfg.planner.log_gripper_force_profile = bool(self._node.get_parameter("planner.log_gripper_force_profile").value)
+        self.cfg.planner.subscribe_goal_min_settle_s = float(self._node.get_parameter("planner.subscribe_goal_min_settle_s").value)
+        self.cfg.planner.subscribe_goal_max_wait_s = float(self._node.get_parameter("planner.subscribe_goal_max_wait_s").value)
+        self.cfg.planner.subscribe_goal_stable_tol = float(self._node.get_parameter("planner.subscribe_goal_stable_tol").value)
+        self.cfg.planner.subscribe_goal_median_window = int(self._node.get_parameter("planner.subscribe_goal_median_window").value)
 
         # Grasp learning
         self.cfg.grasp.learning_enabled = bool(self._node.get_parameter("grasp.learning_enabled").value)
@@ -273,6 +283,7 @@ class ConfigManager:
             "planner.direct_branch_retry_min_dist": (self.cfg.planner, "direct_branch_retry_min_dist", float),
             "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
             "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
+            "planner.direct_final_joint_fallback_max_delta_deg": (self.cfg.planner, "direct_final_joint_fallback_max_delta_deg", float),
             "planner.low_left_standoff_x": (self.cfg.planner, "low_left_standoff_x", float),
             "planner.low_left_standoff_y": (self.cfg.planner, "low_left_standoff_y", float),
             "planner.low_left_standoff_z": (self.cfg.planner, "low_left_standoff_z", float),
@@ -291,6 +302,10 @@ class ConfigManager:
             "planner.log_phase_timings": (self.cfg.planner, "log_phase_timings", bool),
             "planner.log_path_publish": (self.cfg.planner, "log_path_publish", bool),
             "planner.log_gripper_force_profile": (self.cfg.planner, "log_gripper_force_profile", bool),
+            "planner.subscribe_goal_min_settle_s": (self.cfg.planner, "subscribe_goal_min_settle_s", float),
+            "planner.subscribe_goal_max_wait_s": (self.cfg.planner, "subscribe_goal_max_wait_s", float),
+            "planner.subscribe_goal_stable_tol": (self.cfg.planner, "subscribe_goal_stable_tol", float),
+            "planner.subscribe_goal_median_window": (self.cfg.planner, "subscribe_goal_median_window", int),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
             "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),

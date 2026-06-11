@@ -10,6 +10,8 @@ find_package(rviz_common REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 
@@ -39,6 +41,8 @@ ament_target_dependencies(${PROJECT_NAME}
   std_msgs
   sensor_msgs
   geometry_msgs
+  control_msgs
+  trajectory_msgs
   pluginlib
   rcl_interfaces
 )

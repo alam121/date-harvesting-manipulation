@@ -259,8 +259,10 @@ class DeltoGripperController:
         msg.data = self.open_position
         self.publisher.publish(msg)
 
-        # Wait a moment for gripper to open and stabilize
-        time.sleep(0.3)
+        # The command is non-blocking, but 150ms is sufficient for release and
+        # baseline capture while avoiding a fixed 300ms delay in every cycle.
+        time.sleep(float(getattr(
+            self.node.cfg.gripper, "open_settle_s", 0.15)))
 
         # Capture baseline force when gripper is fully open
         self.baseline_force = self.force_data.copy()
@@ -300,7 +302,8 @@ class DeltoGripperController:
         msg.data = position
         self.publisher.publish(msg)
 
-        time.sleep(0.3)
+        time.sleep(float(getattr(
+            self.node.cfg.gripper, "open_settle_s", 0.15)))
         self.baseline_force = self.force_data.copy()
 
         if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):

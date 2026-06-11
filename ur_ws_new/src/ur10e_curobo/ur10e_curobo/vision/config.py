@@ -16,9 +16,8 @@ MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_nano_3_5_26.engine")
+#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_s_p2.engine")
 
-#DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo_26_large_5_5_26.engine")
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.5          # confidence threshold (lower = more detections)
 DEFAULT_IMG_SIZE = 1248             # must match compiled TRT engine exactly
@@ -70,9 +69,16 @@ TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
-DRAW_TOP_N = 5
-SHOW_REJECTED = True
+DRAW_TOP_N = 3
+SHOW_REJECTED = False
 SKIP_DRAW = False
+SHOW_CLASSIFICATION_ZONES = False
+CLASS_ZONE_MID_LEFT_THRESH = 0.20
+CLASS_ZONE_MID_RIGHT_THRESH = 0.80
+
+
+CLASS_ZONE_LOW_LEFT_THRESH = 0.32
+CLASS_ZONE_LOW_RIGHT_THRESH = 0.68
 
 # Z limit in base_link frame
 Z_MAX = 1.50

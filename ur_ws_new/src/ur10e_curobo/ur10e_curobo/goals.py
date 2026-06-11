@@ -84,7 +84,7 @@ from .markers import publish_goal_marker, publish_planned_path, clear_path_marke
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
 from .motions import execute_single_pose as exec_pose
 from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
-from .motions import blend_motion, preplan_js, plan_execute_js, nearest_joint_config
+from .motions import blend_motion, preplan_js, execute_preplan, plan_execute_js, nearest_joint_config
 from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints, solve_ik_fast
@@ -293,24 +293,34 @@ def side_low_wrist3_orientation(node, base_quat, desired_dir, max_delta_deg=45.0
 
 
 def image_lateral_side(node, cx_norm, cy_norm, *, force_very_low_center=False):
-    """Classify fruit side from image position, with bunch-edge override."""
+    """Classify fruit side from bunch-relative position when available, else image position."""
     is_low = cy_norm > 0.60
     rel_y = getattr(node, "fruit_bunch_rel_y", None)
     lower_band = getattr(node.cfg.planner, "bunch_lower_center_band", 0.80)
     if rel_y is not None and rel_y >= lower_band:
         return "CENTER"
-    rel_x = getattr(node, "fruit_bunch_rel_x", None)
-    edge_band = getattr(node.cfg.planner, "bunch_edge_side_band", 0.20)
-    if rel_x is not None:
-        if rel_x <= edge_band:
-            return "LEFT"
-        if rel_x >= 1.0 - edge_band:
-            return "RIGHT"
     if force_very_low_center:
         return "CENTER"
 
-    left_thresh = 0.36 if is_low else 0.30
-    right_thresh = 0.62 if is_low else 0.70
+    left_thresh = float(getattr(
+        node.cfg.planner,
+        "low_left_thresh" if is_low else "mid_high_left_thresh",
+        0.32 if is_low else 0.20,
+    ))
+    right_thresh = float(getattr(
+        node.cfg.planner,
+        "low_right_thresh" if is_low else "mid_high_right_thresh",
+        0.68 if is_low else 0.80,
+    ))
+
+    rel_x = getattr(node, "fruit_bunch_rel_x", None)
+    if rel_x is not None:
+        if rel_x < left_thresh:
+            return "LEFT"
+        if rel_x > right_thresh:
+            return "RIGHT"
+        return "CENTER"
+
     if cx_norm < left_thresh:
         return "LEFT"
     if cx_norm > right_thresh:
@@ -333,6 +343,42 @@ def low_side_standoff_offsets(node, is_left_side):
     y_off = getattr(node.cfg.planner, f"low_{side}_standoff_y", default_y)
     z_off = getattr(node.cfg.planner, f"low_{side}_standoff_z", default_z)
     return x_mag * (1 if is_left_side else -1), y_off, z_off
+
+
+def compute_dynamic_side_home(node, fruit_xyz, is_left_side, reference_joints, desired_dir=None):
+    """Return a date-clamped side-home pose using the fixed side-home FK as reference."""
+    ref_pose = pose_from_joints(node, reference_joints)
+    if ref_pose is None or len(ref_pose) < 7:
+        return None, None
+
+    planner = node.cfg.planner
+    fx, fy, fz = [float(v) for v in fruit_xyz]
+    mx = float(getattr(planner, "side_home_date_margin_x", 0.02))
+    my = float(getattr(planner, "side_home_date_margin_y", 0.08))
+    mz = float(getattr(planner, "side_home_max_z_drop", 0.03))
+
+    rx, ry, rz = [float(v) for v in ref_pose[:3]]
+    dyn_x = min(rx, fx - mx) if is_left_side else max(rx, fx + mx)
+    dyn_y = max(ry, fy + my)
+    dyn_z = max(rz, fz - mz)
+
+    if desired_dir is not None and getattr(planner, "side_home_align_low_orientation", True):
+        quat = yaw_only_align_local_axis(list(ref_pose[3:]), desired_dir)
+    elif getattr(planner, "side_home_use_reference_orientation", True):
+        quat = list(ref_pose[3:])
+    else:
+        cur_pose = node.get_end_effector_pose()
+        quat = list(cur_pose[3:]) if cur_pose and len(cur_pose) >= 7 else list(ref_pose[3:])
+
+    dynamic_pose = [dyn_x, dyn_y, dyn_z, *quat]
+    clamps = {
+        "ref": [rx, ry, rz],
+        "dyn": [dyn_x, dyn_y, dyn_z],
+        "x": abs(dyn_x - rx) > 1e-6,
+        "y": abs(dyn_y - ry) > 1e-6,
+        "z": abs(dyn_z - rz) > 1e-6,
+    }
+    return dynamic_pose, clamps
 
 
 def quat_dot(q1, q2):
@@ -479,7 +525,7 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
 
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
-                    store_trajectory=True, num_steps=None):
+                    store_trajectory=True, num_steps=None, goal_js_override=None):
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
     if node.current_joint_positions is None:
@@ -492,12 +538,15 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     start_js = list(node.current_joint_positions)
     _verbose_direct = getattr(node.cfg.planner, "log_phase_timings", False)
+    _preselected_branch = goal_js_override is not None
 
     # 1) cuRobo native IK (position + orientation), fallback to Jacobian IK (position-only)
-    best_js = None
-    if getattr(node, "_cuda_faulted", False):
+    best_js = list(goal_js_override) if goal_js_override is not None else None
+    if best_js is not None and _verbose_direct:
+        node.get_logger().info(f"[DIRECT] {label}: using preflight-selected IK branch")
+    if best_js is None and getattr(node, "_cuda_faulted", False):
         node.get_logger().warn(f"[DIRECT] {label}: skipping cuRobo IK (CUDA previously faulted)")
-    else:
+    elif best_js is None:
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             # goal_pose: position [1,3], quaternion [1,4]
@@ -550,12 +599,17 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     _total_delta = sum(abs(g - c) for g, c in zip(best_js, start_js))
     _initial_best_delta = max(abs(g - c) for g, c in zip(best_js, start_js))
     _RETRY_THRESH_RAD = 0.70  # ~40° total — above this, search for a closer branch
-    _MAX_DIRECT_DELTA_RAD = 1.05  # ~60°; above this the direct move will be rejected
+    _MAX_DIRECT_DELTA_RAD = (
+        math.radians(float(getattr(
+            planner, "very_low_ik_max_joint_delta_deg", 75.0)))
+        if _preselected_branch else 1.05
+    )
     _retry_min_dist = getattr(planner, "direct_branch_retry_min_dist", 0.15)
     _retry_seed_count = max(0, int(getattr(planner, "direct_branch_retry_seeds", 4)))
     _close_move = _target_dist is not None and _target_dist < _retry_min_dist
     _must_retry_for_safety = _initial_best_delta > _MAX_DIRECT_DELTA_RAD
     _allow_branch_retry = (
+        not _preselected_branch and
         _retry_seed_count > 0 and
         (not _close_move or _must_retry_for_safety)
     )
@@ -724,10 +778,20 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     if not _states_built:
         if label == "FINAL":
-            # For the final approach, defer to plan_and_send for a smooth cuRobo trajectory.
-            if _verbose_direct:
-                node.get_logger().info(f"[DIRECT] {label}: Cartesian path unavailable — deferring to plan_and_send")
-            return False
+            # Sometimes an intermediate Cartesian waypoint jumps IK branch even
+            # though the final endpoint IK is close. In that case a guarded
+            # joint interpolation is safer than falling back to slow trajopt.
+            _fallback_limit = math.radians(float(
+                getattr(planner, "direct_final_joint_fallback_max_delta_deg", 25.0)))
+            if best_delta <= _fallback_limit:
+                node.get_logger().warn(
+                    f"[DIRECT] {label}: Cartesian waypoint branch switch; "
+                    f"using guarded joint fallback (max_delta={best_delta*57.3:.1f}deg)")
+            else:
+                # For large endpoint moves, defer to plan_and_send for a smooth cuRobo trajectory.
+                if _verbose_direct:
+                    node.get_logger().info(f"[DIRECT] {label}: Cartesian path unavailable — deferring to plan_and_send")
+                return False
         # For short moves (DEPTH_CORRECT etc.), joint-space interpolation is fine.
         if _verbose_direct:
             node.get_logger().info(f"[DIRECT] {label}: fallback to joint-space interpolation")
@@ -754,15 +818,45 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if node.stop_requested:
         node.stop_requested = False; return False
 
-    # 5) Visualize & send
+    # 5) Clamp check. Reject the complete motion when any sampled waypoint is
+    # below the safety threshold. A truncated approach leaves the arm at an
+    # unintended pose and makes the subsequent FINAL path less predictable.
+    _clamp_mm, _safe_cutoff, _dest_mm = _log_forearm_flange_clearance(node, states, label)
+    _clamp_threshold = float(getattr(node.cfg.planner, "clamp_safety_threshold_mm", 35.0))
+    _this_traj_truncated = False  # local flag — avoids leaking into subsequent calls
+    _is_approach = label.startswith("APPROACH")
+    _is_final = label.startswith("FINAL")
+    if _is_final and _clamp_mm < _clamp_threshold:
+        node.get_logger().error(
+            f"[CLAMP] {label}: unsafe FINAL clearance "
+            f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
+            f"required={_clamp_threshold:.1f}mm) — skipping goal")
+        return False
+    if _is_approach and _clamp_mm < _clamp_threshold:
+        node.get_logger().error(
+            f"[CLAMP] {label}: rejecting complete APPROACH "
+            f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
+            f"required={_clamp_threshold:.1f}mm)")
+        node._approach_clamp_rejected = True
+        return False
+
     cart_path = forward_kinematics_batch(node, states)
     node._planned_cartesian_path = cart_path  # keep PATH_DEV in sync with this motion
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
 
+    # Wait target: only use FK of the truncated endpoint when THIS trajectory was
+    # truncated.  Using the node flag (_approach_truncated) instead caused the flag
+    # to leak from a previous APPROACH into a later FINAL call, mis-directing the wait.
+    _wait_xyz = target_pose_list[:3]
+    if _this_traj_truncated:
+        _fk_end = forward_kinematics(node, states[-1])
+        if _fk_end:
+            _wait_xyz = [_fk_end.x, _fk_end.y, _fk_end.z]
+
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
-    reached = wait_until_xyz(node, target_pose_list[:3], tol=0.008, timeout=8.0, target_quat=target_quat)
+    reached = wait_until_xyz(node, _wait_xyz, tol=0.008, timeout=8.0, target_quat=target_quat)
     blend_motion(node)
 
     # Abort goal if robot has stalled twice — something is obstructing or IK is wrong
@@ -771,8 +865,16 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             f"[DIRECT] {label}: stall count={node._goal_stall_count} — aborting goal.")
         return False
 
-    # Reject stall-acceptance far from target — prevents gripper close from wrong position
+    # Reject stall-acceptance far from target — but skip this check when the trajectory
+    # was intentionally truncated: the arm is supposed to stop short of the original target.
     cur_pose = node.get_end_effector_pose()
+    if _this_traj_truncated:
+        # Arm stopped at the safe cutoff — this is a successful partial approach
+        if store_trajectory:
+            if not hasattr(node, 'stored_trajectory_states'):
+                node.stored_trajectory_states = []
+            node.stored_trajectory_states.extend(states)
+        return True
     if cur_pose:
         final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
         if final_dist > 0.015:
@@ -786,6 +888,349 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         node.stored_trajectory_states.extend(states)
 
     return True
+
+
+def _log_forearm_flange_clearance(node, states: list, label: str, log_result: bool = True):
+    """Check forearm_link / tool0 clearance across sampled waypoints.
+
+    Returns (min_dist_mm, safe_cutoff_idx, destination_mm):
+      min_dist_mm     -- global minimum surface distance found (mm); negative infinity on error
+      safe_cutoff_idx -- index of last sampled waypoint that is >= threshold; len(states)
+                         if all waypoints are safe, or 0 if even the first is unsafe.
+                         Callers can truncate states[:safe_cutoff_idx+1] to stay in the
+                         safe zone rather than rejecting the whole trajectory.
+      destination_mm  -- surface distance at the final waypoint.
+    """
+    try:
+        if not states:
+            return float('-inf'), 0, float('-inf')
+        from .fk import _fk_lock, _get_kin_model
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        kin = _get_kin_model(node)
+
+        kc = kin.kinematics_config
+        idx_map = kc.link_sphere_idx_map.cpu()
+        name_map = kc.link_name_to_idx_map
+
+        fa_link_idx = name_map.get('forearm_link')
+        t0_link_idx = name_map.get('tool0')
+        if fa_link_idx is None or t0_link_idx is None:
+            node.get_logger().error(f"[CLAMP] {label}: link missing from link map")
+            return float('-inf'), 0, float('-inf')
+
+        fa_sph_list = torch.where(idx_map == fa_link_idx)[0].tolist()
+        t0_sph_list = torch.where(idx_map == t0_link_idx)[0].tolist()
+        if not fa_sph_list or not t0_sph_list:
+            node.get_logger().error(f"[CLAMP] {label}: no spheres found")
+            return float('-inf'), 0, float('-inf')
+
+        threshold_mm = float(getattr(node.cfg.planner, "clamp_safety_threshold_mm", 35.0))
+
+        # Short direct motions are checked at every waypoint. Longer trajectories
+        # are sampled evenly to keep the safety check bounded.
+        n_samples = min(60, len(states))
+        step = max(1, len(states) // n_samples)
+        sample_indices = list(range(0, len(states), step))
+        if sample_indices[-1] != len(states) - 1:
+            sample_indices.append(len(states) - 1)
+
+        danger_mm = float(getattr(
+            node.cfg.planner, "clamp_safety_threshold_mm", 45.0))
+
+        min_dist_mm = float('inf')
+        destination_mm = float('inf')   # clearance at the last sampled waypoint (destination)
+        worst_idx = sample_indices[-1]
+        worst_fa = fa_sph_list[-1]
+        worst_t0 = t0_sph_list[0]
+
+        # Last sample before the first point below the configured safety threshold.
+        safe_cutoff_idx = len(states)
+        first_unsafe_found = False
+
+        q = torch.tensor(
+            [states[idx] for idx in sample_indices],
+            dtype=torch.float32,
+            device=device,
+        )
+        with _fk_lock:
+            with torch.no_grad():
+                ls = kin.forward(q)[6]
+            if ls.ndim == 2:
+                ls = ls.unsqueeze(0)
+            if ls.ndim != 3 or ls.shape[0] != len(sample_indices):
+                # Defensive fallback for malformed output from a CUDA kernel or
+                # a model implementation with stale internal batch buffers.
+                malformed_shape = tuple(ls.shape)
+                sphere_frames = []
+                with torch.no_grad():
+                    for sample_q in q:
+                        sample_ls = kin.forward(sample_q.unsqueeze(0))[6]
+                        if sample_ls.ndim == 2:
+                            sample_ls = sample_ls.unsqueeze(0)
+                        if sample_ls.ndim != 3 or sample_ls.shape[0] < 1:
+                            raise ValueError(
+                                f"single-waypoint sphere shape {tuple(sample_ls.shape)}")
+                        sphere_frames.append(sample_ls[0].clone())
+                ls = torch.stack(sphere_frames, dim=0)
+                if log_result:
+                    node.get_logger().warn(
+                        f"[CLAMP] {label}: recovered malformed FK sphere batch "
+                        f"{malformed_shape} using {len(sample_indices)} single-waypoint checks")
+            else:
+                ls = ls.clone()
+        max_sphere_idx = max(fa_sph_list + t0_sph_list)
+        if max_sphere_idx >= ls.shape[1]:
+            raise ValueError(
+                f"sphere index {max_sphere_idx} outside FK sphere count {ls.shape[1]}")
+
+        fa_sph = ls[:, fa_sph_list, :]
+        t0_sph = ls[:, t0_sph_list, :]
+        fa_xyz = fa_sph[:, :, None, :3]
+        t0_xyz = t0_sph[:, None, :, :3]
+        center_d = torch.norm(fa_xyz - t0_xyz, dim=3)
+        surf_d = (
+            center_d
+            - fa_sph[:, :, None, 3]
+            - t0_sph[:, None, :, 3]
+        )
+        sample_min_mm = surf_d.amin(dim=(1, 2)).detach().cpu().tolist()
+        if len(sample_min_mm) != len(sample_indices):
+            raise ValueError(
+                f"clearance batch length {len(sample_min_mm)} "
+                f"!= sample count {len(sample_indices)}")
+
+        for pos, idx in enumerate(sample_indices):
+            d_mm = float(sample_min_mm[pos]) * 1000.0
+
+            if d_mm < min_dist_mm:
+                min_dist_mm = d_mm
+                worst_idx = idx
+                pair_flat = surf_d[pos].reshape(-1).argmin().item()
+                fa_pos, t0_pos = divmod(pair_flat, len(t0_sph_list))
+                if fa_pos < len(fa_sph_list) and t0_pos < len(t0_sph_list):
+                    worst_fa = fa_sph_list[fa_pos]
+                    worst_t0 = t0_sph_list[t0_pos]
+
+            if idx == sample_indices[-1]:
+                destination_mm = d_mm
+
+            if d_mm >= threshold_mm and not first_unsafe_found:
+                safe_cutoff_idx = idx
+            elif d_mm < threshold_mm and not first_unsafe_found:
+                first_unsafe_found = True
+                safe_cutoff_idx = sample_indices[pos - 1] if pos > 0 else 0
+
+        tight_state = states[min(max(worst_idx, 0), len(states) - 1)]
+        tight_joints = [round(float(v), 4) for v in tight_state]
+        suffix = (
+            f"at waypoint {worst_idx}/{len(states)} "
+            f"joints={tight_joints} "
+            f"(observed clamp <=41.8mm | threshold={threshold_mm:.0f}mm | "
+            f"fa_sph={worst_fa}, t0_sph={worst_t0})"
+        )
+        if log_result:
+            if min_dist_mm < danger_mm:
+                node.get_logger().error(
+                    f"[CLAMP] {label}: DANGER {min_dist_mm:.1f}mm — will trigger UR clamping error! {suffix}")
+            elif min_dist_mm < threshold_mm:
+                node.get_logger().warn(
+                    f"[CLAMP] {label}: WARNING {min_dist_mm:.1f}mm — below safety threshold {suffix}")
+            else:
+                node.get_logger().info(
+                    f"[CLAMP] {label}: {min_dist_mm:.1f}mm OK {suffix}")
+        return min_dist_mm, safe_cutoff_idx, destination_mm
+    except Exception as e:
+        if log_result:
+            node.get_logger().error(
+                f"[CLAMP] {label}: clearance check failed "
+                f"({type(e).__name__}): {e}")
+        return float('-inf'), 0, float('-inf')
+
+
+def _select_safe_approach_candidate(node, approach_pose, start_js):
+    """Preflight several IK branches and return the lowest-cost safe one."""
+    if getattr(node, "_cuda_faulted", False):
+        return None
+
+    planner = node.cfg.planner
+    threshold_mm = max(
+        float(getattr(planner, "clamp_safety_threshold_mm", 45.0)),
+        float(getattr(planner, "very_low_preflight_min_clearance_mm", 50.0)),
+    )
+    max_ratio = float(getattr(planner, "approach_max_path_ratio", 2.5))
+    max_delta = math.radians(float(
+        getattr(planner, "very_low_ik_max_joint_delta_deg", 75.0)))
+    requested = max(1, int(getattr(planner, "very_low_ik_return_seeds", 8)))
+    solver_seeds = int(getattr(node.motion_gen.ik_solver, "num_seeds", requested))
+    return_seeds = min(requested, solver_seeds)
+    preferred_pitch = float(getattr(
+        node, "_very_low_preferred_pitch_deg",
+        getattr(planner, "very_low_preflight_preferred_pitch_deg", 10.0)))
+    second_pitch = float(getattr(
+        planner, "very_low_preflight_second_pitch_deg", -30.0))
+    preferred_wrist = float(getattr(
+        node, "_very_low_preferred_wrist_deg",
+        getattr(planner, "very_low_preflight_preferred_wrist_deg", 0.0)))
+    wrist_angles = [preferred_wrist, 0.0, -20.0, 20.0]
+    wrist_angles = list(dict.fromkeys(wrist_angles))
+    pitch_step = abs(float(getattr(
+        planner, "very_low_preflight_pitch_step_deg", 10.0)))
+    pitch_steps = max(0, int(getattr(
+        planner, "very_low_preflight_pitch_steps", 3)))
+    pitch_offsets = [0.0]
+    for step_idx in range(1, pitch_steps + 1):
+        pitch_offsets.extend([pitch_step * step_idx, -pitch_step * step_idx])
+    pitch_offsets = [preferred_pitch, second_pitch, *pitch_offsets]
+    pitch_offsets = list(dict.fromkeys(pitch_offsets))
+    early_accept_mm = max(threshold_mm, float(getattr(
+        planner, "very_low_preflight_early_accept_mm", threshold_mm)))
+    candidates = []
+    best_observed_clearance = float('-inf')
+    orientations_tested = 0
+    early_stop = False
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
+    retract = torch.tensor([start_js], dtype=torch.float32, device=device)
+    start_pose = node.get_end_effector_pose()
+
+    # First sweep pitch with no wrist rotation. Pitch changes the actual
+    # forearm/flange separation; wrist variants are a slower fallback.
+    orientation_order = [(pitch_deg, preferred_wrist) for pitch_deg in pitch_offsets]
+    orientation_order.extend(
+        (pitch_deg, wrist_deg)
+        for wrist_deg in wrist_angles
+        if wrist_deg != preferred_wrist
+        for pitch_deg in pitch_offsets
+    )
+
+    for pitch_deg, wrist_deg in orientation_order:
+            pitched_quat = quat_apply_local_x_pitch(
+                list(approach_pose[3:]), pitch_deg)
+            orientations_tested += 1
+            orientation_candidate_start = len(candidates)
+            half = math.radians(wrist_deg) / 2.0
+            q_wrist = [math.cos(half), 0.0, 0.0, math.sin(half)]
+            quat = quat_normalize(quat_multiply(pitched_quat, q_wrist))
+            pose = [*approach_pose[:3], *quat]
+            pos_t = torch.tensor([pose[:3]], dtype=torch.float32, device=device)
+            quat_t = torch.tensor([pose[3:]], dtype=torch.float32, device=device)
+
+            try:
+                result = node.motion_gen.ik_solver.solve_single(
+                    Pose(position=pos_t, quaternion=quat_t),
+                    seed_config=seed,
+                    retract_config=retract,
+                    return_seeds=return_seeds,
+                )
+            except Exception as exc:
+                node.get_logger().warn(
+                    f"[PREFLIGHT] pitch={pitch_deg:+.0f}deg "
+                    f"wrist={wrist_deg:+.0f}deg IK exception: {exc}")
+                continue
+
+            solutions = result.js_solution.position
+            success = result.success
+            if solutions.ndim == 3:
+                solutions = solutions[0]
+            if success.ndim == 2:
+                success = success[0]
+
+            for branch_idx in range(min(len(solutions), len(success))):
+                if not bool(success[branch_idx].item()):
+                    continue
+                goal_js = nearest_joint_config(
+                    start_js, solutions[branch_idx].detach().cpu().tolist())
+                deltas = [abs(g - s) for g, s in zip(goal_js, start_js)]
+                if max(deltas) > max_delta:
+                    continue
+
+                states = []
+                for idx in range(31):
+                    alpha = idx / 30.0
+                    smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+                    states.append([
+                        s + smooth * (g - s) for s, g in zip(start_js, goal_js)
+                    ])
+
+                clearance, _, destination = _log_forearm_flange_clearance(
+                    node, states, "PREFLIGHT", log_result=False)
+                best_observed_clearance = max(
+                    best_observed_clearance, min(clearance, destination))
+                if clearance < threshold_mm or destination < threshold_mm:
+                    continue
+
+                cart_path = forward_kinematics_batch(node, states)
+                if len(cart_path) < 2:
+                    continue
+                path_len = sum(
+                    math.dist(
+                        (cart_path[i - 1].x, cart_path[i - 1].y, cart_path[i - 1].z),
+                        (cart_path[i].x, cart_path[i].y, cart_path[i].z),
+                    )
+                    for i in range(1, len(cart_path))
+                )
+                if start_pose is not None:
+                    straight = math.dist(start_pose[:3], pose[:3])
+                else:
+                    straight = math.dist(
+                        (cart_path[0].x, cart_path[0].y, cart_path[0].z),
+                        (cart_path[-1].x, cart_path[-1].y, cart_path[-1].z),
+                    )
+                ratio = path_len / max(straight, 0.001)
+                if straight > 0.02 and ratio > max_ratio:
+                    continue
+
+                joint_cost = sum(deltas) + 1.5 * max(deltas)
+                angle_cost = math.radians(
+                    abs(wrist_deg) + abs(pitch_deg)) * 0.15
+                clearance_bonus = min(clearance, 100.0) * 0.001
+                score = joint_cost + angle_cost - clearance_bonus
+                candidates.append({
+                    "score": score,
+                    "pose": pose,
+                    "goal_js": goal_js,
+                    "pitch_deg": pitch_deg,
+                    "wrist_deg": wrist_deg,
+                    "clearance": clearance,
+                    "path_len": path_len,
+                    "ratio": ratio,
+                    "branch": branch_idx,
+                })
+                if clearance >= early_accept_mm:
+                    break
+
+            new_candidates = candidates[orientation_candidate_start:]
+            if (new_candidates and
+                    max(item["clearance"] for item in new_candidates) >= early_accept_mm):
+                early_stop = True
+                break
+
+    if not candidates:
+        node.get_logger().error(
+            f"[PREFLIGHT] No safe IK branch found for VERY LOW approach "
+            f"(best={best_observed_clearance:.1f}mm, required={threshold_mm:.1f}mm)")
+        return None
+
+    max_clearance = max(item["clearance"] for item in candidates)
+    clearance_window = max(0.0, float(
+        getattr(planner, "very_low_clearance_window_mm", 8.0)))
+    safest_candidates = [
+        item for item in candidates
+        if item["clearance"] >= max_clearance - clearance_window
+    ]
+    best = min(safest_candidates, key=lambda item: item["score"])
+    node._very_low_preferred_pitch_deg = best["pitch_deg"]
+    node._very_low_preferred_wrist_deg = best["wrist_deg"]
+    node.get_logger().info(
+        f"[PREFLIGHT] selected pitch_offset={best['pitch_deg']:+.0f}deg "
+        f"wrist={best['wrist_deg']:+.0f}deg "
+        f"branch={best['branch']} clearance={best['clearance']:.1f}mm "
+        f"path={best['path_len']*100:.1f}cm ratio={best['ratio']:.2f}x "
+        f"from {len(candidates)} safe candidates "
+        f"after {orientations_tested} orientations "
+        f"(best clearance={max_clearance:.1f}mm)")
+    return best
 
 
 def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
@@ -818,6 +1263,32 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     states = interpolated_positions(res)
     curobo_dt = get_curobo_dt(res)
 
+    def _max_joint_step(waypoints):
+        if len(waypoints) < 2:
+            return 0.0, -1, -1
+        best = 0.0
+        best_joint = -1
+        best_idx = -1
+        for i in range(len(waypoints) - 1):
+            for j, (a, b) in enumerate(zip(waypoints[i], waypoints[i + 1])):
+                d = abs(float(b) - float(a))
+                if d > best:
+                    best = d
+                    best_joint = j
+                    best_idx = i + 1
+        return best, best_joint, best_idx
+
+    def _replan_once(reason):
+        if lock: lock.acquire()
+        try:
+            replanned = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+        finally:
+            if lock: lock.release()
+        if not replanned.success:
+            node.get_logger().warn(f"Replan failed for {label} after {reason}")
+            return None
+        return replanned, interpolated_positions(replanned)
+
     # Safety: reject trajectories with joint wraparound (>300 deg on any joint), retry up to 3x
     for _plan_attempt in range(3):
         wraparound = False
@@ -832,19 +1303,44 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                     break
         if not wraparound:
             break
-        if lock: lock.acquire()
-        try:
-            res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
-        finally:
-            if lock: lock.release()
-        if not res.success:
-            node.get_logger().warn(f"Replan failed for {label}")
+        replanned = _replan_once("joint wraparound")
+        if replanned is None:
             return False
-        states = interpolated_positions(res)
+        res, replanned_states = replanned
+        states = replanned_states
         curobo_dt = get_curobo_dt(res)
     else:
         node.get_logger().warn(f"All replans had joint wraparound for {label} — rejecting")
         return False
+
+    if label == "APPROACH":
+        _step, _joint, _idx = _max_joint_step(states)
+        _limit = math.radians(float(getattr(node.cfg.planner, "approach_max_joint_step_deg", 12.0)))
+        if _step > _limit:
+            node.get_logger().warn(
+                f"[JOINT] {label}: abrupt step {math.degrees(_step):.1f}deg "
+                f"at waypoint {_idx} joint{_joint}; replanning")
+            replanned = _replan_once("abrupt approach joint step")
+            if replanned is not None:
+                replanned_res, replanned_states = replanned
+                _step2, _joint2, _idx2 = _max_joint_step(replanned_states)
+                node.get_logger().info(
+                    f"[JOINT] {label} replan: max_step={math.degrees(_step2):.1f}deg "
+                    f"at waypoint {_idx2} joint{_joint2}")
+                if _step2 < _step:
+                    res = replanned_res
+                    curobo_dt = get_curobo_dt(res)
+                    states = replanned_states
+                    _step, _joint, _idx = _step2, _joint2, _idx2
+            if _step > _limit:
+                node.get_logger().warn(
+                    f"[JOINT] {label}: still snappy after replan "
+                    f"({math.degrees(_step):.1f}deg > {math.degrees(_limit):.1f}deg); rejecting")
+                return False
+        else:
+            node.get_logger().info(
+                f"[JOINT] {label}: max_step={math.degrees(_step):.1f}deg "
+                f"at waypoint {_idx} joint{_joint}")
 
     # Early return if trajectory is trivial (already at goal)
     if len(states) <= 2:
@@ -949,6 +1445,17 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                         f"[PATH] {label}: picked shorter path {best_path_len*100:.1f}cm (was {path_len*100:.1f}cm)"
                     )
             states = best_states
+            final_ratio = best_path_len / max(straight, 0.001)
+            node._last_plan_ratio = final_ratio
+            if label.startswith("APPROACH"):
+                max_ratio = float(getattr(
+                    node.cfg.planner, "approach_max_path_ratio", 2.5))
+                if straight > 0.02 and final_ratio > max_ratio:
+                    node.get_logger().error(
+                        f"[PATH] {label}: rejecting roundabout approach "
+                        f"({best_path_len*100:.1f}cm, {final_ratio:.1f}x > {max_ratio:.1f}x)")
+                    node._approach_safety_rejected = True
+                    return False
 
     # 1d) Batched FK + trim overshoot (single GPU call — done AFTER all replanning)
     cart_path = forward_kinematics_batch(node, states)
@@ -980,6 +1487,25 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     node._planned_cartesian_path = cart_path
     node._planned_label = label
 
+    _clamp_mm, _safe_cutoff, _dest_mm = _log_forearm_flange_clearance(node, states, label)
+    _clamp_threshold = float(getattr(node.cfg.planner, "clamp_safety_threshold_mm", 35.0))
+    _is_approach = label.startswith("APPROACH")
+    _is_final = label.startswith("FINAL")
+    if _is_final and _clamp_mm < _clamp_threshold:
+        node.get_logger().error(
+            f"[CLAMP] {label}: rejecting cuRobo FINAL "
+            f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
+            f"required={_clamp_threshold:.1f}mm)")
+        return False
+    if _is_approach and _clamp_mm < _clamp_threshold:
+        node.get_logger().error(
+            f"[CLAMP] {label}: rejecting complete cuRobo APPROACH "
+            f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
+            f"required={_clamp_threshold:.1f}mm)")
+        node._approach_clamp_rejected = True
+        return False
+
+    node._planned_cartesian_path = cart_path
     # 1d) Visualize planned path in RViz (blue line) — reuse pre-computed points
     publish_planned_path(node, states, label, cartesian_points=cart_path)
 
@@ -1147,9 +1673,14 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
         gx, gy, gz = grasp_fk.x, grasp_fk.y, grasp_fk.z
         partial = [reversed_states[0]]
         _clearance_reached = False
-        for wp in reversed_states[1:]:
+        reverse_cart_path = forward_kinematics_batch(node, reversed_states)
+        for wp_idx, wp in enumerate(reversed_states[1:], start=1):
             partial.append(wp)
-            fk = forward_kinematics(node, wp)
+            fk = (
+                reverse_cart_path[wp_idx]
+                if wp_idx < len(reverse_cart_path)
+                else forward_kinematics(node, wp)
+            )
             if fk:
                 dist = math.sqrt((fk.x - gx)**2 + (fk.y - gy)**2 + (fk.z - gz)**2)
                 if dist >= clearance_m:
@@ -1207,7 +1738,8 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
     # Reverse uses a slow dedicated scale — do NOT use speed_predropoff (full speed).
     # global_speed_multiplier is intentionally NOT applied to max_vel here to avoid
     # 10 rad/s peaks that cause jerk at the start of the reverse motion.
-    dt = getattr(planner, "min_dt", 0.012) * 2.0
+    dt = getattr(planner, "min_dt", 0.012) * float(
+        getattr(planner, "reverse_dt_multiplier", 1.7))
 
     # Append deceleration tail: duplicate the last waypoint several times so the
     # controller has multiple dt steps to decelerate the wrist to zero velocity.
@@ -1505,7 +2037,14 @@ def subscribe_to_goal_pose(node):
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):
-        node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_to_goal_pose(node))
+        _wait_timer = [None]
+        def _wait_and_subscribe():
+            if not is_robot_moving(node):
+                if _wait_timer[0] is not None:
+                    _wait_timer[0].cancel()
+                    _wait_timer[0] = None
+                subscribe_to_goal_pose(node)
+        _wait_timer[0] = node.create_timer(0.5, _wait_and_subscribe)
         return
 
     # Cancel any existing idle timer first (prevents multiple timers from stacking)
@@ -1537,6 +2076,7 @@ def subscribe_to_goal_pose(node):
     goal_history = {
         "poses": [], "stable_count": 0,
         "accepted": False, "accept_time": 0.0,
+        "start_time": time.time(), "latest_quat": current_orientation,
     }
 
     def _destroy_sub():
@@ -1571,20 +2111,39 @@ def subscribe_to_goal_pose(node):
                 goal_history["stable_count"] = 0
 
         goal_history["poses"].append(new_xyz)
+        goal_history["latest_quat"] = new_quat
+
+        min_settle_s = max(0.0, float(getattr(node.cfg.planner, "subscribe_goal_min_settle_s", 0.40)))
+        max_wait_s = max(min_settle_s, float(getattr(node.cfg.planner, "subscribe_goal_max_wait_s", 1.20)))
+        stable_tol = float(getattr(node.cfg.planner, "subscribe_goal_stable_tol", 0.020))
+        median_window = max(2, int(getattr(node.cfg.planner, "subscribe_goal_median_window", 5)))
+        elapsed = time.time() - goal_history["start_time"]
+        stable_pair = False
 
         # Need at least 2 consistent readings before accepting
         if len(goal_history["poses"]) >= 2:
             recent = goal_history["poses"][-2:]
-            if math.dist(recent[0], recent[1]) < 0.02:  # <2cm = stable
+            stable_pair = math.dist(recent[0], recent[1]) < stable_tol
+            if stable_pair:
                 goal_history["stable_count"] += 1
             else:
                 goal_history["stable_count"] = 0
 
-        # Accept after 2 stable readings (or after 5 total messages as fallback)
-        if goal_history["stable_count"] >= 2 or len(goal_history["poses"]) >= 5:
+        accept_mode = None
+        accepted_xyz = new_xyz
+        if elapsed >= min_settle_s and stable_pair:
+            accept_mode = "stable"
+        elif elapsed >= max_wait_s and len(goal_history["poses"]) >= 2:
+            recent_np = np.array(goal_history["poses"][-median_window:], dtype=float)
+            accepted_xyz = np.median(recent_np, axis=0).tolist()
+            accept_mode = "median"
+
+        if accept_mode is not None:
             goal_history["accepted"] = True
             goal_history["accept_time"] = time.time()
             node.goal_received = True
+            new_xyz = accepted_xyz
+            new_quat = goal_history["latest_quat"]
 
             # Stop idle timer
             if hasattr(node, 'idle_timer'):
@@ -1620,9 +2179,16 @@ def subscribe_to_goal_pose(node):
                 lateral_type = image_lateral_side(
                     node, cx_norm, cy_norm, force_very_low_center=is_very_low_center)
                 height_type = "VERY LOW" if is_very_low_center else ("LOW" if is_low else "MID/HIGH")
+                rel_x = getattr(node, "fruit_bunch_rel_x", None)
+                rel_y = getattr(node, "fruit_bunch_rel_y", None)
+                if rel_x is not None and rel_y is not None:
+                    bunch_txt = f", bunch rx={rel_x:.2f} ry={rel_y:.2f}"
+                else:
+                    bunch_txt = ", bunch rx/ry=None"
                 node.get_logger().info(
                     f"Primary goal accepted: {height_type} | {lateral_type} "
-                    f"(img cx={cx_norm:.2f} cy={cy_norm:.2f}, z={new_xyz[2]:.2f}m)")
+                    f"(img cx={cx_norm:.2f} cy={cy_norm:.2f}{bunch_txt}, "
+                    f"z={new_xyz[2]:.2f}m, accept={accept_mode})")
             else:
                 is_low = new_xyz[2] < LOW_Z_THRESH
                 height_type = "LOW" if is_low else "MID/HIGH"
@@ -1634,9 +2200,10 @@ def subscribe_to_goal_pose(node):
                     lateral_type = "CENTER"
                 node.get_logger().info(
                     f"Primary goal accepted: {height_type} | {lateral_type} "
-                    f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f})")
+                    f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f}, accept={accept_mode})")
 
             node.latest_goal_classification = f"{height_type} | {lateral_type}"
+            node.goal_lateral_side = lateral_type  # authoritative; reused at planning to avoid re-classification
             try:
                 node.obstacles.update_pose("fruit_obstacle", new_xyz)
             except Exception as _e:
@@ -1714,7 +2281,14 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):
-        node.create_timer(0.5, lambda: (not is_robot_moving(node)) and subscribe_multi_goals(node, max_goals, timeout))
+        _wait_timer = [None]
+        def _wait_and_subscribe_multi():
+            if not is_robot_moving(node):
+                if _wait_timer[0] is not None:
+                    _wait_timer[0].cancel()
+                    _wait_timer[0] = None
+                subscribe_multi_goals(node, max_goals, timeout)
+        _wait_timer[0] = node.create_timer(0.5, _wait_and_subscribe_multi)
         return
 
     # Cancel any existing idle timer
@@ -2181,11 +2755,13 @@ def plan_and_execute(node):
             _img_lateral = True  # default: trust 3D
             if _img_norm is not None:
                 _cx, _cy = _img_norm
-                # Very low fruits usually use center/default HOME, except when the
-                # fruit is at the left/right edge of the bunch segmentation.
                 _force_center_low = is_very_low_center
-                _img_side = image_lateral_side(
-                    node, _cx, _cy, force_very_low_center=_force_center_low)
+                # Reuse the lateral classification from acceptance — avoids threshold boundary
+                # flips between acceptance and execution (the fruit's side doesn't change).
+                _img_side = getattr(node, 'goal_lateral_side', None)
+                if _img_side is None:
+                    _img_side = image_lateral_side(
+                        node, _cx, _cy, force_very_low_center=_force_center_low)
                 _img_lateral = _img_side in ("LEFT", "RIGHT")
             if _log_cycle_start:
                 node.get_logger().info(
@@ -2195,6 +2771,20 @@ def plan_and_execute(node):
             if _force_center_low:
                 if _log_cycle_start:
                     node.get_logger().info("Very low fruit — using center HOME, skipping side-low HOME")
+            # Front-zone override: if the fruit's image cx is within the front band the
+            # fruit is facing the robot directly — use center approach regardless of
+            # bunch_rx lateral classification.  bunch_rx=0.12 can say LEFT while
+            # cx=0.34 is still in front, making a side home unnecessary and causing
+            # long roundabout approach paths.
+            if _img_lateral and _img_norm is not None:
+                _cx_raw = _img_norm[0]
+                _fz_min = float(getattr(node.cfg.planner, "front_zone_cx_min", 0.25))
+                _fz_max = float(getattr(node.cfg.planner, "front_zone_cx_max", 0.75))
+                if _fz_min <= _cx_raw <= _fz_max:
+                    _img_lateral = False
+                    node.get_logger().info(
+                        f"Front-zone override: cx={_cx_raw:.2f} in [{_fz_min:.2f},{_fz_max:.2f}] "
+                        f"— using center approach instead of {_img_side}")
             if (_img_norm is not None and _img_lateral) or (_img_norm is None and dx_ee_to_fruit > LATERAL_THRESH):
                 _side_is_left = (_img_side == "LEFT") if _img_side in ("LEFT", "RIGHT") else (x > trunk_x)
                 if _side_is_left:
@@ -2217,6 +2807,7 @@ def plan_and_execute(node):
                     _side_start_joints = _valid_joint_positions()
                     if _side_start_joints is not None:
                         side_joints = nearest_joint_config(_side_start_joints, side_joints)
+
                     plan_execute_js(node, side_joints, label=side_label, motion_type="home", speed_factor=0.5)
                     is_side_approach = True
                 # Update start state and cur_pose after side HOME
@@ -2351,12 +2942,19 @@ def plan_and_execute(node):
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
                 else:
                     _x_off = 0.0
-                    _y_off = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.07)
+                    _y_off = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
                               if is_very_low_center
                               else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
-                    _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", -0.025)
+                    _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
                               if is_very_low_center
                               else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
+                    _vlc_pitch = 0.0
+                    if is_very_low_center:
+                        _vlc_pitch = getattr(node.cfg.planner, "very_low_center_approach_pitch_deg", 15.0)
+                        if abs(_vlc_pitch) > 1e-6:
+                            orientation = quat_apply_local_x_pitch(orientation, _vlc_pitch)
+                        node.get_logger().info(
+                            f"VERY LOW slip-retry approach pitch={_vlc_pitch:+.1f}deg")
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
             else:
                 if not is_side_approach:
@@ -2387,18 +2985,24 @@ def plan_and_execute(node):
                 side_blend = 0.10 if is_low_lateral else 0.25
                 orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
                 _x_offset = 0.0
-                _y_offset = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.07)
+                _y_offset = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
                              if is_very_low_center
                              else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
-                _z_offset = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", -0.025)
+                _z_offset = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
                              if is_very_low_center
                              else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
+                _vlc_pitch = 0.0
+                if is_very_low_center:
+                    _vlc_pitch = getattr(node.cfg.planner, "very_low_center_approach_pitch_deg", 15.0)
+                    if abs(_vlc_pitch) > 1e-6:
+                        orientation = quat_apply_local_x_pitch(orientation, _vlc_pitch)
                 approach = [ax + _x_offset, ay + _y_offset, az + _z_offset, *orientation]
             if _log_cycle_start:
                 node.get_logger().info(
                     f"{'VERY LOW' if is_very_low_center else 'LOW'} approach pose: {approach[:3]}, is_side={is_side_approach}, "
                     f"is_low_lateral={is_low_lateral}, x_offset={_x_offset:+.3f}, "
                     f"y_offset={_y_offset:+.3f}, z_offset={_z_offset:+.3f}"
+                    + (f", pitch={_vlc_pitch:+.1f}deg" if is_very_low_center else "")
                     + (f", side_dir=[{low_side_dir[0]:.3f},{low_side_dir[1]:.3f},{low_side_dir[2]:.3f}]" if low_side_dir is not None else ""))
         else:
             side_blend =0.0
@@ -2503,17 +3107,54 @@ def plan_and_execute(node):
                 try: node.voxel_obstacles.clear()
                 except Exception: pass
 
+            _preflight_candidate = None
+            if is_very_low_center and not is_side_approach:
+                _preflight_start = _valid_joint_positions()
+                if _preflight_start is None:
+                    node.get_logger().warn(
+                        "No complete joint state for VERY LOW preflight; skipping goal")
+                    _vision_resume()
+                    unlock_target(node)
+                    continue
+                _preflight_candidate = _select_safe_approach_candidate(
+                    node, approach, _preflight_start)
+                if _preflight_candidate is None:
+                    move_to_home_position(node)
+                    if _check_stop(): break
+                    _vision_resume()
+                    unlock_target(node)
+                    continue
+                approach = list(_preflight_candidate["pose"])
+                orientation = list(approach[3:])
+
             _ap_dist = math.sqrt(sum((cur_pose[i] - approach[i])**2 for i in range(3))) if cur_pose else 999.0
             _skip_approach_wait = False
             if _log_phase_timings:
                 node.get_logger().info(f"EE-to-approach distance: {_ap_dist*100:.1f}cm")
-            if _ap_dist < 0.20:
+            if _preflight_candidate is not None:
+                node._approach_clamp_rejected = False
+                node._approach_safety_rejected = False
+                node._approach_truncated = False
+                _approach_ok = _direct_ik_move(
+                    node,
+                    approach,
+                    label="APPROACH_PREFLIGHT",
+                    motion_type="approach",
+                    store_trajectory=True,
+                    goal_js_override=_preflight_candidate["goal_js"],
+                )
+            elif _ap_dist < 0.20:
                 if _log_phase_timings:
                     node.get_logger().info("Approach standoff close — using direct IK (skipping cuRobo plan)")
+                node._approach_clamp_rejected = False
+                node._approach_safety_rejected = False
+                node._approach_truncated = False
                 _approach_ok = _direct_ik_move(node, approach, label="APPROACH", motion_type="approach", store_trajectory=True)
-                if not _approach_ok:
+                if not _approach_ok and not getattr(node, '_approach_clamp_rejected', False):
                     # IK failed (branch mismatch) — cuRobo handles branch switching via TRAJOPT.
                     # Path will be a detour but gets the arm to the correct approach position.
+                    # Skip this retry if the failure was a clamping rejection — replanning gives
+                    # the same tight configuration and wastes several seconds.
                     if _log_phase_timings:
                         node.get_logger().info(
                             f"IK failed — cuRobo plan to approach {[round(v,3) for v in approach[:3]]}"
@@ -2535,23 +3176,101 @@ def plan_and_execute(node):
                         goal_xyz=approach[:3],
                         store_trajectory=True,
                     )
-                if not _approach_ok:
+                if (not _approach_ok and
+                        not getattr(node, '_approach_clamp_rejected', False) and
+                        not getattr(node, '_approach_safety_rejected', False)):
                     node.get_logger().warn("All approach attempts failed — re-homing then skipping to FINAL")
                     move_to_home_position(node)
                     if _check_stop(): break
                     _approach_ok = True
                     _skip_approach_wait = True
             else:
+                node._approach_clamp_rejected = False
+                node._approach_safety_rejected = False
+                node._approach_truncated = False
                 _approach_ok = plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True)
-                if not _approach_ok:
-                    # Fallback: direct IK move (different solver, handles cases plan_single can't)
+                if not _approach_ok and not getattr(node, '_approach_clamp_rejected', False):
+                    # Fallback: direct IK move (different solver, handles cases plan_single can't).
+                    # Skip if the failure was a clamping rejection — same config, same result.
                     node.get_logger().warn("APPROACH plan failed — retrying with direct IK...")
                     _approach_ok = _direct_ik_move(node, approach, label="APPROACH_IK",
                                                    motion_type="approach", store_trajectory=True)
-            if not _approach_ok:
-                node.get_logger().warn("All APPROACH attempts failed — skipping goal.")
+            if _preflight_candidate is not None and not _approach_ok:
+                node.get_logger().error(
+                    "[PREFLIGHT] Validated branch failed during execution; "
+                    "re-homing and skipping goal")
+                move_to_home_position(node)
+                if _check_stop(): break
+                _vision_resume()
                 unlock_target(node)
                 continue
+            if not _approach_ok:
+                # If the failure was a clamping rejection, try rotating the approach
+                # orientation before falling back to home.  Clamping is caused by
+                # wrist_3 reaching a specific angle; small tool-Z rotations (±20°, ±40°)
+                # change the IK branch and often land on a safe wrist configuration.
+                if (getattr(node, '_approach_clamp_rejected', False) or
+                        getattr(node, '_approach_safety_rejected', False)):
+                    _wrist_tried = False
+                    for _wrist_deg in [-20.0, 20.0, -40.0, 40.0]:
+                        half = math.radians(_wrist_deg) / 2.0
+                        q_wrist = [math.cos(half), 0.0, 0.0, math.sin(half)]
+                        _q_varied = quat_normalize(quat_multiply(list(approach[3:]), q_wrist))
+                        _approach_varied = [*approach[:3], *_q_varied]
+                        node._approach_clamp_rejected = False
+                        node._approach_safety_rejected = False
+                        node._approach_truncated = False
+                        _variant_label = f"APPROACH_W{_wrist_deg:+.0f}"
+                        _v_ok = _direct_ik_move(
+                            node, _approach_varied,
+                            label=_variant_label,
+                            motion_type="approach",
+                            store_trajectory=True,
+                        )
+                        if (not _v_ok and
+                                not getattr(node, '_approach_clamp_rejected', False)):
+                            _v_ok = plan_and_send(
+                                node, start,
+                                Pose.from_list(_approach_varied),
+                                label=_variant_label,
+                                motion_type="approach",
+                                goal_xyz=approach[:3],
+                                store_trajectory=True,
+                            )
+                        if _v_ok:
+                            node.get_logger().info(
+                                f"APPROACH wrist variation {_wrist_deg:+.0f}deg succeeded")
+                            orientation = list(_q_varied)
+                            approach = list(_approach_varied)
+                            _approach_ok = True
+                            _wrist_tried = True
+                            break
+                        if (getattr(node, '_approach_clamp_rejected', False) or
+                                getattr(node, '_approach_safety_rejected', False)):
+                            node.get_logger().info(
+                                f"APPROACH wrist {_wrist_deg:+.0f}deg unsafe — trying next")
+                        else:
+                            node.get_logger().info(
+                                f"APPROACH wrist {_wrist_deg:+.0f}deg did not plan — trying next")
+                    if not _approach_ok:
+                        node.get_logger().warn(
+                            "All APPROACH wrist variations unsafe or unplannable — re-homing and skipping goal")
+                        move_to_home_position(node)
+                        if _check_stop(): break
+                        _vision_resume()
+                        unlock_target(node)
+                        continue
+                else:
+                    node.get_logger().warn("All APPROACH attempts failed — re-homing then skipping to FINAL")
+                if not _approach_ok:
+                    move_to_home_position(node)
+                    if _check_stop(): break
+                    _approach_ok = True
+                    _skip_approach_wait = True
+            # Truncated approach: arm stopped before standoff — skip the standoff wait
+            # to avoid the full 10-second timeout waiting for a position the arm won't reach.
+            if getattr(node, '_approach_truncated', False):
+                _skip_approach_wait = True
             # Open gripper during approach motion (arm is already moving)
             if not gripper_opened:
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
@@ -2563,16 +3282,17 @@ def plan_and_execute(node):
                     # Distinguish: arm never moved vs arm moved but stalled near target.
                     _cur_after = node.get_end_effector_pose()
                     _dist_to_approach = math.dist(_cur_after[:3], approach[:3]) if _cur_after else float('inf')
-                    if _dist_to_approach > 0.10:
+                    _truncated = getattr(node, '_approach_truncated', False)
+                    if _dist_to_approach > 0.10 and not _truncated:
                         node.get_logger().warn(
                             f"Approach did not execute (arm {_dist_to_approach*100:.0f}cm from target) — aborting goal, returning HOME.")
                         _vision_resume()
                         unlock_target(node)
                         move_to_home_position(node)
                         break
-                    if _log_phase_timings:
+                    if _log_phase_timings or _truncated:
                         node.get_logger().info(
-                            f"Approach stalled {_dist_to_approach*100:.1f}cm from target — close enough, continuing.")
+                            f"{'[CLAMP-TRUNCATED] ' if _truncated else ''}Approach stopped {_dist_to_approach*100:.1f}cm from standoff — proceeding to FINAL from here.")
                 log_path_deviation(node, "APPROACH")
                 blend_motion(node)
 
@@ -2797,7 +3517,8 @@ def plan_and_execute(node):
 
         _t_grasp = time.time()
         node.control_gripper("CLOSE")
-        time.sleep(0.5)
+        time.sleep(float(getattr(
+            node.cfg.planner, "grasp_post_close_settle_s", 0.10)))
         if _check_stop():
             break
         # Notify vision system about grasp attempt for fruit tracking
@@ -2950,10 +3671,43 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # Reverse along the stored approach path (35cm clearance from fruit).
+        # Reverse along the stored approach path.
+        # Side-approach fruits need more clearance to clear the bunch before dropoff planning.
+        _reverse_clearance = (
+            float(getattr(node.cfg.planner, "side_home_partial_reverse_m", 0.55))
+            if is_side_approach else 0.35
+        )
         _t_reverse_hold = time.time()
         node.motion_phase = "REVERSING"
-        execute_partial_reverse(node, clearance_m=0.35)
+        execute_partial_reverse(node, clearance_m=_reverse_clearance)
+
+        # Pre-plan dropoff in background:
+        # - Center approach: plan from current (post-reverse) joints — runs during hold check (~0.35s)
+        # - Side approach:   plan from center home joints (robot goes there first) — runs during
+        #                    hold check + center home motion (~2-3s), plenty of time
+        import threading as _threading
+        _dropoff_preplan_result = [None]  # [(traj, states)] or [None]
+        _dropoff_plan_start = (
+            list(node.home_joints) if is_side_approach
+            else (list(node.current_joint_positions) if node.current_joint_positions else None)
+        )
+
+        def _bg_preplan_dropoff():
+            try:
+                if _dropoff_plan_start is None:
+                    return
+                _tgt = nearest_joint_config(_dropoff_plan_start, node.dropoff_joints)
+                result = preplan_js(node, _tgt, _dropoff_plan_start, "DROPOFF", "dropoff")
+                _dropoff_preplan_result[0] = result
+                if result is not None:
+                    node.get_logger().info("[PREPLAN] Dropoff pre-plan ready")
+                else:
+                    node.get_logger().warn("[PREPLAN] Dropoff pre-plan returned no trajectory")
+            except Exception as _e:
+                node.get_logger().warn(f"[PREPLAN] Dropoff pre-plan failed: {_e}")
+
+        _preplan_thread = _threading.Thread(target=_bg_preplan_dropoff, daemon=True)
+        _preplan_thread.start()
 
         # Check whether the fruit is still held after reversing away from the bunch.
         # If the fruit was only touched or slipped out during reverse, force deltas
@@ -3030,6 +3784,16 @@ def plan_and_execute(node):
                 node.get_logger().info("Slip check disabled.")
 
         if _slip_detected and _slip_retry_count < _MAX_SLIP_RETRIES:
+            _preplan_thread.join(timeout=float(getattr(
+                node.cfg.planner, "dropoff_preplan_wait_s", 15.0)))
+            if _preplan_thread.is_alive():
+                node.get_logger().error(
+                    "[PREPLAN] Dropoff planner did not finish before slip retry; "
+                    "aborting automatic execution")
+                node.motion_phase = "ERROR"
+                _vision_resume()
+                unlock_target(node)
+                break
             node._slip_retry_count = _slip_retry_count + 1
             node.get_logger().warn(
                 f"SLIP DETECTED: fruit still at [{x:.3f},{y:.3f},{z:.3f}] after grasp "
@@ -3065,19 +3829,63 @@ def plan_and_execute(node):
         except Exception:
             pass
 
-        # Try direct dropoff for both center and side approaches.
+        # For side-approach fruits, go to center HOME before dropoff.
+        # The arm is lateral to the trunk — direct dropoff risks clipping the trunk.
+        # Pre-plan (above) was computed from home_joints so it's valid after this move.
+        if is_side_approach:
+            node.get_logger().info(f"[DROPOFF] Side approach ({side_label}): going to center HOME to clear trunk")
+            node.motion_phase = "HOME"
+            if not move_to_home_position(node):
+                node.get_logger().error(
+                    "[DROPOFF] Could not reach center HOME; aborting automatic dropoff")
+                node.motion_phase = "ERROR"
+                _vision_resume()
+                unlock_target(node)
+                break
+
+        # Do not race a second planner against the background pre-plan. The old
+        # 3-second timeout expired before cuRobo returned, so its valid result was
+        # ignored while another DROP-OFF plan started behind the same planning lock.
+        _preplan_wait_s = float(getattr(
+            node.cfg.planner, "dropoff_preplan_wait_s", 15.0))
+        _preplan_thread.join(timeout=_preplan_wait_s)
+        if _preplan_thread.is_alive():
+            node.get_logger().error(
+                f"[PREPLAN] Dropoff planning still running after "
+                f"{_preplan_wait_s:.1f}s; aborting automatic dropoff")
+            node.motion_phase = "ERROR"
+            _vision_resume()
+            unlock_target(node)
+            break
+
+        # Try direct dropoff — use pre-planned trajectory if available, else re-plan.
         # Only go to center HOME first if dropoff planning fails (trunk in path).
         _t_dropoff = time.time()
         _dropoff_direct = True
         node.motion_phase = "DROPOFF"
-        if not move_to_dropoff_position(node):
+        _preplan_ok = False
+        if _dropoff_preplan_result[0] is not None:
+            _pre_traj, _pre_states = _dropoff_preplan_result[0]
+            _preplan_ok = execute_preplan(node, _pre_traj, _pre_states, "DROPOFF")
+        _dropoff_ok = _preplan_ok
+        if not _dropoff_ok:
+            _dropoff_ok = move_to_dropoff_position(node)
+        if not _dropoff_ok:
             _dropoff_direct = False
             node.get_logger().info("Direct dropoff failed — going to center HOME first to clear trunk")
             node.motion_phase = "HOME"
-            move_to_home_position(node)
-            node.motion_phase = "DROPOFF"
-            move_to_dropoff_position(node)
-        time.sleep(0.2)
+            _home_ok = move_to_home_position(node)
+            if _home_ok:
+                node.motion_phase = "DROPOFF"
+                _dropoff_ok = move_to_dropoff_position(node)
+        if not _dropoff_ok:
+            node.get_logger().error(
+                "[DROPOFF] Recovery failed; keeping gripper closed and ending "
+                "automatic execution so manual HOME remains available")
+            node.motion_phase = "ERROR"
+            _vision_resume()
+            unlock_target(node)
+            break
         # Reset 2-finger mode before dropoff open (all fingers active for release)
         node.gripper_controller.frozen_fingers = set()
         node.control_gripper("OPEN")

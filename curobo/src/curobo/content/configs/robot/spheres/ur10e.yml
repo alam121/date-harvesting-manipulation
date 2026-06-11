@@ -32,19 +32,19 @@ collision_spheres:
       radius: 0.07
   forearm_link:
     - center: [-0, 0, 0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.0951667, 0, 0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.190333, 0, 0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.2855, 0, 0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.380667, 0,0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.475833, 0,0.03]
-      radius: 0.05
+      radius: 0.044
     - center: [-0.571, -1.19904e-17, 0.03]
-      radius: 0.05
+      radius: 0.044
   wrist_1_link:
     - center: [0, 0, 0]
       radius: 0.05
@@ -57,6 +57,8 @@ collision_spheres:
     - center: [0, 0, 0.06]
       radius: 0.09
   tool0:
+    - center: [0, 0, 0]
+      radius: 0.0375  # UR flange sphere (37.5mm, confirmed by Universal Robots)
     - center: [0, 0, 0.12]
       radius: 0.04
   tool0_to_camera_mount_link:

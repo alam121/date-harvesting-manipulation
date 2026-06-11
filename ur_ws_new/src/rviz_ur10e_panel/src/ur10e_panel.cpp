@@ -6,10 +6,17 @@
 #include <QScrollArea>
 #include <QFont>
 #include <QApplication>
+#include <QDir>
 #include <QMessageBox>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <csignal>
+#include <ctime>
+#include <iomanip>
+#include <numeric>
 #include <sstream>
 #include <unistd.h>
 #include <sys/types.h>
@@ -20,6 +27,53 @@
 
 namespace rviz_ur10e_panel
 {
+
+namespace
+{
+
+constexpr std::array<const char *, 6> kJointNames = {
+  "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+  "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
+};
+
+int panelJointIndex(const std::string & name)
+{
+  for (size_t i = 0; i < kJointNames.size(); ++i) {
+    const std::string expected = kJointNames[i];
+    if (name == expected ||
+      (name.size() > expected.size() &&
+      name.compare(name.size() - expected.size(), expected.size(), expected) == 0))
+    {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+double metricScore(double value, double excellent, double poor)
+{
+  if (!std::isfinite(value)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  if (value <= excellent) {
+    return 100.0;
+  }
+  if (value >= poor) {
+    return 0.0;
+  }
+  return 100.0 * (poor - value) / (poor - excellent);
+}
+
+const char * ratingName(double score)
+{
+  if (score >= 90.0) return "Excellent";
+  if (score >= 75.0) return "Good";
+  if (score >= 60.0) return "Fair";
+  if (score >= 40.0) return "Poor";
+  return "Unstable";
+}
+
+}  // namespace
 
 UR10ePanel::UR10ePanel(QWidget * parent)
 : rviz_common::Panel(parent)
@@ -187,13 +241,20 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
   motion_layout->addWidget(debug_preview_cb_, 7, 0, 1, 2);
 
+  zone_overlay_btn_ = new QPushButton("Zone Overlay: OFF");
+  zone_overlay_btn_->setCheckable(true);
+  zone_overlay_btn_->setStyleSheet("background-color: #607d8b; color: white; font-weight: bold;");
+  zone_overlay_btn_->setToolTip("Show/hide date side-classification zones on the vision display");
+  connect(zone_overlay_btn_, &QPushButton::clicked, this, &UR10ePanel::onZoneOverlayToggle);
+  motion_layout->addWidget(zone_overlay_btn_, 8, 0, 1, 2);
+
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
     "background-color: #4caf50; color: white; font-weight: bold; "
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 8, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 9, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -201,7 +262,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 8, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 9, 1);
 
   layout->addWidget(motion_group);
 
@@ -297,6 +358,31 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   capture_layout->addWidget(cap_stop);
 
   layout->addWidget(capture_group);
+
+  // Stability recorder
+  auto * stability_group = new QGroupBox("Robot Stability");
+  auto * stability_layout = new QVBoxLayout(stability_group);
+
+  stability_record_btn_ = new QPushButton("Record Stability");
+  stability_record_btn_->setStyleSheet(
+    "background-color: #3949ab; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 7px;");
+  stability_record_btn_->setToolTip(
+    "Record joint motion, trajectory tracking error, and TCP wrench.\n"
+    "Press again to stop, calculate a rating, and save the CSV.");
+  connect(
+    stability_record_btn_, &QPushButton::clicked,
+    this, &UR10ePanel::onStabilityRecord);
+  stability_layout->addWidget(stability_record_btn_);
+
+  stability_result_label_ = new QLabel("Not recorded");
+  stability_result_label_->setWordWrap(true);
+  stability_result_label_->setStyleSheet(
+    "font-size: 9pt; padding: 5px; background: #e8eaf6; "
+    "color: #283593; border-radius: 4px;");
+  stability_layout->addWidget(stability_result_label_);
+
+  layout->addWidget(stability_group);
 
   // Lidar Scan
   auto * lidar_group = new QGroupBox("Lidar Scan");
@@ -431,6 +517,17 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
 UR10ePanel::~UR10ePanel()
 {
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (stability_csv_.is_open()) {
+      stability_csv_.flush();
+      stability_csv_.close();
+    }
+    if (trajectory_csv_.is_open()) {
+      trajectory_csv_.flush();
+      trajectory_csv_.close();
+    }
+  }
   if (node_) {
     node_.reset();
   }
@@ -484,6 +581,7 @@ void UR10ePanel::setupRos()
   node_ = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
 
   cmd_pub_ = node_->create_publisher<std_msgs::msg::String>("/ui_command", 10);
+  overlay_cmd_pub_ = node_->create_publisher<std_msgs::msg::String>("/vision/overlay_command", 10);
 
   auto goal_qos = rclcpp::QoS(1)
     .reliability(rclcpp::ReliabilityPolicy::BestEffort)
@@ -497,8 +595,20 @@ void UR10ePanel::setupRos()
     "/joint_states", 10,
     [this](sensor_msgs::msg::JointState::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(data_mutex_);
-      for (size_t i = 0; i < std::min(msg->position.size(), size_t(6)); i++) {
-        joint_positions_[i] = msg->position[i];
+      for (size_t i = 0; i < msg->name.size(); ++i) {
+        const int joint_index = panelJointIndex(msg->name[i]);
+        if (joint_index < 0) {
+          continue;
+        }
+        if (i < msg->position.size()) {
+          joint_positions_[joint_index] = msg->position[i];
+        }
+        if (i < msg->velocity.size()) {
+          joint_velocities_[joint_index] = msg->velocity[i];
+        }
+      }
+      if (stability_recording_) {
+        appendStabilitySampleLocked(std::chrono::steady_clock::now());
       }
     });
 
@@ -664,6 +774,56 @@ void UR10ePanel::setupRos()
       std::lock_guard<std::mutex> lock(data_mutex_);
       calib_check_result_ = msg->data;
     });
+
+  wrench_sub_ = node_->create_subscription<geometry_msgs::msg::WrenchStamped>(
+    "/force_torque_sensor_broadcaster/wrench", 10,
+    [this](geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      tcp_wrench_[0] = msg->wrench.force.x;
+      tcp_wrench_[1] = msg->wrench.force.y;
+      tcp_wrench_[2] = msg->wrench.force.z;
+      tcp_wrench_[3] = msg->wrench.torque.x;
+      tcp_wrench_[4] = msg->wrench.torque.y;
+      tcp_wrench_[5] = msg->wrench.torque.z;
+      have_wrench_ = true;
+    });
+
+  controller_state_sub_ =
+    node_->create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+    "/scaled_joint_trajectory_controller/controller_state", 10,
+    [this](control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      const auto & errors = !msg->error.positions.empty() ?
+        msg->error.positions : msg->desired.positions;
+      for (size_t i = 0; i < msg->joint_names.size(); ++i) {
+        const int joint_index = panelJointIndex(msg->joint_names[i]);
+        if (joint_index < 0) {
+          continue;
+        }
+        if (!msg->error.positions.empty() && i < msg->error.positions.size()) {
+          tracking_errors_[joint_index] = msg->error.positions[i];
+          have_tracking_error_ = true;
+        } else if (
+          i < errors.size() && i < msg->actual.positions.size())
+        {
+          tracking_errors_[joint_index] = errors[i] - msg->actual.positions[i];
+          have_tracking_error_ = true;
+        }
+      }
+      if (stability_recording_) {
+        writeFollowedTrajectoryLocked(*msg, std::chrono::steady_clock::now());
+      }
+    });
+
+  trajectory_command_sub_ =
+    node_->create_subscription<trajectory_msgs::msg::JointTrajectory>(
+    "/scaled_joint_trajectory_controller/joint_trajectory", 10,
+    [this](trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (stability_recording_) {
+        writeComputedTrajectoryLocked(*msg, std::chrono::steady_clock::now());
+      }
+    });
 }
 
 void UR10ePanel::publishCmd(const std::string & cmd)
@@ -673,6 +833,15 @@ void UR10ePanel::publishCmd(const std::string & cmd)
   msg.data = cmd;
   cmd_pub_->publish(msg);
   status_label_->setText(QString::fromStdString("Sent: " + cmd));
+}
+
+void UR10ePanel::publishOverlayCmd(const std::string & cmd)
+{
+  if (!overlay_cmd_pub_) return;
+  auto msg = std_msgs::msg::String();
+  msg.data = cmd;
+  overlay_cmd_pub_->publish(msg);
+  status_label_->setText(QString::fromStdString("Vision overlay: " + cmd));
 }
 
 void UR10ePanel::publishStop()
@@ -761,10 +930,458 @@ void UR10ePanel::onGraspFail() { publishCmd("grasp_fail"); }
 void UR10ePanel::onPlanConfirm() { publishCmd("plan_confirm"); }
 void UR10ePanel::onPlanCancel() { publishCmd("plan_cancel"); }
 void UR10ePanel::onLidarScan() { publishCmd("lidar_scan"); }
+void UR10ePanel::onStabilityRecord()
+{
+  if (stability_recording_) {
+    stopStabilityRecording();
+  } else {
+    startStabilityRecording();
+  }
+}
+
+void UR10ePanel::startStabilityRecording()
+{
+  const QString output_dir = QDir::homePath() + "/ur10e_stability";
+  if (!QDir().mkpath(output_dir)) {
+    QMessageBox::critical(
+      this, "Stability Recording",
+      "Could not create output directory:\n" + output_dir);
+    return;
+  }
+
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm local_time{};
+  localtime_r(&now_time, &local_time);
+  std::ostringstream filename;
+  filename << output_dir.toStdString() << "/stability_"
+           << std::put_time(&local_time, "%Y%m%d_%H%M%S") << ".csv";
+  std::ostringstream trajectory_filename;
+  trajectory_filename << output_dir.toStdString() << "/trajectory_comparison_"
+                      << std::put_time(&local_time, "%Y%m%d_%H%M%S") << ".csv";
+
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    stability_csv_.open(filename.str(), std::ios::out | std::ios::trunc);
+    if (!stability_csv_.is_open()) {
+      QMessageBox::critical(
+        this, "Stability Recording",
+        QString::fromStdString("Could not open:\n" + filename.str()));
+      return;
+    }
+    trajectory_csv_.open(
+      trajectory_filename.str(), std::ios::out | std::ios::trunc);
+    if (!trajectory_csv_.is_open()) {
+      stability_csv_.close();
+      QMessageBox::critical(
+        this, "Stability Recording",
+        QString::fromStdString(
+          "Could not open:\n" + trajectory_filename.str()));
+      return;
+    }
+    stability_csv_ <<
+      "elapsed_s,"
+      "pan_pos_rad,lift_pos_rad,elbow_pos_rad,wrist1_pos_rad,wrist2_pos_rad,wrist3_pos_rad,"
+      "pan_vel_rad_s,lift_vel_rad_s,elbow_vel_rad_s,wrist1_vel_rad_s,wrist2_vel_rad_s,wrist3_vel_rad_s,"
+      "pan_error_rad,lift_error_rad,elbow_error_rad,wrist1_error_rad,wrist2_error_rad,wrist3_error_rad,"
+      "force_x_N,force_y_N,force_z_N,torque_x_Nm,torque_y_Nm,torque_z_Nm\n";
+    stability_csv_ << std::fixed << std::setprecision(8);
+    trajectory_csv_ <<
+      "row_type,recording_elapsed_s,trajectory_id,waypoint_index,"
+      "trajectory_time_s,"
+      "computed_pan_rad,computed_lift_rad,computed_elbow_rad,"
+      "computed_wrist1_rad,computed_wrist2_rad,computed_wrist3_rad,"
+      "followed_pan_rad,followed_lift_rad,followed_elbow_rad,"
+      "followed_wrist1_rad,followed_wrist2_rad,followed_wrist3_rad,"
+      "error_pan_rad,error_lift_rad,error_elbow_rad,"
+      "error_wrist1_rad,error_wrist2_rad,error_wrist3_rad,"
+      "computed_pan_vel_rad_s,computed_lift_vel_rad_s,"
+      "computed_elbow_vel_rad_s,computed_wrist1_vel_rad_s,"
+      "computed_wrist2_vel_rad_s,computed_wrist3_vel_rad_s,"
+      "followed_pan_vel_rad_s,followed_lift_vel_rad_s,"
+      "followed_elbow_vel_rad_s,followed_wrist1_vel_rad_s,"
+      "followed_wrist2_vel_rad_s,followed_wrist3_vel_rad_s\n";
+    trajectory_csv_ << std::fixed << std::setprecision(8);
+    stability_csv_path_ = filename.str();
+    trajectory_csv_path_ = trajectory_filename.str();
+    stability_sample_count_ = 0;
+    trajectory_id_ = 0;
+    stability_window_.clear();
+    stability_start_time_ = std::chrono::steady_clock::now();
+    stability_recording_ = true;
+  }
+
+  stability_record_btn_->setText("Stop & Rate");
+  stability_record_btn_->setStyleSheet(
+    "background-color: #c62828; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 7px;");
+  stability_result_label_->setText("Recording... press again to stop and rate.");
+  stability_result_label_->setStyleSheet(
+    "font-size: 9pt; padding: 5px; background: #ffebee; "
+    "color: #b71c1c; border-radius: 4px;");
+  status_label_->setText(
+    QString::fromStdString(
+      "Recording stability and trajectory data: " + stability_csv_path_));
+}
+
+void UR10ePanel::stopStabilityRecording()
+{
+  StabilityResult result;
+  std::string csv_path;
+  std::string trajectory_csv_path;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (!stability_recording_) {
+      return;
+    }
+    stability_recording_ = false;
+    result = calculateStabilityLocked();
+    csv_path = stability_csv_path_;
+    trajectory_csv_path = trajectory_csv_path_;
+
+    if (stability_csv_.is_open()) {
+      stability_csv_ << "\n# rating_score," << result.score << "\n";
+      stability_csv_ << "# rating," <<
+        (result.valid ? ratingName(result.score) : "Insufficient data") << "\n";
+      stability_csv_ << "# rating_window_s,2.0\n";
+      stability_csv_ << "# rating_samples," << result.sample_count << "\n";
+      stability_csv_ << "# velocity_rms_rad_s," << result.velocity_rms << "\n";
+      stability_csv_ << "# position_jitter_rms_rad," <<
+        result.position_jitter_rms << "\n";
+      stability_csv_ << "# tracking_error_rms_rad," <<
+        result.tracking_error_rms << "\n";
+      stability_csv_ << "# force_noise_rms_N," << result.force_noise_rms << "\n";
+      stability_csv_ << "# torque_noise_rms_Nm," << result.torque_noise_rms << "\n";
+      stability_csv_.flush();
+      stability_csv_.close();
+    }
+    if (trajectory_csv_.is_open()) {
+      trajectory_csv_.flush();
+      trajectory_csv_.close();
+    }
+  }
+
+  stability_record_btn_->setText("Record Stability");
+  stability_record_btn_->setStyleSheet(
+    "background-color: #3949ab; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 7px;");
+
+  if (!result.valid) {
+    stability_result_label_->setText(
+      QString("Insufficient data (%1 samples).\nStability CSV: %2\nTrajectory CSV: %3")
+      .arg(result.sample_count)
+      .arg(QString::fromStdString(csv_path))
+      .arg(QString::fromStdString(trajectory_csv_path)));
+    stability_result_label_->setStyleSheet(
+      "font-size: 9pt; padding: 5px; background: #fff8e1; "
+      "color: #e65100; border-radius: 4px;");
+    status_label_->setText("Stability recording stopped: insufficient rating data");
+    return;
+  }
+
+  const QString rating = QString::fromUtf8(ratingName(result.score));
+  const QString tracking_text = std::isfinite(result.tracking_error_rms) ?
+    QString("%1 deg").arg(result.tracking_error_rms * 180.0 / M_PI, 0, 'f', 3) :
+    QString("n/a");
+  stability_result_label_->setText(
+    QString("%1 - %2/100\nVelocity RMS: %3 rad/s | Jitter: %4 deg\n"
+            "Tracking RMS: %5\nStability CSV: %6\nTrajectory CSV: %7")
+    .arg(rating)
+    .arg(result.score, 0, 'f', 1)
+    .arg(result.velocity_rms, 0, 'f', 4)
+    .arg(result.position_jitter_rms * 180.0 / M_PI, 0, 'f', 3)
+    .arg(tracking_text)
+    .arg(QString::fromStdString(csv_path))
+    .arg(QString::fromStdString(trajectory_csv_path)));
+
+  const char * bg = result.score >= 75.0 ? "#e8f5e9" :
+    (result.score >= 60.0 ? "#fff8e1" : "#ffebee");
+  const char * fg = result.score >= 75.0 ? "#2e7d32" :
+    (result.score >= 60.0 ? "#e65100" : "#c62828");
+  stability_result_label_->setStyleSheet(
+    QString("font-size: 9pt; padding: 5px; background: %1; "
+            "color: %2; border-radius: 4px;").arg(bg).arg(fg));
+  status_label_->setText(
+    QString("Stability: %1 (%2/100), saved %3")
+    .arg(rating)
+    .arg(result.score, 0, 'f', 1)
+    .arg(QString::fromStdString(csv_path)));
+}
+
+void UR10ePanel::appendStabilitySampleLocked(
+  const std::chrono::steady_clock::time_point & now)
+{
+  if (!stability_csv_.is_open()) {
+    return;
+  }
+
+  StabilitySample sample;
+  sample.elapsed_s =
+    std::chrono::duration<double>(now - stability_start_time_).count();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (size_t i = 0; i < 6; ++i) {
+    sample.positions[i] = joint_positions_[i];
+    sample.velocities[i] = joint_velocities_[i];
+    sample.tracking_errors[i] = have_tracking_error_ ? tracking_errors_[i] : nan;
+    sample.wrench[i] = have_wrench_ ? tcp_wrench_[i] : nan;
+  }
+
+  stability_csv_ << sample.elapsed_s;
+  for (double value : sample.positions) stability_csv_ << ',' << value;
+  for (double value : sample.velocities) stability_csv_ << ',' << value;
+  for (double value : sample.tracking_errors) stability_csv_ << ',' << value;
+  for (double value : sample.wrench) stability_csv_ << ',' << value;
+  stability_csv_ << '\n';
+
+  stability_window_.push_back(sample);
+  while (
+    !stability_window_.empty() &&
+    sample.elapsed_s - stability_window_.front().elapsed_s > 2.0)
+  {
+    stability_window_.pop_front();
+  }
+  ++stability_sample_count_;
+}
+
+void UR10ePanel::writeComputedTrajectoryLocked(
+  const trajectory_msgs::msg::JointTrajectory & msg,
+  const std::chrono::steady_clock::time_point & now)
+{
+  if (!trajectory_csv_.is_open()) {
+    return;
+  }
+
+  ++trajectory_id_;
+  const double elapsed_s =
+    std::chrono::duration<double>(now - stability_start_time_).count();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+
+  for (size_t point_index = 0; point_index < msg.points.size(); ++point_index) {
+    const auto & point = msg.points[point_index];
+    std::array<double, 6> computed_positions;
+    std::array<double, 6> computed_velocities;
+    computed_positions.fill(nan);
+    computed_velocities.fill(nan);
+
+    for (size_t i = 0; i < msg.joint_names.size(); ++i) {
+      const int joint_index = panelJointIndex(msg.joint_names[i]);
+      if (joint_index < 0) {
+        continue;
+      }
+      if (i < point.positions.size()) {
+        computed_positions[joint_index] = point.positions[i];
+      }
+      if (i < point.velocities.size()) {
+        computed_velocities[joint_index] = point.velocities[i];
+      }
+    }
+
+    const double trajectory_time_s =
+      static_cast<double>(point.time_from_start.sec) +
+      static_cast<double>(point.time_from_start.nanosec) * 1e-9;
+    trajectory_csv_ << "planned_waypoint," << elapsed_s << ','
+                    << trajectory_id_ << ',' << point_index << ','
+                    << trajectory_time_s;
+    for (double value : computed_positions) trajectory_csv_ << ',' << value;
+    for (size_t i = 0; i < 12; ++i) trajectory_csv_ << ',' << nan;
+    for (double value : computed_velocities) trajectory_csv_ << ',' << value;
+    for (size_t i = 0; i < 6; ++i) trajectory_csv_ << ',' << nan;
+    trajectory_csv_ << '\n';
+  }
+}
+
+void UR10ePanel::writeFollowedTrajectoryLocked(
+  const control_msgs::msg::JointTrajectoryControllerState & msg,
+  const std::chrono::steady_clock::time_point & now)
+{
+  if (!trajectory_csv_.is_open()) {
+    return;
+  }
+
+  const double elapsed_s =
+    std::chrono::duration<double>(now - stability_start_time_).count();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  std::array<double, 6> computed_positions;
+  std::array<double, 6> followed_positions;
+  std::array<double, 6> position_errors;
+  std::array<double, 6> computed_velocities;
+  std::array<double, 6> followed_velocities;
+  computed_positions.fill(nan);
+  followed_positions.fill(nan);
+  position_errors.fill(nan);
+  computed_velocities.fill(nan);
+  followed_velocities.fill(nan);
+
+  const auto & reference_positions = !msg.reference.positions.empty() ?
+    msg.reference.positions : msg.desired.positions;
+  const auto & feedback_positions = !msg.feedback.positions.empty() ?
+    msg.feedback.positions : msg.actual.positions;
+  const auto & reference_velocities = !msg.reference.velocities.empty() ?
+    msg.reference.velocities : msg.desired.velocities;
+  const auto & feedback_velocities = !msg.feedback.velocities.empty() ?
+    msg.feedback.velocities : msg.actual.velocities;
+
+  for (size_t i = 0; i < msg.joint_names.size(); ++i) {
+    const int joint_index = panelJointIndex(msg.joint_names[i]);
+    if (joint_index < 0) {
+      continue;
+    }
+    if (i < reference_positions.size()) {
+      computed_positions[joint_index] = reference_positions[i];
+    }
+    if (i < feedback_positions.size()) {
+      followed_positions[joint_index] = feedback_positions[i];
+    }
+    if (i < msg.error.positions.size()) {
+      position_errors[joint_index] = msg.error.positions[i];
+    } else if (
+      i < reference_positions.size() && i < feedback_positions.size())
+    {
+      position_errors[joint_index] =
+        reference_positions[i] - feedback_positions[i];
+    }
+    if (i < reference_velocities.size()) {
+      computed_velocities[joint_index] = reference_velocities[i];
+    }
+    if (i < feedback_velocities.size()) {
+      followed_velocities[joint_index] = feedback_velocities[i];
+    }
+  }
+
+  trajectory_csv_ << "followed_sample," << elapsed_s << ','
+                  << trajectory_id_ << ",-1," << nan;
+  for (double value : computed_positions) trajectory_csv_ << ',' << value;
+  for (double value : followed_positions) trajectory_csv_ << ',' << value;
+  for (double value : position_errors) trajectory_csv_ << ',' << value;
+  for (double value : computed_velocities) trajectory_csv_ << ',' << value;
+  for (double value : followed_velocities) trajectory_csv_ << ',' << value;
+  trajectory_csv_ << '\n';
+}
+
+UR10ePanel::StabilityResult UR10ePanel::calculateStabilityLocked() const
+{
+  StabilityResult result;
+  result.sample_count = stability_window_.size();
+  if (stability_window_.size() < 10) {
+    return result;
+  }
+
+  double velocity_sq_sum = 0.0;
+  size_t velocity_count = 0;
+  double error_sq_sum = 0.0;
+  size_t error_count = 0;
+  std::array<double, 6> position_sum{};
+  std::array<double, 6> wrench_sum{};
+  std::array<size_t, 6> wrench_count{};
+
+  for (const auto & sample : stability_window_) {
+    for (size_t i = 0; i < 6; ++i) {
+      position_sum[i] += sample.positions[i];
+      if (std::isfinite(sample.velocities[i])) {
+        velocity_sq_sum += sample.velocities[i] * sample.velocities[i];
+        ++velocity_count;
+      }
+      if (std::isfinite(sample.tracking_errors[i])) {
+        error_sq_sum += sample.tracking_errors[i] * sample.tracking_errors[i];
+        ++error_count;
+      }
+      if (std::isfinite(sample.wrench[i])) {
+        wrench_sum[i] += sample.wrench[i];
+        ++wrench_count[i];
+      }
+    }
+  }
+
+  double position_variance_sum = 0.0;
+  std::array<double, 6> wrench_variance{};
+  for (const auto & sample : stability_window_) {
+    for (size_t i = 0; i < 6; ++i) {
+      const double position_mean =
+        position_sum[i] / static_cast<double>(stability_window_.size());
+      const double position_delta = sample.positions[i] - position_mean;
+      position_variance_sum += position_delta * position_delta;
+
+      if (wrench_count[i] > 0 && std::isfinite(sample.wrench[i])) {
+        const double wrench_mean =
+          wrench_sum[i] / static_cast<double>(wrench_count[i]);
+        const double wrench_delta = sample.wrench[i] - wrench_mean;
+        wrench_variance[i] += wrench_delta * wrench_delta;
+      }
+    }
+  }
+
+  result.velocity_rms = velocity_count > 0 ?
+    std::sqrt(velocity_sq_sum / static_cast<double>(velocity_count)) :
+    std::numeric_limits<double>::quiet_NaN();
+  result.position_jitter_rms = std::sqrt(
+    position_variance_sum /
+    static_cast<double>(stability_window_.size() * 6));
+  result.tracking_error_rms = error_count > 0 ?
+    std::sqrt(error_sq_sum / static_cast<double>(error_count)) :
+    std::numeric_limits<double>::quiet_NaN();
+
+  double force_variance_sum = 0.0;
+  double torque_variance_sum = 0.0;
+  size_t force_axes = 0;
+  size_t torque_axes = 0;
+  for (size_t i = 0; i < 6; ++i) {
+    if (wrench_count[i] == 0) {
+      continue;
+    }
+    const double axis_variance =
+      wrench_variance[i] / static_cast<double>(wrench_count[i]);
+    if (i < 3) {
+      force_variance_sum += axis_variance;
+      ++force_axes;
+    } else {
+      torque_variance_sum += axis_variance;
+      ++torque_axes;
+    }
+  }
+  result.force_noise_rms = force_axes > 0 ?
+    std::sqrt(force_variance_sum / static_cast<double>(force_axes)) :
+    std::numeric_limits<double>::quiet_NaN();
+  result.torque_noise_rms = torque_axes > 0 ?
+    std::sqrt(torque_variance_sum / static_cast<double>(torque_axes)) :
+    std::numeric_limits<double>::quiet_NaN();
+
+  const std::array<double, 5> scores = {
+    metricScore(result.velocity_rms, 0.002, 0.030),
+    metricScore(result.position_jitter_rms, 0.00035, 0.0035),
+    metricScore(result.tracking_error_rms, 0.00175, 0.0175),
+    metricScore(result.force_noise_rms, 0.5, 5.0),
+    metricScore(result.torque_noise_rms, 0.03, 0.5)
+  };
+  const std::array<double, 5> weights = {0.35, 0.25, 0.25, 0.10, 0.05};
+  double weighted_score = 0.0;
+  double active_weight = 0.0;
+  for (size_t i = 0; i < scores.size(); ++i) {
+    if (std::isfinite(scores[i])) {
+      weighted_score += scores[i] * weights[i];
+      active_weight += weights[i];
+    }
+  }
+
+  result.valid = active_weight >= 0.50;
+  result.score = result.valid ? weighted_score / active_weight : 0.0;
+  return result;
+}
 
 void UR10ePanel::onDebugPreviewChanged(int state)
 {
   publishCmd(state == Qt::Checked ? "set_debug_preview true" : "set_debug_preview false");
+}
+
+void UR10ePanel::onZoneOverlayToggle()
+{
+  const bool enabled = zone_overlay_btn_ && zone_overlay_btn_->isChecked();
+  if (zone_overlay_btn_) {
+    zone_overlay_btn_->setText(enabled ? "Zone Overlay: ON" : "Zone Overlay: OFF");
+    zone_overlay_btn_->setStyleSheet(enabled
+      ? "background-color: #009688; color: white; font-weight: bold;"
+      : "background-color: #607d8b; color: white; font-weight: bold;");
+  }
+  publishOverlayCmd(enabled ? "classification_zones true" : "classification_zones false");
 }
 
 void UR10ePanel::onSendGoal()
