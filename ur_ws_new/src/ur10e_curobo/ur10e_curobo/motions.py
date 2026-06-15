@@ -43,7 +43,8 @@ def publish_stop_trajectory(node):
 #output: Publishes /joint_trajectory_controller/joint_trajectory.
 def execute_single_pose(node, pose: list, motion_type: str = "default"):
     if node.current_joint_positions is None:
-        node.get_logger().warn("No joint state; cannot execute pose."); return
+        node.get_logger().warn("No joint state; cannot execute pose.")
+        return False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     start = JointState.from_position(
@@ -58,7 +59,8 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
     finally:
         if lock: lock.release()
     if not res.success:
-        node.get_logger().warn("Plan failed for single pose."); return
+        node.get_logger().warn("Plan failed for single pose.")
+        return False
 
     states = interpolated_positions(res)
     curobo_dt = get_curobo_dt(res)
@@ -93,11 +95,11 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
                 if lock: lock.release()
             if not res.success:
                 node.get_logger().error("Replan failed after collision detection")
-                return
+                return False
             states = interpolated_positions(res)
         else:
             node.get_logger().error(f"Collision persists after {max_attempts} replans")
-            return
+            return False
 
     planner = node.cfg.planner
     speed_map = {
@@ -119,8 +121,18 @@ def execute_single_pose(node, pose: list, motion_type: str = "default"):
         max_acc=planner.max_joint_acceleration,
         ramp_points=0,
     )
-    if traj.points:
-        node.trajectory_pub.publish(traj)
+    if not traj.points:
+        node.get_logger().warn("Single-pose plan produced an empty trajectory.")
+        return False
+
+    node.trajectory_pub.publish(traj)
+    return wait_until_xyz(
+        node,
+        pose[:3],
+        tol=0.008,
+        timeout=15.0,
+        target_quat=pose[3:] if len(pose) >= 7 else None,
+    )
 
 
 # Plans and executes a joint-space motion to reach a specified set of joint angles.

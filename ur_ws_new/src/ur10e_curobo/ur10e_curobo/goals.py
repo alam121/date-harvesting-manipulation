@@ -78,7 +78,10 @@ class ThreadSafeGoalList:
             self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
-from .config import LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG
+from .config import (
+    LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG,
+    X_FORWARD_Y_LATERAL,
+)
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
@@ -335,14 +338,37 @@ def is_bunch_lower_boundary(node):
 
 
 def low_side_standoff_offsets(node, is_left_side):
+    """Return XYZ offsets using the configured depth/lateral axes."""
     side = "left" if is_left_side else "right"
     default_x = 0.12 if is_left_side else 0.08
     default_y = 0.065 if is_left_side else 0.050
     default_z = -0.055 if is_left_side else -0.025
-    x_mag = getattr(node.cfg.planner, f"low_{side}_standoff_x", default_x)
-    y_off = getattr(node.cfg.planner, f"low_{side}_standoff_y", default_y)
+    lateral_mag = getattr(node.cfg.planner, f"low_{side}_standoff_x", default_x)
+    depth_off = getattr(node.cfg.planner, f"low_{side}_standoff_y", default_y)
     z_off = getattr(node.cfg.planner, f"low_{side}_standoff_z", default_z)
-    return x_mag * (1 if is_left_side else -1), y_off, z_off
+    lateral_off = lateral_mag * (1 if is_left_side else -1)
+    if X_FORWARD_Y_LATERAL:
+        return depth_off, lateral_off, z_off
+    return lateral_off, depth_off, z_off
+
+
+def lateral_value(x, y):
+    return y if X_FORWARD_Y_LATERAL else x
+
+
+def add_axis_offsets(x, y, *, depth=0.0, lateral=0.0):
+    if X_FORWARD_Y_LATERAL:
+        # New robot faces +X, so a positive standoff moves back toward the robot.
+        return x - depth, y + lateral
+    return x + lateral, y + depth
+
+
+def trunk_lateral(node, fallback=0.16):
+    """Return the trunk coordinate along the configured lateral axis."""
+    xyz = getattr(node, "trunk_xyz", None)
+    if xyz is not None:
+        return float(xyz[1] if X_FORWARD_Y_LATERAL else xyz[0])
+    return float(fallback)
 
 
 def compute_dynamic_side_home(node, fruit_xyz, is_left_side, reference_joints, desired_dir=None):
@@ -358,8 +384,15 @@ def compute_dynamic_side_home(node, fruit_xyz, is_left_side, reference_joints, d
     mz = float(getattr(planner, "side_home_max_z_drop", 0.03))
 
     rx, ry, rz = [float(v) for v in ref_pose[:3]]
-    dyn_x = min(rx, fx - mx) if is_left_side else max(rx, fx + mx)
-    dyn_y = max(ry, fy + my)
+    lateral_off = -mx if is_left_side else mx
+    if X_FORWARD_Y_LATERAL:
+        dyn_x = min(rx, fx - my)
+        dyn_y = fy + lateral_off
+        dyn_y = min(ry, dyn_y) if is_left_side else max(ry, dyn_y)
+    else:
+        dyn_x = fx + lateral_off
+        dyn_x = min(rx, dyn_x) if is_left_side else max(rx, dyn_x)
+        dyn_y = max(ry, fy + my)
     dyn_z = max(rz, fz - mz)
 
     if desired_dir is not None and getattr(planner, "side_home_align_low_orientation", True):
@@ -2192,15 +2225,17 @@ def subscribe_to_goal_pose(node):
             else:
                 is_low = new_xyz[2] < LOW_Z_THRESH
                 height_type = "LOW" if is_low else "MID/HIGH"
-                trunk_x = getattr(node, 'trunk_x', None) or 0.16
-                dx_trunk = abs(new_xyz[0] - trunk_x)
-                if dx_trunk > LATERAL_THRESH:
-                    lateral_type = "LEFT" if new_xyz[0] > trunk_x else "RIGHT"
+                trunk_lat = trunk_lateral(node)
+                fruit_lat = lateral_value(new_xyz[0], new_xyz[1])
+                lateral_dist = abs(fruit_lat - trunk_lat)
+                if lateral_dist > LATERAL_THRESH:
+                    lateral_type = "LEFT" if fruit_lat > trunk_lat else "RIGHT"
                 else:
                     lateral_type = "CENTER"
                 node.get_logger().info(
                     f"Primary goal accepted: {height_type} | {lateral_type} "
-                    f"(z={new_xyz[2]:.2f}m, fruit_x={new_xyz[0]:.3f}, trunk_x={trunk_x:.3f}, accept={accept_mode})")
+                    f"(z={new_xyz[2]:.2f}m, fruit_lateral={fruit_lat:.3f}, "
+                    f"trunk_lateral={trunk_lat:.3f}, accept={accept_mode})")
 
             node.latest_goal_classification = f"{height_type} | {lateral_type}"
             node.goal_lateral_side = lateral_type  # authoritative; reused at planning to avoid re-classification
@@ -2717,19 +2752,19 @@ def plan_and_execute(node):
                     f"{_approach_height_label} approach ({_height_source}, z={z:.2f}): "
                     f"fruit=[{x:.3f},{y:.3f},{z:.3f}]")
         else:
-            # Mid/high: standoff directly behind fruit in Y only — same X and Z as fruit
+            # Mid/high: standoff directly behind fruit along the configured depth axis.
             # Right-side fruits get a larger standoff to improve approach angle
-            _is_right = x < (node.trunk_x or 0.16)
+            _is_right = lateral_value(x, y) < trunk_lateral(node)
             _midhi_standoff = 0.12 if _is_right else standoff
             _midhi_z_offset = getattr(node.cfg.planner, "mid_center_approach_z_offset", 0.0)
-            ax = x
-            ay = y + _midhi_standoff
+            ax, ay = add_axis_offsets(x, y, depth=_midhi_standoff)
             az = z + _midhi_z_offset
             if _log_cycle_start:
                 node.get_logger().info(
                     f"MID/HIGH approach ({_height_source}, z={z:.2f}): "
                     f"fruit=[{x:.3f},{y:.3f},{z:.3f}] standoff=[{ax:.3f},{ay:.3f},{az:.3f}] "
-                    f"y_offset={_midhi_standoff:+.3f} z_offset={_midhi_z_offset:+.3f} right={_is_right}")
+                    f"depth_offset={_midhi_standoff:+.3f} "
+                    f"z_offset={_midhi_z_offset:+.3f} right={_is_right}")
 
         # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
@@ -2740,15 +2775,13 @@ def plan_and_execute(node):
         # Side HOME: use predefined home_left / home_right based on fruit vs trunk position
         is_side_approach = False
         side_home_reacquired = False
-        trunk_x = node.trunk_x  # live trunk x from /trunk_position topic
+        trunk_lat = trunk_lateral(node)
+        fruit_lat = lateral_value(x, y)
         _img_norm = getattr(node, 'fruit_image_norm', None)
         _img_side = None
         _force_center_low = False
-        if trunk_x is None:
-            trunk_x = 0.16  # fallback if vision hasn't published yet
-            node.get_logger().warn("No trunk_position received yet, using default trunk_x=0.16")
         if cur_pose is not None:
-            dx_ee_to_fruit = abs(x - trunk_x)
+            lateral_dist = abs(fruit_lat - trunk_lat)
             # If image-based classification said CENTER, respect it — skip side home
             # even if 3D coordinate check would say lateral. If it said LEFT/RIGHT,
             # use that side so preview and execution do not disagree.
@@ -2765,7 +2798,8 @@ def plan_and_execute(node):
                 _img_lateral = _img_side in ("LEFT", "RIGHT")
             if _log_cycle_start:
                 node.get_logger().info(
-                    f"EE-to-fruit x distance: {dx_ee_to_fruit:.2f}m, trunk_x={trunk_x:.3f}"
+                    f"Fruit lateral distance: {lateral_dist:.2f}m, "
+                    f"trunk_lateral={trunk_lat:.3f}"
                     + (f", img_side={_img_side}" if _img_norm is not None else "")
                     + (", very_low_center=True" if _force_center_low else ""))
             if _force_center_low:
@@ -2785,8 +2819,12 @@ def plan_and_execute(node):
                     node.get_logger().info(
                         f"Front-zone override: cx={_cx_raw:.2f} in [{_fz_min:.2f},{_fz_max:.2f}] "
                         f"— using center approach instead of {_img_side}")
-            if (_img_norm is not None and _img_lateral) or (_img_norm is None and dx_ee_to_fruit > LATERAL_THRESH):
-                _side_is_left = (_img_side == "LEFT") if _img_side in ("LEFT", "RIGHT") else (x > trunk_x)
+            if (_img_norm is not None and _img_lateral) or (_img_norm is None and lateral_dist > LATERAL_THRESH):
+                _side_is_left = (
+                    (_img_side == "LEFT")
+                    if _img_side in ("LEFT", "RIGHT")
+                    else (fruit_lat > trunk_lat)
+                )
                 if _side_is_left:
                     side_joints = node.home_left_low_joints if is_low else node.home_left_joints
                     side_label = "HOME_LEFT_LOW" if is_low else "HOME_LEFT"
@@ -2803,7 +2841,8 @@ def plan_and_execute(node):
                 if side_joints is not None:
                     if _log_cycle_start:
                         node.get_logger().info(
-                            f"{side_label}: fruit x={x:.2f}, trunk_x={trunk_x:.3f}")
+                            f"{side_label}: fruit_lateral={fruit_lat:.2f}, "
+                            f"trunk_lateral={trunk_lat:.3f}")
                     _side_start_joints = _valid_joint_positions()
                     if _side_start_joints is not None:
                         side_joints = nearest_joint_config(_side_start_joints, side_joints)
@@ -2872,20 +2911,23 @@ def plan_and_execute(node):
                     if is_low:
                         ax, ay, az = x, y, z
                     else:
-                        _is_right = x < (node.trunk_x or trunk_x or 0.16)
+                        fruit_lat = lateral_value(x, y)
+                        _is_right = fruit_lat < trunk_lateral(node)
                         _midhi_standoff = 0.12 if _is_right else standoff
-                        ax, ay, az = x, y + _midhi_standoff, z
+                        ax, ay = add_axis_offsets(x, y, depth=_midhi_standoff)
+                        az = z
             else:
                 if _log_cycle_start:
                     node.get_logger().info("Fruit near center; using default HOME without side move.")
 
+        fruit_lat = lateral_value(x, y)
         _height_log = "VERY_LOW" if is_very_low_center else ("LOW" if is_low else "MID_HIGH")
         if _log_cycle_start:
             node.get_logger().info(
                 f"[DECISION] height={_height_log} source={_height_source} "
                 f"side={_img_side if _img_norm is not None else '3D'} "
                 f"side_home={is_side_approach} side_home_reacq={side_home_reacquired} "
-                f"trunk_x={trunk_x:.3f} fruit_x={x:.3f}")
+                f"trunk_lateral={trunk_lat:.3f} fruit_lateral={fruit_lat:.3f}")
 
         # Skip approach if EE is already close to the goal
         skip_approach = False
@@ -2931,9 +2973,11 @@ def plan_and_execute(node):
             # — same source as the first attempt, so gripper opens to the same width
             # Recompute standoff using current x, y, z (same formula as is_low / MID/HIGH)
             if is_low:
-                _is_lat = abs(x - trunk_x) > LATERAL_THRESH
+                fruit_lat = lateral_value(x, y)
+                _is_lat = abs(fruit_lat - trunk_lat) > LATERAL_THRESH
                 if _is_lat and is_side_approach:
-                    _x_off, _y_off, _z_off = low_side_standoff_offsets(node, x > trunk_x)
+                    _x_off, _y_off, _z_off = low_side_standoff_offsets(
+                        node, fruit_lat > trunk_lat)
                     low_side_dir = [-_x_off, -_y_off, 0.0]
                     _base_quat = list(cur_quat) if cur_quat is not None else _stored_approach[3:]
                     orientation, _yaw_delta = side_low_wrist3_orientation(node, _base_quat, low_side_dir)
@@ -2941,10 +2985,12 @@ def plan_and_execute(node):
                         f"Side-low wrist yaw correction: {_yaw_delta*57.3:+.1f}deg")
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
                 else:
-                    _x_off = 0.0
-                    _y_off = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
-                              if is_very_low_center
-                              else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
+                    _depth_off = (
+                        getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
+                        if is_very_low_center
+                        else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07)
+                    )
+                    _x_off, _y_off = add_axis_offsets(0.0, 0.0, depth=_depth_off)
                     _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
                               if is_very_low_center
                               else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
@@ -2969,12 +3015,14 @@ def plan_and_execute(node):
                 f"fruit_radius={fruit_radius}")
 
         elif is_low:
-            is_low_lateral = abs(x - trunk_x) > LATERAL_THRESH
+            fruit_lat = lateral_value(x, y)
+            is_low_lateral = abs(fruit_lat - trunk_lat) > LATERAL_THRESH
             if is_low_lateral and is_side_approach:
-                # Side approach: standoff at same height and Y as fruit.
+                # Side approach: combine configured depth and lateral standoffs.
                 # Use one lateral direction for both APPROACH and FINAL so the wrist is already
                 # facing the fruit before the short grasp move begins.
-                _x_offset, _y_offset, _z_offset = low_side_standoff_offsets(node, x > trunk_x)
+                _x_offset, _y_offset, _z_offset = low_side_standoff_offsets(
+                    node, fruit_lat > trunk_lat)
                 low_side_dir = [-_x_offset, -_y_offset, 0.0]
                 _base_quat = list(cur_quat) if cur_quat is not None else list(target_quat)
                 orientation, _yaw_delta = side_low_wrist3_orientation(node, _base_quat, low_side_dir)
@@ -2984,10 +3032,13 @@ def plan_and_execute(node):
             else:
                 side_blend = 0.10 if is_low_lateral else 0.25
                 orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
-                _x_offset = 0.0
-                _y_offset = (getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
-                             if is_very_low_center
-                             else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07))
+                _depth_offset = (
+                    getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
+                    if is_very_low_center
+                    else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07)
+                )
+                _x_offset, _y_offset = add_axis_offsets(
+                    0.0, 0.0, depth=_depth_offset)
                 _z_offset = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
                              if is_very_low_center
                              else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
@@ -3021,7 +3072,7 @@ def plan_and_execute(node):
 
         def _final_offsets(is_slip_retry=False):
             if is_low and is_side_approach:
-                _side = "left" if x > trunk_x else "right"
+                _side = "left" if lateral_value(x, y) > trunk_lat else "right"
                 _default_z = 0.020 if _side == "left" else 0.010
                 return (
                     getattr(node.cfg.planner, "low_side_final_y_offset", 0.0),
@@ -3047,7 +3098,11 @@ def plan_and_execute(node):
             preview_steps = []
             # 1. Current position (HOME or side HOME)
             if is_side_approach:
-                side_label = "HOME_LEFT" if x > (node.trunk_x or 0.16) else "HOME_RIGHT"
+                side_label = (
+                    "HOME_LEFT"
+                    if lateral_value(x, y) > trunk_lateral(node)
+                    else "HOME_RIGHT"
+                )
                 side_js = node.home_left_joints if "LEFT" in side_label else node.home_right_joints
                 preview_steps.append({"label": side_label, "joints": side_js})
             else:
@@ -3056,8 +3111,14 @@ def plan_and_execute(node):
             if not skip_approach:
                 preview_steps.append({"label": "APPROACH", "position": approach[:3]})
             # 3. Final
-            _preview_y_offset, _preview_z_offset = _final_offsets(is_slip_retry=False)
-            preview_steps.append({"label": "FINAL", "position": [x, y - _preview_y_offset, z + _preview_z_offset]})
+            _preview_depth_offset, _preview_z_offset = _final_offsets(
+                is_slip_retry=False)
+            _preview_x, _preview_y = add_axis_offsets(
+                x, y, depth=-_preview_depth_offset)
+            preview_steps.append({
+                "label": "FINAL",
+                "position": [_preview_x, _preview_y, z + _preview_z_offset],
+            })
             # 4. Dropoff
             preview_steps.append({"label": "DROPOFF", "joints": node.dropoff_joints})
             # 5. Return HOME
@@ -3075,10 +3136,15 @@ def plan_and_execute(node):
                 lateral_label = image_lateral_side(
                     node, _cx, _cy, force_very_low_center=_is_very_low_label)
             else:
-                trunk_x_val = node.trunk_x or 0.16
-                dx_trunk = abs(x - trunk_x_val)
+                trunk_lat_val = trunk_lateral(node)
+                fruit_lat_val = lateral_value(x, y)
+                lateral_dist = abs(fruit_lat_val - trunk_lat_val)
                 height_label = "LOW" if is_low else "MID/HIGH"
-                lateral_label = ("LEFT" if x > trunk_x_val else "RIGHT") if dx_trunk > LATERAL_THRESH else "CENTER"
+                lateral_label = (
+                    ("LEFT" if fruit_lat_val > trunk_lat_val else "RIGHT")
+                    if lateral_dist > LATERAL_THRESH
+                    else "CENTER"
+                )
             node.get_logger().info(
                 f"PLAN PREVIEW: {height_label} | {lateral_label} | "
                 f"side={is_side_approach} | goal=[{x:.3f},{y:.3f},{z:.3f}] | "
@@ -3401,7 +3467,7 @@ def plan_and_execute(node):
         if _log_cycle_start:
             node.get_logger().info(f"FINAL orientation: reusing approach orientation (is_low={is_low})")
         _is_slip_retry = getattr(node, "_slip_retry_count", 0) > 0
-        y_offset, z_offset = _final_offsets(is_slip_retry=_is_slip_retry)
+        depth_offset, z_offset = _final_offsets(is_slip_retry=_is_slip_retry)
         fruit_radius = getattr(node, 'latest_fruit_radius', None) or 0.035
         # Recompute approach direction from current EE → reacquired fruit (not stale state_manager).
         # This ensures the approach vector is accurate after the arm has settled at standoff.
@@ -3437,11 +3503,13 @@ def plan_and_execute(node):
                     f"FINAL orientation: side-low local +Z/front aligned toward fruit "
                     f"(tilt={_front_tilt*57.3:.1f}deg cap={_front_tilt_cap:.1f}deg)")
 
-        gx, gy, gz = x, y - y_offset, z + z_offset
+        gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
+        gz = z + z_offset
         final_target = [gx, gy, gz, *orientation]
         if _log_cycle_start:
             node.get_logger().info(
-                f"FINAL target offsets: y=-{y_offset:.3f} z=+{z_offset:.3f} "
+                f"FINAL target offsets: depth=-{depth_offset:.3f} "
+                f"z=+{z_offset:.3f} "
                 f"target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
         node.motion_phase = "FINAL"
         # Vision is already "paused" from _vision_pause() — keep it that way for final move.

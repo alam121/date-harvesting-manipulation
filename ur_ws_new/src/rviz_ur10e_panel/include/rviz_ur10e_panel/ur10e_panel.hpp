@@ -95,9 +95,11 @@ private:
     double velocity_rms = std::numeric_limits<double>::quiet_NaN();
     double position_jitter_rms = std::numeric_limits<double>::quiet_NaN();
     double tracking_error_rms = std::numeric_limits<double>::quiet_NaN();
+    double tracking_error_max = std::numeric_limits<double>::quiet_NaN();
     double force_noise_rms = std::numeric_limits<double>::quiet_NaN();
     double torque_noise_rms = std::numeric_limits<double>::quiet_NaN();
     size_t sample_count = 0;
+    bool trajectory_tracking = false;
     bool valid = false;
   };
 

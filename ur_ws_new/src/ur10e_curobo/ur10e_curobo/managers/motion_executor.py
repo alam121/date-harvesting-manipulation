@@ -4,6 +4,7 @@
 import copy
 import threading
 import time
+from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
 import rclpy
 from rclpy.node import Node
@@ -12,8 +13,9 @@ from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
+from curobo.util_file import get_assets_path, get_robot_configs_path, join_path, load_yaml
 
-from ..config import WORLD_CONFIG, STATIC_OBSTACLES
+from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES
 from ..dynamic_obstacle import DynamicObstacleManager
 from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
@@ -74,17 +76,27 @@ class MotionExecutor:
             10
         )
 
-        # Wait for trunk detection to set pole position before cuRobo init
-        world_config = self._wait_for_trunk_and_build_world(timeout=40.0)
+        vision_enabled = self._config.cfg.perception.enabled
+        if vision_enabled:
+            # Use the detected trunk position before constructing the planner world.
+            world_config = self._wait_for_trunk_and_build_world(timeout=40.0)
+        else:
+            world_config = copy.deepcopy(WORLD_CONFIG)
+            self._node.get_logger().info(
+                "Vision disabled: skipping trunk detection wait and using "
+                "configured static obstacles"
+            )
 
         # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
         from ..static_obstacles import _obs_to_spec
         self.static_obstacles = [_obs_to_spec(i, obs) for i, obs in enumerate(STATIC_OBSTACLES)]
 
         # cuRobo setup
-        self._node.get_logger().info("Loading cuRobo configuration...")
+        robot_config = self._profile_curobo_config()
+        self._node.get_logger().info(
+            f"Loading cuRobo configuration for robot profile {ROBOT_PROFILE!r}...")
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            self._config.cfg.planner.urdf_config,
+            robot_config,
             world_config,
             interpolation_dt=self._config.cfg.planner.interpolation_dt
         )
@@ -107,11 +119,12 @@ class MotionExecutor:
         self.obstacles.add_sphere("dyn_sphere", radius=0.1)
         self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
 
-        # Voxel obstacle manager for depth-based collision avoidance
-        self.voxel_obstacles = VoxelObstacleManager(
-            node=self._node,
-            motion_gen=self.motion_gen
-        )
+        if vision_enabled:
+            # Voxel collision data is published by the vision node.
+            self.voxel_obstacles = VoxelObstacleManager(
+                node=self._node,
+                motion_gen=self.motion_gen
+            )
 
         # Teleop subscription
         self._node.create_subscription(
@@ -125,10 +138,46 @@ class MotionExecutor:
         self._node.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
         self._node.create_timer(1.0, self._publish_static_obstacles)
 
-        # One-shot timer to take initial voxel snapshot once depth data is available
-        self._initial_voxel_timer = self._node.create_timer(2.0, self._initial_voxel_snapshot)
+        if vision_enabled:
+            # Take the initial snapshot once the depth stream is available.
+            self._initial_voxel_timer = self._node.create_timer(
+                2.0, self._initial_voxel_snapshot
+            )
 
         self._node.get_logger().info("MotionExecutor initialized")
+
+    def _profile_curobo_config(self):
+        """Return a cuRobo config with geometry matching ROBOT_PROFILE."""
+        config_name = self._config.cfg.planner.urdf_config
+        if ROBOT_PROFILE == "new":
+            return config_name
+
+        robot_config = load_yaml(
+            join_path(get_robot_configs_path(), config_name))
+        kinematics = robot_config["robot_cfg"]["kinematics"]
+        source_urdf = Path(join_path(get_assets_path(), kinematics["urdf_path"]))
+        text = source_urdf.read_text()
+
+        replacements = {
+            'xyz="-0.008324 0.148998 0.040079"':
+                'xyz="0 0 -0.174"',
+            'rpy="-0.171298 -0.007406 -3.134152" '
+            'xyz="-0.001111 0.153451 0.081263"':
+                'rpy="-0.166668 0.013504 0.252667" '
+                'xyz="0.042550 -0.150154 0.074587"',
+        }
+        for current, previous in replacements.items():
+            if current not in text:
+                raise RuntimeError(
+                    f"Expected new-profile URDF transform not found: {current}")
+            text = text.replace(current, previous, 1)
+
+        profile_urdf = Path("/tmp/ur10e_curobo_old_profile.urdf")
+        profile_urdf.write_text(text)
+        kinematics["urdf_path"] = str(profile_urdf)
+        self._node.get_logger().info(
+            f"Generated old-profile cuRobo URDF: {profile_urdf}")
+        return robot_config
 
     def _wait_for_trunk_and_build_world(self, timeout: float = 15.0, collect_secs: float = 2.0) -> dict:
         """Wait for trunk position from vision, collect samples, then build WORLD_CONFIG."""

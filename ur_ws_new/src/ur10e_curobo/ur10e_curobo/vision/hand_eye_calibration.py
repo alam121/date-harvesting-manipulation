@@ -2,7 +2,7 @@
 Hand-eye calibration: find the transform from camera to gripper (eye-in-hand).
 
 Usage:
-  1. Print the chessboard pattern (18x25 squares, 30 mm each).
+  1. Generate and print the configured ChArUco board at 100% scale.
   2. Place the board flat and stationary in the robot's workspace.
   3. Run this script.
   4. Move the robot to ~15-20 different poses (vary rotation and translation)
@@ -13,6 +13,7 @@ Usage:
 The result (4x4 camera-to-gripper transform) is saved to a YAML file.
 """
 
+import argparse
 import re
 import sys
 import time
@@ -32,13 +33,27 @@ from scipy.spatial.transform import Rotation
 URDF_FILES = [
     Path(__file__).resolve().parents[4] / "src/universal_robot/urdf/ur_macro.xacro",
     Path(__file__).resolve().parents[5] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
-    Path(__file__).resolve().parents[3] / "ur10e_curobo.urdf",
+    Path(__file__).resolve().parents[1] / "ur10e_curobo.urdf",
 ]
 
-# ── Chessboard parameters ─────────────────────────────────────────────
-BOARD_ROWS = 10         # inner corners per row    (11 squares → 10 inner corners)
-BOARD_COLS = 7          # inner corners per column (8 squares → 7 inner corners)
-SQUARE_SIZE = 0.030     # square side length in metres (30 mm)
+# ── ChArUco board parameters ──────────────────────────────────────────
+# The supplied "7 x 24" dimensions are inner ChArUco corners, matching common
+# chessboard notation. Therefore the physical board is 8 x 25 squares and has
+# 100 marker positions.
+BOARD_INNER_X = 7
+BOARD_INNER_Y = 24
+BOARD_SQUARES_X = BOARD_INNER_X + 1
+BOARD_SQUARES_Y = BOARD_INNER_Y + 1
+SQUARE_SIZE = 0.030
+MARKER_SIZE = 0.022
+ARUCO_DICTIONARY_ID = cv2.aruco.DICT_5X5_100
+ARUCO_DICTIONARY_NAME = "DICT_5X5_100"
+MIN_CHARUCO_CORNERS = 12
+BOARD_DPI = 300
+
+# Legacy plain chessboard option: 7 × 10 inner corners (8 × 11 squares).
+CHESSBOARD_INNER_X = 7
+CHESSBOARD_INNER_Y = 10
 
 # ── Output path ───────────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).resolve().parent
@@ -47,6 +62,64 @@ OUTPUT_FILE = OUTPUT_DIR / "hand_eye_calibration.yaml"
 # ── TF frames ─────────────────────────────────────────────────────────
 BASE_FRAME = "base_link"
 EE_FRAME = "tool0"  # UR driver end-effector frame
+
+
+def create_charuco_board(
+    legacy_pattern=False,
+    squares_x=BOARD_SQUARES_X,
+    squares_y=BOARD_SQUARES_Y,
+):
+    dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY_ID)
+    board = cv2.aruco.CharucoBoard(
+        (squares_x, squares_y),
+        SQUARE_SIZE,
+        MARKER_SIZE,
+        dictionary,
+    )
+    board.setLegacyPattern(legacy_pattern)
+    return dictionary, board
+
+
+def generate_board_image(output_path: Path, target_type: str) -> None:
+    """Generate a print-ready PNG whose DPI metadata preserves physical size."""
+    from PIL import Image
+
+    if target_type == "charuco":
+        _, board = create_charuco_board()
+        squares_x = BOARD_SQUARES_X
+        squares_y = BOARD_SQUARES_Y
+    else:
+        board = None
+        squares_x = CHESSBOARD_INNER_X + 1
+        squares_y = CHESSBOARD_INNER_Y + 1
+
+    width_mm = squares_x * SQUARE_SIZE * 1000.0
+    height_mm = squares_y * SQUARE_SIZE * 1000.0
+    width_px = round(width_mm / 25.4 * BOARD_DPI)
+    height_px = round(height_mm / 25.4 * BOARD_DPI)
+    if target_type == "charuco":
+        image = board.generateImage(
+            (width_px, height_px), marginSize=0, borderBits=1)
+    else:
+        image = np.full((height_px, width_px), 255, dtype=np.uint8)
+        x_edges = np.rint(np.linspace(0, width_px, squares_x + 1)).astype(int)
+        y_edges = np.rint(np.linspace(0, height_px, squares_y + 1)).astype(int)
+        for row in range(squares_y):
+            for col in range(squares_x):
+                if (row + col) % 2 == 0:
+                    image[y_edges[row]:y_edges[row + 1],
+                          x_edges[col]:x_edges[col + 1]] = 0
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(image).save(output_path, dpi=(BOARD_DPI, BOARD_DPI))
+    print(f"Generated {target_type} board: {output_path}")
+    print(f"  Squares: {squares_x} x {squares_y}")
+    print(f"  Physical size: {width_mm:.0f} x {height_mm:.0f} mm")
+    print(f"  Square: {SQUARE_SIZE * 1000:.0f} mm")
+    if target_type == "charuco":
+        print(f"  Marker: {MARKER_SIZE * 1000:.0f} mm")
+        print(f"  Dictionary: {ARUCO_DICTIONARY_NAME}")
+    print("Print at 100% / Actual Size with all page scaling disabled.")
 
 
 def get_ee_pose(tf_buffer: Buffer, node: Node, timeout_sec: float = 2.0):
@@ -72,6 +145,40 @@ def rotation_matrix_to_rvec(R):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="UR10e hand-eye calibration")
+    parser.add_argument(
+        "--target",
+        choices=("charuco", "chessboard"),
+        default="charuco",
+        help="calibration target type (default: charuco)",
+    )
+    parser.add_argument(
+        "--resolution",
+        choices=("qhdplus", "4k"),
+        default="qhdplus",
+        help="ZED X One capture resolution (default: qhdplus)",
+    )
+    parser.add_argument(
+        "--generate-board",
+        nargs="?",
+        const="AUTO",
+        metavar="OUTPUT.png",
+        help="generate the selected print-ready target and exit",
+    )
+    args = parser.parse_args()
+    if args.generate_board:
+        if args.generate_board == "AUTO":
+            filename = (
+                "charuco_7x24_30mm_22mm_dict5x5_100.png"
+                if args.target == "charuco"
+                else "chessboard_8x11_30mm.png"
+            )
+            output_path = OUTPUT_DIR / filename
+        else:
+            output_path = Path(args.generate_board).expanduser().resolve()
+        generate_board_image(output_path, args.target)
+        return
+
     rclpy.init()
     node = Node("hand_eye_calibration")
     tf_buffer = Buffer()
@@ -99,7 +206,6 @@ def main():
     else:
         print()
         node.get_logger().error("TF not available after 60 s — is the robot driver running?")
-        zed.close()
         rclpy.shutdown()
         return
     print()
@@ -107,16 +213,24 @@ def main():
     # ── ZED X One Mono setup (CameraOne API) ─────────────────────────
     zed = sl.CameraOne()
     init_params = sl.InitParametersOne()
-    init_params.camera_resolution = sl.RESOLUTION.QHDPLUS  # match production resolution
-    init_params.camera_fps = 30
+    if args.resolution == "4k":
+        init_params.camera_resolution = sl.RESOLUTION.HD4K
+        init_params.camera_fps = 15
+        init_params.enable_hdr = False
+    else:
+        init_params.camera_resolution = sl.RESOLUTION.QHDPLUS
+        init_params.camera_fps = 30
+        init_params.enable_hdr = True
     init_params.coordinate_units = sl.UNIT.METER
-    init_params.enable_hdr = True   # same setting used during normal operation
 
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
         node.get_logger().error(f"ZED X One Mono open failed: {status}")
         return
-    node.get_logger().info("ZED X One Mono opened for hand-eye calibration.")
+    node.get_logger().info(
+        f"ZED X One Mono opened for hand-eye calibration "
+        f"({args.resolution}, HDR={'on' if init_params.enable_hdr else 'off'})."
+    )
 
     # CameraOne: calibration_parameters is the mono calibration directly (no .left_cam)
     cam_info = zed.get_camera_information()
@@ -134,9 +248,54 @@ def main():
 
     image_mat = sl.Mat()
 
-    # ── Chessboard object points ──────────────────────────────────────
-    objp = np.zeros((BOARD_ROWS * BOARD_COLS, 3), np.float32)
-    objp[:, :2] = np.mgrid[0:BOARD_COLS, 0:BOARD_ROWS].T.reshape(-1, 2) * SQUARE_SIZE
+    board = None
+    detector = None
+    objp = None
+    criteria = None
+    if args.target == "charuco":
+        dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY_ID)
+        charuco_params = cv2.aruco.CharucoParameters()
+        # Interpolate corners in image space. Supplying camera intrinsics here can
+        # reject all corners when the SDK calibration geometry differs between
+        # QHD+ and 4K, even though the marker outlines are detected correctly.
+        charuco_params.minMarkers = 1
+        charuco_params.tryRefineMarkers = True
+        detector_params = cv2.aruco.DetectorParameters()
+        detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        marker_detector = cv2.aruco.ArucoDetector(
+            dictionary, detector_params)
+        charuco_detectors = []
+        for squares_x, squares_y, orientation in (
+            (BOARD_SQUARES_X, BOARD_SQUARES_Y, "portrait"),
+            (BOARD_SQUARES_Y, BOARD_SQUARES_X, "landscape"),
+            (BOARD_INNER_X, BOARD_INNER_Y, "7x24-squares"),
+            (BOARD_INNER_Y, BOARD_INNER_X, "24x7-squares"),
+        ):
+            for legacy_pattern, layout in ((False, "modern"), (True, "legacy")):
+                _, candidate_board = create_charuco_board(
+                    legacy_pattern=legacy_pattern,
+                    squares_x=squares_x,
+                    squares_y=squares_y,
+                )
+                charuco_detectors.append(
+                    (
+                        f"{squares_x}x{squares_y} {orientation} {layout}",
+                        candidate_board,
+                        cv2.aruco.CharucoDetector(
+                            candidate_board, charuco_params, detector_params),
+                    )
+                )
+    else:
+        objp = np.zeros(
+            (CHESSBOARD_INNER_X * CHESSBOARD_INNER_Y, 3), np.float32)
+        objp[:, :2] = np.mgrid[
+            0:CHESSBOARD_INNER_X, 0:CHESSBOARD_INNER_Y
+        ].T.reshape(-1, 2) * SQUARE_SIZE
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            30,
+            0.001,
+        )
 
     # ── Storage for calibration data ──────────────────────────────────
     R_gripper2base_list = []   # rotation:    gripper -> base
@@ -144,12 +303,20 @@ def main():
     R_target2cam_list = []     # rotation:    chessboard -> camera
     t_target2cam_list = []     # translation: chessboard -> camera
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     sample_count = 0
 
     node.get_logger().info(
         f"Hand-eye calibration ready.\n"
-        f"  Chessboard: {BOARD_COLS}x{BOARD_ROWS}, square={SQUARE_SIZE*1000:.0f}mm\n"
+        + (
+            f"  ChArUco: {BOARD_INNER_X}x{BOARD_INNER_Y} inner corners "
+            f"({BOARD_SQUARES_X}x{BOARD_SQUARES_Y} squares), "
+            f"square={SQUARE_SIZE*1000:.0f}mm, marker={MARKER_SIZE*1000:.0f}mm\n"
+            f"  Dictionary: {ARUCO_DICTIONARY_NAME}\n"
+            if args.target == "charuco"
+            else f"  Chessboard: {CHESSBOARD_INNER_X}x{CHESSBOARD_INNER_Y} "
+                 f"inner corners, square={SQUARE_SIZE*1000:.0f}mm\n"
+        )
+        +
         f"  Move the robot, press 'c' to capture, 'q' to finish.\n"
         f"  Aim for 15-20 diverse poses."
     )
@@ -162,21 +329,77 @@ def main():
         frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel (BGRA→BGR)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Try to find chessboard
-        found, corners = cv2.findChessboardCorners(
-            gray, (BOARD_COLS, BOARD_ROWS),
-            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK,
-        )
-
         display = frame.copy()
-        if found:
-            corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            cv2.drawChessboardCorners(display, (BOARD_COLS, BOARD_ROWS), corners2, found)
-            cv2.putText(display, "Chessboard FOUND - press 'c' to capture",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if args.target == "charuco":
+            marker_corners, marker_ids, _ = marker_detector.detectMarkers(gray)
+            best_detection = None
+            for layout_name, candidate_board, candidate_detector in charuco_detectors:
+                candidate_corners, candidate_ids, _, _ = candidate_detector.detectBoard(
+                    gray,
+                    markerCorners=marker_corners,
+                    markerIds=marker_ids,
+                )
+                candidate_count = (
+                    0 if candidate_ids is None else len(candidate_ids)
+                )
+                if best_detection is None or candidate_count > best_detection[0]:
+                    best_detection = (
+                        candidate_count,
+                        layout_name,
+                        candidate_board,
+                        candidate_corners,
+                        candidate_ids,
+                    )
+            corner_count, layout_name, active_board, charuco_corners, charuco_ids = (
+                best_detection
+            )
+            marker_count = 0 if marker_ids is None else len(marker_ids)
+            found = corner_count >= MIN_CHARUCO_CORNERS
+            if marker_ids is not None and len(marker_ids) > 0:
+                cv2.aruco.drawDetectedMarkers(
+                    display, marker_corners, marker_ids)
+            if charuco_ids is not None and corner_count > 0:
+                cv2.aruco.drawDetectedCornersCharuco(
+                    display, charuco_corners, charuco_ids)
+            status_text = (
+                f"ChArUco FOUND: {marker_count} markers, "
+                f"{corner_count} corners ({layout_name}) - press 'c'"
+                if found
+                else f"Markers: {marker_count} | ChArUco corners: "
+                     f"{corner_count}/{MIN_CHARUCO_CORNERS} ({layout_name})"
+            )
         else:
-            cv2.putText(display, "No chessboard detected",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            found, chessboard_corners = cv2.findChessboardCorners(
+                gray,
+                (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
+                cv2.CALIB_CB_ADAPTIVE_THRESH
+                + cv2.CALIB_CB_NORMALIZE_IMAGE
+                + cv2.CALIB_CB_FAST_CHECK,
+            )
+            if found:
+                chessboard_corners = cv2.cornerSubPix(
+                    gray, chessboard_corners, (11, 11), (-1, -1), criteria)
+                cv2.drawChessboardCorners(
+                    display,
+                    (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
+                    chessboard_corners,
+                    found,
+                )
+            status_text = (
+                "Chessboard FOUND - press 'c'"
+                if found
+                else "No chessboard detected"
+            )
+
+        cv2.putText(
+            display,
+            status_text,
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0) if found else (0, 0, 255),
+            2,
+        )
 
         cv2.putText(display, f"Samples: {sample_count}  |  'c'=capture  'q'=calibrate & quit",
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -199,8 +422,13 @@ def main():
                 cv2.waitKey(1500)
                 continue
 
-            # Solve chessboard pose in camera frame
-            ret, rvec, tvec = cv2.solvePnP(objp, corners2, camera_matrix, dist_coeffs)
+            if args.target == "charuco":
+                obj_points, image_points = active_board.matchImagePoints(
+                    charuco_corners, charuco_ids)
+            else:
+                obj_points, image_points = objp, chessboard_corners
+            ret, rvec, tvec = cv2.solvePnP(
+                obj_points, image_points, camera_matrix, dist_coeffs)
             if not ret:
                 node.get_logger().warn("solvePnP failed — skipping.")
                 continue
@@ -437,7 +665,24 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp):
             print(f"  SKIP (joint not found): {urdf_path}")
             continue
         joint_old = match.group(1)
-        joint_new = pat_xyz_first.sub(repl_xyz_first, joint_old)
+        joint_new = joint_old
+
+        # The main xacro stores new/old robot camera transforms in one
+        # conditional origin. Update only the new-robot branch.
+        if "robot_profile == 'new'" in joint_old:
+            joint_new = re.sub(
+                r"""(xyz="\$\{')[^']*(' if robot_profile == 'new')""",
+                rf'\g<1>{xyz_str}\g<2>',
+                joint_new,
+            )
+            joint_new = re.sub(
+                r"""(rpy="\$\{')[^']*(' if robot_profile == 'new')""",
+                rf'\g<1>{rpy_str}\g<2>',
+                joint_new,
+            )
+
+        if joint_new == joint_old:
+            joint_new = pat_xyz_first.sub(repl_xyz_first, joint_old)
         if joint_new == joint_old:
             joint_new = pat_rpy_first.sub(repl_rpy_first, joint_old)
         if joint_new == joint_old:

@@ -8,6 +8,7 @@
    <!-- possible 'ur_type' values: ur3, ur5, ur10, ur3e, ur5e, ur7e, ur10e, ur12e, ur16e, ur8long, ur15, ur18, ur20, ur30 -->
    <!-- the default value should raise an error in case this was called without defining the type -->
    <xacro:arg name="ur_type" default="ur5x"/>
+   <xacro:arg name="robot_profile" default="new"/>
 
    <!-- parameters -->
    <xacro:arg name="tf_prefix" default="" />
@@ -88,6 +89,7 @@
    <!-- arm -->
    <xacro:ur_robot
      name="$(arg name)"
+     robot_profile="$(arg robot_profile)"
      tf_prefix="$(arg tf_prefix)"
      parent="world"
      joint_limits_parameters_file="$(arg joint_limit_params)"

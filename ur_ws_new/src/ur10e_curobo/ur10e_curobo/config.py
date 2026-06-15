@@ -25,6 +25,90 @@ LOW_Z_THRESH = 0.94
 # Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
 LATERAL_THRESH = 0.03
 
+# Change only this value when moving the software between robots.
+ROBOT_PROFILE = "new"  # "new" or "old"
+
+ROBOT_PROFILES = {
+    "new": {
+        "x_forward_y_lateral": True,
+        "joints": {
+            "home": [
+                0.1027379184961319, -1.7702552280821742, 2.3806751410113733,
+                -4.593595167199606, -1.8454354445086878, 2.8553261756896973,
+            ],
+            "dropoff": [
+                -1.085060343146324, -1.570564409295553, 2.355928007756368,
+                -2.613685270349020, -1.386652294789450, 2.914407730102539,
+            ],
+            "predropoff": [
+                -0.223708137869835, -1.685942789117330, 2.032441679631368,
+                2.154242201442383, -1.655924622212545, 3.139664408062593,
+            ],
+            "home_left": [
+                0.478533282876015, -1.346234158878662, 1.558529917393820,
+                2.368615074748657, -2.396069590245382, 2.668417453765869,
+            ],
+            "home_right": [
+                -0.899723514914513, -1.583177228967184, 1.820996824895040,
+                1.713459654445312, -0.714943234120504, -1.915191411972046,
+            ],
+            "home_right_low": [
+                -0.745371803641319, -1.571585317651266, 2.182028357182638,
+                1.685810013408325, -0.951295677815573, -2.485493898391724,
+            ],
+            "home_left_low": [
+                0.289905086159706, -1.360401467686035, 1.979759279881613,
+                1.732021971339844, -2.009532276784078, 2.741180419921875,
+            ],
+        },
+    },
+    "old": {
+        "x_forward_y_lateral": False,
+        "joints": {
+            "home": [
+                5.108725070953369, -1.794300218621725, 2.4091363588916224,
+                1.6457602220722656, 4.382841110229492, -0.23138553300966436,
+            ],
+            "dropoff": [
+                -2.362258497868673, -1.5946093998351039, 2.3843892256366175,
+                -2.6575151882567347, 4.8416242599487305, -0.17230397859682256,
+            ],
+            "predropoff": [
+                -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
+                -4.172773023644918, 4.572351932525635, 0.05295269936323166,
+            ],
+            "home_left": [
+                -0.7986648718463343, -1.370279149418213, 1.5869911352740687,
+                -3.958400150338644, 3.832206964492798, -0.4182942549334925,
+            ],
+            "home_right": [
+                -2.1769216696368616, -1.6072222195067347, 1.8494580427752894,
+                -4.613555570641989, 5.513333320617676, 1.2812821865081787,
+            ],
+            "home_right_low": [
+                -2.0225699583636683, -1.5956303081908167, 2.210489575062887,
+                -4.641205211678976, 5.276980876922607, 0.710979700088501,
+            ],
+            "home_left_low": [
+                -0.9872930685626429, -1.384446458225586, 2.0082204977618616,
+                -4.594993253747457, 4.218744277954102, -0.3455312887774866,
+            ],
+        },
+    },
+}
+
+if ROBOT_PROFILE not in ROBOT_PROFILES:
+    raise ValueError(
+        f"Unknown ROBOT_PROFILE {ROBOT_PROFILE!r}; "
+        f"choose one of {sorted(ROBOT_PROFILES)}")
+
+ACTIVE_ROBOT_PROFILE = ROBOT_PROFILES[ROBOT_PROFILE]
+X_FORWARD_Y_LATERAL = ACTIVE_ROBOT_PROFILE["x_forward_y_lateral"]
+
+
+def _profile_joints(name: str) -> List[float]:
+    return list(ACTIVE_ROBOT_PROFILE["joints"][name])
+
 # ---------- Static Obstacles (single source of truth) ----------
 # Define obstacles once here, used for both cuRobo planning and RViz visualization
 STATIC_OBSTACLES = [
@@ -40,7 +124,11 @@ STATIC_OBSTACLES = [
         "type": "cylinder",
         "radius": 0.02,    # 2cm radius = 4cm diameter trunk
         "height": 1.2,     # 1.2m visible trunk section
-        "pose": [0.16, -1.00, 0.6, 1, 0, 0, 0],  # center at 0.6m height
+        "pose": (
+            [1.00, 0.16, 0.6, 1, 0, 0, 0]
+            if X_FORWARD_Y_LATERAL
+            else [0.16, -1.00, 0.6, 1, 0, 0, 0]
+        ),
         "color": (0.55, 0.27, 0.07, 1.0),  # Brown
     },
 ]
@@ -62,7 +150,11 @@ WORLD_CONFIG = {
 # Voxel grid configuration for depth-based obstacle avoidance
 VOXEL_CONFIG = {
     "dims": [1.5, 1.5, 1.5],           # 1.5m cube workspace
-    "pose": [0.3, -0.5, 0.8, 1, 0, 0, 0],  # Workspace center (x, y, z, qw, qx, qy, qz)
+    "pose": (
+        [0.5, 0.3, 0.8, 1, 0, 0, 0]
+        if X_FORWARD_Y_LATERAL
+        else [0.3, -0.5, 0.8, 1, 0, 0, 0]
+    ),
     "voxel_size": 0.02,                # 2cm resolution
     "max_esdf_distance": 0.3,          # Max distance to compute ESDF
     # Collision verification parameters
@@ -110,30 +202,15 @@ class Topics:
 
 @dataclass
 class JointsPreset:
-    home: List[float] = field(default_factory=lambda: [5.108725070953369, -1.794300218621725, 2.4091363588916224, 1.6457602220722656, 4.382841110229492, -0.23138553300966436]
-
-)
-    dropoff: List[float] = field(default_factory=lambda: [-2.362258497868673, -1.5946093998351039, 2.3843892256366175, -2.6575151882567347, 4.8416242599487305, -0.17230397859682256]
-)
-    
-    
-    predropoff: List[float] = field(default_factory=lambda: [-1.5009062925921839, -1.7099877796568812, 2.0609028975116175, -4.172773023644918, 4.572351932525635, 0.05295269936323166]
-)
-    # Side home positions for laterally distant fruits
-    home_left: List[float] = field(default_factory=lambda:  [-0.7986648718463343, -1.370279149418213, 1.5869911352740687, -3.958400150338644, 3.832206964492798, -0.4182942549334925]
-
-
-)
-    home_right: List[float] = field(default_factory=lambda:  [-2.1769216696368616, -1.6072222195067347, 1.8494580427752894, -4.613555570641989, 5.513333320617676, 1.2812821865081787]
-
-
-)
-    home_right_low: List[float] = field(default_factory=lambda:  [-2.0225699583636683, -1.5956303081908167, 2.210489575062887, -4.641205211678976, 5.276980876922607, 0.710979700088501]
-
-)
-    home_left_low: List[float] = field(default_factory=lambda: [-0.9872930685626429, -1.384446458225586, 2.0082204977618616, -4.594993253747457, 4.218744277954102, -0.3455312887774866]
-
-)
+    home: List[float] = field(default_factory=lambda: _profile_joints("home"))
+    dropoff: List[float] = field(default_factory=lambda: _profile_joints("dropoff"))
+    predropoff: List[float] = field(default_factory=lambda: _profile_joints("predropoff"))
+    home_left: List[float] = field(default_factory=lambda: _profile_joints("home_left"))
+    home_right: List[float] = field(default_factory=lambda: _profile_joints("home_right"))
+    home_right_low: List[float] = field(
+        default_factory=lambda: _profile_joints("home_right_low"))
+    home_left_low: List[float] = field(
+        default_factory=lambda: _profile_joints("home_left_low"))
 
 @dataclass
 class Planner:
@@ -188,11 +265,11 @@ class Planner:
     very_low_preflight_pitch_steps: int = 3
     very_low_clearance_window_mm: float = 8.0   # choose path cost only among near-safest IK branches
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
-    side_home_x_offset: float = 0.16            # m; |EE x - trunk_x| for side home (left = trunk_x + offset, right = trunk_x - offset)
+    side_home_x_offset: float = 0.16            # Legacy name: lateral Y offset for side home
     side_home_partial_reverse_m: float = 0.55   # m; partial reverse clearance for side-approach fruits (vs 0.35m center)
 
 
-    mid_center_approach_y_offset: float = 0.10
+    mid_center_approach_y_offset: float = 0.10  # Legacy name: forward/back X standoff
     mid_center_approach_z_offset: float = -0.05
     mid_high_left_thresh: float = 0.20      # bunch/image rel-x below this is MID/HIGH LEFT
     mid_high_right_thresh: float = 0.80     # bunch/image rel-x above this is MID/HIGH RIGHT
@@ -203,39 +280,39 @@ class Planner:
 
 
 
-    low_center_approach_y_offset: float = 0.03
+    low_center_approach_y_offset: float = 0.03  # Legacy name: forward/back X standoff
     low_center_approach_z_offset: float = -0.07
 
 
-    very_low_center_approach_y_offset: float = 0.08
+    very_low_center_approach_y_offset: float = 0.08  # Legacy name: forward/back X standoff
     very_low_center_approach_z_offset: float = -0.050
     very_low_center_approach_pitch_deg: float = 5.0  # local tool X pitch to open forearm-flange clearance
 
 
-    low_left_standoff_x: float = 0.12           # m; left side-low lateral standoff
-    low_left_standoff_y: float = 0.035          # m; left side-low back standoff
+    low_left_standoff_x: float = 0.12           # Legacy name: left side-low lateral Y standoff
+    low_left_standoff_y: float = 0.035          # Legacy name: side-low depth X standoff
     low_left_standoff_z: float = -0.055         # m; left side-low vertical standoff
 
 
 
-    low_right_standoff_x: float = 0.08          # m; right side-low lateral standoff
-    low_right_standoff_y: float = 0.050         # m; right side-low back standoff
+    low_right_standoff_x: float = 0.08          # Legacy name: right side-low lateral Y standoff
+    low_right_standoff_y: float = 0.050         # Legacy name: side-low depth X standoff
     low_right_standoff_z: float = -0.025        # m; avoid large upward push on right-side final
 
 
 
 
-    low_side_final_y_offset: float = 0.0        # m; keep side-low final motion lateral
+    low_side_final_y_offset: float = 0.0        # Legacy name: final X offset
     low_left_final_z_offset: float = 0.020      # m; left side-low gripper center offset
     low_right_final_z_offset: float = 0.010     # m; right side-low gripper center offset
 
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
-    low_center_final_y_offset: float = -0.01    # m; small pull toward camera for low-center final
+    low_center_final_y_offset: float = -0.01    # Legacy name: final X offset
     low_center_final_z_offset: float = 0.030    # m; gripper center offset above low-center fruit
 
-    mid_center_final_y_offset: float = -0.02    # m; small pull toward camera/robot for MID/HIGH center final
+    mid_center_final_y_offset: float = -0.02    # Legacy name: final X offset
     mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
@@ -255,7 +332,7 @@ class Planner:
 
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
-    pre_dropoff_y_offset: float = 0.25  # m back from dropoff
+    pre_dropoff_y_offset: float = 0.25  # Legacy name: X back/forward offset
 
     # === REACQUIRE ===
     reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
@@ -267,6 +344,8 @@ class Planner:
     subscribe_goal_median_window: int = 5      # recent XYZ samples for fast fallback median
 
     # === DEBUG ===
+    use_fake_hardware: bool = False    # ros2_control mock hardware never publishes robot_program_running;
+                                        # treat the program as always "running" so wait_until_xyz doesn't stall
     debug_plan_preview: bool = True    # show full plan and wait for confirmation before executing
     log_cycle_start: bool = False      # verbose per-goal start/decision metadata
     log_phase_timings: bool = False    # per-phase timing lines; cycle summary always includes timings
@@ -275,7 +354,7 @@ class Planner:
 
 @dataclass
 class Perception:
-    enabled: bool = True
+    enabled: bool = False
     weights: str = "yolov8n-seg.pt"
     img_size: int = 512
     conf_thres: float = 0.45

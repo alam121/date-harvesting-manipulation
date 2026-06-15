@@ -7,7 +7,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER
+from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE
 
 if TYPE_CHECKING:
     pass
@@ -60,7 +60,8 @@ class ConfigManager:
         self._apply_env_overrides()
         self._expose_shortcuts()
         self._node.add_on_set_parameters_callback(self._on_parameter_change)
-        self._node.get_logger().info("ConfigManager initialized")
+        self._node.get_logger().info(
+            f"ConfigManager initialized with robot profile {ROBOT_PROFILE!r}")
 
     def _declare_parameters(self) -> None:
         """Declare all ROS parameters with defaults from AppConfig."""
@@ -102,6 +103,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.bunch_lower_center_band", self.cfg.planner.bunch_lower_center_band)
         self._node.declare_parameter("planner.final_overshoot_threshold", self.cfg.planner.final_overshoot_threshold)
         self._node.declare_parameter("planner.final_overshoot_max_backoff", self.cfg.planner.final_overshoot_max_backoff)
+        self._node.declare_parameter("planner.use_fake_hardware", self.cfg.planner.use_fake_hardware)
         self._node.declare_parameter("planner.debug_plan_preview", self.cfg.planner.debug_plan_preview)
         self._node.declare_parameter("planner.log_cycle_start", self.cfg.planner.log_cycle_start)
         self._node.declare_parameter("planner.log_phase_timings", self.cfg.planner.log_phase_timings)
@@ -184,6 +186,7 @@ class ConfigManager:
         self.cfg.planner.bunch_lower_center_band = float(self._node.get_parameter("planner.bunch_lower_center_band").value)
         self.cfg.planner.final_overshoot_threshold = float(self._node.get_parameter("planner.final_overshoot_threshold").value)
         self.cfg.planner.final_overshoot_max_backoff = float(self._node.get_parameter("planner.final_overshoot_max_backoff").value)
+        self.cfg.planner.use_fake_hardware = bool(self._node.get_parameter("planner.use_fake_hardware").value)
         self.cfg.planner.debug_plan_preview = bool(self._node.get_parameter("planner.debug_plan_preview").value)
         self.cfg.planner.log_cycle_start = bool(self._node.get_parameter("planner.log_cycle_start").value)
         self.cfg.planner.log_phase_timings = bool(self._node.get_parameter("planner.log_phase_timings").value)

@@ -11,6 +11,9 @@ setup(
         f"{package_name}.vision",
         f"{package_name}.teleop",
     ],
+    package_data={
+        f"{package_name}.vision": ["charuco_7x24_30mm_22mm_dict5x5_100.png"],
+    },
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
@@ -37,4 +40,3 @@ setup(
         ],
     },
 )
-

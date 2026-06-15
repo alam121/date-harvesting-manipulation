@@ -57,6 +57,7 @@
 
   <xacro:macro name="ur_robot" params="
     name
+    robot_profile:=new
     tf_prefix
     parent
     *origin
@@ -501,7 +502,9 @@
     <joint name="tool0_to_mount" type="fixed">
   <parent link="tool0"/>
   <child link="tool0_to_camera_mount_link"/>
-  <origin xyz="0 0 0" rpy="0 0 0"/>
+  <origin
+    xyz="${'-0.008324 0.148998 -0.016921' if robot_profile == 'new' else '0 0 0'}"
+    rpy="0 0 0"/>
 </joint>
 
 <link name="zed2_left_camera_frame">
@@ -540,7 +543,9 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin xyz="0.042550 -0.150154 0.074587" rpy="-0.166668 0.013504 0.252667"/><!-- hand-eye calibrated (DANIILIDIS, 4.02mm error, 36 samples, updated 2026-05-03 21:59:45) -->
+    <origin
+      xyz="${'-0.001111 0.153451 0.081263' if robot_profile == 'new' else '0.042550 -0.150154 0.074587'}"
+      rpy="${'-0.171298 -0.007406 -3.134152' if robot_profile == 'new' else '-0.166668 0.013504 0.252667'}"/>
   </joint>
 
     

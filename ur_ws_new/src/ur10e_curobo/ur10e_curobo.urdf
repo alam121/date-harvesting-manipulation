@@ -1011,7 +1011,7 @@
   <joint name="tool0_to_mount" type="fixed">
     <parent link="tool0"/>
     <child link="tool0_to_camera_mount_link"/>
-    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="-0.116616 0.110078 -0.024749"/>
   </joint>
   <link name="zed2_left_camera_frame">
     <visual>
@@ -1038,8 +1038,8 @@
   <joint name="tool0_to_zed2_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed2_left_camera_frame"/>
-    <origin rpy="-0.172164 0.008484 0.204048" xyz="0.034102 -0.153032 0.079616"/>
-    <!-- hand-eye calibrated (DANIILIDIS, 2.05mm error, 32 samples, 2026-04-26) -->
+    <origin rpy="-0.171298 -0.007406 -3.134152" xyz="-0.001111 0.153451 0.081263"/>
+    <!-- hand-eye calibrated (DANIILIDIS, 2.03mm error, 34 samples, 2026-06-14 16:55:16) -->
   </joint>
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>

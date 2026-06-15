@@ -44,7 +44,7 @@ class UR10eCuroboMoveIt(Node):
     def __init__(self):
         super().__init__(
             "ur10e_curobo_moveit_node",
-            automatically_declare_parameters_from_overrides=True
+            automatically_declare_parameters_from_overrides=False
         )
 
         # Thread-safety: lock held during plan_single / plan_single_js
@@ -95,6 +95,12 @@ class UR10eCuroboMoveIt(Node):
             '/external_goal_pose',        # always listen to new poses
             self._continuous_goal_tracker,  # callback function below
             self.goal_qos
+        )
+        self.create_subscription(
+            PoseStamped,
+            '/manual_goal_pose',
+            self._manual_goal_pose_cb,
+            self.goal_qos,
         )
 
         # Subscribe to fruit radius from vision for adaptive gripper
@@ -604,7 +610,7 @@ class UR10eCuroboMoveIt(Node):
                 curr_pose = self.get_end_effector_pose()
                 print(f"  current pose: {curr_pose}")
                 self._manual_goal()
-                print(f"[{ts()}] manual goal entry done. total goals={len(self.goal_poses)}")
+                print(f"[{ts()}] manual goal command dispatched.")
 
             elif key == 's':
                 print(f"[{ts()}] subscribing to /external_goal_pose…")
@@ -700,9 +706,50 @@ class UR10eCuroboMoveIt(Node):
         except ValueError:
             print("Invalid input."); return
         goal = [x, y, z] + (cur[3:] if cur else [1.0,0.0,0.0,0.0])
-        self.goal_poses.append(goal)
-        markers_mod.publish_goal_marker(self, goal[:3]) 
-        print("Manual goal saved.")
+        self._start_manual_goal(goal)
+        print("Manual goal sent directly.")
+
+    def _manual_goal_pose_cb(self, msg: PoseStamped):
+        """Execute an RViz manual pose directly, without the harvest sequence."""
+        if msg.header.frame_id and msg.header.frame_id != "base_link":
+            self.get_logger().warn(
+                f"Manual goal frame must be base_link, got {msg.header.frame_id!r}.")
+            return
+        goal = [
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+        ]
+        self._start_manual_goal(goal)
+
+    def _start_manual_goal(self, goal):
+        """Plan once from the current state directly to a manual Cartesian goal."""
+        markers_mod.publish_goal_marker(self, goal[:3])
+
+        def run_manual_goal():
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn(
+                    "Motion already in progress, ignoring manual goal.")
+                return
+            try:
+                self.stop_requested = False
+                self.motion_phase = "MANUAL"
+                self.get_logger().info(
+                    "Executing direct manual goal: "
+                    f"[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
+                if motions_mod.execute_single_pose(self, goal, motion_type="manual"):
+                    self.get_logger().info("Direct manual goal reached.")
+                else:
+                    self.get_logger().warn("Direct manual goal failed or was stopped.")
+            finally:
+                self.motion_phase = "IDLE"
+                self._motion_lock.release()
+
+        threading.Thread(target=run_manual_goal, daemon=True).start()
 
     def _continuous_goal_tracker(self, msg: PoseStamped):
         # Always store latest goal pose unconditionally for immediate access

@@ -25,7 +25,7 @@ import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 from .config import (
     CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
-    TRUNK_Y_OFFSET,
+    TRUNK_DEPTH_OFFSET,
     USE_LIDAR, LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDXONE_IMAGE_TOPIC, ZEDXONE_WIDTH, ZEDXONE_HEIGHT,
     ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
@@ -37,6 +37,7 @@ from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
     lidar_pts_in_mask, centroid_from_lidar_pts,
 )
+from ..config import X_FORWARD_Y_LATERAL
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
 from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings, apply_zed_stereo_settings
@@ -1096,7 +1097,11 @@ class VisionNode:
                 pt_base.header.frame_id = "base_link"
                 pt_base.header.stamp = rclpyTime().to_msg()
                 pt_base.point.x = float(_xyz_b[0])
-                pt_base.point.y = float(_xyz_b[1]) + TRUNK_Y_OFFSET
+                pt_base.point.y = float(_xyz_b[1])
+                if X_FORWARD_Y_LATERAL:
+                    pt_base.point.x -= TRUNK_DEPTH_OFFSET
+                else:
+                    pt_base.point.y += TRUNK_DEPTH_OFFSET
                 pt_base.point.z = float(_xyz_b[2])
             else:
                 point_msg = PointStamped()
@@ -1107,7 +1112,10 @@ class VisionNode:
                 point_msg.point.z = _trunk_xyz_cam[2]
                 pt_base = self.tf_buffer.transform(
                     point_msg, "base_link", timeout=rclpyDuration(seconds=0.005))
-                pt_base.point.y += TRUNK_Y_OFFSET
+                if X_FORWARD_Y_LATERAL:
+                    pt_base.point.x -= TRUNK_DEPTH_OFFSET
+                else:
+                    pt_base.point.y += TRUNK_DEPTH_OFFSET
             trunk_pub.publish(pt_base)
             return True
         except Exception:

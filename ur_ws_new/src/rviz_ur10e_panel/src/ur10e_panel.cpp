@@ -338,8 +338,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   goal_layout->addWidget(new QLabel("qy"), 2, 2); goal_layout->addWidget(qy_in_, 2, 3);
   goal_layout->addWidget(new QLabel("qz"), 3, 2); goal_layout->addWidget(qz_in_, 3, 3);
 
-  auto * send_btn = new QPushButton("Send Goal");
+  auto * send_btn = new QPushButton("Move Directly");
   send_btn->setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;");
+  send_btn->setToolTip("Plan once from the current robot pose directly to this manual goal");
   connect(send_btn, &QPushButton::clicked, this, &UR10ePanel::onSendGoal);
   goal_layout->addWidget(send_btn, 4, 0, 1, 4);
 
@@ -360,15 +361,17 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   layout->addWidget(capture_group);
 
   // Stability recorder
-  auto * stability_group = new QGroupBox("Robot Stability");
+  auto * stability_group = new QGroupBox("Robot Stability / Tracking");
   auto * stability_layout = new QVBoxLayout(stability_group);
 
-  stability_record_btn_ = new QPushButton("Record Stability");
+  stability_record_btn_ = new QPushButton("Record Stability / Tracking");
   stability_record_btn_->setStyleSheet(
     "background-color: #3949ab; color: white; font-weight: bold; "
     "font-size: 10pt; padding: 7px;");
   stability_record_btn_->setToolTip(
     "Record joint motion, trajectory tracking error, and TCP wrench.\n"
+    "Moving samples are rated for trajectory tracking; settled samples are "
+    "rated for stability.\n"
     "Press again to stop, calculate a rating, and save the CSV.");
   connect(
     stability_record_btn_, &QPushButton::clicked,
@@ -587,7 +590,7 @@ void UR10ePanel::setupRos()
     .reliability(rclcpp::ReliabilityPolicy::BestEffort)
     .durability(rclcpp::DurabilityPolicy::Volatile);
   goal_pub_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
-    "/external_goal_pose", goal_qos);
+    "/manual_goal_pose", goal_qos);
 
   stop_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/emergency_stop", 10);
 
@@ -1040,7 +1043,10 @@ void UR10ePanel::stopStabilityRecording()
     trajectory_csv_path = trajectory_csv_path_;
 
     if (stability_csv_.is_open()) {
-      stability_csv_ << "\n# rating_score," << result.score << "\n";
+      stability_csv_ << "\n# result_mode," <<
+        (result.trajectory_tracking ? "trajectory_tracking" :
+        "stationary_stability") << "\n";
+      stability_csv_ << "# rating_score," << result.score << "\n";
       stability_csv_ << "# rating," <<
         (result.valid ? ratingName(result.score) : "Insufficient data") << "\n";
       stability_csv_ << "# rating_window_s,2.0\n";
@@ -1050,6 +1056,8 @@ void UR10ePanel::stopStabilityRecording()
         result.position_jitter_rms << "\n";
       stability_csv_ << "# tracking_error_rms_rad," <<
         result.tracking_error_rms << "\n";
+      stability_csv_ << "# tracking_error_max_rad," <<
+        result.tracking_error_max << "\n";
       stability_csv_ << "# force_noise_rms_N," << result.force_noise_rms << "\n";
       stability_csv_ << "# torque_noise_rms_Nm," << result.torque_noise_rms << "\n";
       stability_csv_.flush();
@@ -1061,7 +1069,7 @@ void UR10ePanel::stopStabilityRecording()
     }
   }
 
-  stability_record_btn_->setText("Record Stability");
+  stability_record_btn_->setText("Record Stability / Tracking");
   stability_record_btn_->setStyleSheet(
     "background-color: #3949ab; color: white; font-weight: bold; "
     "font-size: 10pt; padding: 7px;");
@@ -1083,16 +1091,37 @@ void UR10ePanel::stopStabilityRecording()
   const QString tracking_text = std::isfinite(result.tracking_error_rms) ?
     QString("%1 deg").arg(result.tracking_error_rms * 180.0 / M_PI, 0, 'f', 3) :
     QString("n/a");
-  stability_result_label_->setText(
-    QString("%1 - %2/100\nVelocity RMS: %3 rad/s | Jitter: %4 deg\n"
-            "Tracking RMS: %5\nStability CSV: %6\nTrajectory CSV: %7")
-    .arg(rating)
-    .arg(result.score, 0, 'f', 1)
-    .arg(result.velocity_rms, 0, 'f', 4)
-    .arg(result.position_jitter_rms * 180.0 / M_PI, 0, 'f', 3)
-    .arg(tracking_text)
-    .arg(QString::fromStdString(csv_path))
-    .arg(QString::fromStdString(trajectory_csv_path)));
+  if (result.trajectory_tracking) {
+    const QString tracking_max_text =
+      std::isfinite(result.tracking_error_max) ?
+      QString("%1 deg").arg(
+        result.tracking_error_max * 180.0 / M_PI, 0, 'f', 3) :
+      QString("n/a");
+    stability_result_label_->setText(
+      QString("Trajectory Tracking: %1 - %2/100\n"
+              "Position error RMS: %3 | Max: %4\n"
+              "Motion velocity RMS: %5 rad/s\n"
+              "Stability CSV: %6\nTrajectory CSV: %7")
+      .arg(rating)
+      .arg(result.score, 0, 'f', 1)
+      .arg(tracking_text)
+      .arg(tracking_max_text)
+      .arg(result.velocity_rms, 0, 'f', 4)
+      .arg(QString::fromStdString(csv_path))
+      .arg(QString::fromStdString(trajectory_csv_path)));
+  } else {
+    stability_result_label_->setText(
+      QString("Stationary Stability: %1 - %2/100\n"
+              "Velocity RMS: %3 rad/s | Position jitter: %4 deg\n"
+              "Tracking RMS: %5\nStability CSV: %6\nTrajectory CSV: %7")
+      .arg(rating)
+      .arg(result.score, 0, 'f', 1)
+      .arg(result.velocity_rms, 0, 'f', 4)
+      .arg(result.position_jitter_rms * 180.0 / M_PI, 0, 'f', 3)
+      .arg(tracking_text)
+      .arg(QString::fromStdString(csv_path))
+      .arg(QString::fromStdString(trajectory_csv_path)));
+  }
 
   const char * bg = result.score >= 75.0 ? "#e8f5e9" :
     (result.score >= 60.0 ? "#fff8e1" : "#ffebee");
@@ -1102,7 +1131,9 @@ void UR10ePanel::stopStabilityRecording()
     QString("font-size: 9pt; padding: 5px; background: %1; "
             "color: %2; border-radius: 4px;").arg(bg).arg(fg));
   status_label_->setText(
-    QString("Stability: %1 (%2/100), saved %3")
+    QString("%1: %2 (%3/100), saved %4")
+    .arg(result.trajectory_tracking ? "Trajectory tracking" :
+      "Stationary stability")
     .arg(rating)
     .arg(result.score, 0, 'f', 1)
     .arg(QString::fromStdString(csv_path)));
@@ -1270,6 +1301,7 @@ UR10ePanel::StabilityResult UR10ePanel::calculateStabilityLocked() const
   size_t velocity_count = 0;
   double error_sq_sum = 0.0;
   size_t error_count = 0;
+  double tracking_error_max = 0.0;
   std::array<double, 6> position_sum{};
   std::array<double, 6> wrench_sum{};
   std::array<size_t, 6> wrench_count{};
@@ -1283,6 +1315,8 @@ UR10ePanel::StabilityResult UR10ePanel::calculateStabilityLocked() const
       }
       if (std::isfinite(sample.tracking_errors[i])) {
         error_sq_sum += sample.tracking_errors[i] * sample.tracking_errors[i];
+        tracking_error_max = std::max(
+          tracking_error_max, std::abs(sample.tracking_errors[i]));
         ++error_count;
       }
       if (std::isfinite(sample.wrench[i])) {
@@ -1319,6 +1353,8 @@ UR10ePanel::StabilityResult UR10ePanel::calculateStabilityLocked() const
   result.tracking_error_rms = error_count > 0 ?
     std::sqrt(error_sq_sum / static_cast<double>(error_count)) :
     std::numeric_limits<double>::quiet_NaN();
+  result.tracking_error_max = error_count > 0 ?
+    tracking_error_max : std::numeric_limits<double>::quiet_NaN();
 
   double force_variance_sum = 0.0;
   double torque_variance_sum = 0.0;
@@ -1344,6 +1380,17 @@ UR10ePanel::StabilityResult UR10ePanel::calculateStabilityLocked() const
   result.torque_noise_rms = torque_axes > 0 ?
     std::sqrt(torque_variance_sum / static_cast<double>(torque_axes)) :
     std::numeric_limits<double>::quiet_NaN();
+
+  // A moving robot should be judged by how closely it follows the controller
+  // reference. Joint travel and velocity are expected motion, not instability.
+  result.trajectory_tracking =
+    std::isfinite(result.velocity_rms) && result.velocity_rms > 0.030;
+  if (result.trajectory_tracking) {
+    result.valid = error_count > 0;
+    result.score = result.valid ?
+      metricScore(result.tracking_error_rms, 0.00175, 0.0175) : 0.0;
+    return result;
+  }
 
   const std::array<double, 5> scores = {
     metricScore(result.velocity_rms, 0.002, 0.030),
@@ -1395,7 +1442,7 @@ void UR10ePanel::onSendGoal()
   double qy = qy_in_->text().toDouble(&ok); if (!ok) return;
   double qz = qz_in_->text().toDouble(&ok); if (!ok) return;
   publishGoal(x, y, z, qw, qx, qy, qz);
-  status_label_->setText(QString("Goal sent: (%1, %2, %3)").arg(x, 0, 'f', 3).arg(y, 0, 'f', 3).arg(z, 0, 'f', 3));
+  status_label_->setText(QString("Direct manual goal sent: (%1, %2, %3)").arg(x, 0, 'f', 3).arg(y, 0, 'f', 3).arg(z, 0, 'f', 3));
   status_label_->setStyleSheet(
     "color: #2d6a4f; font-weight: bold; padding: 4px; "
     "background: #e8f5e9; border-radius: 4px;");

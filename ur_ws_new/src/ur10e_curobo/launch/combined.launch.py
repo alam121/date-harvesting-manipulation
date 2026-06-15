@@ -6,6 +6,7 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -58,6 +59,14 @@ def generate_launch_description():
         executable='main',
         name='ur10e_control',
         output='screen',
+        parameters=[{
+            'planner.use_fake_hardware': ParameterValue(
+                LaunchConfiguration('use_fake_hardware'), value_type=bool
+            ),
+            'perception.enabled': ParameterValue(
+                LaunchConfiguration('vision'), value_type=bool
+            ),
+        }],
         condition=IfCondition(LaunchConfiguration('main'))
     )
 

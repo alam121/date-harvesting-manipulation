@@ -94,9 +94,9 @@ CLASS_FILTER_ENABLED = True
 GOAL_CLASS_NAME = "date-fruits-77rw"  # class picked as grasp target (must match model.names)
 VIZ_ONLY_CLASSES = ["trunk"]          # classes shown in visualization only
 
-# Trunk depth correction: camera overestimates trunk distance (Y in base_link)
+# Trunk depth correction along the configured forward/back axis.
 # Positive value moves pole closer to robot. Tune per setup.
-TRUNK_Y_OFFSET = 0.0  # meters — added to detected Y (tune if camera depth is off)
+TRUNK_DEPTH_OFFSET = 0.0
 
 # ── ZED X One Mono (SN57931814) — QHD+ / QHDPLUS with HDR ───────────────────
 # QHDPLUS (3200x1800) is the maximum resolution that supports HDR on ZED X One.

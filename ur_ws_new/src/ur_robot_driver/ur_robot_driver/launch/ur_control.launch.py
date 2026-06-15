@@ -60,6 +60,7 @@ def launch_setup(context, *args, **kwargs):
     controllers_file = LaunchConfiguration("controllers_file")
     description_package = LaunchConfiguration("description_package")
     description_file = LaunchConfiguration("description_file")
+    robot_profile = LaunchConfiguration("robot_profile")
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     tf_prefix = LaunchConfiguration("tf_prefix")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
@@ -109,6 +110,9 @@ def launch_setup(context, *args, **kwargs):
             PathJoinSubstitution([FindExecutable(name="xacro")]),
             " ",
             PathJoinSubstitution([FindPackageShare(description_package), "urdf", description_file]),
+            " ",
+            "robot_profile:=",
+            robot_profile,
             " ",
             "robot_ip:=",
             robot_ip,
@@ -507,6 +511,14 @@ def generate_launch_description():
             "description_file",
             default_value="ur.urdf.xacro",
             description="URDF/XACRO description file with the robot.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "robot_profile",
+            default_value="new",
+            choices=["new", "old"],
+            description="Selects robot-specific camera and mount transforms.",
         )
     )
     declared_arguments.append(

@@ -35,7 +35,13 @@ class StateManager:
         # Control flags
         self._running: bool = True
         self._stop_requested: bool = False
-        self._robot_running: bool = False
+        # With fake hardware, the GPIO "program_running" state interface stays at its
+        # initial value (0) forever, so the io_and_status_controller never publishes
+        # /io_and_status_controller/robot_program_running. Default to True in that case
+        # so wait_until_xyz() doesn't sit forever in the "Robot program OFF" branch.
+        self._robot_running: bool = bool(
+            self._config.cfg.planner.use_fake_hardware
+        )
 
         # TF status flags (for logging suppression)
         self.tf_warning_printed: bool = False
@@ -217,6 +223,11 @@ class StateManager:
 
     def _robot_running_cb(self, msg: Bool) -> None:
         """Track robot program running state."""
+        if self._config.cfg.planner.use_fake_hardware:
+            # Mock hardware has no UR program, so its GPIO controller reports
+            # false even while the trajectory controller is active.
+            self._robot_running = True
+            return
         self._robot_running = msg.data
         if msg.data:
             self._node.get_logger().info("Robot program is running.")
