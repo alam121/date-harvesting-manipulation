@@ -1,236 +1,262 @@
-
 # ManipulatorsDatePalm
 
-## Current Latest
-- Branch: `dev_current`
-- Vision: external `date_v1.9.py` node (publishes `/external_goal_pose`)
-- Manipulator: `ros2 run ur10e_curobo main`
+Main repository for the UR10e date-palm harvesting system.
 
-## Overview
+This repo contains the ROS 2 Humble workspace, UR10e/cuRobo control stack,
+RViz operator panel, vision pipeline, Delto gripper integration, LiDAR scan
+workflow, camera recording tools, and supporting robot-driver changes used for
+date harvesting experiments.
 
-ROS 2 Humble control stack for UR10e robot arm for autonomous date palm harvesting:
+## Start Here
 
-1. **cuRobo** — GPU-accelerated motion planning (collision-free trajectories)
-2. **MoveIt** — trajectory management and execution
-3. **Delto 3-Finger Gripper** — force-profile based grasp with learning
-4. **ZED Camera + YOLO** — 3D detection and goal generation
-5. **Voxel Obstacles** — depth-based collision avoidance using ZED point clouds
-6. **Grasp Learning** — learns grasp success from force profile during closure
+For day-to-day robot operation, use the operator guide:
 
-## Command Setup (One-Time Per Machine)
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md)
 
-Use repo-managed commands from `<repo>/bin` so cloning on another machine keeps the same command names.
+For package-level launch and configuration details:
+
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md)
+
+For common install/runtime problems:
+
+- [Troubleshooting Guide](troubleshoot.md)
+
+## Documentation Map
+
+Core system docs:
+
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md) - RViz workflow, reachability goals, safe zone, LiDAR scan, camera recording, troubleshooting.
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md) - launch commands, manual launch, UR pendant instructions, keyboard controls.
+- [Codebase Architecture](ur_ws_new/src/ur10e_curobo/CODEBASE_ARCHITECTURE.md) - high-level package architecture.
+- [Goals Architecture](ur_ws_new/src/ur10e_curobo/GOALS_ARCHITECTURE.md) - goal and harvesting pipeline organization.
+- [Motion Control / Collision Avoidance](ur_ws_new/src/ur10e_curobo/C1_4_MOTION_CONTROL_COLLISION_AVOIDANCE_UPDATED.md) - planning and collision behavior.
+- [Latency Analysis](ur_ws_new/src/ur10e_curobo/C1_5_LATENCY_ANALYSIS.md) - timing notes.
+- [Harvesting Strategy](ur_ws_new/src/ur10e_curobo/E1_4_PROGRAMMED_HARVESTING_STRATEGY_UPDATED.md) - programmed harvesting approach.
+
+Related package docs:
+
+- [ZED Date Detector README](ur_ws_new/src/zed_date_detector/README.md)
+- [UR Robot Driver README](ur_ws_new/src/ur_robot_driver/README.md)
+- [UR Driver ROS Interface](ur_ws_new/src/ur_robot_driver/ur_robot_driver/doc/ROS_INTERFACE.md)
+- [Delto ROS 2 README](ur_ws_new/src/DELTO_ROS2/README.md)
+- [cuRobo README](curobo/README.md)
+
+## Repository Layout
+
+```text
+.
+├── bin/                         # Repo-managed launch/setup helper commands
+├── curobo/                      # cuRobo source/vendor tree
+├── ur_ws_new/                   # Main ROS 2 Humble workspace
+│   ├── fastdds_config.xml       # FastDDS buffer profile
+│   └── src/
+│       ├── ur10e_curobo/        # Main UR10e/cuRobo harvesting package
+│       ├── rviz_ur10e_panel/    # RViz operator panel plugin
+│       ├── ur_robot_driver/     # UR driver source with local changes
+│       ├── DELTO_ROS2/          # Delto gripper driver
+│       └── zed_date_detector/   # ZED/date detector package
+├── troubleshoot.md              # Runtime/build troubleshooting guide
+└── README.md                    # This file
+```
+
+## Main Capabilities
+
+- UR10e control through ROS 2 control and the UR robot driver.
+- cuRobo GPU motion planning for joint-space and Cartesian motions.
+- RViz operator panel with tabs for motion, goals, monitoring, camera, heat, and settings.
+- Reachability cloud for clicking known-good goals from the current posture.
+- Safe-zone walls and path validation for bounded in-zone work.
+- LiDAR scan workflow with scan preview, preflight validation, and bag recording.
+- Camera feed snapshot/video recording from `/vision/display`.
+- ZED/YOLO vision pipeline for date/trunk perception.
+- Delto 3-finger gripper control and force-profile grasp feedback.
+- Stability/tracking recorder for joint, wrench, and trajectory comparison logs.
+
+## Quick Start
+
+One-time shell setup:
 
 ```bash
-cd <repo_root>
+cd /home/datepalm2/manipulatorsdatepalm
 ./bin/install_shell.sh
 source ~/.bashrc
 ```
 
-This adds `<repo_root>/bin` to `PATH` and sets `MANIPULATOR_REPO`.
-It also keeps repo commands ahead of older `~/bin` wrappers if both exist.
+Build:
 
-## Quick Start
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --symlink-install
+source install/setup.bash
+```
 
-### Launch everything (real robot)
+Launch real robot with main control, vision, teleop, and GUI:
+
 ```bash
 launch_ur10e main vision teleop gui
 ```
 
-### Launch with fake hardware (simulation)
+Launch fake hardware for testing:
+
 ```bash
-launch_ur10e fake main
+launch_ur10e fake main vision teleop gui
 ```
 
-### Available launch nodes
-| Node | Description |
-|------|-------------|
-| `main` | Main control pipeline (approach, grasp, dropoff) |
-| `vision` | ZED/YOLO vision node |
-| `teleop` | Joystick teleop control |
-| `gui` | Desktop GUI control panel |
-| `calibrate` | Standalone grasp force calibration tool |
-| `hand_eye` | Hand-eye (camera-to-gripper) calibration |
+## Common Launch Options
 
-### Hand-Eye Calibration
-Calibrate the ZED camera-to-gripper transform using a chessboard:
 ```bash
-launch_ur10e hand_eye teleop
-```
-1. Place a chessboard flat in the workspace
-2. Move the robot to 15-20 different poses (vary rotation and translation)
-3. Press `c` to capture at each pose, `q` when done
-4. Result saved to `vision/hand_eye_calibration.yaml`
-
-### Grasp Calibration
-Train the force-profile grasp learner without running the full pipeline:
-```bash
-launch_ur10e calibrate teleop
-```
-Keys: `c`=close, `o`=open, `y`=success, `n`=fail, `s`=stats, `q`=quit
-
-Data stored in `~/grasp_learning_data/` (CSV log + pickle model).
-
-## RViz Keyboard Shortcuts
-When the RViz window is focused:
-
-| Key | Action |
-|-----|--------|
-| H | Home position |
-| D | Dropoff position |
-| E | Execute stored goals |
-| S | Subscribe to vision goals |
-| O | Open gripper |
-| C | Close gripper |
-| U | Update voxel obstacles |
-| Y | Grasp feedback: success |
-| N | Grasp feedback: fail |
-
-## Harvesting Pipeline
-
-```
-HOME → APPROACH → REACQUIRE → FINAL GRASP → CLOSE → PARTIAL REVERSE → DROPOFF → HOME
+launch_ur10e [fake] [main] [vision] [teleop] [gui]
 ```
 
-1. **Approach** — cuRobo plans collision-free path to detected fruit
-2. **Reacquire** — vision re-locks fruit position with stability check
-3. **Final Grasp** — slow IK-based precision move to fruit
-4. **Close & Evaluate** — gripper closes, force profile analyzed (early contact = grabbed)
-5. **Partial Reverse** — pull back ~12cm to clear the date bunch
-6. **Dropoff** — cuRobo plans collision-free path to dropoff, release
+Options:
 
-### Grasp Force Profile Detection
-During the 10-step gripper closure, force deltas are recorded at each step:
-- **Grabbed fruit**: forces rise at step 5-7 (fingers contact object mid-closure)
-- **Closed on air**: forces only spike at step 9-10 (mechanical stop)
+| Option | Description |
+| --- | --- |
+| `fake` | Use fake/simulated hardware. |
+| `main` | Start the main `ur10e_curobo` control node. |
+| `vision` | Start the ZED/YOLO vision node. |
+| `teleop` | Start joystick teleop. |
+| `gui` | Start the desktop GUI panel. |
 
-The grasp learner uses an EMA threshold on the first-contact step to predict success.
+For detailed launch and manual terminal commands, see:
 
-## Dependencies
-1. Install `ros2 humble` via debian package
-2. Install [cuRobo](https://curobo.org/get_started/5_docker_development.html#docker-dev) (native on Jetson)
-3. Install ROS packages:
-```bash
-sudo apt install ros-humble-ur-msgs ros-humble-ur-client-library \
-  ros-humble-moveit ros-humble-moveit-servo ros-humble-moveit-visual-tools \
-  ros-humble-moveit-resources ros-humble-moveit-planners-ompl \
-  ros-humble-moveit-ros-perception ros-humble-ros2-control \
-  ros-humble-ros2-controllers ros-humble-controller-interface \
-  ros-humble-controller-manager ros-humble-control-toolbox \
-  ros-humble-realtime-tools ros-humble-rviz2 ros-humble-rviz-visual-tools \
-  ros-humble-ackermann-msgs
-pip install warp-lang==1.0.0
-```
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md)
 
-## Build
-```bash
-cd <repo_root>/ur_ws_new
-colcon build --symlink-install --packages-select ur10e_curobo
-source install/setup.bash
-```
+## RViz Operator Workflow
 
-## FastDDS Buffer Configuration
-The system uses a custom FastDDS config (`ur_ws_new/fastdds_config.xml`) to increase UDP buffer sizes and suppress startup warnings. This is set automatically by `launch_ur10e.py` via `FASTRTPS_DEFAULT_PROFILES_FILE`.
+The RViz panel is the primary operator surface.
 
-If you see `sequence size exceeds remaining buffer` warnings, increase the kernel UDP buffer limits:
-```bash
-sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608 net.core.rmem_default=8388608 net.core.wmem_default=8388608
-```
+Important tabs:
 
-To make it permanent:
-```bash
-echo -e "net.core.rmem_max=8388608\nnet.core.wmem_max=8388608\nnet.core.rmem_default=8388608\nnet.core.wmem_default=8388608" | sudo tee /etc/sysctl.d/10-fastdds.conf && sudo sysctl --system
-```
+- Motion: HOME, dropoff, execute, gripper, plan confirmation.
+- Goal: manual goals, goal capture, LiDAR scan, reachability/scan preview.
+- Monitor: harvest results, stability recorder, joints, forces.
+- Camera: save images and record videos from `/vision/display`.
+- Heat: joint/tool temperature monitoring.
+- Settings: velocity and process refresh controls.
 
-## Setup UR10e Connection
+Detailed operator instructions:
+
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md)
+
+## Output Directories
+
+Runtime logs and recordings are saved under the user home directory:
+
+| Output | Directory |
+| --- | --- |
+| LiDAR scan bags | `~/lidar_scans` |
+| Camera snapshots/videos | `~/camera_recordings` |
+| Stability/tracking CSVs | `~/ur10e_stability` |
+| Grasp learning data | `~/grasp_learning_data` |
+
+## Hardware Notes
+
+UR10e robot:
+
+- Robot IP: `192.168.1.190`
+- Control PC interface commonly uses `192.168.1.101/24`
+
+Network setup:
+
 ```bash
 sudo ip addr flush dev eth0
 sudo ip addr add 192.168.1.101/24 dev eth0
 sudo ip addr add 169.254.186.100/24 dev eth0
 sudo ip link set eth0 up
 ```
-Robot IP: `192.168.1.190`
 
-## Run Individually
+UR pendant:
 
-### UR10e Bringup
+1. Power on the robot.
+2. Release brakes.
+3. Load the external control program.
+4. Press Start.
+
+If you see reverse-interface disconnects, restart the UR program and press
+Start again.
+
+## Build Notes
+
+Build everything:
+
 ```bash
-ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --symlink-install
+source install/setup.bash
 ```
 
-### Delto Gripper
+Build only the RViz panel after C++ panel edits:
+
 ```bash
-ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --packages-select rviz_ur10e_panel
+source install/setup.bash
 ```
 
-### Main Node
-```bash
-ros2 run ur10e_curobo main
-```
+Python-only edits in `ur10e_curobo` usually only require restarting the Python
+node when using `--symlink-install`.
 
 ## Key Configuration
 
-Speed and motion parameters in `ur10e_curobo/config.py`:
+Primary config file:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `global_speed_multiplier` | 5.0 | Scales all motion speeds |
-| `speed_approach` | 1.0 | Approach to fruit |
-| `speed_final` | 0.2 | Slow precision grasp |
-| `speed_predropoff` | 0.3 | Reverse trajectory speed |
-| `speed_dropoff` | 2.0 | Move to dropoff |
-| `speed_home` | 0.5 | Return to home |
-
-Gripper parameters in `ur10e_curobo/config.py` (`Gripper` dataclass):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `closing_steps` | 10 | Gripper closure steps |
-| `step_delay_s` | 0.05 | Delay between steps |
-| `use_suction` | false | Enable suction mode |
-
-## Project Structure
-
-```
-ur_ws_new/src/ur10e_curobo/ur10e_curobo/
-  main.py                  # Entry point
-  node.py                  # Main ROS2 node
-  goals.py                 # Harvesting pipeline (approach/grasp/dropoff)
-  motions.py               # Trajectory building and execution
-  config.py                # All configuration parameters
-  delto_gripper_controller.py  # Gripper control + force profile
-  grasp_learner.py         # Force-profile grasp learning
-  grasp_calibrate.py       # Standalone calibration tool
-  grasp_learning_config.py # Grasp learning parameters
-  grasp_outcome_classifier.py  # Template-based grasp classifier
-  gripper.py               # Gripper initialization
-  voxel_obstacle.py        # Depth-based collision avoidance
-  utils.py                 # Helpers (TF, wait, IK)
-  markers.py               # RViz visualization
-  managers/
-    config_manager.py      # Parameter management
-    state_manager.py       # Robot state tracking
-    motion_executor.py     # Trajectory execution + teleop
-  vision/
-    node.py                # Vision processing node
-    hand_eye_calibration.py
-  teleop/
-    teleop_node.py         # Joystick teleop
+```text
+ur_ws_new/src/ur10e_curobo/ur10e_curobo/config.py
 ```
 
-## Headless Machine Setup
+Important sections:
+
+- `ROBOT_PROFILE`
+- `ENVIRONMENT`
+- stored HOME / side-home / dropoff joint presets
+- `Planner`
+- `LidarScan`
+- safe-zone and reachability settings
+- gripper settings
+
+## Troubleshooting
+
+Start with:
+
+- [Troubleshooting Guide](troubleshoot.md)
+- [UR10e Operator Guide - Troubleshooting](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md#10-troubleshooting)
+
+Quick checks:
+
 ```bash
-ssh -X username@remote_ip
-sudo nano /etc/ssh/sshd_config
-# Ensure: X11Forwarding yes, X11DisplayOffset 10, X11UseLocalhost yes
-sudo systemctl restart ssh
-sudo apt install xauth
+ros2 node list
+ros2 topic hz /vision/display
+ros2 topic echo /joint_states --once
+ros2 control list_controllers
 ```
 
-## YOLOv8 Training
+Common issues:
+
+- Robot program is not running on the UR pendant.
+- Workspace was not sourced after rebuild.
+- Safe-zone box rejects a path that leaves the work area.
+- Goal is Cartesian-close but on a bad IK branch.
+- Camera recording has no frames because `/vision/display` is not publishing.
+
+## Development Notes
+
+Before pushing code changes:
+
 ```bash
-pip install ultralytics
-yolo task=segment mode=train model=yolov8n-seg.pt data=data.yaml epochs=50 imgsz=720 batch=8
-yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False
-/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16
+cd /home/datepalm2/manipulatorsdatepalm
+python3 -m py_compile \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/node.py \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/lidar_scan.py \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/config.py
+git diff --check
 ```
+
+For RViz panel changes:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --packages-select rviz_ur10e_panel
+```
+
+Do not commit generated `__pycache__` files.
