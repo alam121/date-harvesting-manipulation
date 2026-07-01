@@ -31,7 +31,7 @@ from .config import (
     ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
-    SHOW_CLASSIFICATION_ZONES,
+    SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
 )
 from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
@@ -43,6 +43,9 @@ from .ros_utils import wait_for_transform, create_pointcloud2_msg
 from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings, apply_zed_stereo_settings
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker
+
+# Verbose per-date depth-sampling diagnostics (throttled ~2 Hz). Set False when done.
+DEBUG_DEPTH_SAMPLING = False
 from .scoring import compute_fruit_score, compute_collision_free_direction
 from .yolo_thread import YoloThread
 from .visualization import VisionVisualizer
@@ -139,6 +142,7 @@ class VisionNode:
         self.yolo_thread: Optional[YoloThread] = None
         self.visualizer: Optional[VisionVisualizer] = None
         self._show_classification_zones = SHOW_CLASSIFICATION_ZONES
+        self._show_gap_debug = SHOW_GAP_DEBUG
 
         # ROS2
         self.node = None
@@ -252,6 +256,16 @@ class VisionNode:
                 if self.visualizer is not None:
                     self.visualizer.show_classification_zones = False
                 self.node.get_logger().info("[vision] classification zone overlay OFF")
+            elif cmd in ("gap_debug true", "gaps true"):
+                self._show_gap_debug = True
+                if self.visualizer is not None:
+                    self.visualizer.show_gap_debug = True
+                self.node.get_logger().info("[vision] branch-gap debug overlay ON")
+            elif cmd in ("gap_debug false", "gaps false"):
+                self._show_gap_debug = False
+                if self.visualizer is not None:
+                    self.visualizer.show_gap_debug = False
+                self.node.get_logger().info("[vision] branch-gap debug overlay OFF")
         self.node.create_subscription(_String, "/vision/overlay_command", _overlay_cb, 10)
 
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
@@ -461,6 +475,7 @@ class VisionNode:
 
         self.visualizer = VisionVisualizer(intrinsics, image_scale, display_scale)
         self.visualizer.show_classification_zones = self._show_classification_zones
+        self.visualizer.show_gap_debug = self._show_gap_debug
 
         # Start ZED Mini depth warp thread now that all closure variables are defined
         if _pending_depth_thread is not None:
@@ -1346,6 +1361,34 @@ class VisionNode:
             Xc = (u_c - cx_) * Zc / fx_
             Yc = (v_c - cy_) * Zc / fy_
 
+            if DEBUG_DEPTH_SAMPLING:
+                _now = time()
+                if _now - getattr(self, "_last_depth_dbg_t", 0.0) > 0.5:
+                    self._last_depth_dbg_t = _now
+                    _p5, _p50, _p95 = (float(p) for p in np.percentile(zs, [5, 50, 95]))
+                    _near = int(np.count_nonzero(zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
+                    _far = int(zs.shape[0] - _near)
+                    # near-depth points in the bbox but OUTSIDE the mask -> if high while
+                    # in-mask near count is ~0, the date depth is landing off the mask
+                    # (extrinsic/warp misalignment) rather than being absent (sensor).
+                    _out = pts_bbox[~in_mask]
+                    _out_near = (int(np.count_nonzero(_out[:, 2] <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
+                                 if _out.shape[0] else 0)
+                    # Base-frame position via the same cam->base TF used for the goal.
+                    # If this jumps with arm pose while cam Zc stays stable -> hand-eye/TF,
+                    # not depth.
+                    _base_str = ""
+                    if getattr(self, "_cached_tf_base", None) is not None:
+                        _Rb, _tb = self._cached_tf_base
+                        _pb = _Rb @ np.array([Xc, Yc, Zc], dtype=np.float64) + _tb
+                        _base_str = f" base=[{_pb[0]:.3f},{_pb[1]:.3f},{_pb[2]:.3f}]"
+                    self.node.get_logger().info(
+                        f"[DEPTH_DBG] bbox=({x1},{y1},{x2},{y2}) in_mask={int(zs.shape[0])}pts "
+                        f"z(m) p5/p50/p95={_p5:.3f}/{_p50:.3f}/{_p95:.3f} "
+                        f"near(<=p5+10cm)={_near} far={_far} -> Zc={Zc:.3f} | "
+                        f"near_but_OUTSIDE_mask={_out_near}/{int(_out.shape[0])}"
+                        f" | cam=[{Xc:.3f},{Yc:.3f},{Zc:.3f}]{_base_str}")
+
             if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
                 mark_reject("Z out of range")
                 return None
@@ -1393,7 +1436,7 @@ class VisionNode:
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
-            if self.target_lock_active:
+            if self.target_lock_active or self._show_gap_debug:
                 self._detect_branch_gap(pc_np, gap_target)
             else:
                 gap_target["between_branches"] = False
@@ -1469,7 +1512,7 @@ class VisionNode:
 
             # Branch gap detection (depth ring sampling around fruit)
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
-            if self.target_lock_active:
+            if self.target_lock_active or self._show_gap_debug:
                 self._detect_branch_gap(pc_np, gap_target)
             else:
                 gap_target["between_branches"] = False
@@ -1598,6 +1641,16 @@ class VisionNode:
             else:
                 blocked.append(False)
 
+        target["_ring_debug"] = {
+            "cx": cx_img,
+            "cy": cy_img,
+            "r": ring_r,
+            "blocked": blocked,
+            "n_samples": n_samples,
+            "gap_angle": 0.0,
+            "detected": False,
+        }
+
         # Count blocked sectors and find widest clear gap (circular scan)
         n_blocked = sum(blocked)
         if n_blocked < 3 or n_blocked > n_samples - 3:
@@ -1639,12 +1692,8 @@ class VisionNode:
 
         target["between_branches"] = True
         target["gap_angle_cam"] = float(gap_angle)
-        # Store raw ring data so visualization can draw the sample points
-        target["_ring_debug"] = {
-            "cx": cx_img, "cy": cy_img, "r": ring_r,
-            "blocked": blocked, "n_samples": n_samples,
-            "gap_angle": gap_angle,
-        }
+        target["_ring_debug"]["gap_angle"] = gap_angle
+        target["_ring_debug"]["detected"] = True
 
     def _fit_ellipse(self, mask_clean: np.ndarray) -> tuple:
         """Fit ellipse to mask and extract short axis."""
@@ -2096,7 +2145,12 @@ class VisionNode:
                 self.bbox_norm_pub.publish(_bbox_msg)
 
             # Publish branch gap info for 2-finger mode
-            between_branches = t_best.get("between_branches", False)
+            # Debug mode may analyze an unlocked target for visualization, but
+            # only a real target lock may command the two-finger grasp behavior.
+            between_branches = (
+                self.target_lock_active
+                and t_best.get("between_branches", False)
+            )
             gap_angle_cam = t_best.get("gap_angle_cam", 0.0)
             gap_angle_base = gap_angle_cam
             if between_branches and _R_tf is not None:

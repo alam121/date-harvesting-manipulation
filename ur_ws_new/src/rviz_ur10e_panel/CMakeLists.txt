@@ -12,6 +12,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(ur_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 
@@ -43,6 +44,7 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   control_msgs
   trajectory_msgs
+  ur_msgs
   pluginlib
   rcl_interfaces
 )

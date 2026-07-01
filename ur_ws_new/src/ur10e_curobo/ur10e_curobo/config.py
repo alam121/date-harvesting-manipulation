@@ -25,74 +25,155 @@ LOW_Z_THRESH = 0.94
 # Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
 LATERAL_THRESH = 0.03
 
-# Change only this value when moving the software between robots.
-ROBOT_PROFILE = "new"  # "new" or "old"
+# Change these when moving the software between robots / locations.
+ROBOT_PROFILE = "old"  # "new" or "old"  — robot mounting / kinematics convention
+ENVIRONMENT   = "outdoor"  # "lab" or "outdoor" — workspace layout (home/dropoff positions)
+
+# Joint configs depend on BOTH the robot (mounting/kinematics) and the environment (where
+# the tree and dropoff bin are), so they are defined per (robot, environment).
+# x_forward_y_lateral is a robot-only property and does not change with environment.
+_NEW_LAB_JOINTS = {
+    "home": [
+        0.2966473698616028, -1.6924630604186, 2.319343153630392,
+        -4.599916835824484, -1.8223055044757288, 2.912656307220459,
+    ],
+    "dropoff": [
+        -1.085060343146324, -1.570564409295553, 2.355928007756368,
+        -2.613685270349020, -1.386652294789450, 2.914407730102539,
+    ],
+    "predropoff": [
+        -0.223708137869835, -1.685942789117330, 2.032441679631368,
+        2.154242201442383, -1.655924622212545, 3.139664408062593,
+    ],
+    "home_left": [
+        0.643364429473877, -1.5703463061984912, 1.9470141569720667,
+        -4.550284524957174, -2.1596739927874964, 2.4302515983581543,
+    ],
+    "home_right": [
+        -0.9581039587603968, -1.9419809780516566, 2.136008087788717,
+        -4.9219705067076625, -0.6445449034320276, 4.893132209777832,
+    ],
+    "home_right_low": [
+        -0.579287354146139, -1.8774057827391566, 2.3498411814319056,
+        -4.595168252984518, -1.0441439787494105, 3.820992946624756,
+    ],
+    "home_left_low": [
+        0.529047966003418, -1.5133289259723206, 2.0492852369891565,
+        -4.616746803323263, -2.054364029561178, 2.6127915382385254,
+    ],
+}
+
+_OLD_LAB_JOINTS = {
+    "home": [
+        5.108725070953369, -1.794300218621725, 2.4091363588916224,
+        1.6457602220722656, 4.382841110229492, -0.23138553300966436,
+    ],
+    "dropoff": [
+        -2.362258497868673, -1.5946093998351039, 2.3843892256366175,
+        -2.6575151882567347, 4.8416242599487305, -0.17230397859682256,
+    ],
+    "predropoff": [
+        -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
+        -4.172773023644918, 4.572351932525635, 0.05295269936323166,
+    ],
+    "home_left": [
+        -0.7986648718463343, -1.370279149418213, 1.5869911352740687,
+        -3.958400150338644, 3.832206964492798, -0.4182942549334925,
+    ],
+    "home_right": [
+        -2.1769216696368616, -1.6072222195067347, 1.8494580427752894,
+        -4.613555570641989, 5.513333320617676, 1.2812821865081787,
+    ],
+    "home_right_low": [
+        -2.0225699583636683, -1.5956303081908167, 2.210489575062887,
+        -4.641205211678976, 5.276980876922607, 0.710979700088501,
+    ],
+    "home_left_low": [
+        -0.9872930685626429, -1.384446458225586, 2.0082204977618616,
+        -4.594993253747457, 4.218744277954102, -0.3455312887774866,
+    ],
+}
+
+# ===== OUTDOOR joint sets — EDIT THESE for the field/orchard =====
+# Outdoor homes are LOW (below the base plane, near the ground). Per-joint order:
+# [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3], radians.
+# Seeded from the lab values for now — jog the arm outdoors, read /joint_states, and
+# replace each list with the recorded pose. Only the keys you change take effect.
+_NEW_OUTDOOR_JOINTS = {
+    "home": [
+        0.2966473698616028, -1.6924630604186, 2.319343153630392,
+        -4.599916835824484, -1.8223055044757288, 2.912656307220459,
+    ],
+    "dropoff": [
+        -1.085060343146324, -1.570564409295553, 2.355928007756368,
+        -2.613685270349020, -1.386652294789450, 2.914407730102539,
+    ],
+    "predropoff": [
+        -0.223708137869835, -1.685942789117330, 2.032441679631368,
+        2.154242201442383, -1.655924622212545, 3.139664408062593,
+    ],
+    "home_left": [
+        0.643364429473877, -1.5703463061984912, 1.9470141569720667,
+        -4.550284524957174, -2.1596739927874964, 2.4302515983581543,
+    ],
+    "home_right": [
+        -0.9581039587603968, -1.9419809780516566, 2.136008087788717,
+        -4.9219705067076625, -0.6445449034320276, 4.893132209777832,
+    ],
+    "home_right_low": [
+        -0.579287354146139, -1.8774057827391566, 2.3498411814319056,
+        -4.595168252984518, -1.0441439787494105, 3.820992946624756,
+    ],
+    "home_left_low": [
+        0.529047966003418, -1.5133289259723206, 2.0492852369891565,
+        -4.616746803323263, -2.054364029561178, 2.6127915382385254,
+    ],
+}
+
+_OLD_OUTDOOR_JOINTS = {
+    "home": [
+        5.108725070953369, -1.794300218621725, 2.4091363588916224,
+        1.6457602220722656, 4.382841110229492, -0.23138553300966436,
+    ],
+    "dropoff": [
+        -2.362258497868673, -1.5946093998351039, 2.3843892256366175,
+        -2.6575151882567347, 4.8416242599487305, -0.17230397859682256,
+    ],
+    "predropoff": [
+        -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
+        -4.172773023644918, 4.572351932525635, 0.05295269936323166,
+    ],
+    "home_left": [
+        -0.7986648718463343, -1.370279149418213, 1.5869911352740687,
+        -3.958400150338644, 3.832206964492798, -0.4182942549334925,
+    ],
+    "home_right": [
+        -2.1769216696368616, -1.6072222195067347, 1.8494580427752894,
+        -4.613555570641989, 5.513333320617676, 1.2812821865081787,
+    ],
+    "home_right_low": [
+        -2.0225699583636683, -1.5956303081908167, 2.210489575062887,
+        -4.641205211678976, 5.276980876922607, 0.710979700088501,
+    ],
+    "home_left_low": [
+        -0.9872930685626429, -1.384446458225586, 2.0082204977618616,
+        -4.594993253747457, 4.218744277954102, -0.3455312887774866,
+    ],
+}
 
 ROBOT_PROFILES = {
     "new": {
         "x_forward_y_lateral": True,
-        "joints": {
-            "home": [
-                0.1027379184961319, -1.7702552280821742, 2.3806751410113733,
-                -4.593595167199606, -1.8454354445086878, 2.8553261756896973,
-            ],
-            "dropoff": [
-                -1.085060343146324, -1.570564409295553, 2.355928007756368,
-                -2.613685270349020, -1.386652294789450, 2.914407730102539,
-            ],
-            "predropoff": [
-                -0.223708137869835, -1.685942789117330, 2.032441679631368,
-                2.154242201442383, -1.655924622212545, 3.139664408062593,
-            ],
-            "home_left": [
-                0.478533282876015, -1.346234158878662, 1.558529917393820,
-                2.368615074748657, -2.396069590245382, 2.668417453765869,
-            ],
-            "home_right": [
-                -0.899723514914513, -1.583177228967184, 1.820996824895040,
-                1.713459654445312, -0.714943234120504, -1.915191411972046,
-            ],
-            "home_right_low": [
-                -0.745371803641319, -1.571585317651266, 2.182028357182638,
-                1.685810013408325, -0.951295677815573, -2.485493898391724,
-            ],
-            "home_left_low": [
-                0.289905086159706, -1.360401467686035, 1.979759279881613,
-                1.732021971339844, -2.009532276784078, 2.741180419921875,
-            ],
+        "environments": {
+            "lab": {"joints": _NEW_LAB_JOINTS},
+            "outdoor": {"joints": _NEW_OUTDOOR_JOINTS},
         },
     },
     "old": {
         "x_forward_y_lateral": False,
-        "joints": {
-            "home": [
-                5.108725070953369, -1.794300218621725, 2.4091363588916224,
-                1.6457602220722656, 4.382841110229492, -0.23138553300966436,
-            ],
-            "dropoff": [
-                -2.362258497868673, -1.5946093998351039, 2.3843892256366175,
-                -2.6575151882567347, 4.8416242599487305, -0.17230397859682256,
-            ],
-            "predropoff": [
-                -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
-                -4.172773023644918, 4.572351932525635, 0.05295269936323166,
-            ],
-            "home_left": [
-                -0.7986648718463343, -1.370279149418213, 1.5869911352740687,
-                -3.958400150338644, 3.832206964492798, -0.4182942549334925,
-            ],
-            "home_right": [
-                -2.1769216696368616, -1.6072222195067347, 1.8494580427752894,
-                -4.613555570641989, 5.513333320617676, 1.2812821865081787,
-            ],
-            "home_right_low": [
-                -2.0225699583636683, -1.5956303081908167, 2.210489575062887,
-                -4.641205211678976, 5.276980876922607, 0.710979700088501,
-            ],
-            "home_left_low": [
-                -0.9872930685626429, -1.384446458225586, 2.0082204977618616,
-                -4.594993253747457, 4.218744277954102, -0.3455312887774866,
-            ],
+        "environments": {
+            "lab": {"joints": _OLD_LAB_JOINTS},
+            "outdoor": {"joints": _OLD_OUTDOOR_JOINTS},
         },
     },
 }
@@ -105,33 +186,44 @@ if ROBOT_PROFILE not in ROBOT_PROFILES:
 ACTIVE_ROBOT_PROFILE = ROBOT_PROFILES[ROBOT_PROFILE]
 X_FORWARD_Y_LATERAL = ACTIVE_ROBOT_PROFILE["x_forward_y_lateral"]
 
+_ENVIRONMENTS = ACTIVE_ROBOT_PROFILE["environments"]
+if ENVIRONMENT not in _ENVIRONMENTS:
+    raise ValueError(
+        f"Unknown ENVIRONMENT {ENVIRONMENT!r}; "
+        f"choose one of {sorted(_ENVIRONMENTS)}")
+
+ACTIVE_ENVIRONMENT = _ENVIRONMENTS[ENVIRONMENT]
+
 
 def _profile_joints(name: str) -> List[float]:
-    return list(ACTIVE_ROBOT_PROFILE["joints"][name])
+    return list(ACTIVE_ENVIRONMENT["joints"][name])
 
 # ---------- Static Obstacles (single source of truth) ----------
 # Define obstacles once here, used for both cuRobo planning and RViz visualization
-STATIC_OBSTACLES = [
-    {
-        "name": "table",
-        "type": "cuboid",
-        "dims": [5.0, 5.0, 0.2],
-        "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
-        "color": (1.0, 0.0, 0.0, 1.0),  # Red
-    },
-    {
-        "name": "trunk",
-        "type": "cylinder",
-        "radius": 0.02,    # 2cm radius = 4cm diameter trunk
-        "height": 1.2,     # 1.2m visible trunk section
-        "pose": (
-            [1.00, 0.16, 0.6, 1, 0, 0, 0]
-            if X_FORWARD_Y_LATERAL
-            else [0.16, -1.00, 0.6, 1, 0, 0, 0]
-        ),
-        "color": (0.55, 0.27, 0.07, 1.0),  # Brown
-    },
-]
+_TABLE_OBSTACLE = {
+    "name": "table",
+    "type": "cuboid",
+    "dims": [5.0, 5.0, 0.2],
+    "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
+    "color": (1.0, 0.0, 0.0, 1.0),  # Red
+}
+_TRUNK_OBSTACLE = {
+    "name": "trunk",
+    "type": "cylinder",
+    "radius": 0.02,    # 2cm radius = 4cm diameter trunk
+    "height": 1.2,     # 1.2m visible trunk section
+    "pose": (
+        [1.00, 0.16, 0.6, 1, 0, 0, 0]
+        if X_FORWARD_Y_LATERAL
+        else [0.16, -1.00, 0.6, 1, 0, 0, 0]
+    ),
+    "color": (0.55, 0.27, 0.07, 1.0),  # Brown
+}
+
+# The lab has a physical table under the arm; outdoor (field/orchard) does not — drop the
+# table obstacle outdoors so it doesn't block low approaches. Applies to both cuRobo
+# planning (WORLD_CONFIG) and RViz visualization, which both derive from STATIC_OBSTACLES.
+STATIC_OBSTACLES = ([] if ENVIRONMENT == "outdoor" else [_TABLE_OBSTACLE]) + [_TRUNK_OBSTACLE]
 
 # Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES.
 # cuRobo's OBB collision checker only reads "cuboid" — cylinders are not loaded.
@@ -184,6 +276,29 @@ PLAN_CFG_JS_NO_FINETUNE = MotionGenPlanConfig(
     enable_finetune_trajopt=False,
     enable_graph=False,
     enable_graph_attempt=None,
+)
+
+# Last-resort recovery for large/contorted reconfigurations (e.g. HOME ~170deg away from a
+# flipped in-zone pose) where the straight-line trajopt seed sweeps through obstacles and the
+# optimizer can't converge from any local seed. The graph planner finds a collision-free
+# GLOBAL seed that trajopt then smooths. Graph search resizes internal buffers that otherwise
+# corrupt subsequent plan_single_js calls, so the caller MUST motion_gen.reset() afterward.
+PLAN_CFG_JS_GRAPH = MotionGenPlanConfig(
+    max_attempts=8,
+    enable_finetune_trajopt=True,
+    enable_graph=True,
+    enable_graph_attempt=1,
+)
+
+# Cheap config for reachability PREFLIGHT (e.g. lidar-scan candidate probing). A preflight
+# only needs a yes/no "can the arm get here" answer, not a polished trajectory. The big cost
+# was the strict finetune smoothing pass (~12s per failure, and FINETUNE_TRAJOPT_FAIL on
+# reachable poses) — dropping it gives most of the speedup. max_attempts is kept moderately
+# high because it controls IK-seed diversity: too low (e.g. 4) makes borderline-reachable
+# semicircle poses spuriously IK_FAIL and collapses the sweep to a tiny fallback arc.
+PLAN_CFG_SCAN_PREFLIGHT = MotionGenPlanConfig(
+    max_attempts=20,
+    enable_finetune_trajopt=False,
 )
 
 # ---------- Runtime parameters (override via ROS params / env) ----------
@@ -244,7 +359,43 @@ class Planner:
     approach_max_joint_step_deg: float = 12.0  # reject APPROACH plans with abrupt per-waypoint joint jumps
     approach_max_path_ratio: float = 2.5       # reject roundabout approach paths
     home_reached_tolerance_deg: float = 3.0    # skip planning when already at HOME
-    home_direct_fallback_max_delta_deg: float = 20.0  # guarded fallback after HOME trajopt failure
+    home_direct_fallback_max_delta_deg: float = 40.0  # guarded fallback after HOME trajopt failure (still forearm/flange clearance-checked)
+    home_verified_interp_max_delta_deg: float = 185.0  # HOME-only recovery: dense cuRobo validity + forearm/flange checked
+    home_verified_interp_step_deg: float = 1.0         # max joint step for HOME verified interpolation samples
+    home_verified_route_max_candidates: int = 120      # bounded deterministic route search after direct HOME path is invalid
+    home_cartesian_pose_recovery: bool = False         # TCP-only HOME can land on the wrong joint branch; keep exact-HOME strict
+    home_cart_finish_max_delta_deg: float = 45.0       # after HOME_CART, only chase exact joint branch when close
+    goal_failure_recover_to_posture: bool = True       # after queued goal failure, move to nearest good posture and retry once
+    goal_recovery_cartesian_fallback: bool = False     # after posture retry fails, try collision-aware Cartesian plan once
+    goal_recovery_repeat_staging_after_posture: bool = False  # avoid repeating same expensive staging sweep after posture retry
+    goal_recovery_local_staging: bool = True           # try target-local standoff before moving to stored postures
+    goal_recovery_stage_offsets_m: List[float] = field(
+        default_factory=lambda: [0.20, 0.12, 0.30])
+    goal_recovery_stage_max_attempts: int = 3          # cap expensive standoff/descent planner attempts per recovery pass
+    goal_recovery_stage_marker_first: bool = True      # when marker/current orientations differ, try requested marker-orientation standoff first
+    safe_zone_path_margin_m: float = 0.01              # keep manual Cartesian TCP samples this far inside the safe-zone box
+    dynamic_goal_ordering: bool = False                # False: run the queue strictly in insertion order; True: choose next queued goal by current IK reachability
+    goal_reachability_skip_delta_deg: float = 100.0    # postpone/skip queued goals above this nearest-IK delta
+    goal_recovery_max_ik_delta_deg: float = 100.0      # do not grind staging/posture recovery above this nearest-IK delta
+    shortest_ik_plan_max_delta_deg: float = 80.0       # fail fast when nearest IK branch is too far for short-goal planning
+    shortest_ik_max_tries: int = 2                     # number of near IK branches to try before recovery/fallback
+    safe_zone_verified_interp_first: bool = True       # for nearby IK goals, validate/execute direct joint interpolation before slow Cartesian trajopt
+    safe_zone_verified_interp_max_delta_deg: float = 80.0
+    safe_zone_verified_interp_step_deg: float = 1.0
+    reachability_cloud_enabled: bool = True            # RViz cloud of TCP positions reachable from the current posture
+    reachability_cloud_period_s: float = 1.0
+    reachability_cloud_samples: int = 1000
+    reachability_cloud_point_size_m: float = 0.025
+    reachability_cloud_max_delta_deg: float = 100.0
+    reachability_cloud_validate_green: bool = True
+    reachability_direction_enabled: bool = True        # draw TCP local-axis direction rays on green samples
+    reachability_direction_axis: List[float] = field(
+        default_factory=lambda: [0.0, 0.0, 1.0])       # TCP local +Z matches approach-axis helpers
+    reachability_direction_length_m: float = 0.08
+    reachability_direction_stride: int = 1             # draw every Nth green direction ray; 1 shows every green point
+    reachability_click_max_distance_m: float = 0.06  # RViz /clicked_point must be this close to a green sample
+    reachability_click_green_only: bool = True        # only queue clicks in the fast-success green band
+    reachability_goal_speed_factor: float = 0.20      # very slow execution for reachability-click goals
 
     # === DIRECT IK TUNING ===
     direct_branch_retry_min_dist: float = 0.15  # m; skip expensive branch search for close moves
@@ -258,18 +409,23 @@ class Planner:
     clamp_safety_threshold_mm: float = 45.0
     very_low_preflight_min_clearance_mm: float = 50.0
     very_low_preflight_early_accept_mm: float = 50.0
-    very_low_preflight_preferred_pitch_deg: float = 10.0
+    very_low_preflight_preferred_pitch_deg: float = -5.0  # negative pitch tried first on approach (start at -5)
     very_low_preflight_second_pitch_deg: float = -30.0
     very_low_preflight_preferred_wrist_deg: float = 0.0
     very_low_preflight_pitch_step_deg: float = 10.0
     very_low_preflight_pitch_steps: int = 3
     very_low_clearance_window_mm: float = 8.0   # choose path cost only among near-safest IK branches
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
-    side_home_x_offset: float = 0.16            # Legacy name: lateral Y offset for side home
+    # Offset names below are semantic. They are mapped through ROBOT_PROFILE:
+    # - new robot: depth -> X, lateral -> Y
+    # - old robot: depth -> Y, lateral -> X
+    side_home_lateral_offset: float = 0.16      # m; side-home lateral distance from trunk
+    side_home_x_offset: float = 0.16            # legacy alias for side_home_lateral_offset
     side_home_partial_reverse_m: float = 0.55   # m; partial reverse clearance for side-approach fruits (vs 0.35m center)
 
 
-    mid_center_approach_y_offset: float = 0.10  # Legacy name: forward/back X standoff
+    mid_center_approach_depth_offset: float = 0.10
+    mid_center_approach_y_offset: float = 0.10  # legacy alias for mid_center_approach_depth_offset
     mid_center_approach_z_offset: float = -0.05
     mid_high_left_thresh: float = 0.20      # bunch/image rel-x below this is MID/HIGH LEFT
     mid_high_right_thresh: float = 0.80     # bunch/image rel-x above this is MID/HIGH RIGHT
@@ -280,39 +436,48 @@ class Planner:
 
 
 
-    low_center_approach_y_offset: float = 0.03  # Legacy name: forward/back X standoff
+    low_center_approach_depth_offset: float = 0.03
+    low_center_approach_y_offset: float = 0.03  # legacy alias for low_center_approach_depth_offset
     low_center_approach_z_offset: float = -0.07
 
 
-    very_low_center_approach_y_offset: float = 0.08  # Legacy name: forward/back X standoff
-    very_low_center_approach_z_offset: float = -0.050
+    very_low_center_approach_depth_offset: float = 0.08
+    very_low_center_approach_y_offset: float = 0.08  # legacy alias for very_low_center_approach_depth_offset
+    very_low_center_approach_z_offset: float = -0.025
     very_low_center_approach_pitch_deg: float = 5.0  # local tool X pitch to open forearm-flange clearance
 
 
-    low_left_standoff_x: float = 0.12           # Legacy name: left side-low lateral Y standoff
-    low_left_standoff_y: float = 0.035          # Legacy name: side-low depth X standoff
+    low_left_standoff_lateral: float = 0.12
+    low_left_standoff_depth: float = 0.035
+    low_left_standoff_x: float = 0.12           # legacy alias for low_left_standoff_lateral
+    low_left_standoff_y: float = 0.035          # legacy alias for low_left_standoff_depth
     low_left_standoff_z: float = -0.055         # m; left side-low vertical standoff
 
 
 
-    low_right_standoff_x: float = 0.08          # Legacy name: right side-low lateral Y standoff
-    low_right_standoff_y: float = 0.050         # Legacy name: side-low depth X standoff
+    low_right_standoff_lateral: float = 0.08
+    low_right_standoff_depth: float = 0.050
+    low_right_standoff_x: float = 0.08          # legacy alias for low_right_standoff_lateral
+    low_right_standoff_y: float = 0.050         # legacy alias for low_right_standoff_depth
     low_right_standoff_z: float = -0.025        # m; avoid large upward push on right-side final
 
 
 
 
-    low_side_final_y_offset: float = 0.0        # Legacy name: final X offset
+    low_side_final_depth_offset: float = 0.0
+    low_side_final_y_offset: float = 0.0        # legacy alias for low_side_final_depth_offset
     low_left_final_z_offset: float = 0.020      # m; left side-low gripper center offset
     low_right_final_z_offset: float = 0.010     # m; right side-low gripper center offset
 
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
-    low_center_final_y_offset: float = -0.01    # Legacy name: final X offset
-    low_center_final_z_offset: float = 0.030    # m; gripper center offset above low-center fruit
+    low_center_final_depth_offset: float = -0.01
+    low_center_final_y_offset: float = -0.01    # legacy alias for low_center_final_depth_offset
+    low_center_final_z_offset: float = 0.033    # m; gripper center offset above low-center fruit
 
-    mid_center_final_y_offset: float = -0.02    # Legacy name: final X offset
+    mid_center_final_depth_offset: float = -0.02
+    mid_center_final_y_offset: float = -0.02    # legacy alias for mid_center_final_depth_offset
     mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
@@ -332,7 +497,8 @@ class Planner:
 
 
     pre_dropoff_z_offset: float = -0.1  # m above dropoff
-    pre_dropoff_y_offset: float = 0.25  # Legacy name: X back/forward offset
+    pre_dropoff_depth_offset: float = 0.25
+    pre_dropoff_y_offset: float = 0.25  # legacy alias for pre_dropoff_depth_offset
 
     # === REACQUIRE ===
     reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
@@ -385,6 +551,38 @@ class LidarScan:
     bag_dir: str = "~/lidar_scans"
     # Speed factor multiplied into plan_execute_js (lower = slower = denser scan)
     speed_factor: float = 0.08
+    use_semicircle: bool = True
+    semicircle_points: int = 7
+    semicircle_radius_m: float = 0.22
+    semicircle_arc_deg: float = 180.0
+    semicircle_use_base_angles: bool = True           # use fixed base-frame scan angles instead of centering arc on current TCP
+    semicircle_start_deg: float = 0.0                 # front half in base frame; 0=+X, 90=+Y
+    semicircle_end_deg: float = 180.0                 # opposite of the previous back-side sweep
+    semicircle_z_offset_m: float = 0.0
+    semicircle_face_target: bool = False              # keep current tool orientation; arc shape matters more than exact center-facing
+    semicircle_local_axis: List[float] = field(
+        default_factory=lambda: [0.0, 0.0, 1.0])
+    semicircle_adaptive_scan: bool = True             # allow skipped angles/variable radius instead of forcing a perfect arc
+    semicircle_radius_candidates_m: List[float] = field(
+        default_factory=lambda: [0.12, 0.22])
+    semicircle_min_points: int = 3
+    local_close_fallback_enabled: bool = True          # if arc fails, scan a small local reachable sweep
+    local_close_first: bool = False                    # keep the scan arc-shaped; use local fallback only if the arc cannot run
+    local_close_offsets_m: List[float] = field(
+        default_factory=lambda: [0.0, 0.04, 0.08])
+    local_close_axis: List[float] = field(
+        default_factory=lambda: [0.0, 1.0, 0.0])       # base-frame direction for local fallback sweep
+    semicircle_use_reachability: bool = False          # generated center-facing scan poses keep LiDAR aimed at center
+    semicircle_allow_geometric_fallback: bool = True   # use generated horizontal arc when green samples are sparse
+    semicircle_reachability_max_radius_error_m: float = 0.12
+    semicircle_z_tolerance_m: float = 0.02             # keep reachability-picked scan points near one horizontal plane
+    semicircle_path_z_tolerance_m: float = 0.035       # reject joint shortcuts that visibly climb out of the scan plane
+    semicircle_max_joint_delta_deg: float = 75.0       # reject scan poses that require a large joint-branch jump
+    semicircle_max_joint_step_deg: float = 8.0         # reject Cartesian plans with abrupt joint jumps between samples
+    semicircle_max_failed_candidates: int = 3          # stop scan preflight early when this arc side is clearly unreachable
+    semicircle_preview_enabled: bool = True            # show candidate scan arc before pressing lidar_scan
+    arc_highlight_enabled: bool = True                 # paint reachability-cloud points that sit on/near the scan arc a darker green
+    arc_highlight_tol_m: float = 0.04                  # radial band (m) for "near or on the arc"
     # Joint-space waypoints defining the half-circle arc around the tree.
     # Default: home_left → home → home_right  (calibrate to your setup)
     scan_waypoints: List[List[float]] = field(default_factory=lambda: [

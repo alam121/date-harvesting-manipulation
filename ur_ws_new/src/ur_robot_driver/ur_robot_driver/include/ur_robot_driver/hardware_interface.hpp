@@ -58,7 +58,9 @@
 #include "ur_dashboard_msgs/msg/robot_mode.hpp"
 
 // ROS
+#include "rclcpp/rclcpp.hpp"
 #include "rclcpp/macros.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -182,6 +184,7 @@ protected:
   urcl::vector6d_t urcl_joint_positions_;
   urcl::vector6d_t urcl_joint_velocities_;
   urcl::vector6d_t urcl_joint_efforts_;
+  urcl::vector6d_t urcl_joint_temperatures_;
   urcl::vector6d_t urcl_ft_sensor_measurements_;
   urcl::vector6d_t urcl_tcp_pose_;
   urcl::vector6d_t urcl_target_tcp_pose_;
@@ -205,6 +208,10 @@ protected:
   int32_t tool_output_voltage_;
   double tool_output_current_;
   double tool_temperature_;
+  // Per-joint temperatures (degC) from RTDE, published on a side topic for monitoring.
+  std::shared_ptr<rclcpp::Node> aux_node_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_temperature_pub_;
+  double last_joint_temp_pub_sec_ = 0.0;
   double speed_scaling_;
   double target_speed_fraction_;
   double speed_scaling_combined_;

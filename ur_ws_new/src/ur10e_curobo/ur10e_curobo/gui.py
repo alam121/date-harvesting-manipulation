@@ -897,6 +897,23 @@ class MainWindow(QtWidgets.QWidget):
         self.robot_state_label.setStyleSheet("font-size: 11pt; padding: 4px;")
         layout.addWidget(self.robot_state_label)
 
+        # Tabbed controls — keeps the panel short. Status stays above the tabs and the
+        # EMERGENCY STOP stays below them, so both are visible from every tab.
+        tabs = QtWidgets.QTabWidget()
+        motion_tab = QtWidgets.QWidget()
+        motion_tab_layout = QtWidgets.QVBoxLayout(motion_tab)
+        motion_tab_layout.setSpacing(6)
+        goal_tab = QtWidgets.QWidget()
+        goal_tab_layout = QtWidgets.QVBoxLayout(goal_tab)
+        goal_tab_layout.setSpacing(6)
+        settings_tab = QtWidgets.QWidget()
+        settings_tab_layout = QtWidgets.QVBoxLayout(settings_tab)
+        settings_tab_layout.setSpacing(6)
+        tabs.addTab(motion_tab, "Motion")
+        tabs.addTab(goal_tab, "Goal")
+        tabs.addTab(settings_tab, "Settings")
+        layout.addWidget(tabs, stretch=1)
+
         # Velocity Scale
         vel_group = QtWidgets.QGroupBox("Velocity Scale")
         vel_layout = QtWidgets.QVBoxLayout(vel_group)
@@ -927,7 +944,7 @@ class MainWindow(QtWidgets.QWidget):
         apply_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
         apply_btn.clicked.connect(self._apply_velocity_scale)
         vel_layout.addWidget(apply_btn)
-        layout.addWidget(vel_group)
+        settings_tab_layout.addWidget(vel_group)
 
         # Manual Goal (compact)
         goal_group = QtWidgets.QGroupBox("Manual Goal")
@@ -960,7 +977,7 @@ class MainWindow(QtWidgets.QWidget):
         send_btn.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
         send_btn.clicked.connect(self._handle_send_goal)
         goal_layout.addWidget(send_btn, 4, 0, 1, 4)
-        layout.addWidget(goal_group)
+        goal_tab_layout.addWidget(goal_group)
 
         # Motion Commands
         motion_group = QtWidgets.QGroupBox("Motion")
@@ -987,38 +1004,51 @@ class MainWindow(QtWidgets.QWidget):
         clear_btn.clicked.connect(lambda: self._send_cmd("clear"))
         motion_layout.addWidget(clear_btn, 1, 1)
 
+        # Manual side-home moves — test/calibrate home_left/home_right per robot profile
+        home_left_btn = QtWidgets.QPushButton("Home Left")
+        home_left_btn.setStyleSheet("background-color: #00897b; color: white; font-weight: bold;")
+        home_left_btn.setToolTip("Move to the stored home_left joint config (active robot profile)")
+        home_left_btn.clicked.connect(lambda: self._send_cmd("home_left"))
+        motion_layout.addWidget(home_left_btn, 2, 0)
+
+        home_right_btn = QtWidgets.QPushButton("Home Right")
+        home_right_btn.setStyleSheet("background-color: #00897b; color: white; font-weight: bold;")
+        home_right_btn.setToolTip("Move to the stored home_right joint config (active robot profile)")
+        home_right_btn.clicked.connect(lambda: self._send_cmd("home_right"))
+        motion_layout.addWidget(home_right_btn, 2, 1)
+
         check_calib_btn = QtWidgets.QPushButton("Check Calibration (trunk)")
         check_calib_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
         check_calib_btn.setToolTip("Check hand-eye calibration using the detected trunk as the reference")
         check_calib_btn.clicked.connect(lambda: self._send_cmd("check_calibration"))
-        motion_layout.addWidget(check_calib_btn, 2, 0, 1, 2)
+        motion_layout.addWidget(check_calib_btn, 3, 0, 1, 2)
 
         self.calib_result_label = QtWidgets.QLabel("—")
         self.calib_result_label.setWordWrap(True)
         self.calib_result_label.setStyleSheet(
             "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;")
-        motion_layout.addWidget(self.calib_result_label, 3, 0, 1, 2)
+        motion_layout.addWidget(self.calib_result_label, 4, 0, 1, 2)
 
         self.debug_preview_cb = QtWidgets.QCheckBox("Debug Plan Preview")
         self.debug_preview_cb.setChecked(True)
         self.debug_preview_cb.setToolTip("Show full plan in RViz before executing")
         self.debug_preview_cb.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 4px;")
         self.debug_preview_cb.stateChanged.connect(self._on_debug_preview_changed)
-        motion_layout.addWidget(self.debug_preview_cb, 4, 0, 1, 2)
+        motion_layout.addWidget(self.debug_preview_cb, 5, 0, 1, 2)
 
         # Plan confirm/cancel buttons (shown when plan preview is waiting)
         self.plan_confirm_btn = QtWidgets.QPushButton("Confirm Plan")
         self.plan_confirm_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
         self.plan_confirm_btn.clicked.connect(lambda: self._send_cmd("plan_confirm"))
         self.plan_confirm_btn.setVisible(False)
-        motion_layout.addWidget(self.plan_confirm_btn, 5, 0)
+        motion_layout.addWidget(self.plan_confirm_btn, 6, 0)
 
         self.plan_cancel_btn = QtWidgets.QPushButton("Cancel Plan")
         self.plan_cancel_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
         self.plan_cancel_btn.clicked.connect(lambda: self._send_cmd("plan_cancel"))
         self.plan_cancel_btn.setVisible(False)
-        motion_layout.addWidget(self.plan_cancel_btn, 5, 1)
-        layout.addWidget(motion_group)
+        motion_layout.addWidget(self.plan_cancel_btn, 6, 1)
+        motion_tab_layout.addWidget(motion_group)
 
         # Gripper
         gripper_group = QtWidgets.QGroupBox("Gripper")
@@ -1031,7 +1061,7 @@ class MainWindow(QtWidgets.QWidget):
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(lambda: self._send_cmd("close"))
         gripper_layout.addWidget(close_btn)
-        layout.addWidget(gripper_group)
+        motion_tab_layout.addWidget(gripper_group)
 
         # Keyboard Mode Button (opens separate window)
         kbd_btn = QtWidgets.QPushButton("Open Keyboard Control Window")
@@ -1049,7 +1079,7 @@ class MainWindow(QtWidgets.QWidget):
             }
         """)
         kbd_btn.clicked.connect(self._open_keyboard_window)
-        layout.addWidget(kbd_btn)
+        settings_tab_layout.addWidget(kbd_btn)
 
         # Capture
         capture_group = QtWidgets.QGroupBox("Capture")
@@ -1062,15 +1092,19 @@ class MainWindow(QtWidgets.QWidget):
         cap_stop = QtWidgets.QPushButton("Stop")
         cap_stop.clicked.connect(lambda: self._send_cmd("capture_stop"))
         capture_layout.addWidget(cap_stop)
-        layout.addWidget(capture_group)
+        goal_tab_layout.addWidget(capture_group)
 
-        # Emergency Stop
+        # Push each tab's groups to the top so they don't stretch vertically.
+        motion_tab_layout.addStretch(1)
+        goal_tab_layout.addStretch(1)
+        settings_tab_layout.addStretch(1)
+
+        # Emergency Stop — always visible, below the tabs
         stop_btn = QtWidgets.QPushButton("EMERGENCY STOP")
         stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 12pt; padding: 12px;")
         stop_btn.clicked.connect(self._handle_stop)
         layout.addWidget(stop_btn)
 
-        layout.addStretch(1)
         return panel
 
     def _build_monitor_panel(self):

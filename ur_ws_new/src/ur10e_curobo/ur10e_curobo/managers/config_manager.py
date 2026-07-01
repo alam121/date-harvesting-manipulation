@@ -7,7 +7,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE
+from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE, ENVIRONMENT
 
 if TYPE_CHECKING:
     pass
@@ -61,7 +61,8 @@ class ConfigManager:
         self._expose_shortcuts()
         self._node.add_on_set_parameters_callback(self._on_parameter_change)
         self._node.get_logger().info(
-            f"ConfigManager initialized with robot profile {ROBOT_PROFILE!r}")
+            f"ConfigManager initialized with robot profile {ROBOT_PROFILE!r} "
+            f"/ environment {ENVIRONMENT!r}")
 
     def _declare_parameters(self) -> None:
         """Declare all ROS parameters with defaults from AppConfig."""
@@ -70,6 +71,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.urdf_config", self.cfg.planner.urdf_config)
         self._node.declare_parameter("planner.interpolation_dt", self.cfg.planner.interpolation_dt)
         self._node.declare_parameter("planner.pre_dropoff_z_offset", self.cfg.planner.pre_dropoff_z_offset)
+        self._node.declare_parameter("planner.pre_dropoff_depth_offset", self.cfg.planner.pre_dropoff_depth_offset)
         self._node.declare_parameter("planner.pre_dropoff_y_offset", self.cfg.planner.pre_dropoff_y_offset)
 
         # Planner speed & smoothness params
@@ -90,12 +92,17 @@ class ConfigManager:
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
         self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
         self._node.declare_parameter("planner.direct_final_joint_fallback_max_delta_deg", self.cfg.planner.direct_final_joint_fallback_max_delta_deg)
+        self._node.declare_parameter("planner.low_left_standoff_lateral", self.cfg.planner.low_left_standoff_lateral)
+        self._node.declare_parameter("planner.low_left_standoff_depth", self.cfg.planner.low_left_standoff_depth)
         self._node.declare_parameter("planner.low_left_standoff_x", self.cfg.planner.low_left_standoff_x)
         self._node.declare_parameter("planner.low_left_standoff_y", self.cfg.planner.low_left_standoff_y)
         self._node.declare_parameter("planner.low_left_standoff_z", self.cfg.planner.low_left_standoff_z)
+        self._node.declare_parameter("planner.low_right_standoff_lateral", self.cfg.planner.low_right_standoff_lateral)
+        self._node.declare_parameter("planner.low_right_standoff_depth", self.cfg.planner.low_right_standoff_depth)
         self._node.declare_parameter("planner.low_right_standoff_x", self.cfg.planner.low_right_standoff_x)
         self._node.declare_parameter("planner.low_right_standoff_y", self.cfg.planner.low_right_standoff_y)
         self._node.declare_parameter("planner.low_right_standoff_z", self.cfg.planner.low_right_standoff_z)
+        self._node.declare_parameter("planner.low_side_final_depth_offset", self.cfg.planner.low_side_final_depth_offset)
         self._node.declare_parameter("planner.low_side_final_y_offset", self.cfg.planner.low_side_final_y_offset)
         self._node.declare_parameter("planner.low_left_final_z_offset", self.cfg.planner.low_left_final_z_offset)
         self._node.declare_parameter("planner.low_right_final_z_offset", self.cfg.planner.low_right_final_z_offset)
@@ -153,6 +160,7 @@ class ConfigManager:
         self.cfg.planner.urdf_config = self._node.get_parameter("planner.urdf_config").value
         self.cfg.planner.interpolation_dt = float(self._node.get_parameter("planner.interpolation_dt").value)
         self.cfg.planner.pre_dropoff_z_offset = float(self._node.get_parameter("planner.pre_dropoff_z_offset").value)
+        self.cfg.planner.pre_dropoff_depth_offset = float(self._node.get_parameter("planner.pre_dropoff_depth_offset").value)
         self.cfg.planner.pre_dropoff_y_offset = float(self._node.get_parameter("planner.pre_dropoff_y_offset").value)
 
         # Planner speed & smoothness
@@ -173,12 +181,17 @@ class ConfigManager:
         self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
         self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
         self.cfg.planner.direct_final_joint_fallback_max_delta_deg = float(self._node.get_parameter("planner.direct_final_joint_fallback_max_delta_deg").value)
+        self.cfg.planner.low_left_standoff_lateral = float(self._node.get_parameter("planner.low_left_standoff_lateral").value)
+        self.cfg.planner.low_left_standoff_depth = float(self._node.get_parameter("planner.low_left_standoff_depth").value)
         self.cfg.planner.low_left_standoff_x = float(self._node.get_parameter("planner.low_left_standoff_x").value)
         self.cfg.planner.low_left_standoff_y = float(self._node.get_parameter("planner.low_left_standoff_y").value)
         self.cfg.planner.low_left_standoff_z = float(self._node.get_parameter("planner.low_left_standoff_z").value)
+        self.cfg.planner.low_right_standoff_lateral = float(self._node.get_parameter("planner.low_right_standoff_lateral").value)
+        self.cfg.planner.low_right_standoff_depth = float(self._node.get_parameter("planner.low_right_standoff_depth").value)
         self.cfg.planner.low_right_standoff_x = float(self._node.get_parameter("planner.low_right_standoff_x").value)
         self.cfg.planner.low_right_standoff_y = float(self._node.get_parameter("planner.low_right_standoff_y").value)
         self.cfg.planner.low_right_standoff_z = float(self._node.get_parameter("planner.low_right_standoff_z").value)
+        self.cfg.planner.low_side_final_depth_offset = float(self._node.get_parameter("planner.low_side_final_depth_offset").value)
         self.cfg.planner.low_side_final_y_offset = float(self._node.get_parameter("planner.low_side_final_y_offset").value)
         self.cfg.planner.low_left_final_z_offset = float(self._node.get_parameter("planner.low_left_final_z_offset").value)
         self.cfg.planner.low_right_final_z_offset = float(self._node.get_parameter("planner.low_right_final_z_offset").value)
@@ -243,7 +256,7 @@ class ConfigManager:
         self.home_right_joints = self.cfg.joints.home_right
         self.dropoff_joints = self.cfg.joints.dropoff
         self.predropoff_joints = self.cfg.joints.predropoff
-        self.yoffset = self.cfg.planner.pre_dropoff_y_offset
+        self.yoffset = self.cfg.planner.pre_dropoff_depth_offset
         self.zoffset = self.cfg.planner.pre_dropoff_z_offset
         self.cam_frame = self.cfg.perception.cam_frame
 
@@ -287,12 +300,17 @@ class ConfigManager:
             "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
             "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
             "planner.direct_final_joint_fallback_max_delta_deg": (self.cfg.planner, "direct_final_joint_fallback_max_delta_deg", float),
+            "planner.low_left_standoff_lateral": (self.cfg.planner, "low_left_standoff_lateral", float),
+            "planner.low_left_standoff_depth": (self.cfg.planner, "low_left_standoff_depth", float),
             "planner.low_left_standoff_x": (self.cfg.planner, "low_left_standoff_x", float),
             "planner.low_left_standoff_y": (self.cfg.planner, "low_left_standoff_y", float),
             "planner.low_left_standoff_z": (self.cfg.planner, "low_left_standoff_z", float),
+            "planner.low_right_standoff_lateral": (self.cfg.planner, "low_right_standoff_lateral", float),
+            "planner.low_right_standoff_depth": (self.cfg.planner, "low_right_standoff_depth", float),
             "planner.low_right_standoff_x": (self.cfg.planner, "low_right_standoff_x", float),
             "planner.low_right_standoff_y": (self.cfg.planner, "low_right_standoff_y", float),
             "planner.low_right_standoff_z": (self.cfg.planner, "low_right_standoff_z", float),
+            "planner.low_side_final_depth_offset": (self.cfg.planner, "low_side_final_depth_offset", float),
             "planner.low_side_final_y_offset": (self.cfg.planner, "low_side_final_y_offset", float),
             "planner.low_left_final_z_offset": (self.cfg.planner, "low_left_final_z_offset", float),
             "planner.low_right_final_z_offset": (self.cfg.planner, "low_right_final_z_offset", float),
@@ -311,6 +329,7 @@ class ConfigManager:
             "planner.subscribe_goal_median_window": (self.cfg.planner, "subscribe_goal_median_window", int),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
+            "planner.pre_dropoff_depth_offset": (self.cfg.planner, "pre_dropoff_depth_offset", float),
             "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),
             # Grasp learning
             "grasp.learning_enabled": (self.cfg.grasp, "learning_enabled", bool),

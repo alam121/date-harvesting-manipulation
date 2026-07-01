@@ -2,6 +2,7 @@
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
+import math
 import numpy as np
 import rclpy
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
@@ -53,6 +54,18 @@ def clear_path_markers(node):
     m2.ns = "robot_path"
     m2.action = Marker.DELETEALL
     node.path_marker_pub.publish(m2)
+
+
+def clear_goal_markers(node):
+    """Delete all queued-goal markers (spheres, approach arrows, labels) in RViz."""
+    stamp = node.get_clock().now().to_msg()
+    for ns in ("goal_positions", "goal_approach", "goal_labels"):
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = stamp
+        m.ns = ns
+        m.action = Marker.DELETEALL
+        node.goal_marker_pub.publish(m)
 
 
 def publish_goal_marker(node, position, rank=None):
@@ -259,6 +272,197 @@ def clear_plan_preview(node):
         m.ns = ns
         m.action = Marker.DELETEALL
         node.goal_marker_pub.publish(m)
+
+
+def publish_lidar_scan_preview(node, targets, *, valid: bool = True):
+    """Publish a short-lived LiDAR scan arc preview without touching plan_preview."""
+    stamp = node.get_clock().now().to_msg()
+    for ns in (
+        "lidar_scan_preview",
+        "lidar_scan_preview_lines",
+        "lidar_scan_preview_points",
+        "lidar_scan_preview_labels",
+    ):
+        delete = Marker()
+        delete.header.frame_id = "base_link"
+        delete.header.stamp = stamp
+        delete.ns = ns
+        delete.action = Marker.DELETEALL
+        node.goal_marker_pub.publish(delete)
+
+    color = (0.1, 1.0, 0.35, 0.95) if valid else (0.1, 0.9, 1.0, 0.75)
+    arc_line = Marker()
+    arc_line.header.frame_id = "base_link"
+    arc_line.header.stamp = stamp
+    arc_line.ns = "lidar_scan_preview_lines"
+    arc_line.id = 0
+    arc_line.type = Marker.LINE_STRIP
+    arc_line.action = Marker.ADD
+    arc_line.pose.orientation.w = 1.0
+    arc_line.scale.x = 0.008
+    arc_line.color.r, arc_line.color.g, arc_line.color.b, arc_line.color.a = color
+    arc_line.lifetime.sec = 2
+
+    for i, target in enumerate(targets):
+        pose = target.get("pose") if isinstance(target, dict) else target
+        if pose is None or len(pose) < 3:
+            continue
+        pos = [float(pose[0]), float(pose[1]), float(pose[2])]
+
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = stamp
+        m.ns = "lidar_scan_preview_points"
+        m.id = i
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = pos[0]
+        m.pose.position.y = pos[1]
+        m.pose.position.z = pos[2]
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.045
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+        m.lifetime.sec = 2
+        node.goal_marker_pub.publish(m)
+
+        t = Marker()
+        t.header.frame_id = "base_link"
+        t.header.stamp = stamp
+        t.ns = "lidar_scan_preview_labels"
+        t.id = i
+        t.type = Marker.TEXT_VIEW_FACING
+        t.action = Marker.ADD
+        t.pose.position.x = pos[0]
+        t.pose.position.y = pos[1]
+        t.pose.position.z = pos[2] + 0.105
+        t.scale.z = 0.050
+        t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+        t.text = f"S{i + 1}"
+        t.lifetime.sec = 2
+        node.goal_marker_pub.publish(t)
+
+        arc_line.points.append(Point(x=pos[0], y=pos[1], z=pos[2]))
+
+    if len(arc_line.points) >= 2:
+        node.goal_marker_pub.publish(arc_line)
+
+
+def publish_reachability_cloud(node, points, deltas_deg, directions=None):
+    """Publish current-posture reachability samples as an RViz colored point cloud."""
+    pub = getattr(node, "reachability_marker_pub", None)
+    if pub is None:
+        return
+
+    stamp = node.get_clock().now().to_msg()
+    if not points:
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = stamp
+        m.ns = "reachability_cloud"
+        m.action = Marker.DELETEALL
+        pub.publish(m)
+        return
+
+    planner = node.cfg.planner
+    green_cap = float(getattr(
+        planner, "safe_zone_verified_interp_max_delta_deg", 80.0))
+    yellow_cap = float(getattr(
+        planner, "shortest_ik_plan_max_delta_deg", 80.0))
+    max_cap = float(getattr(
+        planner, "reachability_cloud_max_delta_deg",
+        getattr(planner, "goal_reachability_skip_delta_deg", 100.0)))
+    size = float(getattr(planner, "reachability_cloud_point_size_m", 0.025))
+    period = float(getattr(planner, "reachability_cloud_period_s", 1.0))
+
+    m = Marker()
+    m.header.frame_id = "base_link"
+    m.header.stamp = stamp
+    m.ns = "reachability_cloud"
+    m.id = 0
+    m.type = Marker.SPHERE_LIST
+    m.action = Marker.ADD
+    m.pose.orientation.w = 1.0
+    m.scale.x = m.scale.y = m.scale.z = size
+    m.lifetime.sec = max(1, int(math.ceil(period * 2.5)))
+
+    # Reachable points lying on/near the scan arc get a darker green so the operator can see
+    # which green samples the lidar sweep will actually pass through. Lazy import avoids the
+    # markers<->lidar_scan circular import.
+    arc_desc = None
+    arc_tol = 0.04
+    try:
+        if bool(getattr(node.cfg.lidar_scan, "arc_highlight_enabled", True)):
+            from . import lidar_scan as _ls
+            arc_desc = _ls.arc_descriptor(node)
+            arc_tol = float(getattr(node.cfg.lidar_scan, "arc_highlight_tol_m", 0.04))
+    except Exception:
+        arc_desc = None
+
+    for p, delta in zip(points, deltas_deg):
+        m.points.append(p)
+        c = ColorRGBA()
+        c.a = 0.38
+        if delta <= green_cap:
+            if arc_desc is not None and _ls.point_on_arc(arc_desc, p.x, p.y, p.z, arc_tol):
+                c.r, c.g, c.b = 0.0, 0.40, 0.0   # dark green: on/near the scan arc
+                c.a = 0.90
+            else:
+                c.r, c.g, c.b = 0.18, 0.70, 0.24
+                c.a = 0.46
+        elif delta <= yellow_cap:
+            c.r, c.g, c.b = 0.90, 0.72, 0.16
+        else:
+            t = min(1.0, max(0.0, (delta - yellow_cap) / max(max_cap - yellow_cap, 1.0)))
+            c.r, c.g, c.b = 0.90, 0.36 * (1.0 - t), 0.10
+            c.a = 0.28
+        m.colors.append(c)
+    pub.publish(m)
+
+    d = Marker()
+    d.header.frame_id = "base_link"
+    d.header.stamp = stamp
+    d.ns = "reachability_directions"
+    d.id = 0
+    d.type = Marker.LINE_LIST
+    d.action = Marker.ADD if directions else Marker.DELETE
+    d.pose.orientation.w = 1.0
+    d.scale.x = 0.004
+    d.color.r, d.color.g, d.color.b, d.color.a = 0.20, 0.58, 0.72, 0.45
+    d.lifetime.sec = m.lifetime.sec
+    length = float(getattr(planner, "reachability_direction_length_m", 0.08))
+    if directions:
+        for p, direction in zip(points, directions):
+            if direction is None:
+                continue
+            norm = math.sqrt(sum(float(v) * float(v) for v in direction))
+            if norm < 1e-6:
+                continue
+            d.points.append(p)
+            e = Point()
+            e.x = p.x + float(direction[0]) / norm * length
+            e.y = p.y + float(direction[1]) / norm * length
+            e.z = p.z + float(direction[2]) / norm * length
+            d.points.append(e)
+    pub.publish(d)
+
+    t = Marker()
+    t.header.frame_id = "base_link"
+    t.header.stamp = stamp
+    t.ns = "reachability_cloud"
+    t.id = 1
+    t.type = Marker.TEXT_VIEW_FACING
+    t.action = Marker.ADD
+    t.pose.orientation.w = 1.0
+    t.pose.position.x = min(p.x for p in points)
+    t.pose.position.y = min(p.y for p in points)
+    t.pose.position.z = max(p.z for p in points) + 0.08
+    t.scale.z = 0.035
+    t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+    t.text = (
+        f"Reachability from current posture: green <= {green_cap:.0f}deg, "
+        f"yellow <= {yellow_cap:.0f}deg")
+    t.lifetime.sec = m.lifetime.sec
+    pub.publish(t)
 
 
 def publish_path_marker(node):

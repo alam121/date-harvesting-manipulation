@@ -679,6 +679,14 @@ URPositionHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous
 {
   RCLCPP_INFO(rclcpp::get_logger("URPositionHardwareInterface"), "Activating HW interface");
 
+  // Side publisher for per-joint temperatures (degC). The HW component owns its own node so
+  // it can publish without a dedicated controller; we never spin it (publishing needs no spin).
+  if (!aux_node_) {
+    aux_node_ = std::make_shared<rclcpp::Node>("ur_hardware_aux");
+    joint_temperature_pub_ = aux_node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+        "/joint_temperatures", rclcpp::SystemDefaultsQoS());
+  }
+
   for (size_t i = 0; i < 6; i++) {
     force_mode_task_frame_[i] = NO_NEW_CMD_;
     force_mode_selection_vector_[i] = static_cast<uint32_t>(NO_NEW_CMD_);
@@ -772,6 +780,7 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     readData(data_pkg, "actual_q", urcl_joint_positions_);
     readData(data_pkg, "actual_qd", urcl_joint_velocities_);
     readData(data_pkg, "actual_current", urcl_joint_efforts_);
+    readData(data_pkg, "joint_temperatures", urcl_joint_temperatures_);
 
     readData(data_pkg, "target_speed_fraction", target_speed_fraction_);
     readData(data_pkg, "speed_scaling", speed_scaling_);
@@ -848,6 +857,14 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     }
 
     updateNonDoubleValues();
+
+    // Publish per-joint temperatures at ~2 Hz (they change slowly; keep it off the RT path).
+    if (joint_temperature_pub_ && (time.seconds() - last_joint_temp_pub_sec_) >= 0.5) {
+      last_joint_temp_pub_sec_ = time.seconds();
+      std_msgs::msg::Float64MultiArray temp_msg;
+      temp_msg.data.assign(urcl_joint_temperatures_.begin(), urcl_joint_temperatures_.end());
+      joint_temperature_pub_->publish(temp_msg);
+    }
 
     return hardware_interface::return_type::OK;
   }

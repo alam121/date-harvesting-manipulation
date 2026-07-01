@@ -98,7 +98,11 @@ class MotionExecutor:
         self.motion_gen_config = MotionGenConfig.load_from_robot_config(
             robot_config,
             world_config,
-            interpolation_dt=self._config.cfg.planner.interpolation_dt
+            interpolation_dt=self._config.cfg.planner.interpolation_dt,
+            # Pre-allocate room for static obstacles + the 6 safe-zone wall panels (+ head-
+            # room). Without this the OBB cache is sized to the initial world and adding the
+            # walls fails with "number of OBB is larger than collision cache".
+            collision_cache={"obb": 64, "mesh": 10},
         )
 
         self.motion_gen = MotionGen(self.motion_gen_config)
@@ -109,6 +113,9 @@ class MotionExecutor:
 
         self.motion_gen.warmup()
         self._node.get_logger().info("cuRobo warmup done")
+
+        # Wire the RViz safe-zone box to keep-out walls in cuRobo's world (whole-arm bound).
+        self._node._safe_zone_on_change = self._update_safe_zone_walls
 
         # Dynamic obstacle manager
         self.obstacles = DynamicObstacleManager(
@@ -156,7 +163,7 @@ class MotionExecutor:
             join_path(get_robot_configs_path(), config_name))
         kinematics = robot_config["robot_cfg"]["kinematics"]
         source_urdf = Path(join_path(get_assets_path(), kinematics["urdf_path"]))
-        text = source_urdf.read_text()
+        text = source_urdf.read_text(encoding="utf-8")
 
         replacements = {
             'xyz="-0.008324 0.148998 0.040079"':
@@ -173,7 +180,7 @@ class MotionExecutor:
             text = text.replace(current, previous, 1)
 
         profile_urdf = Path("/tmp/ur10e_curobo_old_profile.urdf")
-        profile_urdf.write_text(text)
+        profile_urdf.write_text(text, encoding="utf-8")
         kinematics["urdf_path"] = str(profile_urdf)
         self._node.get_logger().info(
             f"Generated old-profile cuRobo URDF: {profile_urdf}")
@@ -502,6 +509,65 @@ class MotionExecutor:
             except Exception as e:
                 self._node.get_logger().warn(f"Initial voxel snapshot failed: {e}")
             self._initial_voxel_timer.cancel()
+
+    def _safe_zone_wall_cuboids(self, lo, hi):
+        """Four VERTICAL (lateral) panels fencing the box's back/front/sides — the blind
+        directions the camera can't see. Floor and ceiling are intentionally omitted: a
+        floor panel intersects the robot's own base/shoulder links (the arm reaches in from
+        its base, which sits below the work box) and would put the start state in collision,
+        bricking all planning. So this bounds the arm horizontally while leaving the base
+        region unobstructed. Panels are centered on each face (thickness T), oversized in z
+        by V so they fence tall reaches, and by M laterally to seal corners. Any panel that
+        still contains the base origin is skipped."""
+        from curobo.geom.types import Cuboid
+        T, M, V = 0.10, 0.10, 0.40
+        sx, sy, sz = hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+        cx, cy, cz = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0
+        q = [1.0, 0.0, 0.0, 0.0]
+        specs = [
+            ("xmin", (lo[0] - T / 2, cy, cz), (T, sy + M, sz + V)),
+            ("xmax", (hi[0] + T / 2, cy, cz), (T, sy + M, sz + V)),
+            ("ymin", (cx, lo[1] - T / 2, cz), (sx + M, T, sz + V)),
+            ("ymax", (cx, hi[1] + T / 2, cz), (sx + M, T, sz + V)),
+            # Floor just below the box bottom. Only safe when the box bottom is at/below the
+            # ground (below the base) — otherwise it slices the base and is auto-skipped.
+            ("zmin", (cx, cy, lo[2] - T / 2), (sx + M, sy + M, T)),
+            # Roof just above the box top. Drag the top high enough to clear the arm or it
+            # will clip the upper links (start-collision).
+            ("zmax", (cx, cy, hi[2] + T / 2), (sx + M, sy + M, T)),
+        ]
+        walls = []
+        for nm, c, d in specs:
+            if abs(c[0]) <= d[0] / 2 and abs(c[1]) <= d[1] / 2 and abs(c[2]) <= d[2] / 2:
+                self._node.get_logger().warn(
+                    f"safezone_{nm} panel overlaps the base origin — skipped "
+                    f"(move that side of the box away from the robot base).")
+                continue
+            walls.append(Cuboid(name=f"safezone_{nm}", pose=[*c, *q], dims=list(d)))
+        return walls
+
+    def _update_safe_zone_walls(self) -> None:
+        """(Re)apply keep-out walls to cuRobo's world from node.safe_zone_*, or clear them
+        when the zone is disabled. Persists across voxel updates (those only touch the voxel
+        list, not cuboids)."""
+        if self.motion_gen is None:
+            return
+        node = self._node
+        try:
+            wm = self.motion_gen.world_model
+            wm.cuboid = [c for c in (wm.cuboid or [])
+                         if not c.name.startswith("safezone_")]
+            enabled = bool(getattr(node, "safe_zone_enabled", False))
+            if enabled:
+                lo = [min(a, b) for a, b in zip(node.safe_zone_min, node.safe_zone_max)]
+                hi = [max(a, b) for a, b in zip(node.safe_zone_min, node.safe_zone_max)]
+                wm.cuboid.extend(self._safe_zone_wall_cuboids(lo, hi))
+            self.motion_gen.update_world(wm)
+            n = len([c for c in wm.cuboid if c.name.startswith("safezone_")])
+            node.get_logger().info(
+                f"Safe-zone walls {'applied' if enabled else 'cleared'} ({n} panels).")
+        except Exception as e:
+            node.get_logger().warn(f"Safe-zone wall update failed: {e}")
 
     def _publish_static_obstacles(self) -> None:
         """Publish static obstacles for visualization."""

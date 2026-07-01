@@ -3,6 +3,7 @@ import json
 import threading
 import rclpy
 import os
+import time
 import numpy as np
 import math
 from collections import deque
@@ -12,14 +13,17 @@ from rclpy.qos import QoSProfile
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray, String, Float32
-from geometry_msgs.msg import PoseStamped
-from .config import AppConfig
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from .config import AppConfig, ROBOT_PROFILE, ENVIRONMENT
 
 from .utils import read_key
 from . import fk as fk_mod
 from . import markers as markers_mod
 from . import motions as motions_mod
 from . import goals as goals_mod
+from . import goal_marker as goal_marker_mod
+from . import safe_zone as safe_zone_mod
 from .goals import ThreadSafeGoalList
 from . import gripper as gripper_mod
 from ur_msgs.srv import SetIO
@@ -41,6 +45,10 @@ from .managers import ConfigManager, StateManager, MotionExecutor
 
 
 class UR10eCuroboMoveIt(Node):
+    # Speed multiplier for "Execute Queue" goal moves, relative to the active
+    # velocity scale. <1.0 makes these waypoint moves slower than normal motions.
+    GOAL_MOVE_SPEED_FACTOR = 0.5
+
     def __init__(self):
         super().__init__(
             "ur10e_curobo_moveit_node",
@@ -67,6 +75,7 @@ class UR10eCuroboMoveIt(Node):
 
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_positions_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/robot_path_marker", 10)
+        self.reachability_marker_pub = self.create_publisher(Marker, "/reachability_cloud", 10)
 
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
 
@@ -79,11 +88,17 @@ class UR10eCuroboMoveIt(Node):
 
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
+        self.create_subscription(Image, "/vision/display", self._camera_image_cb, 10)
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
         self._vision_mode_pub = self.create_publisher(String, "/vision/mode", 10)
         self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
+        # Active robot type + environment for the RViz panel. Republished periodically so
+        # the panel shows it regardless of who started first.
+        self.robot_config_pub = self.create_publisher(String, "/robot_config_info", 10)
+        self.create_timer(2.0, lambda: self.robot_config_pub.publish(
+            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {ENVIRONMENT}")))
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
@@ -101,6 +116,12 @@ class UR10eCuroboMoveIt(Node):
             '/manual_goal_pose',
             self._manual_goal_pose_cb,
             self.goal_qos,
+        )
+        self.create_subscription(
+            PointStamped,
+            '/clicked_point',
+            self._clicked_reachability_point_cb,
+            10,
         )
 
         # Subscribe to fruit radius from vision for adaptive gripper
@@ -167,9 +188,29 @@ class UR10eCuroboMoveIt(Node):
 
         # System control publishers
         self._refresh_camera_pub = self.create_publisher(String, "/camera_command", 10)
+        self._camera_lock = threading.Lock()
+        self._camera_latest_msg = None
+        self._camera_bridge = None
+        self._camera_video_writer = None
+        self._camera_video_path = ""
+        self._camera_video_recording = False
+        self._camera_video_frames = 0
+        self._camera_video_fps = 15.0
 
         # perception disabled - using external date_v1.9.py instead
         self.perception = None
+
+        # Draggable RViz goal marker (3D-viewport counterpart to the panel buttons)
+        goal_marker_mod.setup_goal_marker(self)
+        safe_zone_mod.setup_safe_zone(self)
+        self._reachability_sample_pattern = None
+        self._latest_reachability_samples = []
+        self._reachability_goal_metadata = {}
+        self.create_timer(
+            max(0.25, float(getattr(
+                self.cfg.planner, "reachability_cloud_period_s", 1.0))),
+            self._publish_reachability_cloud,
+        )
 
         # keyboard
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
@@ -186,6 +227,244 @@ class UR10eCuroboMoveIt(Node):
         msg = String()
         msg.data = mode
         self._vision_mode_pub.publish(msg)
+
+    def _reachability_offsets(self, samples: int, cap_rad: float):
+        """Deterministic joint-offset samples around zero, scaled by max joint delta."""
+        cached = getattr(self, "_reachability_sample_pattern", None)
+        if cached is not None and cached[0] == samples:
+            pattern = cached[1]
+        else:
+            rng = np.random.default_rng(7)
+            raw = rng.normal(size=(max(samples - 13, 0), len(self.joint_order)))
+            norm = np.max(np.abs(raw), axis=1, keepdims=True)
+            norm[norm < 1e-6] = 1.0
+            radii = rng.uniform(0.15, 1.0, size=(raw.shape[0], 1))
+            pattern = (raw / norm) * radii
+            axes = [np.zeros(len(self.joint_order))]
+            for j in range(len(self.joint_order)):
+                for sign in (-1.0, 1.0):
+                    v = np.zeros(len(self.joint_order))
+                    v[j] = sign
+                    axes.append(v)
+            pattern = np.vstack([np.array(axes), pattern])[:samples]
+            self._reachability_sample_pattern = (samples, pattern)
+        return pattern * cap_rad
+
+    @staticmethod
+    def _quat_rotate_vec(q, v):
+        qw, qx, qy, qz = [float(x) for x in q]
+        vx, vy, vz = [float(x) for x in v]
+        # q * [0, v] * q^-1, expanded to avoid an extra dependency.
+        tx = 2.0 * (qy * vz - qz * vy)
+        ty = 2.0 * (qz * vx - qx * vz)
+        tz = 2.0 * (qx * vy - qy * vx)
+        return [
+            vx + qw * tx + (qy * tz - qz * ty),
+            vy + qw * ty + (qz * tx - qx * tz),
+            vz + qw * tz + (qx * ty - qy * tx),
+        ]
+
+    def _publish_reachability_cloud(self):
+        planner = self.cfg.planner
+        if not bool(getattr(planner, "reachability_cloud_enabled", True)):
+            markers_mod.publish_reachability_cloud(self, [], [])
+            try:
+                from . import lidar_scan as lidar_scan_mod
+                lidar_scan_mod.publish_lidar_scan_preview(self)
+            except Exception as e:
+                self.get_logger().debug(f"Lidar scan preview update skipped: {e}")
+            return
+        if not getattr(self, "joint_order", None):
+            return
+        if self.current_joint_positions is None:
+            return
+        if getattr(self, "motion_phase", "IDLE") != "IDLE":
+            return
+        lock = getattr(self, "_planning_lock", None)
+        if lock is not None and lock.locked():
+            return
+
+        current = np.array(self.current_joint_positions, dtype=float)
+        max_delta_deg = float(getattr(
+            planner,
+            "reachability_cloud_max_delta_deg",
+            getattr(planner, "goal_reachability_skip_delta_deg", 100.0)))
+        max_delta_rad = math.radians(max_delta_deg)
+        samples = max(16, int(getattr(planner, "reachability_cloud_samples", 320)))
+
+        offsets = self._reachability_offsets(samples, max_delta_rad)
+        joint_samples = (current.reshape(1, -1) + offsets).tolist()
+        poses = fk_mod.forward_kinematics_pose_batch(self, joint_samples)
+        if not poses:
+            return
+        points = [
+            Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+            for p in poses
+        ]
+
+        deltas = np.max(np.abs(offsets), axis=1)
+        keep_points = []
+        keep_deltas = []
+        keep_samples = []
+        keep_directions = []
+        in_zone = getattr(self, "in_safe_zone", lambda _xyz: True)
+        green_cap = float(getattr(
+            planner, "safe_zone_verified_interp_max_delta_deg", 80.0))
+        yellow_cap = float(getattr(
+            planner, "shortest_ik_plan_max_delta_deg", 80.0))
+        valid_direct = [False for _ in joint_samples]
+        green_indices = [
+            i for i, d in enumerate(deltas)
+            if math.degrees(float(d)) <= green_cap
+        ]
+        if green_indices and bool(getattr(
+                planner, "reachability_cloud_validate_green", True)):
+            green_targets = [joint_samples[i] for i in green_indices]
+            green_valid = motions_mod.validate_joint_interpolations_batch(
+                self,
+                current.tolist(),
+                green_targets,
+                max_delta_deg=green_cap,
+                step_deg=float(getattr(
+                    planner, "safe_zone_verified_interp_step_deg", 1.0)),
+            )
+            for i, ok in zip(green_indices, green_valid):
+                valid_direct[i] = bool(ok)
+        else:
+            for i in green_indices:
+                valid_direct[i] = True
+
+        direction_axis = list(getattr(
+            planner, "reachability_direction_axis", [0.0, 0.0, 1.0]))
+        direction_stride = max(1, int(getattr(
+            planner, "reachability_direction_stride", 4)))
+        show_directions = bool(getattr(
+            planner, "reachability_direction_enabled", True))
+        green_seen = 0
+        for i, (pose, p, d, joints) in enumerate(zip(poses, points, deltas, joint_samples)):
+            xyz = [p.x, p.y, p.z]
+            if not in_zone(xyz):
+                continue
+            keep_points.append(p)
+            delta_deg = math.degrees(float(d))
+            display_delta_deg = delta_deg
+            if delta_deg <= green_cap and not valid_direct[i]:
+                display_delta_deg = max(yellow_cap + 1.0, delta_deg)
+            keep_deltas.append(delta_deg)
+            keep_samples.append({
+                "xyz": xyz,
+                "pose": list(pose[:7]),
+                "delta_deg": delta_deg,
+                "display_delta_deg": display_delta_deg,
+                "valid_direct": bool(valid_direct[i]),
+                "joints": list(joints),
+            })
+            if display_delta_deg <= green_cap and valid_direct[i]:
+                green_seen += 1
+                if show_directions and (green_seen - 1) % direction_stride == 0:
+                    keep_directions.append(
+                        self._quat_rotate_vec(pose[3:7], direction_axis))
+                else:
+                    keep_directions.append(None)
+            else:
+                keep_directions.append(None)
+        self._latest_reachability_samples = keep_samples
+        markers_mod.publish_reachability_cloud(
+            self,
+            keep_points,
+            [s["display_delta_deg"] for s in keep_samples],
+            keep_directions)
+        try:
+            from . import lidar_scan as lidar_scan_mod
+            lidar_scan_mod.publish_lidar_scan_preview(self)
+        except Exception as e:
+            self.get_logger().debug(f"Lidar scan preview update skipped: {e}")
+
+    def _clicked_reachability_point_cb(self, msg: PointStamped):
+        """Queue the nearest green reachability-cloud sample from an RViz click."""
+        if msg.header.frame_id and msg.header.frame_id != "base_link":
+            self.get_logger().warn(
+                f"Reachability click must be in base_link, got {msg.header.frame_id!r}.")
+            return
+        samples = list(getattr(self, "_latest_reachability_samples", []) or [])
+        if not samples:
+            self.get_logger().warn(
+                "Reachability click ignored: no reachability cloud samples yet.")
+            return
+
+        clicked = [float(msg.point.x), float(msg.point.y), float(msg.point.z)]
+        best = min(
+            samples,
+            key=lambda s: math.dist(clicked, s["xyz"]),
+        )
+        dist = math.dist(clicked, best["xyz"])
+        planner = self.cfg.planner
+        max_dist = float(getattr(planner, "reachability_click_max_distance_m", 0.06))
+        if dist > max_dist:
+            self.get_logger().warn(
+                f"Reachability click ignored: nearest sample is {dist*100:.1f}cm away "
+                f"(limit {max_dist*100:.1f}cm).")
+            return
+
+        green_cap = float(getattr(
+            planner, "safe_zone_verified_interp_max_delta_deg", 80.0))
+        if (
+            bool(getattr(planner, "reachability_click_green_only", True))
+            and (
+                best.get("display_delta_deg", best["delta_deg"]) > green_cap
+                or not bool(best.get("valid_direct", True))
+            )
+        ):
+            reason = (
+                f"delta {best['delta_deg']:.1f}deg exceeds green cap {green_cap:.0f}deg"
+                if best.get("display_delta_deg", best["delta_deg"]) > green_cap
+                else "cuRobo direct-path validation failed"
+            )
+            self.get_logger().warn(
+                f"Reachability click ignored: nearest sample is not green-valid "
+                f"({reason}).")
+            return
+        if self.current_joint_positions is None:
+            self.get_logger().warn("Reachability click ignored: joint state unavailable.")
+            return
+        valid_now = motions_mod.validate_joint_interpolations_batch(
+            self,
+            list(self.current_joint_positions),
+            [best["joints"]],
+            max_delta_deg=green_cap,
+            step_deg=float(getattr(
+                planner, "safe_zone_verified_interp_step_deg", 1.0)),
+        )
+        if not valid_now or not valid_now[0]:
+            self.get_logger().warn(
+                "Reachability click ignored: selected sample no longer has a "
+                "cuRobo-valid direct path from the current posture.")
+            return
+
+        pose = fk_mod.pose_from_joints(self, best["joints"])
+        if not pose or len(pose) < 7:
+            self.get_logger().warn("Reachability click ignored: FK pose unavailable.")
+            return
+        goal = [float(v) for v in pose[:7]]
+        if self.goal_poses.any_within_distance(goal[:3], 0.01):
+            self.get_logger().info(
+                "Reachability click already queued (within 1cm) — skipping")
+            return
+        self.latest_goal_pose = list(goal)
+        self.goal_poses.append(goal)
+        self._reachability_goal_metadata[self._goal_meta_key(goal)] = {
+            "joints": list(best["joints"]),
+            "delta_deg": float(best["delta_deg"]),
+        }
+        markers_mod.publish_goal_marker(self, goal[:3])
+        self.get_logger().info(
+            f"Queued goal #{len(self.goal_poses)} from reachability click: "
+            f"[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] "
+            f"(delta={best['delta_deg']:.1f}deg, snap={dist*100:.1f}cm)")
+
+    @staticmethod
+    def _goal_meta_key(goal):
+        return tuple(round(float(v), 4) for v in goal[:7])
 
     def reset_goal_tracking(self):
         """Reset all goal tracking state for a fresh cycle."""
@@ -219,6 +498,105 @@ class UR10eCuroboMoveIt(Node):
         if hasattr(self, 'classifier'):
             self.classifier.tick()
 
+    def _camera_output_dir(self):
+        path = os.path.expanduser("~/camera_recordings")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _get_camera_bridge(self):
+        if self._camera_bridge is None:
+            from cv_bridge import CvBridge
+            self._camera_bridge = CvBridge()
+        return self._camera_bridge
+
+    def _camera_msg_to_bgr(self, msg):
+        bridge = self._get_camera_bridge()
+        return bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+
+    def _camera_image_cb(self, msg):
+        with self._camera_lock:
+            self._camera_latest_msg = msg
+            if not self._camera_video_recording:
+                return
+            try:
+                import cv2
+                frame = self._camera_msg_to_bgr(msg)
+                if self._camera_video_writer is None:
+                    h, w = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    self._camera_video_writer = cv2.VideoWriter(
+                        self._camera_video_path,
+                        fourcc,
+                        self._camera_video_fps,
+                        (w, h),
+                    )
+                    if not self._camera_video_writer.isOpened():
+                        self.get_logger().error(
+                            f"Camera video: failed to open {self._camera_video_path}")
+                        self._camera_video_recording = False
+                        self._camera_video_writer = None
+                        return
+                self._camera_video_writer.write(frame)
+                self._camera_video_frames += 1
+            except Exception as e:
+                self.get_logger().error(f"Camera video recording failed: {e}")
+                if self._camera_video_writer is not None:
+                    self._camera_video_writer.release()
+                self._camera_video_writer = None
+                self._camera_video_recording = False
+
+    def _save_camera_snapshot(self):
+        with self._camera_lock:
+            msg = self._camera_latest_msg
+        if msg is None:
+            self.get_logger().warn("Camera snapshot: no /vision/display frame received yet")
+            return
+        try:
+            import cv2
+            frame = self._camera_msg_to_bgr(msg)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self._camera_output_dir(), f"camera_{stamp}.png")
+            if not cv2.imwrite(path, frame):
+                self.get_logger().error(f"Camera snapshot: failed to save {path}")
+                return
+            self.get_logger().info(f"Camera snapshot saved: {path}")
+        except Exception as e:
+            self.get_logger().error(f"Camera snapshot failed: {e}")
+
+    def _start_camera_video_recording(self):
+        with self._camera_lock:
+            if self._camera_video_recording:
+                self.get_logger().warn(
+                    f"Camera video already recording: {self._camera_video_path}")
+                return
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self._camera_video_path = os.path.join(
+                self._camera_output_dir(), f"camera_video_{stamp}.mp4")
+            self._camera_video_writer = None
+            self._camera_video_frames = 0
+            self._camera_video_recording = True
+        self.get_logger().info(
+            f"Camera video recording started: {self._camera_video_path}")
+
+    def _stop_camera_video_recording(self):
+        with self._camera_lock:
+            if not self._camera_video_recording and self._camera_video_writer is None:
+                self.get_logger().warn("Camera video: not recording")
+                return
+            path = self._camera_video_path
+            frames = self._camera_video_frames
+            writer = self._camera_video_writer
+            self._camera_video_recording = False
+            self._camera_video_writer = None
+            self._camera_video_path = ""
+            self._camera_video_frames = 0
+        try:
+            if writer is not None:
+                writer.release()
+        finally:
+            self.get_logger().info(
+                f"Camera video recording stopped: {path} ({frames} frames)")
+
     def _ui_command_cb(self, msg: String):
         """Handle commands from the GUI."""
         import json
@@ -230,7 +608,17 @@ class UR10eCuroboMoveIt(Node):
         # Use mutex to prevent concurrent execution of motion commands
         def run_home():
             if not self._motion_lock.acquire(blocking=False):
-                self.get_logger().warn("Motion already in progress, ignoring HOME command")
+                if getattr(self, "motion_phase", "") == "LIDAR_SCAN_HOME":
+                    self.get_logger().warn(
+                        "Already returning HOME after LiDAR scan; ignoring duplicate HOME.")
+                    return
+                self.stop_requested = True
+                self.goal_poses.clear()
+                getattr(self, "_reachability_goal_metadata", {}).clear()
+                motions_mod.publish_stop_trajectory(self)
+                self.get_logger().warn(
+                    "Motion already in progress; requested stop for HOME. "
+                    "Press HOME again after the active planner returns.")
                 return
             try:
                 self.stop_requested = False  # clear any prior stop before homing
@@ -258,14 +646,63 @@ class UR10eCuroboMoveIt(Node):
             finally:
                 self._motion_lock.release()
 
+        def run_execute_moves():
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn(
+                    "Motion already in progress, ignoring EXECUTE MOVES command")
+                return
+            try:
+                self._execute_goals_no_grasp()
+            finally:
+                self._motion_lock.release()
+
+        def run_side_home(which):
+            # Manually move to a stored side-home joint config (for testing/calibrating
+            # home_left/home_right per robot profile). Same path as the auto side approach.
+            label = which.upper()
+            attr = {
+                "home_left": "home_left_joints",
+                "home_right": "home_right_joints",
+                "home_left_low": "home_left_low_joints",
+                "home_right_low": "home_right_low_joints",
+            }[which]
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn(f"Motion already in progress, ignoring {label} command")
+                return
+            try:
+                self.stop_requested = False
+                target = list(getattr(self, attr))
+                cur = self.current_joint_positions
+                if cur is not None:
+                    target = motions_mod.nearest_joint_config(list(cur), target)
+                ok = motions_mod.plan_execute_js(
+                    self, target, label=label, motion_type="home", speed_factor=0.5)
+                if not ok:
+                    self.get_logger().warn(
+                        f"{label}: move failed — cuRobo could not plan to this config "
+                        f"(likely in collision or unreachable for the active robot profile). "
+                        f"target joints={[round(v, 4) for v in target]}")
+            finally:
+                self._motion_lock.release()
+
         if cmd == "home":
             threading.Thread(target=run_home, daemon=True).start()
         elif cmd == "dropoff":
             threading.Thread(target=run_dropoff, daemon=True).start()
         elif cmd == "execute":
             threading.Thread(target=run_execute, daemon=True).start()
+        elif cmd == "execute_moves":
+            threading.Thread(target=run_execute_moves, daemon=True).start()
+        elif cmd in ("home_left", "home_right", "home_left_low", "home_right_low"):
+            threading.Thread(target=lambda c=cmd: run_side_home(c), daemon=True).start()
+        elif cmd == "add_current_goal":
+            self._add_current_as_goal()
         elif cmd == "clear":
             self.goal_poses.clear()
+            getattr(self, "_reachability_goal_metadata", {}).clear()
+            markers_mod.clear_goal_markers(self)
+            markers_mod.clear_path_markers(self)
+            markers_mod.clear_plan_preview(self)
             self.get_logger().info("Goals cleared")
         elif cmd == "open":
             gripper_mod.control_gripper(self, 'OPEN')
@@ -275,6 +712,10 @@ class UR10eCuroboMoveIt(Node):
             self.stop_requested = True
             motions_mod.publish_stop_trajectory(self)
             self.goal_poses.clear()
+            getattr(self, "_reachability_goal_metadata", {}).clear()
+            markers_mod.clear_goal_markers(self)
+            markers_mod.clear_path_markers(self)
+            markers_mod.clear_plan_preview(self)
         elif cmd.startswith("capture "):
             try:
                 duration = float(cmd.split()[1])
@@ -348,6 +789,12 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "refresh_camera":
             self._refresh_camera_pub.publish(String(data="refresh"))
             self.get_logger().info("Camera refresh requested")
+        elif cmd == "camera_snapshot":
+            self._save_camera_snapshot()
+        elif cmd == "camera_video_start":
+            self._start_camera_video_recording()
+        elif cmd == "camera_video_stop":
+            self._stop_camera_video_recording()
         elif cmd == "plan_confirm":
             self._state_mgr.plan_confirmed = True
             self._state_mgr.plan_confirm_event.set()
@@ -360,6 +807,24 @@ class UR10eCuroboMoveIt(Node):
             val = cmd.split()[1].lower()
             self.cfg.planner.debug_plan_preview = val in ("true", "1", "yes")
             self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
+        elif cmd.startswith("set_reachability_cloud "):
+            val = cmd.split()[1].lower()
+            enabled = val in ("true", "1", "yes", "on")
+            self.cfg.planner.reachability_cloud_enabled = enabled
+            if not enabled:
+                self._latest_reachability_samples = []
+                markers_mod.publish_reachability_cloud(self, [], [])
+                markers_mod.publish_lidar_scan_preview(self, [], valid=False)
+            self.get_logger().info(
+                f"Reachability cloud {'enabled' if enabled else 'disabled'}")
+        elif cmd.startswith("set_lidar_scan_preview "):
+            val = cmd.split()[1].lower()
+            enabled = val in ("true", "1", "yes", "on")
+            self.cfg.lidar_scan.semicircle_preview_enabled = enabled
+            if not enabled:
+                markers_mod.publish_lidar_scan_preview(self, [], valid=False)
+            self.get_logger().info(
+                f"LiDAR scan preview {'enabled' if enabled else 'disabled'}")
         elif cmd == "debug_world":
             self.debug_print_world()
         elif cmd == "check_calibration":
@@ -541,6 +1006,8 @@ class UR10eCuroboMoveIt(Node):
             "speed_approach": self.cfg.planner.speed_approach,
             "speed_predropoff": self.cfg.planner.speed_predropoff,
             "debug_plan_preview": self.cfg.planner.debug_plan_preview,
+            "reachability_cloud_enabled": self.cfg.planner.reachability_cloud_enabled,
+            "lidar_scan_preview_enabled": self.cfg.lidar_scan.semicircle_preview_enabled,
             "plan_waiting_confirm": self._state_mgr.plan_waiting,
             "motion_phase": self.motion_phase,
             "grasp_history": list(self.grasp_history),
@@ -659,6 +1126,7 @@ class UR10eCuroboMoveIt(Node):
                 motions_mod.publish_stop_trajectory(self)
                 # Clear any queued goals so execution loop can exit quickly
                 self.goal_poses.clear()
+                getattr(self, "_reachability_goal_metadata", {}).clear()
 
             elif key == 'z':
                 # Toggle teleop enable
@@ -837,6 +1305,7 @@ class UR10eCuroboMoveIt(Node):
             self.stop_goal_capture()
             
         self.goal_poses.clear()
+        getattr(self, "_reachability_goal_metadata", {}).clear()
         self.goal_capture_count = 0
         ee = self.get_end_effector_pose()
         self.goal_sort_ref = ee[:3] if ee else [0.0,0.0,0.0]
@@ -861,7 +1330,7 @@ class UR10eCuroboMoveIt(Node):
     
         if hasattr(self, 'goal_pose_sub'):
             self.destroy_subscription(self.goal_pose_sub); del self.goal_pose_sub
-        self.goal_poses.sort(key=lambda g: __import__('math').dist(g[:3], self.goal_sort_ref or [0,0,0]))
+        # Keep insertion order — the queue executes in the order goals were captured.
         self.get_logger().info(f"Goal capture stopped. Collected {self.goal_capture_count} goals.")
 
     def _capture_goal_cb(self, msg: PoseStamped):
@@ -875,9 +1344,343 @@ class UR10eCuroboMoveIt(Node):
             return
         goal = [gx,gy,gz,qw,qx,qy,qz]
         self.goal_poses.append(goal)
-        self.goal_poses.sort(key=lambda g: math.dist(g[:3], self.goal_sort_ref or [0,0,0]))
+        # Keep insertion order — no distance sort, so the queue runs in capture order.
         self.goal_capture_count += 1
         markers_mod.publish_goal_marker(self, goal[:3])
+
+    def _add_current_as_goal(self):
+        """Append the robot's current joint posture to the goal queue.
+
+        Lets the operator jog/move the arm to a posture, snapshot it as a goal,
+        repeat to build a multi-goal sequence, then run them all with Execute.
+        Insertion order is preserved (no distance sort) so the queue runs in
+        the order postures were added. A TCP pose is still stored for RViz
+        markers, but execution uses the exact captured joint configuration.
+        """
+        if self.current_joint_positions is None:
+            self.get_logger().warn(
+                "Cannot add current joint posture as goal: joint state unavailable")
+            return
+        cur = self.get_end_effector_pose()
+        if not cur or len(cur) < 7:
+            self.get_logger().warn(
+                "Cannot add current joint posture as goal: end-effector pose unavailable")
+            return
+        joints = [float(v) for v in self.current_joint_positions]
+        for meta in getattr(self, "_reachability_goal_metadata", {}).values():
+            if meta.get("source") != "current_joint":
+                continue
+            saved = list(meta.get("joints", []))
+            if len(saved) == len(joints):
+                max_err = max(abs(a - b) for a, b in zip(saved, joints))
+                if max_err < math.radians(1.0):
+                    self.get_logger().info(
+                        "Current joint posture already in goal queue "
+                        "(within 1deg) — skipping")
+                    return
+        goal = [float(v) for v in cur[:7]]
+        self.goal_poses.append(goal)
+        self._reachability_goal_metadata[self._goal_meta_key(goal)] = {
+            "joints": joints,
+            "delta_deg": 0.0,
+            "source": "current_joint",
+        }
+        markers_mod.publish_goal_marker(self, goal[:3])
+        self.get_logger().info(
+            f"Added current joint posture as goal #{len(self.goal_poses)}: "
+            f"tcp=[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
+
+    def _execute_goals_no_grasp(self):
+        """Run every queued goal as a plain Cartesian move — no grasp behavior.
+
+        Pops goals in insertion order and plans/executes a direct move to each
+        with ``execute_single_pose`` (the same path as a manual goal), so the
+        arm just visits the poses in sequence with no gripper/harvest logic.
+        Honors stop_requested and aborts the rest if a move fails.
+        """
+        if self.goal_capture_active:
+            self.stop_goal_capture()
+        if not self.goal_poses:
+            self.get_logger().info("No queued goals to execute.")
+            return
+        self.stop_requested = False
+        total = len(self.goal_poses)
+        idx = 0
+        while self.goal_poses and getattr(self, 'running', True):
+            if getattr(self, 'stop_requested', False):
+                self.get_logger().warn("Stop requested — aborting goal moves.")
+                break
+            goal, reach_delta = self._pop_next_reachable_goal()
+            if goal is None:
+                break
+            goal_key = self._goal_meta_key(goal)
+            idx += 1
+            self.motion_phase = "MOVING"
+            markers_mod.publish_goal_marker(self, goal[:3])
+            self.get_logger().info(
+                f"Move {idx}/{total} → "
+                f"[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
+            if not getattr(self, "in_safe_zone", lambda _x: True)(goal[:3]):
+                self.get_logger().warn(
+                    f"GOAL{idx}: target [{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] is "
+                    f"OUTSIDE the safe zone — skipping.")
+                getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                continue
+            skip_delta = float(getattr(
+                self.cfg.planner, "goal_reachability_skip_delta_deg", 100.0))
+            if reach_delta is not None and reach_delta > skip_delta:
+                self.get_logger().warn(
+                    f"GOAL{idx}: skipped because nearest IK delta "
+                    f"{reach_delta:.1f}deg exceeds {skip_delta:.0f}deg.")
+                getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                continue
+            meta = getattr(self, "_reachability_goal_metadata", {}).get(goal_key)
+            cur_pose = self.get_end_effector_pose()
+            if meta is not None and meta.get("source") == "current_joint":
+                cur_joints = self.current_joint_positions
+                saved_joints = list(meta.get("joints", []))
+                if cur_joints is not None and len(saved_joints) == len(cur_joints):
+                    target = motions_mod.nearest_joint_config(
+                        list(cur_joints), saved_joints)
+                    joint_err = max(abs(t - c) for c, t in zip(target, cur_joints))
+                    if joint_err < math.radians(0.5):
+                        self.get_logger().info(
+                            f"GOAL{idx}: already at saved joint posture "
+                            f"(max_err={math.degrees(joint_err):.1f}deg); skipping motion.")
+                        getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                        continue
+            elif cur_pose is not None and len(cur_pose) >= 7:
+                pos_err = math.dist(cur_pose[:3], goal[:3])
+                quat_dot = abs(sum(a * b for a, b in zip(cur_pose[3:7], goal[3:7])))
+                if pos_err < 0.01 and quat_dot > 0.999:
+                    self.get_logger().info(
+                        f"GOAL{idx}: already at target "
+                        f"(pos_err={pos_err*100:.1f}cm); skipping motion.")
+                    getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                    continue
+            move_speed_factor = self.GOAL_MOVE_SPEED_FACTOR
+            if meta is not None and meta.get("source") != "current_joint":
+                move_speed_factor = float(getattr(
+                    self.cfg.planner, "reachability_goal_speed_factor", 0.20))
+            if meta is not None:
+                source = str(meta.get("source", "reachability"))
+                if source == "current_joint":
+                    self.get_logger().info(
+                        f"GOAL{idx}: using saved current joint posture "
+                        f"(cached delta={float(meta.get('delta_deg', 0.0)):.1f}deg, "
+                        f"speed={move_speed_factor:.2f}x).")
+                    ok = motions_mod.plan_execute_js(
+                        self,
+                        list(meta["joints"]),
+                        label=f"GOAL{idx}_JOINTS",
+                        motion_type="manual",
+                        speed_factor=move_speed_factor)
+                else:
+                    self.get_logger().info(
+                        f"GOAL{idx}: using reachability-click joint sample "
+                        f"(cached delta={float(meta.get('delta_deg', 0.0)):.1f}deg, "
+                        f"speed={move_speed_factor:.2f}x).")
+                    ok = motions_mod.execute_known_joint_goal(
+                        self,
+                        list(meta["joints"]),
+                        label=f"GOAL{idx}_REACHABLE",
+                        motion_type="manual",
+                        speed_factor=move_speed_factor)
+            else:
+                ok = motions_mod.execute_pose_shortest(
+                    self, list(goal), label=f"GOAL{idx}", motion_type="manual",
+                    speed_factor=move_speed_factor)
+            current_joint_failed = (
+                not ok and meta is not None and meta.get("source") == "current_joint")
+            if current_joint_failed:
+                self.get_logger().warn(
+                    f"GOAL{idx}: saved joint-posture move failed; not falling back "
+                    "to TCP-pose planning.")
+            if not ok and not current_joint_failed and not getattr(self, 'stop_requested', False):
+                # The marker's orientation can force a far IK flip even when the position
+                # is close. Retry keeping the marker POSITION but using the arm's CURRENT
+                # tool orientation, so IK stays near current and the move is short.
+                cur = self.get_end_effector_pose()
+                if cur is not None and len(cur) >= 7:
+                    quat_dot = abs(sum(
+                        a * b for a, b in zip(goal[3:7], cur[3:7])))
+                    if quat_dot < 0.999:
+                        retry_pose = list(goal[:3]) + list(cur[3:7])
+                        self.get_logger().warn(
+                            f"GOAL{idx}: failed with marker orientation — retrying with "
+                            f"current tool orientation (position only).")
+                        ok = motions_mod.execute_pose_shortest(
+                            self, retry_pose, label=f"GOAL{idx}_FREEORI",
+                            motion_type="manual",
+                            speed_factor=move_speed_factor)
+                    else:
+                        self.get_logger().warn(
+                            f"GOAL{idx}: marker orientation already matches current "
+                            f"tool orientation; skipping duplicate FREEORI retry.")
+            recovery_cap = float(getattr(
+                self.cfg.planner, "goal_recovery_max_ik_delta_deg", 100.0))
+            recovery_allowed = (
+                reach_delta is None
+                or math.isfinite(reach_delta) and reach_delta <= recovery_cap
+            )
+            if not ok and not getattr(self, 'stop_requested', False) and not recovery_allowed:
+                self.get_logger().warn(
+                    f"GOAL{idx}: nearest IK delta {reach_delta:.1f}deg exceeds "
+                    f"recovery cap {recovery_cap:.0f}deg; skipping staging/posture "
+                    "recovery instead of grinding planner retries.")
+            if (
+                not ok
+                and not getattr(self, 'stop_requested', False)
+                and recovery_allowed
+                and bool(getattr(
+                    self.cfg.planner, "goal_recovery_local_staging", True))
+            ):
+                self.get_logger().warn(
+                    f"GOAL{idx}: trying target-local staging before posture recovery.")
+                ok = motions_mod.execute_goal_via_local_staging(
+                    self,
+                    list(goal),
+                    label=f"GOAL{idx}_LOCAL_STAGE",
+                    motion_type="manual",
+                    speed_factor=move_speed_factor)
+            if (
+                not ok
+                and not getattr(self, 'stop_requested', False)
+                and recovery_allowed
+                and bool(getattr(
+                    self.cfg.planner, "goal_failure_recover_to_posture", True))
+            ):
+                self.get_logger().warn(
+                    f"GOAL{idx}: failed from current posture — moving to nearest "
+                    f"good posture, then retrying once.")
+                if motions_mod.move_to_nearest_good_posture(
+                        self, label=f"GOAL{idx}_RECOVERY",
+                        goal_pose=list(goal)):
+                    ok = motions_mod.execute_pose_shortest(
+                        self, list(goal), label=f"GOAL{idx}_RETRY",
+                        motion_type="manual",
+                        speed_factor=move_speed_factor)
+                    if not ok and not getattr(self, 'stop_requested', False):
+                        cur = self.get_end_effector_pose()
+                        if cur is not None and len(cur) >= 7:
+                            quat_dot = abs(sum(
+                                a * b for a, b in zip(goal[3:7], cur[3:7])))
+                            if quat_dot < 0.999:
+                                retry_pose = list(goal[:3]) + list(cur[3:7])
+                                self.get_logger().warn(
+                                    f"GOAL{idx}_RETRY: failed with marker orientation — "
+                                    f"retrying with current tool orientation.")
+                                ok = motions_mod.execute_pose_shortest(
+                                    self, retry_pose, label=f"GOAL{idx}_RETRY_FREEORI",
+                                    motion_type="manual",
+                                    speed_factor=move_speed_factor)
+                            else:
+                                self.get_logger().warn(
+                                    f"GOAL{idx}_RETRY: marker orientation already "
+                                    f"matches current tool orientation; skipping "
+                                    f"duplicate FREEORI retry.")
+                    if (
+                        not ok
+                        and not getattr(self, 'stop_requested', False)
+                        and bool(getattr(
+                            self.cfg.planner,
+                            "goal_recovery_cartesian_fallback",
+                            True))
+                    ):
+                        self.get_logger().warn(
+                            f"GOAL{idx}: posture retry still needs a large IK jump — "
+                            f"trying Cartesian recovery plan.")
+                        if bool(getattr(
+                                self.cfg.planner,
+                                "goal_recovery_local_staging",
+                                True)) and bool(getattr(
+                                    self.cfg.planner,
+                                    "goal_recovery_repeat_staging_after_posture",
+                                    False)):
+                            ok = motions_mod.execute_goal_via_local_staging(
+                                self,
+                                list(goal),
+                                label=f"GOAL{idx}_RECOVERED_STAGE",
+                                motion_type="manual",
+                                speed_factor=move_speed_factor)
+                        if not ok:
+                            ok = motions_mod.execute_single_pose(
+                                self,
+                                list(goal),
+                                motion_type="manual",
+                                speed_factor=move_speed_factor)
+                        if not ok and not getattr(self, 'stop_requested', False):
+                            cur = self.get_end_effector_pose()
+                            if cur is not None and len(cur) >= 7:
+                                quat_dot = abs(sum(
+                                    a * b for a, b in zip(goal[3:7], cur[3:7])))
+                                if quat_dot < 0.999:
+                                    cart_pose = list(goal[:3]) + list(cur[3:7])
+                                    self.get_logger().warn(
+                                        f"GOAL{idx}: Cartesian recovery failed with "
+                                        f"marker orientation — retrying position-only.")
+                                    ok = motions_mod.execute_single_pose(
+                                        self,
+                                        cart_pose,
+                                        motion_type="manual",
+                                        speed_factor=move_speed_factor)
+                else:
+                    self.get_logger().warn(
+                        f"GOAL{idx}: recovery posture move failed; not retrying.")
+            if not ok:
+                self.get_logger().warn(
+                    f"Move {idx}/{total} failed or stopped; "
+                    f"aborting remaining goals.")
+                getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                break
+            getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+        self.motion_phase = "IDLE"
+        self.get_logger().info("Goal moves finished.")
+
+    def _pop_next_reachable_goal(self):
+        """Pick the queued goal that is easiest from the current posture."""
+        if not bool(getattr(self.cfg.planner, "dynamic_goal_ordering", True)):
+            return self.goal_poses.pop(0), None
+
+        goals = (
+            self.goal_poses.snapshot()
+            if hasattr(self.goal_poses, "snapshot")
+            else [g for g in self.goal_poses]
+        )
+        if not goals:
+            return None, None
+
+        scored = []
+        for i, goal in enumerate(goals):
+            if not getattr(self, "in_safe_zone", lambda _x: True)(goal[:3]):
+                scored.append((float("inf"), i, goal, "outside"))
+                continue
+            meta = getattr(self, "_reachability_goal_metadata", {}).get(
+                self._goal_meta_key(goal))
+            if meta is not None and self.current_joint_positions is not None:
+                target = motions_mod.nearest_joint_config(
+                    self.current_joint_positions, list(meta["joints"]))
+                delta = math.degrees(max(
+                    abs(t - c) for c, t in zip(target, self.current_joint_positions)))
+            else:
+                delta = motions_mod.estimate_nearest_ik_delta_deg(self, list(goal))
+            scored.append((delta, i, goal, "ok"))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        best_delta, best_idx, best_goal, status = scored[0]
+        skip_delta = float(getattr(
+            self.cfg.planner, "goal_reachability_skip_delta_deg", 100.0))
+        if status == "outside":
+            self.get_logger().warn("All queued goals are outside the safe zone.")
+        elif best_delta > skip_delta:
+            self.get_logger().warn(
+                f"Best queued goal still needs {best_delta:.1f}deg IK delta "
+                f"(cap {skip_delta:.0f}deg); skipping instead of grinding recovery.")
+        else:
+            self.get_logger().info(
+                f"Selected queued goal #{best_idx + 1}/{len(goals)} "
+                f"(nearest IK delta={best_delta:.1f}deg)")
+        return self.goal_poses.pop(best_idx), best_delta
 
     def _prep_and_execute(self):
 

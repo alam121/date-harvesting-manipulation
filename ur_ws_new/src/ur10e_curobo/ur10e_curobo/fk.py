@@ -148,6 +148,43 @@ def forward_kinematics_batch(node, joint_states: List[List[float]]) -> List[Poin
         return []
 
 
+def forward_kinematics_pose_batch(node, joint_states: List[List[float]]) -> List[list]:
+    """Compute batched FK poses as [x, y, z, qw, qx, qy, qz]."""
+    if not joint_states:
+        return []
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        q = torch.tensor(joint_states, dtype=torch.float32, device=device)
+        with _fk_lock:
+            kin = _get_kin_model(node)
+            with torch.no_grad():
+                ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
+            if ee_pos.ndim == 1:
+                ee_pos = ee_pos.unsqueeze(0)
+            if ee_quat.ndim == 1:
+                ee_quat = ee_quat.unsqueeze(0)
+            if (
+                ee_pos.ndim != 2
+                or ee_quat.ndim != 2
+                or ee_pos.shape[0] != len(joint_states)
+                or ee_quat.shape[0] != len(joint_states)
+            ):
+                poses = []
+                with torch.no_grad():
+                    for sample_q in q:
+                        p, quat, _, _, _, _, _ = kin.forward(sample_q.unsqueeze(0))
+                        poses.append(
+                            p.reshape(-1, 3)[0].cpu().tolist()
+                            + quat.reshape(-1, 4)[0].cpu().tolist())
+                return poses
+            positions = ee_pos.cpu().tolist()
+            quats = ee_quat.cpu().tolist()
+        return [list(p) + list(q) for p, q in zip(positions, quats)]
+    except Exception as e:
+        node.get_logger().warn(f"Batched FK pose failed: {e}")
+        return []
+
+
 def solve_ik_fast(node, target_pose: list, seed: Optional[list] = None, iters: int = 25, lr: float = 0.6):
     """Lightweight IK via gradient descent on the isolated FK model.
 

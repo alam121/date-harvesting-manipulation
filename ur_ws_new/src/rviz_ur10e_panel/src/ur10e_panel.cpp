@@ -4,6 +4,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QScrollArea>
+#include <QTabWidget>
 #include <QFont>
 #include <QApplication>
 #include <QDir>
@@ -100,6 +101,12 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   robot_state_label_->setStyleSheet("font-size: 10pt; padding: 2px;");
   layout->addWidget(robot_state_label_);
 
+  // Active robot type + environment (from Python config, via /robot_config_info)
+  config_label_ = new QLabel("Robot: \xe2\x80\x94  |  Env: \xe2\x80\x94");
+  config_label_->setStyleSheet(
+    "font-size: 10pt; font-weight: bold; padding: 2px; color: #1565c0;");
+  layout->addWidget(config_label_);
+
   // Motion phase + reacquire result (side by side)
   auto * phase_row = new QHBoxLayout();
 
@@ -124,6 +131,34 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   phase_row->addWidget(reacq_group, 2);
 
   layout->addLayout(phase_row);
+
+  // Tabbed controls to avoid a long scroll. Status + Motion Phase stay above the tabs
+  // and EMERGENCY STOP stays just below them, so both are visible from every tab.
+  auto * tabs = new QTabWidget();
+  auto * motion_tab = new QWidget();
+  auto * motion_tab_layout = new QVBoxLayout(motion_tab);
+  motion_tab_layout->setSpacing(6);
+  auto * goal_tab = new QWidget();
+  auto * goal_tab_layout = new QVBoxLayout(goal_tab);
+  goal_tab_layout->setSpacing(6);
+  auto * monitor_tab = new QWidget();
+  auto * monitor_tab_layout = new QVBoxLayout(monitor_tab);
+  monitor_tab_layout->setSpacing(6);
+  auto * settings_tab = new QWidget();
+  auto * settings_tab_layout = new QVBoxLayout(settings_tab);
+  settings_tab_layout->setSpacing(6);
+  auto * heat_tab = new QWidget();
+  auto * heat_tab_layout = new QVBoxLayout(heat_tab);
+  heat_tab_layout->setSpacing(6);
+  auto * camera_tab = new QWidget();
+  auto * camera_tab_layout = new QVBoxLayout(camera_tab);
+  camera_tab_layout->setSpacing(6);
+  tabs->addTab(motion_tab, "Motion");
+  tabs->addTab(goal_tab, "Goal");
+  tabs->addTab(monitor_tab, "Monitor");
+  tabs->addTab(camera_tab, "Camera");
+  tabs->addTab(heat_tab, "Heat");
+  tabs->addTab(settings_tab, "Settings");
 
   // Last harvest result banner + session tally
   auto * harvest_group = new QGroupBox("Last Harvest Result");
@@ -162,7 +197,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     tally_row->addWidget(cell);
   }
   harvest_vlayout->addLayout(tally_row);
-  layout->addWidget(harvest_group);
+  monitor_tab_layout->addWidget(harvest_group);
 
   // Emergency Stop
   auto * stop_btn = new QPushButton("EMERGENCY STOP");
@@ -171,6 +206,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 10px;");
   connect(stop_btn, &QPushButton::clicked, this, &UR10ePanel::onStop);
   layout->addWidget(stop_btn);
+
+  layout->addWidget(tabs, 1);
 
   // Motion Commands
   auto * motion_group = new QGroupBox("Motion");
@@ -241,12 +278,22 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
   motion_layout->addWidget(debug_preview_cb_, 7, 0, 1, 2);
 
+  reachability_cloud_cb_ = new QCheckBox("Reachability Cloud");
+  reachability_cloud_cb_->setChecked(true);
+  reachability_cloud_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
+  reachability_cloud_cb_->setToolTip(
+    "Show/hide the sampled green/yellow reachability cloud and LiDAR scan preview in RViz");
+  connect(
+    reachability_cloud_cb_, &QCheckBox::stateChanged,
+    this, &UR10ePanel::onReachabilityCloudChanged);
+  motion_layout->addWidget(reachability_cloud_cb_, 8, 0, 1, 2);
+
   zone_overlay_btn_ = new QPushButton("Zone Overlay: OFF");
   zone_overlay_btn_->setCheckable(true);
   zone_overlay_btn_->setStyleSheet("background-color: #607d8b; color: white; font-weight: bold;");
   zone_overlay_btn_->setToolTip("Show/hide date side-classification zones on the vision display");
   connect(zone_overlay_btn_, &QPushButton::clicked, this, &UR10ePanel::onZoneOverlayToggle);
-  motion_layout->addWidget(zone_overlay_btn_, 8, 0, 1, 2);
+  motion_layout->addWidget(zone_overlay_btn_, 9, 0, 1, 2);
 
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
@@ -254,7 +301,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 9, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 10, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -262,9 +309,24 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 9, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 10, 1);
 
-  layout->addWidget(motion_group);
+  motion_tab_layout->addWidget(motion_group);
+
+  // Side-home moves — test/calibrate home_left/home_right per robot profile.
+  // Published to /ui_command and handled node-side (run_side_home).
+  auto * side_home_row = new QHBoxLayout();
+  auto * home_left_btn = new QPushButton("Home Left");
+  home_left_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
+  home_left_btn->setToolTip("Move to the stored home_left joint config (active robot profile)");
+  connect(home_left_btn, &QPushButton::clicked, this, &UR10ePanel::onHomeLeft);
+  side_home_row->addWidget(home_left_btn);
+  auto * home_right_btn = new QPushButton("Home Right");
+  home_right_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
+  home_right_btn->setToolTip("Move to the stored home_right joint config (active robot profile)");
+  connect(home_right_btn, &QPushButton::clicked, this, &UR10ePanel::onHomeRight);
+  side_home_row->addWidget(home_right_btn);
+  motion_tab_layout->addLayout(side_home_row);
 
   // Gripper
   auto * gripper_group = new QGroupBox("Gripper");
@@ -278,7 +340,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(close_btn, &QPushButton::clicked, this, &UR10ePanel::onGripperClose);
   gripper_layout->addWidget(close_btn);
 
-  layout->addWidget(gripper_group);
+  motion_tab_layout->addWidget(gripper_group);
 
   // Velocity Scale
   auto * vel_group = new QGroupBox("Velocity Scale");
@@ -315,7 +377,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(apply_btn, &QPushButton::clicked, this, &UR10ePanel::onApplyVelocity);
   vel_layout->addWidget(apply_btn);
 
-  layout->addWidget(vel_group);
+  settings_tab_layout->addWidget(vel_group);
 
   // Manual Goal
   auto * goal_group = new QGroupBox("Manual Goal");
@@ -344,7 +406,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(send_btn, &QPushButton::clicked, this, &UR10ePanel::onSendGoal);
   goal_layout->addWidget(send_btn, 4, 0, 1, 4);
 
-  layout->addWidget(goal_group);
+  goal_tab_layout->addWidget(goal_group);
 
   // Capture
   auto * capture_group = new QGroupBox("Capture");
@@ -358,7 +420,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(cap_stop, &QPushButton::clicked, this, &UR10ePanel::onCaptureStop);
   capture_layout->addWidget(cap_stop);
 
-  layout->addWidget(capture_group);
+  goal_tab_layout->addWidget(capture_group);
 
   // Stability recorder
   auto * stability_group = new QGroupBox("Robot Stability / Tracking");
@@ -385,11 +447,11 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "color: #283593; border-radius: 4px;");
   stability_layout->addWidget(stability_result_label_);
 
-  layout->addWidget(stability_group);
+  monitor_tab_layout->addWidget(stability_group);
 
   // Lidar Scan
   auto * lidar_group = new QGroupBox("Lidar Scan");
-  auto * lidar_layout = new QHBoxLayout(lidar_group);
+  auto * lidar_layout = new QVBoxLayout(lidar_group);
   auto * lidar_scan_btn = new QPushButton("Lidar Scan");
   lidar_scan_btn->setStyleSheet(
     "background-color: #00796b; color: white; font-weight: bold; "
@@ -399,7 +461,53 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "Bag saved to ~/lidar_scans/. Waypoints configured in config.py LidarScan.");
   connect(lidar_scan_btn, &QPushButton::clicked, this, &UR10ePanel::onLidarScan);
   lidar_layout->addWidget(lidar_scan_btn);
-  layout->addWidget(lidar_group);
+
+  lidar_scan_preview_cb_ = new QCheckBox("LiDAR Scan Preview");
+  lidar_scan_preview_cb_->setChecked(true);
+  lidar_scan_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
+  lidar_scan_preview_cb_->setToolTip("Show/hide the S1..S7 horizontal scan arc preview in RViz");
+  connect(
+    lidar_scan_preview_cb_, &QCheckBox::stateChanged,
+    this, &UR10ePanel::onLidarScanPreviewChanged);
+  lidar_layout->addWidget(lidar_scan_preview_cb_);
+
+  goal_tab_layout->addWidget(lidar_group);
+
+  // Camera recording
+  auto * camera_group = new QGroupBox("Camera Feed Recording");
+  auto * camera_layout = new QGridLayout(camera_group);
+  camera_layout->setSpacing(6);
+
+  auto * snapshot_btn = new QPushButton("Save Image");
+  snapshot_btn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;");
+  snapshot_btn->setToolTip("Save the latest /vision/display frame to ~/camera_recordings");
+  connect(snapshot_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraSnapshot);
+  camera_layout->addWidget(snapshot_btn, 0, 0, 1, 2);
+
+  auto * video_start_btn = new QPushButton("Start Video");
+  video_start_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
+  video_start_btn->setToolTip("Start recording /vision/display to ~/camera_recordings");
+  connect(video_start_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStart);
+  camera_layout->addWidget(video_start_btn, 1, 0);
+
+  auto * video_stop_btn = new QPushButton("Stop Video");
+  video_stop_btn->setStyleSheet("background-color: #c62828; color: white; font-weight: bold;");
+  video_stop_btn->setToolTip("Stop the current camera video recording");
+  connect(video_stop_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStop);
+  camera_layout->addWidget(video_stop_btn, 1, 1);
+
+  auto * camera_refresh_btn = new QPushButton("Refresh Camera");
+  camera_refresh_btn->setStyleSheet("background-color: #607d8b; color: white;");
+  connect(camera_refresh_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshCamera);
+  camera_layout->addWidget(camera_refresh_btn, 2, 0, 1, 2);
+
+  auto * camera_note = new QLabel("Saved to ~/camera_recordings");
+  camera_note->setStyleSheet("font-size: 9pt; color: #455a64; padding: 3px;");
+  camera_note->setAlignment(Qt::AlignCenter);
+  camera_layout->addWidget(camera_note, 3, 0, 1, 2);
+
+  camera_tab_layout->addWidget(camera_group);
+  camera_tab_layout->addStretch(1);
 
   // Grasp Feedback
   auto * grasp_group = new QGroupBox("Grasp Feedback");
@@ -415,7 +523,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(fail_btn, &QPushButton::clicked, this, &UR10ePanel::onGraspFail);
   grasp_layout->addWidget(fail_btn);
 
-  layout->addWidget(grasp_group);
+  monitor_tab_layout->addWidget(grasp_group);
 
   // System
   auto * sys_group = new QGroupBox("System");
@@ -437,7 +545,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(exit_btn, &QPushButton::clicked, this, &UR10ePanel::onExit);
   sys_layout->addWidget(exit_btn, 1, 0, 1, 2);
 
-  layout->addWidget(sys_group);
+  settings_tab_layout->addWidget(sys_group);
 
   // Joint Positions
   auto * joint_group = new QGroupBox("Joint Positions (rad)");
@@ -453,7 +561,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
       "background: #37474f; color: #64b5f6; padding: 3px; border-radius: 3px;");
     joint_layout->addWidget(joint_labels_[i], i / 3, (i % 3) * 2 + 1);
   }
-  layout->addWidget(joint_group);
+  monitor_tab_layout->addWidget(joint_group);
 
   // Gripper Forces
   auto * force_group = new QGroupBox("Gripper Forces");
@@ -475,7 +583,77 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     vl->addWidget(force_labels_[i]);
     force_layout->addWidget(w);
   }
-  layout->addWidget(force_group);
+  monitor_tab_layout->addWidget(force_group);
+
+  // ---------------- Heat / Thermal tab ----------------
+  // No per-joint temperature is exposed by the driver; we show per-joint current
+  // (/joint_states.effort, mapped from UR actual_current) as a heat/load proxy, plus the
+  // tool-flange temperature (the only real degC available) and the gripper motor current.
+  auto * heat_note = new QLabel(
+    "Real per-joint temperature (\xC2\xB0""C) from /joint_temperatures when the driver "
+    "publishes it; per-joint current (A) shown as a load proxy. Tool flange reports real "
+    "\xC2\xB0""C.");
+  heat_note->setWordWrap(true);
+  heat_note->setStyleSheet("color: #90a4ae; font-size: 9pt; padding: 2px;");
+  heat_tab_layout->addWidget(heat_note);
+
+  auto * jtemp_group = new QGroupBox("Joint Temperature (\xC2\xB0""C)");
+  auto * jtemp_layout = new QGridLayout(jtemp_group);
+  jtemp_layout->setSpacing(4);
+  const char * jtemp_names[] = {"Pan", "Lift", "Elbow", "W1", "W2", "W3"};
+  for (int i = 0; i < 6; i++) {
+    jtemp_layout->addWidget(new QLabel(jtemp_names[i]), i / 3, (i % 3) * 2);
+    joint_temp_labels_[i] = new QLabel("-- \xC2\xB0""C");
+    joint_temp_labels_[i]->setFont(QFont("Courier", 9, QFont::Bold));
+    joint_temp_labels_[i]->setStyleSheet(
+      "background: #37474f; color: #b0bec5; padding: 3px; border-radius: 3px;");
+    jtemp_layout->addWidget(joint_temp_labels_[i], i / 3, (i % 3) * 2 + 1);
+  }
+  heat_tab_layout->addWidget(jtemp_group);
+
+  auto * jcur_group = new QGroupBox("Joint Current / Load (A)");
+  auto * jcur_layout = new QGridLayout(jcur_group);
+  jcur_layout->setSpacing(4);
+  const char * jheat_names[] = {"Pan", "Lift", "Elbow", "W1", "W2", "W3"};
+  for (int i = 0; i < 6; i++) {
+    jcur_layout->addWidget(new QLabel(jheat_names[i]), i / 3, (i % 3) * 2);
+    joint_current_labels_[i] = new QLabel("0.00 A");
+    joint_current_labels_[i]->setFont(QFont("Courier", 9, QFont::Bold));
+    joint_current_labels_[i]->setStyleSheet(
+      "background: #37474f; color: #b0bec5; padding: 3px; border-radius: 3px;");
+    jcur_layout->addWidget(joint_current_labels_[i], i / 3, (i % 3) * 2 + 1);
+  }
+  heat_tab_layout->addWidget(jcur_group);
+
+  auto * tooltemp_group = new QGroupBox("Tool Flange Temperature");
+  auto * tooltemp_layout = new QHBoxLayout(tooltemp_group);
+  tool_temp_label_ = new QLabel("-- \xC2\xB0""C");
+  tool_temp_label_->setAlignment(Qt::AlignCenter);
+  tool_temp_label_->setFont(QFont("Courier", 14, QFont::Bold));
+  tool_temp_label_->setStyleSheet(
+    "background: #263238; color: #b0bec5; padding: 6px; border-radius: 4px;");
+  tooltemp_layout->addWidget(tool_temp_label_);
+  heat_tab_layout->addWidget(tooltemp_group);
+
+  auto * ghmot_group = new QGroupBox("Gripper Motor Current (heat proxy)");
+  auto * ghmot_layout = new QHBoxLayout(ghmot_group);
+  const char * ghmot_names[] = {"Left", "Center", "Right"};
+  for (int i = 0; i < 3; i++) {
+    auto * w = new QWidget();
+    auto * vl = new QVBoxLayout(w);
+    vl->setSpacing(2);
+    auto * lbl = new QLabel(ghmot_names[i]);
+    lbl->setAlignment(Qt::AlignCenter);
+    vl->addWidget(lbl);
+    gripper_heat_labels_[i] = new QLabel("0.00");
+    gripper_heat_labels_[i]->setAlignment(Qt::AlignCenter);
+    gripper_heat_labels_[i]->setFont(QFont("Courier", 10, QFont::Bold));
+    gripper_heat_labels_[i]->setStyleSheet(
+      "background: #263238; color: #b0bec5; padding: 4px; border-radius: 4px;");
+    vl->addWidget(gripper_heat_labels_[i]);
+    ghmot_layout->addWidget(w);
+  }
+  heat_tab_layout->addWidget(ghmot_group);
 
   // Goals info
   auto * goals_group = new QGroupBox("Goals");
@@ -503,9 +681,40 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   goal_coords_label_->setStyleSheet("color: #7b1fa2;");
   goals_layout->addWidget(goal_coords_label_);
 
-  layout->addWidget(goals_group);
+  // Queue current robot pose as a goal, then run the whole queue in sequence.
+  auto * add_current_btn = new QPushButton("Add Current Pos as Goal (G)");
+  add_current_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
+  add_current_btn->setToolTip(
+    "Append the robot's current end-effector pose to the goal queue.\n"
+    "Move the arm, press again to add more, then Execute to run them in order.");
+  connect(add_current_btn, &QPushButton::clicked, this, &UR10ePanel::onAddCurrentGoal);
+  goals_layout->addWidget(add_current_btn);
+
+  auto * queue_run_row = new QHBoxLayout();
+  auto * exec_queue_btn = new QPushButton("Execute Queue (moves)");
+  exec_queue_btn->setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;");
+  exec_queue_btn->setToolTip(
+    "Move through all queued goals in order as plain Cartesian moves "
+    "(no grasp behavior)");
+  connect(exec_queue_btn, &QPushButton::clicked, this, &UR10ePanel::onExecuteMoves);
+  queue_run_row->addWidget(exec_queue_btn);
+
+  auto * clear_queue_btn = new QPushButton("Clear Queue");
+  clear_queue_btn->setStyleSheet("background-color: #9e9e9e; color: white;");
+  clear_queue_btn->setToolTip("Remove all queued goals");
+  connect(clear_queue_btn, &QPushButton::clicked, this, &UR10ePanel::onClear);
+  queue_run_row->addWidget(clear_queue_btn);
+  goals_layout->addLayout(queue_run_row);
+
+  goal_tab_layout->addWidget(goals_group);
 
   layout->addStretch(1);
+  motion_tab_layout->addStretch(1);
+  goal_tab_layout->addStretch(1);
+  monitor_tab_layout->addStretch(1);
+  heat_tab_layout->addStretch(1);
+  settings_tab_layout->addStretch(1);
+
   scroll->setWidget(container);
 
   auto * outer = new QVBoxLayout(this);
@@ -569,6 +778,7 @@ bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
       case Qt::Key_S: onSubscribe(); return true;
       case Qt::Key_M: onSubscribeMulti(); return true;
       case Qt::Key_E: onExecute(); return true;
+      case Qt::Key_G: onAddCurrentGoal(); return true;
       case Qt::Key_O: onGripperOpen(); return true;
       case Qt::Key_C: onGripperClose(); return true;
       case Qt::Key_U: onUpdateVoxel(); return true;
@@ -609,6 +819,10 @@ void UR10ePanel::setupRos()
         if (i < msg->velocity.size()) {
           joint_velocities_[joint_index] = msg->velocity[i];
         }
+        if (i < msg->effort.size()) {
+          // Driver maps UR actual_current (A) onto joint effort — used as a heat/load proxy.
+          joint_efforts_[joint_index] = msg->effort[i];
+        }
       }
       if (stability_recording_) {
         appendStabilitySampleLocked(std::chrono::steady_clock::now());
@@ -622,6 +836,24 @@ void UR10ePanel::setupRos()
       for (size_t i = 0; i < std::min(msg->data.size(), size_t(3)); i++) {
         gripper_forces_[i] = msg->data[i];
       }
+    });
+
+  tool_data_sub_ = node_->create_subscription<ur_msgs::msg::ToolDataMsg>(
+    "/io_and_status_controller/tool_data", 10,
+    [this](ur_msgs::msg::ToolDataMsg::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      tool_temperature_ = msg->tool_temperature;
+      have_tool_temp_ = true;
+    });
+
+  joint_temp_sub_ = node_->create_subscription<std_msgs::msg::Float64MultiArray>(
+    "/joint_temperatures", 10,
+    [this](std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      for (size_t i = 0; i < std::min(msg->data.size(), size_t(6)); i++) {
+        joint_temperatures_[i] = msg->data[i];
+      }
+      have_joint_temps_ = true;
     });
 
   running_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
@@ -679,6 +911,24 @@ void UR10ePanel::setupRos()
         if (colon != std::string::npos) {
           auto val_start = data.find_first_not_of(" ", colon + 1);
           debug_plan_preview_ = (data.substr(val_start, 4) == "true");
+        }
+      }
+      // Extract reachability_cloud_enabled
+      pos = data.find("\"reachability_cloud_enabled\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        if (colon != std::string::npos) {
+          auto val_start = data.find_first_not_of(" ", colon + 1);
+          reachability_cloud_enabled_ = (data.substr(val_start, 4) == "true");
+        }
+      }
+      // Extract lidar_scan_preview_enabled
+      pos = data.find("\"lidar_scan_preview_enabled\"");
+      if (pos != std::string::npos) {
+        auto colon = data.find(':', pos);
+        if (colon != std::string::npos) {
+          auto val_start = data.find_first_not_of(" ", colon + 1);
+          lidar_scan_preview_enabled_ = (data.substr(val_start, 4) == "true");
         }
       }
       // Extract motion_phase
@@ -776,6 +1026,13 @@ void UR10ePanel::setupRos()
     [this](std_msgs::msg::String::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(data_mutex_);
       calib_check_result_ = msg->data;
+    });
+
+  config_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/robot_config_info", 10,
+    [this](std_msgs::msg::String::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      robot_config_text_ = msg->data;
     });
 
   wrench_sub_ = node_->create_subscription<geometry_msgs::msg::WrenchStamped>(
@@ -882,6 +1139,8 @@ void UR10ePanel::publishGoal(double x, double y, double z,
 
 void UR10ePanel::onStop() { publishStop(); }
 void UR10ePanel::onHome() { publishCmd("home"); }
+void UR10ePanel::onHomeLeft() { publishCmd("home_left"); }
+void UR10ePanel::onHomeRight() { publishCmd("home_right"); }
 void UR10ePanel::onSetHomeCurrent()
 {
   auto reply = QMessageBox::question(
@@ -896,6 +1155,8 @@ void UR10ePanel::onSetHomeCurrent()
 }
 void UR10ePanel::onDropoff() { publishCmd("dropoff"); }
 void UR10ePanel::onExecute() { publishCmd("execute"); }
+void UR10ePanel::onExecuteMoves() { publishCmd("execute_moves"); }
+void UR10ePanel::onAddCurrentGoal() { publishCmd("add_current_goal"); }
 void UR10ePanel::onClear() { publishCmd("clear"); }
 void UR10ePanel::onCheckCalibration() { publishCmd("check_calibration"); }
 void UR10ePanel::onGripperOpen() { publishCmd("open"); }
@@ -928,6 +1189,9 @@ void UR10ePanel::onExit()
 }
 void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
 void UR10ePanel::onRefreshCamera() { publishCmd("refresh_camera"); }
+void UR10ePanel::onCameraSnapshot() { publishCmd("camera_snapshot"); }
+void UR10ePanel::onCameraVideoStart() { publishCmd("camera_video_start"); }
+void UR10ePanel::onCameraVideoStop() { publishCmd("camera_video_stop"); }
 void UR10ePanel::onGraspSuccess() { publishCmd("grasp_success"); }
 void UR10ePanel::onGraspFail() { publishCmd("grasp_fail"); }
 void UR10ePanel::onPlanConfirm() { publishCmd("plan_confirm"); }
@@ -1419,6 +1683,18 @@ void UR10ePanel::onDebugPreviewChanged(int state)
   publishCmd(state == Qt::Checked ? "set_debug_preview true" : "set_debug_preview false");
 }
 
+void UR10ePanel::onReachabilityCloudChanged(int state)
+{
+  publishCmd(state == Qt::Checked ?
+    "set_reachability_cloud true" : "set_reachability_cloud false");
+}
+
+void UR10ePanel::onLidarScanPreviewChanged(int state)
+{
+  publishCmd(state == Qt::Checked ?
+    "set_lidar_scan_preview true" : "set_lidar_scan_preview false");
+}
+
 void UR10ePanel::onZoneOverlayToggle()
 {
   const bool enabled = zone_overlay_btn_ && zone_overlay_btn_->isChecked();
@@ -1473,6 +1749,10 @@ void UR10ePanel::onVelocityPreset()
 void UR10ePanel::updateDisplay()
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
+
+  if (!robot_config_text_.empty()) {
+    config_label_->setText(QString::fromStdString(robot_config_text_));
+  }
 
   // Motion phase badge
   {
@@ -1544,6 +1824,44 @@ void UR10ePanel::updateDisplay()
     force_labels_[i]->setText(QString("%1 N").arg(gripper_forces_[i], 0, 'f', 2));
   }
 
+  // Heat tab: real per-joint temperature (degC) when published, colour-graded.
+  for (int i = 0; i < 6; i++) {
+    if (have_joint_temps_) {
+      const double tc = joint_temperatures_[i];
+      joint_temp_labels_[i]->setText(QString("%1 \xC2\xB0""C").arg(tc, 0, 'f', 1));
+      const char * col = (tc > 60.0) ? "#ff5252" : (tc > 45.0) ? "#ffb300" : "#69f0ae";
+      joint_temp_labels_[i]->setStyleSheet(
+        QString("background: #37474f; color: %1; padding: 3px; border-radius: 3px;").arg(col));
+    }
+  }
+
+  // Heat tab: per-joint current (A) as a heat/load proxy, colour-graded by magnitude.
+  for (int i = 0; i < 6; i++) {
+    const double a = std::abs(joint_efforts_[i]);
+    joint_current_labels_[i]->setText(QString("%1 A").arg(joint_efforts_[i], 0, 'f', 2));
+    const char * col = (a > 6.0) ? "#ff5252" : (a > 3.0) ? "#ffb300" : "#b0bec5";
+    joint_current_labels_[i]->setStyleSheet(
+      QString("background: #37474f; color: %1; padding: 3px; border-radius: 3px;").arg(col));
+  }
+
+  // Tool flange temperature (real degC, the only joint-side temperature the driver exposes).
+  if (have_tool_temp_) {
+    const char * tcol = (tool_temperature_ > 60.0) ? "#ff5252"
+      : (tool_temperature_ > 45.0) ? "#ffb300" : "#69f0ae";
+    tool_temp_label_->setText(QString("%1 \xC2\xB0""C").arg(tool_temperature_, 0, 'f', 1));
+    tool_temp_label_->setStyleSheet(
+      QString("background: #263238; color: %1; padding: 6px; border-radius: 4px;").arg(tcol));
+  }
+
+  // Gripper motor current (heat proxy) mirrors the force values.
+  for (int i = 0; i < 3; i++) {
+    const double g = std::abs(gripper_forces_[i]);
+    gripper_heat_labels_[i]->setText(QString::number(gripper_forces_[i], 'f', 2));
+    const char * gcol = (g > 6.0) ? "#ff5252" : (g > 3.0) ? "#ffb300" : "#b0bec5";
+    gripper_heat_labels_[i]->setStyleSheet(
+      QString("background: #263238; color: %1; padding: 4px; border-radius: 4px;").arg(gcol));
+  }
+
   // Goals
   goal_count_label_->setText(QString("Goals: %1").arg(goal_count_));
   current_velocity_label_->setText(QString("Velocity: %1x").arg(velocity_scale_, 0, 'f', 1));
@@ -1577,6 +1895,16 @@ void UR10ePanel::updateDisplay()
   debug_preview_cb_->setChecked(debug_plan_preview_);
   debug_preview_cb_->blockSignals(false);
 
+  // Sync reachability cloud checkbox
+  reachability_cloud_cb_->blockSignals(true);
+  reachability_cloud_cb_->setChecked(reachability_cloud_enabled_);
+  reachability_cloud_cb_->blockSignals(false);
+
+  // Sync LiDAR scan preview checkbox
+  lidar_scan_preview_cb_->blockSignals(true);
+  lidar_scan_preview_cb_->setChecked(lidar_scan_preview_enabled_);
+  lidar_scan_preview_cb_->blockSignals(false);
+
   // Show goal coordinates
   if (!goal_coords_str_.empty() && goal_coords_str_ != "[]") {
     // Format: [[x,y,z],[x,y,z],...] → readable lines
@@ -1607,6 +1935,8 @@ void UR10ePanel::save(rviz_common::Config config) const
 {
   rviz_common::Panel::save(config);
   config.mapSetValue("velocity_slider", velocity_slider_->value());
+  config.mapSetValue("reachability_cloud", reachability_cloud_cb_->isChecked() ? 1 : 0);
+  config.mapSetValue("lidar_scan_preview", lidar_scan_preview_cb_->isChecked() ? 1 : 0);
 }
 
 void UR10ePanel::load(const rviz_common::Config & config)
@@ -1615,6 +1945,18 @@ void UR10ePanel::load(const rviz_common::Config & config)
   int val;
   if (config.mapGetInt("velocity_slider", &val)) {
     velocity_slider_->setValue(val);
+  }
+  if (config.mapGetInt("reachability_cloud", &val)) {
+    reachability_cloud_enabled_ = (val != 0);
+    if (reachability_cloud_cb_) {
+      reachability_cloud_cb_->setChecked(reachability_cloud_enabled_);
+    }
+  }
+  if (config.mapGetInt("lidar_scan_preview", &val)) {
+    lidar_scan_preview_enabled_ = (val != 0);
+    if (lidar_scan_preview_cb_) {
+      lidar_scan_preview_cb_->setChecked(lidar_scan_preview_enabled_);
+    }
   }
 }
 

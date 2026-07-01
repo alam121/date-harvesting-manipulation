@@ -2,6 +2,13 @@
 
 This README describes how to launch and operate the UR10e robot system with cuRobo motion planning, vision, teleop, and GUI.
 
+For day-to-day operation from RViz, including reachability goals, LiDAR scanning,
+camera recording, safe-zone behavior, and troubleshooting, read:
+
+```text
+OPERATOR_GUIDE.md
+```
+
 ---
 
 ## Quick Start

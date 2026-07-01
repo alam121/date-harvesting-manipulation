@@ -27,10 +27,12 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
+#include <ur_msgs/msg/tool_data_msg.hpp>
 
 namespace rviz_ur10e_panel
 {
@@ -50,9 +52,13 @@ public:
 private Q_SLOTS:
   void onStop();
   void onHome();
+  void onHomeLeft();
+  void onHomeRight();
   void onSetHomeCurrent();
   void onDropoff();
   void onExecute();
+  void onExecuteMoves();
+  void onAddCurrentGoal();
   void onClear();
   void onCheckCalibration();
   void onGripperOpen();
@@ -69,9 +75,14 @@ private Q_SLOTS:
   void onExit();
   void onRefreshMain();
   void onRefreshCamera();
+  void onCameraSnapshot();
+  void onCameraVideoStart();
+  void onCameraVideoStop();
   void onGraspSuccess();
   void onGraspFail();
   void onDebugPreviewChanged(int state);
+  void onReachabilityCloudChanged(int state);
+  void onLidarScanPreviewChanged(int state);
   void onZoneOverlayToggle();
   void onPlanConfirm();
   void onPlanCancel();
@@ -134,19 +145,27 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_info_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_scale_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr calib_check_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr config_sub_;
   rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     controller_state_sub_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr
     trajectory_command_sub_;
+  rclcpp::Subscription<ur_msgs::msg::ToolDataMsg>::SharedPtr tool_data_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr joint_temp_sub_;
 
   // Data
   std::mutex data_mutex_;
   double joint_positions_[6] = {};
   double joint_velocities_[6] = {};
+  double joint_efforts_[6] = {};   // per-joint current (A) from /joint_states.effort — heat proxy
   double tracking_errors_[6] = {};
   double tcp_wrench_[6] = {};
   double gripper_forces_[3] = {};
+  double tool_temperature_ = 0.0;  // tool/wrist flange temperature (degC)
+  bool have_tool_temp_ = false;
+  double joint_temperatures_[6] = {};  // per-joint temperature (degC) from /joint_temperatures
+  bool have_joint_temps_ = false;
   bool have_tracking_error_ = false;
   bool have_wrench_ = false;
   bool robot_running_ = false;
@@ -155,8 +174,11 @@ private:
   std::string latest_goal_;
   std::string goal_coords_str_;
   std::string calib_check_result_;
+  std::string robot_config_text_;
   bool plan_waiting_confirm_ = false;
   bool debug_plan_preview_ = true;
+  bool reachability_cloud_enabled_ = true;
+  bool lidar_scan_preview_enabled_ = true;
   std::string motion_phase_ = "IDLE";
   std::string reacquire_result_;
   std::string last_outcome_;
@@ -179,6 +201,7 @@ private:
   // UI
   QLabel * status_label_;
   QLabel * robot_state_label_;
+  QLabel * config_label_;
   QLabel * velocity_value_label_;
   QLabel * current_velocity_label_;
   QLabel * goal_count_label_;
@@ -188,10 +211,16 @@ private:
   QSlider * velocity_slider_;
   QLabel * joint_labels_[6];
   QLabel * force_labels_[3];
+  QLabel * joint_current_labels_[6];
+  QLabel * joint_temp_labels_[6];
+  QLabel * gripper_heat_labels_[3];
+  QLabel * tool_temp_label_;
   QLineEdit * x_in_, * y_in_, * z_in_;
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
   QSpinBox * multi_goal_count_spin_;
   QCheckBox * debug_preview_cb_;
+  QCheckBox * reachability_cloud_cb_;
+  QCheckBox * lidar_scan_preview_cb_;
   QPushButton * zone_overlay_btn_;
   QPushButton * plan_confirm_btn_;
   QPushButton * plan_cancel_btn_;

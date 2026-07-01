@@ -72,6 +72,11 @@ class ThreadSafeGoalList:
                 return list(self._goals[index])
             return None
 
+    def snapshot(self):
+        """Return a shallow copy of the current goals."""
+        with self._lock:
+            return [list(g) for g in self._goals]
+
     def sort(self, key=None, reverse=False):
         """Sort goals in place with optional key function."""
         with self._lock:
@@ -337,14 +342,37 @@ def is_bunch_lower_boundary(node):
     return rel_y is not None and rel_y >= lower_band
 
 
+def _planner_value(planner, semantic_name, legacy_name=None, default=0.0):
+    semantic_exists = hasattr(planner, semantic_name)
+    legacy_exists = legacy_name is not None and hasattr(planner, legacy_name)
+    if semantic_exists:
+        semantic_value = getattr(planner, semantic_name)
+        if legacy_exists:
+            legacy_value = getattr(planner, legacy_name)
+            # Backward compatibility: if an old ROS param/config override changed
+            # the legacy field while the new semantic field is still at its default,
+            # honor the legacy override.
+            if semantic_value == default and legacy_value != default:
+                return legacy_value
+        return semantic_value
+    if legacy_exists:
+        return getattr(planner, legacy_name)
+    return default
+
+
 def low_side_standoff_offsets(node, is_left_side):
     """Return XYZ offsets using the configured depth/lateral axes."""
     side = "left" if is_left_side else "right"
     default_x = 0.12 if is_left_side else 0.08
     default_y = 0.065 if is_left_side else 0.050
     default_z = -0.055 if is_left_side else -0.025
-    lateral_mag = getattr(node.cfg.planner, f"low_{side}_standoff_x", default_x)
-    depth_off = getattr(node.cfg.planner, f"low_{side}_standoff_y", default_y)
+    planner = node.cfg.planner
+    lateral_mag = _planner_value(
+        planner, f"low_{side}_standoff_lateral",
+        f"low_{side}_standoff_x", default_x)
+    depth_off = _planner_value(
+        planner, f"low_{side}_standoff_depth",
+        f"low_{side}_standoff_y", default_y)
     z_off = getattr(node.cfg.planner, f"low_{side}_standoff_z", default_z)
     lateral_off = lateral_mag * (1 if is_left_side else -1)
     if X_FORWARD_Y_LATERAL:
@@ -379,8 +407,12 @@ def compute_dynamic_side_home(node, fruit_xyz, is_left_side, reference_joints, d
 
     planner = node.cfg.planner
     fx, fy, fz = [float(v) for v in fruit_xyz]
-    mx = float(getattr(planner, "side_home_date_margin_x", 0.02))
-    my = float(getattr(planner, "side_home_date_margin_y", 0.08))
+    mx = float(_planner_value(
+        planner, "side_home_date_margin_lateral",
+        "side_home_date_margin_x", 0.02))
+    my = float(_planner_value(
+        planner, "side_home_date_margin_depth",
+        "side_home_date_margin_y", 0.08))
     mz = float(getattr(planner, "side_home_max_z_drop", 0.03))
 
     rx, ry, rz = [float(v) for v in ref_pose[:3]]
@@ -1096,11 +1128,11 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
     requested = max(1, int(getattr(planner, "very_low_ik_return_seeds", 8)))
     solver_seeds = int(getattr(node.motion_gen.ik_solver, "num_seeds", requested))
     return_seeds = min(requested, solver_seeds)
+    # No sticky pitch: every goal starts from the configured preferred pitch and
+    # re-sweeps -5 -> -10 -> -20 -> -30 from scratch, landing on the gentlest safe
+    # negative tilt rather than inheriting a larger tilt that won on a previous goal.
     preferred_pitch = float(getattr(
-        node, "_very_low_preferred_pitch_deg",
-        getattr(planner, "very_low_preflight_preferred_pitch_deg", 10.0)))
-    second_pitch = float(getattr(
-        planner, "very_low_preflight_second_pitch_deg", -30.0))
+        planner, "very_low_preflight_preferred_pitch_deg", -5.0))
     preferred_wrist = float(getattr(
         node, "_very_low_preferred_wrist_deg",
         getattr(planner, "very_low_preflight_preferred_wrist_deg", 0.0)))
@@ -1110,10 +1142,15 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
         planner, "very_low_preflight_pitch_step_deg", 10.0)))
     pitch_steps = max(0, int(getattr(
         planner, "very_low_preflight_pitch_steps", 3)))
-    pitch_offsets = [0.0]
-    for step_idx in range(1, pitch_steps + 1):
-        pitch_offsets.extend([pitch_step * step_idx, -pitch_step * step_idx])
-    pitch_offsets = [preferred_pitch, second_pitch, *pitch_offsets]
+    # Strict negative-pitch-first, gentlest tilt first: lead with the (negative)
+    # preferred pitch, then sweep negatives by increasing magnitude (-10, -20, -30),
+    # then 0, then positives as a last-resort tail. This stops at the smallest negative
+    # pitch that clears the clearance bar instead of jumping straight to a large tilt.
+    # A positive preferred is dropped from the seed so positive pitch can never lead.
+    negative_offsets = [-pitch_step * i for i in range(1, pitch_steps + 1)]
+    positive_offsets = [pitch_step * i for i in range(1, pitch_steps + 1)]
+    seed_pitches = [preferred_pitch] if preferred_pitch <= 0.0 else []
+    pitch_offsets = [*seed_pitches, *negative_offsets, 0.0, *positive_offsets]
     pitch_offsets = list(dict.fromkeys(pitch_offsets))
     early_accept_mm = max(threshold_mm, float(getattr(
         planner, "very_low_preflight_early_accept_mm", threshold_mm)))
@@ -1253,7 +1290,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
         if item["clearance"] >= max_clearance - clearance_window
     ]
     best = min(safest_candidates, key=lambda item: item["score"])
-    node._very_low_preferred_pitch_deg = best["pitch_deg"]
+    # Pitch is not sticky — each goal re-sweeps from the configured preferred pitch.
     node._very_low_preferred_wrist_deg = best["wrist_deg"]
     node.get_logger().info(
         f"[PREFLIGHT] selected pitch_offset={best['pitch_deg']:+.0f}deg "
@@ -2738,7 +2775,9 @@ def plan_and_execute(node):
             is_low = z < LOW_Z_THRESH
             _height_source = f"z_thresh={LOW_Z_THRESH:.2f}"
 
-        standoff = getattr(node.cfg.planner, "mid_center_approach_y_offset", 0.10)
+        standoff = _planner_value(
+            node.cfg.planner, "mid_center_approach_depth_offset",
+            "mid_center_approach_y_offset", 0.10)
         d_blend = blend_approach_direction(node, x, y, z)
 
         if is_low:
@@ -2986,9 +3025,13 @@ def plan_and_execute(node):
                     approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
                 else:
                     _depth_off = (
-                        getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
+                        _planner_value(
+                            node.cfg.planner, "very_low_center_approach_depth_offset",
+                            "very_low_center_approach_y_offset", 0.08)
                         if is_very_low_center
-                        else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07)
+                        else _planner_value(
+                            node.cfg.planner, "low_center_approach_depth_offset",
+                            "low_center_approach_y_offset", 0.07)
                     )
                     _x_off, _y_off = add_axis_offsets(0.0, 0.0, depth=_depth_off)
                     _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
@@ -3033,9 +3076,13 @@ def plan_and_execute(node):
                 side_blend = 0.10 if is_low_lateral else 0.25
                 orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
                 _depth_offset = (
-                    getattr(node.cfg.planner, "very_low_center_approach_y_offset", 0.08)
+                    _planner_value(
+                        node.cfg.planner, "very_low_center_approach_depth_offset",
+                        "very_low_center_approach_y_offset", 0.08)
                     if is_very_low_center
-                    else getattr(node.cfg.planner, "low_center_approach_y_offset", 0.07)
+                    else _planner_value(
+                        node.cfg.planner, "low_center_approach_depth_offset",
+                        "low_center_approach_y_offset", 0.07)
                 )
                 _x_offset, _y_offset = add_axis_offsets(
                     0.0, 0.0, depth=_depth_offset)
@@ -3075,7 +3122,9 @@ def plan_and_execute(node):
                 _side = "left" if lateral_value(x, y) > trunk_lat else "right"
                 _default_z = 0.020 if _side == "left" else 0.010
                 return (
-                    getattr(node.cfg.planner, "low_side_final_y_offset", 0.0),
+                    _planner_value(
+                        node.cfg.planner, "low_side_final_depth_offset",
+                        "low_side_final_y_offset", 0.0),
                     getattr(node.cfg.planner, f"low_{_side}_final_z_offset", _default_z),
                 )
             if is_low:
@@ -3083,11 +3132,15 @@ def plan_and_execute(node):
                 if is_slip_retry:
                     _z = min(_z, 0.02)
                 return (
-                    getattr(node.cfg.planner, "low_center_final_y_offset", 0.004),
+                    _planner_value(
+                        node.cfg.planner, "low_center_final_depth_offset",
+                        "low_center_final_y_offset", 0.004),
                     _z,
                 )
             return (
-                getattr(node.cfg.planner, "mid_center_final_y_offset", 0.008),
+                _planner_value(
+                    node.cfg.planner, "mid_center_final_depth_offset",
+                    "mid_center_final_y_offset", 0.008),
                 (getattr(node.cfg.planner, "mid_center_slip_final_z_offset", 0.020)
                  if is_slip_retry
                  else getattr(node.cfg.planner, "mid_center_final_z_offset", 0.030)),
@@ -3126,25 +3179,35 @@ def plan_and_execute(node):
 
             markers_mod.publish_plan_preview(node, preview_steps)
 
-            _img_norm = getattr(node, 'fruit_image_norm', None)
-            if _img_norm is not None:
-                _cx, _cy = _img_norm
-                _very_low_thresh = getattr(node.cfg.planner, "very_low_center_cy_thresh", 0.90)
-                _is_low_label = _cy > 0.60
-                _is_very_low_label = (_is_low_label and _cy >= _very_low_thresh) or is_bunch_lower_boundary(node)
-                height_label = "VERY LOW" if _is_very_low_label else ("LOW" if _is_low_label else "MID/HIGH")
-                lateral_label = image_lateral_side(
-                    node, _cx, _cy, force_very_low_center=_is_very_low_label)
+            # Show EXACTLY the classification the approach will execute, so the preview
+            # can never disagree with the planned motion (previously it recomputed both
+            # labels from live vision and could flip across threshold boundaries between
+            # acceptance and execution):
+            #   height  -> the is_very_low_center / is_low decided above for planning
+            #   lateral -> the stored goal_lateral_side that planning reuses (see ~L2823),
+            #              not a fresh image_lateral_side() that can boundary-flip.
+            if is_very_low_center:
+                height_label = "VERY LOW"
+            elif is_low:
+                height_label = "LOW"
             else:
-                trunk_lat_val = trunk_lateral(node)
-                fruit_lat_val = lateral_value(x, y)
-                lateral_dist = abs(fruit_lat_val - trunk_lat_val)
-                height_label = "LOW" if is_low else "MID/HIGH"
-                lateral_label = (
-                    ("LEFT" if fruit_lat_val > trunk_lat_val else "RIGHT")
-                    if lateral_dist > LATERAL_THRESH
-                    else "CENTER"
-                )
+                height_label = "MID/HIGH"
+            lateral_label = getattr(node, 'goal_lateral_side', None)
+            if lateral_label is None:
+                _img_norm = getattr(node, 'fruit_image_norm', None)
+                if _img_norm is not None:
+                    _cx, _cy = _img_norm
+                    lateral_label = image_lateral_side(
+                        node, _cx, _cy, force_very_low_center=is_very_low_center)
+                else:
+                    trunk_lat_val = trunk_lateral(node)
+                    fruit_lat_val = lateral_value(x, y)
+                    lateral_dist = abs(fruit_lat_val - trunk_lat_val)
+                    lateral_label = (
+                        ("LEFT" if fruit_lat_val > trunk_lat_val else "RIGHT")
+                        if lateral_dist > LATERAL_THRESH
+                        else "CENTER"
+                    )
             node.get_logger().info(
                 f"PLAN PREVIEW: {height_label} | {lateral_label} | "
                 f"side={is_side_approach} | goal=[{x:.3f},{y:.3f},{z:.3f}] | "
@@ -3271,56 +3334,36 @@ def plan_and_execute(node):
                 unlock_target(node)
                 continue
             if not _approach_ok:
-                # If the failure was a clamping rejection, try rotating the approach
-                # orientation before falling back to home.  Clamping is caused by
-                # wrist_3 reaching a specific angle; small tool-Z rotations (±20°, ±40°)
-                # change the IK branch and often land on a safe wrist configuration.
+                # A clamping/safety rejection means the chosen IK branch folds the
+                # forearm toward the tool flange (self-clamp). Wrist-3 roll spins the
+                # tool about its own approach axis and CANNOT change that forearm/flange
+                # clearance. The pitch + IK-branch preflight does: it sweeps approach
+                # pitch AND alternate IK branches, scoring forearm/flange clearance (and
+                # also covers wrist variants). Reuse it here instead of wrist-only roll.
                 if (getattr(node, '_approach_clamp_rejected', False) or
                         getattr(node, '_approach_safety_rejected', False)):
-                    _wrist_tried = False
-                    for _wrist_deg in [-20.0, 20.0, -40.0, 40.0]:
-                        half = math.radians(_wrist_deg) / 2.0
-                        q_wrist = [math.cos(half), 0.0, 0.0, math.sin(half)]
-                        _q_varied = quat_normalize(quat_multiply(list(approach[3:]), q_wrist))
-                        _approach_varied = [*approach[:3], *_q_varied]
+                    _safe_start = _valid_joint_positions()
+                    _safe_candidate = (
+                        _select_safe_approach_candidate(node, approach, _safe_start)
+                        if _safe_start is not None else None)
+                    if _safe_candidate is not None:
                         node._approach_clamp_rejected = False
                         node._approach_safety_rejected = False
                         node._approach_truncated = False
-                        _variant_label = f"APPROACH_W{_wrist_deg:+.0f}"
-                        _v_ok = _direct_ik_move(
-                            node, _approach_varied,
-                            label=_variant_label,
+                        approach = list(_safe_candidate["pose"])
+                        orientation = list(approach[3:])
+                        _approach_ok = _direct_ik_move(
+                            node,
+                            approach,
+                            label="APPROACH_PREFLIGHT",
                             motion_type="approach",
                             store_trajectory=True,
+                            goal_js_override=_safe_candidate["goal_js"],
                         )
-                        if (not _v_ok and
-                                not getattr(node, '_approach_clamp_rejected', False)):
-                            _v_ok = plan_and_send(
-                                node, start,
-                                Pose.from_list(_approach_varied),
-                                label=_variant_label,
-                                motion_type="approach",
-                                goal_xyz=approach[:3],
-                                store_trajectory=True,
-                            )
-                        if _v_ok:
-                            node.get_logger().info(
-                                f"APPROACH wrist variation {_wrist_deg:+.0f}deg succeeded")
-                            orientation = list(_q_varied)
-                            approach = list(_approach_varied)
-                            _approach_ok = True
-                            _wrist_tried = True
-                            break
-                        if (getattr(node, '_approach_clamp_rejected', False) or
-                                getattr(node, '_approach_safety_rejected', False)):
-                            node.get_logger().info(
-                                f"APPROACH wrist {_wrist_deg:+.0f}deg unsafe — trying next")
-                        else:
-                            node.get_logger().info(
-                                f"APPROACH wrist {_wrist_deg:+.0f}deg did not plan — trying next")
                     if not _approach_ok:
                         node.get_logger().warn(
-                            "All APPROACH wrist variations unsafe or unplannable — re-homing and skipping goal")
+                            "APPROACH clamp-unsafe and no safe pitch/branch found — "
+                            "re-homing and skipping goal")
                         move_to_home_position(node)
                         if _check_stop(): break
                         _vision_resume()
@@ -3632,9 +3675,9 @@ def plan_and_execute(node):
             if cur:
                 f0, f1, f2 = deltas[0], deltas[1], deltas[2]  # left, center, right
 
-                # Lateral correction: imbalance between left (F0) and right (F2)
-                # F0 > F2 → fruit is left of center → shift gripper left (−X)
-                # F2 > F0 → fruit is right of center → shift gripper right (+X)
+                # Lateral correction: imbalance between left (F0) and right (F2).
+                # Keep this in semantic axes; add_axis_offsets maps it to the
+                # active robot profile (old: X lateral/Y depth, new: Y lateral/X depth).
                 lateral_imbalance = f0 - f2
                 lateral_correction = -float(lateral_imbalance) * 0.008  # ~8mm per 1N imbalance
                 lateral_correction = max(-0.02, min(0.02, lateral_correction))  # clamp ±20mm
@@ -3659,9 +3702,15 @@ def plan_and_execute(node):
                     f"vertical={vertical_correction*1000:+.1f}mm"
                 )
 
+                target_x, target_y = add_axis_offsets(
+                    cur[0],
+                    cur[1],
+                    depth=forward_correction,
+                    lateral=lateral_correction,
+                )
                 closer_target = [
-                    cur[0] + lateral_correction,
-                    cur[1] + forward_correction,
+                    target_x,
+                    target_y,
                     cur[2] + vertical_correction,
                     *cur[3:]
                 ]
@@ -3691,9 +3740,14 @@ def plan_and_execute(node):
         if abs(_depth_correction) > 0.003:  # only move if correction > 3mm
             _cur_for_depth = node.get_end_effector_pose()
             if _cur_for_depth:
-                _depth_target = [
+                _depth_x, _depth_y = add_axis_offsets(
                     _cur_for_depth[0],
-                    _cur_for_depth[1] + _depth_correction,
+                    _cur_for_depth[1],
+                    depth=_depth_correction,
+                )
+                _depth_target = [
+                    _depth_x,
+                    _depth_y,
                     _cur_for_depth[2],
                     *_cur_for_depth[3:]
                 ]
@@ -3977,10 +4031,15 @@ def plan_and_execute(node):
 
                 next_standoff = 0.12
                 if next_is_low:
-                    nax, nay, naz = nx, ny - 0.01, nz - 0.12
+                    next_depth = _planner_value(
+                        node.cfg.planner, "low_center_approach_depth_offset",
+                        "low_center_approach_y_offset", 0.07)
+                    next_z_offset = getattr(
+                        node.cfg.planner, "low_center_approach_z_offset", -0.07)
+                    nax, nay = add_axis_offsets(nx, ny, depth=next_depth)
+                    naz = nz + next_z_offset
                 else:
-                    nax = nx
-                    nay = ny + next_standoff
+                    nax, nay = add_axis_offsets(nx, ny, depth=next_standoff)
                     naz = nz
 
                 # Try planning from current (dropoff) position to next approach

@@ -10,6 +10,7 @@ from .config import (
     DRAW_ONLY_BEST, DRAW_TOP_N, SHOW_REJECTED, SKIP_DRAW,
     SHOW_CLASSIFICATION_ZONES, CLASS_ZONE_MID_LEFT_THRESH, CLASS_ZONE_MID_RIGHT_THRESH,
     CLASS_ZONE_LOW_LEFT_THRESH, CLASS_ZONE_LOW_RIGHT_THRESH, APPROACH_CHECK_DIST,
+    SHOW_GAP_DEBUG,
 )
 from .math_utils import project_point_to_image
 from .scoring import estimate_fruit_radius
@@ -23,6 +24,7 @@ class VisionVisualizer:
         self.image_scale = image_scale
         self.display_scale = display_scale
         self.show_classification_zones = SHOW_CLASSIFICATION_ZONES
+        self.show_gap_debug = SHOW_GAP_DEBUG
         self._s = 1.0  # active draw scale, set per-frame in render_frame
 
     # ------------------------------------------------------------------
@@ -428,6 +430,61 @@ class VisionVisualizer:
                         cv2.LINE_AA,
                     )
 
+    def draw_gap_debug(
+        self,
+        image: np.ndarray,
+        target: Dict[str, Any],
+    ) -> None:
+        """Draw branch-ring samples and the selected clear-gap direction."""
+        if not self.show_gap_debug:
+            return
+
+        debug = target.get("_ring_debug")
+        if not debug:
+            return
+
+        cx = int(round(debug["cx"]))
+        cy = int(round(debug["cy"]))
+        ring_r = float(debug["r"])
+        blocked = debug["blocked"]
+        n_samples = int(debug["n_samples"])
+
+        cv2.circle(
+            image, (cx, cy), int(round(ring_r)),
+            (180, 180, 180, 255), self._thick(1), cv2.LINE_AA,
+        )
+        for i, is_blocked in enumerate(blocked):
+            angle = i * (2.0 * math.pi / n_samples)
+            px = int(round(cx + ring_r * math.cos(angle)))
+            py = int(round(cy + ring_r * math.sin(angle)))
+            color = (0, 0, 255, 255) if is_blocked else (0, 255, 0, 255)
+            cv2.circle(image, (px, py), self._radius(4), color, -1, cv2.LINE_AA)
+
+        detected = bool(debug.get("detected", False))
+        if detected:
+            gap_angle = float(debug["gap_angle"])
+            arrow_len = ring_r + self._len(35)
+            end = (
+                int(round(cx + arrow_len * math.cos(gap_angle))),
+                int(round(cy + arrow_len * math.sin(gap_angle))),
+            )
+            cv2.arrowedLine(
+                image, (cx, cy), end, (255, 255, 0, 255),
+                self._thick(3), cv2.LINE_AA, tipLength=0.2,
+            )
+            label = f"GAP {math.degrees(gap_angle):.0f} deg | 2-FINGER"
+            label_color = (255, 255, 0, 255)
+        else:
+            label = "NO USABLE GAP | 3-FINGER"
+            label_color = (220, 220, 220, 255)
+
+        cv2.putText(
+            image, label,
+            (max(4, cx - int(ring_r)), max(self._radius(18), cy - int(ring_r) - self._radius(8))),
+            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55), label_color,
+            self._thick(2), cv2.LINE_AA,
+        )
+
     def _draw_target_labels(
         self,
         image: np.ndarray,
@@ -592,6 +649,12 @@ class VisionVisualizer:
                     )
                 if t.get("polygon") is not None:
                     t["polygon"] = (t["polygon"] * s).astype(np.int32)
+                if t.get("_ring_debug") is not None:
+                    debug = dict(t["_ring_debug"])
+                    debug["cx"] *= s
+                    debug["cy"] *= s
+                    debug["r"] *= s
+                    t["_ring_debug"] = debug
                 return t
             targets = [_scale_target(t) for t in targets]
             rejected_targets = [_scale_target(t) for t in rejected_targets]
@@ -623,6 +686,8 @@ class VisionVisualizer:
             if not DRAW_ONLY_BEST and i not in draw_indices:
                 continue
             self.draw_target(image, t, is_best=(i == best_idx), idx=i)
+            if i == best_idx:
+                self.draw_gap_debug(image, t)
 
         self.draw_hud(image, net_fps, loop_fps)
 
