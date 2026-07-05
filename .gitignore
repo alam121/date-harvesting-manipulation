@@ -1,69 +1,39 @@
-
-# ROS
-build/
-install/
-log/
-# ML / DL models
-*.pth
-*.h5
-*.onnx
-*.engine
-*.pptx
-*.pyc
-# Videos / data
-*.mp4
-*.bag
-# Generated outputs
-zed_output*
-
-# colcon outputs
+# ROS / colcon build outputs
 build/
 install/
 log/
 **/build/
 **/install/
 **/log/
-
-# archives/installers
-*.tar.gz
-*.tgz
-*.zip
-build/
-install/
-log/
-**/build/
-**/install/
-**/log/
-*.tar.gz
-# Large detector weights (keep out of Git)
-ur_ws_new/src/zed_date_detector/best.pt
-ur_ws_new/src/zed_date_detector/models/yolov8m-seg.pt
-# outputs / artifacts (never commit)
-Date_detection/
-ur_ws_new/src/zed_date_detector/zed_date_detector/Date_detection/
-*.mp4
-*.h5
-*.onnx
-*.engine
-
-# keep only models weights
-*.pt
-!ur_ws_new/src/zed_date_detector/models/**/*.pt
-# ROS / colcon
-build/
-install/
-log/
-**/build/
-**/install/
-**/log/
-
-# common artifacts
-*.tar.gz
-*.tgz
-*.zip
-*.bag
-*.db
 
 # Python artifacts
 __pycache__/
 *.pyc
+
+# ML / DL model weights (kept out of Git)
+*.pth
+*.h5
+*.onnx
+*.engine
+*.pt
+# ...except the curated detector weights under models/
+!ur_ws_new/src/zed_date_detector/models/**/*.pt
+# ...but never the large ones
+ur_ws_new/src/zed_date_detector/best.pt
+ur_ws_new/src/zed_date_detector/models/yolov8m-seg.pt
+
+# Videos / data / databases
+*.mp4
+*.bag
+*.db
+
+# Archives / installers
+*.tar.gz
+*.tgz
+*.zip
+*.pptx
+
+# Generated outputs / detection artifacts
+zed_output*
+Date_detection/
+ur_ws_new/src/zed_date_detector/zed_date_detector/Date_detection/
