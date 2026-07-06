@@ -96,6 +96,9 @@ class VisionNode:
         # Set by the main node via /vision/mode topic.
         self.detection_mode: str = "full"
         self._reacquire_frame_skip: int = 0  # frame counter for YOLO throttle in reacquire mode
+        # True once we have confirmed the paused state (inference drained) to the
+        # motion node. Reset when leaving paused so the next pause re-acks.
+        self._vision_paused_acked: bool = False
 
 
         # Target lock
@@ -241,6 +244,10 @@ class VisionNode:
             if mode in ("full", "reacquire", "paused"):
                 self.detection_mode = mode
         self.node.create_subscription(_String, "/vision/mode", _mode_cb, 10)
+        # Report the effective detection state back to the motion node. Used for a
+        # deterministic GPU handoff: we publish "paused" only after in-flight YOLO
+        # inference has drained, so cuRobo can plan without a fixed guess delay.
+        self._mode_state_pub = self.node.create_publisher(_String, "/vision/mode_state", 10)
 
         # Runtime visualization overlays. Kept separate from /vision/mode so
         # debugging UI does not change detection behavior.
@@ -635,10 +642,20 @@ class VisionNode:
                 if _paused:
                     # Keep the display live during robot motion, but skip stale
                     # detections/depth/heatmap work so cuRobo keeps the GPU.
+                    # On entering paused, wait for any in-flight inference to drain,
+                    # then confirm to the motion node that the GPU is free.
+                    if not self._vision_paused_acked:
+                        self.yolo_thread.paused = True
+                        self.yolo_thread.wait_until_idle(timeout=0.5)
+                        self._publish_mode_state("paused")
+                        self._vision_paused_acked = True
                     current_dets = None
                     _enqueue_raw_viz_frame()
                     continue
                 else:
+                    if self._vision_paused_acked:
+                        self.yolo_thread.paused = False
+                        self._vision_paused_acked = False
                     self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
                     if not _reacquire or self._reacquire_frame_skip == 0:
                         self.yolo_thread.set_image(image_left.get_data())
@@ -1007,6 +1024,16 @@ class VisionNode:
         )
         Thread(target=self.yolo_thread.run, daemon=True).start()
         return zed
+
+    def _publish_mode_state(self, state: str) -> None:
+        """Report the effective detection state to the motion node (GPU handoff ack)."""
+        pub = getattr(self, "_mode_state_pub", None)
+        if pub is None:
+            return
+        from std_msgs.msg import String as _String
+        msg = _String()
+        msg.data = state
+        pub.publish(msg)
 
     def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub,
                              orig_mask: Optional[np.ndarray] = None) -> bool:

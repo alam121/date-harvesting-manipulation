@@ -116,6 +116,18 @@ class YoloThread:
             self.image_net = image
             self.run_event.set()
 
+    def wait_until_idle(self, timeout: float = 0.5) -> bool:
+        """Block until no inference is pending or in flight, so the GPU is free
+        for cuRobo. Returns True once idle, False if still busy after timeout."""
+        deadline = time() + timeout
+        while time() < deadline:
+            # No queued job and not mid-inference (inference_lock is free).
+            if not self.run_event.is_set() and self.inference_lock.acquire(blocking=False):
+                self.inference_lock.release()
+                return True
+            sleep(0.002)
+        return False
+
     def get_detections(self):
         """Get latest fruit detections (thread-safe). Trunk is excluded."""
         with self.lock:

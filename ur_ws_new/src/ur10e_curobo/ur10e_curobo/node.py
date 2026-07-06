@@ -93,6 +93,11 @@ class UR10eCuroboMoveIt(Node):
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
         self._vision_mode_pub = self.create_publisher(String, "/vision/mode", 10)
+        # GPU handoff handshake: the vision node confirms it has paused and drained
+        # any in-flight YOLO inference by publishing "paused" on /vision/mode_state.
+        self._vision_mode_state = None
+        self._vision_paused_event = threading.Event()
+        self.create_subscription(String, "/vision/mode_state", self._vision_mode_state_cb, 10)
         self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
         # Active robot type + environment for the RViz panel. Republished periodically so
         # the panel shows it regardless of who started first.
@@ -224,9 +229,28 @@ class UR10eCuroboMoveIt(Node):
 
     def set_vision_mode(self, mode: str):
         """Switch the vision node between 'full' (approach) and 'reacquire' modes."""
+        if mode == "paused":
+            # Arm the handshake before commanding pause so we only accept a fresh
+            # "paused" ack that arrives after this request.
+            self._vision_paused_event.clear()
         msg = String()
         msg.data = mode
         self._vision_mode_pub.publish(msg)
+
+    def _vision_mode_state_cb(self, msg: String):
+        """Handle the vision node's effective-state report (GPU handoff ack)."""
+        self._vision_mode_state = msg.data
+        if msg.data == "paused":
+            self._vision_paused_event.set()
+
+    def wait_for_vision_paused(self, timeout: float = 0.30) -> bool:
+        """Block until the vision node confirms it has paused and drained in-flight
+        YOLO inference, freeing the GPU for cuRobo. Returns True on confirmation,
+        False on timeout (caller should then fall back to a fixed delay)."""
+        ev = getattr(self, "_vision_paused_event", None)
+        if ev is None:
+            return False
+        return ev.wait(timeout=timeout)
 
     def _reachability_offsets(self, samples: int, cap_rad: float):
         """Deterministic joint-offset samples around zero, scaled by max joint delta."""

@@ -2680,12 +2680,16 @@ def plan_and_execute(node):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _yolo = getattr(node, 'yolo_thread', None)  # local inference_lock only (same process)
     # Vision mode helpers — these publish to /vision/mode to control the separate vision process.
-    # _vision_pause() sleeps 120ms after publishing: ROS2 topic latency (~20ms) + worst-case
-    # YOLO inference time at 640px on Jetson (~50ms) + margin. Without this gap, YOLO TRT
-    # and cuRobo CUDA kernels overlap on the shared GPU and trigger device-side asserts.
+    # _vision_pause() waits for the vision node to confirm it has paused and drained
+    # any in-flight YOLO inference (see wait_for_vision_paused). Without this handoff,
+    # YOLO TRT and cuRobo CUDA kernels overlap on the shared GPU and trigger
+    # device-side asserts. If no ack arrives (vision not running or ack dropped), fall
+    # back to a fixed 120ms delay: ROS2 topic latency (~20ms) + worst-case YOLO
+    # inference at 640px on Jetson (~50ms) + margin.
     def _vision_pause():
         node.set_vision_mode("paused")
-        time.sleep(0.12)
+        if not node.wait_for_vision_paused(timeout=0.30):
+            time.sleep(0.12)
     def _vision_resume(): node.set_vision_mode("full")
 
     def _check_stop():
