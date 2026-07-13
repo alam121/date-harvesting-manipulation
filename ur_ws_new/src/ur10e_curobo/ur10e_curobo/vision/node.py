@@ -40,7 +40,13 @@ from ..perception_lidar import (
 from ..config import X_FORWARD_Y_LATERAL
 from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
-from .zed_utils import apply_zed_one_settings, apply_zed_mini_settings, apply_zed_stereo_settings
+from .zed_utils import (
+    apply_zed_one_manual_exposure,
+    apply_zed_one_exposure_preset,
+    apply_zed_one_settings,
+    apply_zed_mini_settings,
+    apply_zed_stereo_settings,
+)
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker
 
@@ -137,7 +143,8 @@ class VisionNode:
         self._latest_ros_image: Optional[np.ndarray] = None
         self._ros_image_lock = Lock()
 
-        # ZED X Mini (depth camera for --use_zed_mini mode)
+        # Open ZED cameras. _zed is the live image camera; _zed_mini is depth-only.
+        self._zed = None
         self._zed_mini = None
 
         # Components
@@ -290,6 +297,36 @@ class VisionNode:
                 # from inside a callback that runs on this executor would deadlock.
                 _exec = self.executor
                 Thread(target=_exec.shutdown, daemon=True).start()
+            elif cmd in ("preset lab", "preset outdoor"):
+                preset = cmd.split()[1]
+                if self._zed is None:
+                    self.node.get_logger().warn(
+                        f"Camera preset {preset}: ZED camera is not open yet")
+                    return
+                applied = apply_zed_one_exposure_preset(self._zed, preset)
+                self.node.get_logger().info(
+                    f"Camera exposure preset applied: {applied}")
+            elif cmd.startswith("settings "):
+                if self._zed is None:
+                    self.node.get_logger().warn(
+                        "Camera settings: ZED camera is not open yet")
+                    return
+                values = {}
+                for token in cmd.split()[1:]:
+                    if "=" not in token:
+                        continue
+                    key, value = token.split("=", 1)
+                    values[key.strip().lower()] = value.strip()
+                try:
+                    auto = values.get("auto", "0").lower() in ("1", "true", "yes", "on")
+                    exposure = int(values.get("exposure", "8"))
+                    gain = int(values.get("gain", "0"))
+                except ValueError:
+                    self.node.get_logger().warn(f"Camera settings ignored: bad command '{cmd}'")
+                    return
+                apply_zed_one_manual_exposure(self._zed, auto, exposure, gain)
+                self.node.get_logger().info(
+                    f"Camera settings applied: auto={int(auto)} exposure={exposure} gain={gain}")
 
         from std_msgs.msg import String as StdString
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
@@ -957,6 +994,7 @@ class VisionNode:
                 print(f"[ZedXOne] Failed to open after 10 attempts: {repr(status)}")
                 return None
             print("ZED X One Mono initialized")
+            self._zed = zed
             apply_zed_camera_settings(zed)
 
             if use_zed_mini:
@@ -1008,6 +1046,7 @@ class VisionNode:
                 print(repr(status))
                 return None
             print("Camera Initialized")
+            self._zed = zed
             apply_zed_stereo_settings(zed)
             zed.enable_positional_tracking(sl.PositionalTrackingParameters())
             obj_param = sl.ObjectDetectionParameters()

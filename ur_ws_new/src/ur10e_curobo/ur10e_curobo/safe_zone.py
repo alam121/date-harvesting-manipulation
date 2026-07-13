@@ -4,8 +4,8 @@ Because the camera is eye-in-hand and forward-facing, it cannot see behind/to th
 sides of the arm, so obstacles there can never be perceived. Instead of trusting
 perception everywhere, we define a trusted box up front and keep the arm inside it.
 
-Two draggable corner handles (min / max) define an axis-aligned box in base_link;
-the box is shown as a translucent cube. A right-click menu enables/disables
+Two draggable corner handles (min / max) resize an axis-aligned box in base_link;
+a center handle moves the whole box. A right-click menu enables/disables
 enforcement and snaps the box around the robot. State lives on the node:
 
     node.safe_zone_min / node.safe_zone_max : list[3]  (base_link metres)
@@ -24,6 +24,7 @@ from interactive_markers import InteractiveMarkerServer, MenuHandler
 from visualization_msgs.msg import (
     InteractiveMarker,
     InteractiveMarkerControl,
+    InteractiveMarkerFeedback,
     Marker,
 )
 
@@ -31,8 +32,9 @@ _SERVER = "safe_zone"
 _SQRT_HALF = 1.0 / math.sqrt(2.0)
 
 # Sensible default box in base_link (metres) — tweak by dragging, then Enable.
-DEFAULT_MIN = [0.10, -0.60, 0.10]
-DEFAULT_MAX = [0.70, 0.20, 0.85]
+# The lower z bound is below base_link so outdoor/low fruit poses can be enclosed.
+DEFAULT_MIN = [0.05, -0.90, -0.65]
+DEFAULT_MAX = [0.70, 0.25, 0.95]
 
 
 def _corner_marker(name: str, pos, color) -> InteractiveMarker:
@@ -71,6 +73,41 @@ def _corner_marker(name: str, pos, color) -> InteractiveMarker:
     return im
 
 
+def _center_marker(name: str, pos) -> InteractiveMarker:
+    """A draggable center handle that translates the whole safe-zone box."""
+    im = InteractiveMarker()
+    im.header.frame_id = "base_link"
+    im.name = name
+    im.description = ""
+    im.scale = 0.18
+    im.pose.position.x, im.pose.position.y, im.pose.position.z = (
+        float(pos[0]), float(pos[1]), float(pos[2]))
+    im.pose.orientation.w = 1.0
+
+    cube = Marker()
+    cube.type = Marker.CUBE
+    cube.scale.x = cube.scale.y = cube.scale.z = 0.06
+    cube.color.r, cube.color.g, cube.color.b, cube.color.a = 1.0, 0.90, 0.10, 0.85
+    vis = InteractiveMarkerControl()
+    vis.interaction_mode = InteractiveMarkerControl.MOVE_3D
+    vis.always_visible = True
+    vis.markers.append(cube)
+    im.controls.append(vis)
+
+    for axis, qx, qy, qz in (("x", _SQRT_HALF, 0.0, 0.0),
+                             ("y", 0.0, 0.0, _SQRT_HALF),
+                             ("z", 0.0, _SQRT_HALF, 0.0)):
+        ctl = InteractiveMarkerControl()
+        ctl.orientation.w = _SQRT_HALF
+        ctl.orientation.x = qx
+        ctl.orientation.y = qy
+        ctl.orientation.z = qz
+        ctl.name = f"move_{axis}"
+        ctl.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        im.controls.append(ctl)
+    return im
+
+
 def setup_safe_zone(node):
     node.safe_zone_min = list(getattr(node, "safe_zone_min", DEFAULT_MIN))
     node.safe_zone_max = list(getattr(node, "safe_zone_max", DEFAULT_MAX))
@@ -79,6 +116,26 @@ def setup_safe_zone(node):
     box_pub = node.create_publisher(Marker, "/safe_zone_box", 1)
     server = InteractiveMarkerServer(node, _SERVER)
     menu = MenuHandler()
+
+    def _center():
+        return [(node.safe_zone_min[i] + node.safe_zone_max[i]) / 2.0 for i in range(3)]
+
+    def _half_size():
+        return [abs(node.safe_zone_max[i] - node.safe_zone_min[i]) / 2.0 for i in range(3)]
+
+    def _move_marker(name, pos):
+        im = server.get(name)
+        if im is not None:
+            im.pose.position.x, im.pose.position.y, im.pose.position.z = (
+                float(pos[0]), float(pos[1]), float(pos[2]))
+            server.insert(im)
+
+    def _sync_marker_poses(include_corners=True, include_center=True):
+        if include_corners:
+            _move_marker(f"{_SERVER}_min", node.safe_zone_min)
+            _move_marker(f"{_SERVER}_max", node.safe_zone_max)
+        if include_center:
+            _move_marker(f"{_SERVER}_center", _center())
 
     def _fire_change():
         cb = getattr(node, "_safe_zone_on_change", None)
@@ -132,6 +189,42 @@ def setup_safe_zone(node):
     # versions; avoids relying on per-drag feedback callbacks).
     _state = {"last": None}
 
+    def _on_corner_feedback(fb):
+        if fb.marker_name.endswith("_min"):
+            target = node.safe_zone_min
+        elif fb.marker_name.endswith("_max"):
+            target = node.safe_zone_max
+        else:
+            return
+
+        target[0] = fb.pose.position.x
+        target[1] = fb.pose.position.y
+        target[2] = fb.pose.position.z
+        key = (tuple(round(v, 4) for v in node.safe_zone_min),
+               tuple(round(v, 4) for v in node.safe_zone_max))
+        _state["last"] = key
+        _sync_marker_poses(include_corners=False, include_center=True)
+        server.applyChanges()
+        publish_box()
+
+        if fb.event_type == InteractiveMarkerFeedback.MOUSE_UP:
+            _fire_change()
+
+    def _on_center_feedback(fb):
+        half = _half_size()
+        center = [fb.pose.position.x, fb.pose.position.y, fb.pose.position.z]
+        node.safe_zone_min = [center[i] - half[i] for i in range(3)]
+        node.safe_zone_max = [center[i] + half[i] for i in range(3)]
+        key = (tuple(round(v, 4) for v in node.safe_zone_min),
+               tuple(round(v, 4) for v in node.safe_zone_max))
+        _state["last"] = key
+        _sync_marker_poses(include_corners=True, include_center=False)
+        server.applyChanges()
+        publish_box()
+
+        if fb.event_type == InteractiveMarkerFeedback.MOUSE_UP:
+            _fire_change()
+
     def _sync():
         if not _read_corners():
             return
@@ -141,6 +234,8 @@ def setup_safe_zone(node):
             # Live-update only the visual box while dragging. Walls are (re)applied on the
             # discrete Enable/Snap actions to avoid hammering cuRobo's update_world.
             _state["last"] = key
+            _sync_marker_poses(include_corners=False, include_center=True)
+            server.applyChanges()
             publish_box()
 
     node.create_timer(0.2, _sync)
@@ -160,6 +255,14 @@ def setup_safe_zone(node):
         publish_box()
         _fire_change()
 
+    def _set_corners(min_corner, max_corner):
+        node.safe_zone_min = list(min_corner)
+        node.safe_zone_max = list(max_corner)
+        _sync_marker_poses(include_corners=True, include_center=True)
+        server.applyChanges()
+        publish_box()
+        _fire_change()
+
     def _on_snap(_fb):
         # Center a default-sized box around the robot's current TCP.
         cur = node.get_end_effector_pose()
@@ -167,21 +270,38 @@ def setup_safe_zone(node):
             node.get_logger().warn("Safe zone snap: TCP pose unavailable")
             return
         half = [0.30, 0.40, 0.375]
-        node.safe_zone_min = [cur[i] - half[i] for i in range(3)]
-        node.safe_zone_max = [cur[i] + half[i] for i in range(3)]
-        for which, pos in (("min", node.safe_zone_min), ("max", node.safe_zone_max)):
-            im = server.get(f"{_SERVER}_{which}")
-            if im is not None:
-                im.pose.position.x, im.pose.position.y, im.pose.position.z = (
-                    float(pos[0]), float(pos[1]), float(pos[2]))
-                server.insert(im)
-        server.applyChanges()
-        publish_box()
-        _fire_change()
+        _set_corners([cur[i] - half[i] for i in range(3)],
+                     [cur[i] + half[i] for i in range(3)])
+
+    def _on_snap_deep(_fb):
+        # Outdoor/deep mode: include low TCP poses while keeping enough height for approach.
+        cur = node.get_end_effector_pose()
+        if not cur or len(cur) < 3:
+            node.get_logger().warn("Safe zone deep snap: TCP pose unavailable")
+            return
+        min_corner = [cur[0] - 0.35, cur[1] - 0.45, min(-0.65, cur[2] - 0.18)]
+        max_corner = [cur[0] + 0.55, cur[1] + 0.45, max(0.95, cur[2] + 0.90)]
+        _set_corners(min_corner, max_corner)
+        node.get_logger().info(
+            f"Safe zone deep snap: min={[round(v, 2) for v in node.safe_zone_min]} "
+            f"max={[round(v, 2) for v in node.safe_zone_max]}")
 
     menu.insert("Enable safe zone", callback=_on_enable)
     menu.insert("Disable safe zone", callback=_on_disable)
     menu.insert("Snap box around robot", callback=_on_snap)
+    menu.insert("Snap outdoor/deep box", callback=_on_snap_deep)
+
+    def enable_safe_zone():
+        _on_enable(None)
+
+    def disable_safe_zone():
+        _on_disable(None)
+
+    def snap_safe_zone():
+        _on_snap(None)
+
+    def snap_deep_safe_zone():
+        _on_snap_deep(None)
 
     for which, color in (("min", (0.20, 0.55, 1.0, 0.9)),
                          ("max", (1.0, 0.55, 0.10, 0.9))):
@@ -190,6 +310,18 @@ def setup_safe_zone(node):
                             color)
         server.insert(im)
         menu.apply(server, im.name)
+        server.setCallback(
+            im.name, _on_corner_feedback, InteractiveMarkerFeedback.POSE_UPDATE)
+        server.setCallback(
+            im.name, _on_corner_feedback, InteractiveMarkerFeedback.MOUSE_UP)
+
+    center = _center_marker(f"{_SERVER}_center", _center())
+    server.insert(center)
+    menu.apply(server, center.name)
+    server.setCallback(
+        center.name, _on_center_feedback, InteractiveMarkerFeedback.POSE_UPDATE)
+    server.setCallback(
+        center.name, _on_center_feedback, InteractiveMarkerFeedback.MOUSE_UP)
     server.applyChanges()
     publish_box()
 
@@ -200,11 +332,15 @@ def setup_safe_zone(node):
         return all(min(lo[i], hi[i]) <= xyz[i] <= max(lo[i], hi[i]) for i in range(3))
 
     node.in_safe_zone = in_safe_zone
+    node.enable_safe_zone = enable_safe_zone
+    node.disable_safe_zone = disable_safe_zone
+    node.snap_safe_zone = snap_safe_zone
+    node.snap_deep_safe_zone = snap_deep_safe_zone
 
     # Keep references alive (servers stop publishing if garbage-collected).
     node._safe_zone_server = server
     node._safe_zone_menu = menu
     node.get_logger().info(
-        "Safe-zone box ready in RViz (drag the two corner handles; right-click to "
-        "Enable/Disable/Snap). Disabled by default.")
+        "Safe-zone box ready in RViz (drag yellow center to move, blue/orange "
+        "corners to resize; right-click to Enable/Disable/Snap). Disabled by default.")
     return server

@@ -152,7 +152,14 @@ class UIManager:
             self._node._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._node._set_current_as_home()
-        elif cmd in ("grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera"):
+        elif cmd in (
+            "grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera",
+            "camera_preset_lab", "camera_preset_outdoor",
+        ):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("camera_settings "):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("safe_zone_"):
             pass  # handled by node.py's _ui_command_cb
         elif cmd == "debug_world":
             self._motion.debug_print_world()

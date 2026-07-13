@@ -49,6 +49,7 @@ class MotionExecutor:
 
         # Motion lock (prevents concurrent motions)
         self._motion_lock = threading.Lock()
+        self._last_ee_pose: Optional[List[float]] = None
 
         # Teleop state
         self.teleop_enabled: bool = True
@@ -243,7 +244,12 @@ class MotionExecutor:
 
     def get_end_effector_pose(self) -> Optional[List[float]]:
         """Compute FK for current joint state."""
-        return fk_mod.get_end_effector_pose(self._create_fk_facade())
+        facade = self._create_fk_facade()
+        facade._last_ee_pose = self._last_ee_pose
+        pose = fk_mod.get_end_effector_pose(facade)
+        if pose is not None:
+            self._last_ee_pose = list(pose)
+        return pose
 
     def acquire_motion_lock(self, blocking: bool = False) -> bool:
         """Acquire motion lock for exclusive motion control."""

@@ -58,6 +58,10 @@ class UR10eCuroboMoveIt(Node):
         # Thread-safety: lock held during plan_single / plan_single_js
         # FK checks this (non-blocking) to skip CUDA ops during graph capture
         self._planning_lock = threading.Lock()
+        self._reachability_worker_lock = threading.Lock()
+        self._reachability_worker_active = False
+        self._reachability_clear_pending = True
+        self._lidar_preview_clear_pending = True
 
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
@@ -214,7 +218,7 @@ class UR10eCuroboMoveIt(Node):
         self.create_timer(
             max(0.25, float(getattr(
                 self.cfg.planner, "reachability_cloud_period_s", 1.0))),
-            self._publish_reachability_cloud,
+            self._schedule_reachability_cloud_publish,
         )
 
         # keyboard
@@ -288,15 +292,31 @@ class UR10eCuroboMoveIt(Node):
             vz + qw * tz + (qx * ty - qy * tx),
         ]
 
+    def _schedule_reachability_cloud_publish(self):
+        if self._reachability_worker_active:
+            return
+        self._reachability_worker_active = True
+
+        def _run():
+            try:
+                self._publish_reachability_cloud()
+            finally:
+                self._reachability_worker_active = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _publish_reachability_cloud(self):
         planner = self.cfg.planner
         if not bool(getattr(planner, "reachability_cloud_enabled", True)):
-            markers_mod.publish_reachability_cloud(self, [], [])
-            try:
-                from . import lidar_scan as lidar_scan_mod
-                lidar_scan_mod.publish_lidar_scan_preview(self)
-            except Exception as e:
-                self.get_logger().debug(f"Lidar scan preview update skipped: {e}")
+            if getattr(self, "_reachability_clear_pending", True):
+                markers_mod.publish_reachability_cloud(self, [], [])
+                self._reachability_clear_pending = False
+            if getattr(self, "_lidar_preview_clear_pending", True):
+                try:
+                    markers_mod.publish_lidar_scan_preview(self, [], valid=False)
+                except Exception as e:
+                    self.get_logger().debug(f"Lidar scan preview clear skipped: {e}")
+                self._lidar_preview_clear_pending = False
             return
         if not getattr(self, "joint_order", None):
             return
@@ -393,6 +413,8 @@ class UR10eCuroboMoveIt(Node):
             else:
                 keep_directions.append(None)
         self._latest_reachability_samples = keep_samples
+        self._reachability_clear_pending = True
+        self._lidar_preview_clear_pending = True
         markers_mod.publish_reachability_cloud(
             self,
             keep_points,
@@ -792,6 +814,14 @@ class UR10eCuroboMoveIt(Node):
             self._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._set_current_as_home()
+        elif cmd == "safe_zone_enable":
+            getattr(self, "enable_safe_zone", lambda: None)()
+        elif cmd == "safe_zone_disable":
+            getattr(self, "disable_safe_zone", lambda: None)()
+        elif cmd == "safe_zone_snap":
+            getattr(self, "snap_safe_zone", lambda: None)()
+        elif cmd == "safe_zone_snap_deep":
+            getattr(self, "snap_deep_safe_zone", lambda: None)()
         elif cmd == "grasp_success":
             self._grasp_feedback = True
             self.get_logger().info("Grasp feedback: SUCCESS")
@@ -813,6 +843,15 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "refresh_camera":
             self._refresh_camera_pub.publish(String(data="refresh"))
             self.get_logger().info("Camera refresh requested")
+        elif cmd == "camera_preset_lab":
+            self._refresh_camera_pub.publish(String(data="preset lab"))
+            self.get_logger().info("Camera exposure preset requested: lab")
+        elif cmd == "camera_preset_outdoor":
+            self._refresh_camera_pub.publish(String(data="preset outdoor"))
+            self.get_logger().info("Camera exposure preset requested: outdoor")
+        elif cmd.startswith("camera_settings "):
+            self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
+            self.get_logger().info(f"Camera settings requested: {cmd}")
         elif cmd == "camera_snapshot":
             self._save_camera_snapshot()
         elif cmd == "camera_video_start":
@@ -837,8 +876,15 @@ class UR10eCuroboMoveIt(Node):
             self.cfg.planner.reachability_cloud_enabled = enabled
             if not enabled:
                 self._latest_reachability_samples = []
+                self._reachability_clear_pending = True
+                self._lidar_preview_clear_pending = True
                 markers_mod.publish_reachability_cloud(self, [], [])
                 markers_mod.publish_lidar_scan_preview(self, [], valid=False)
+                self._reachability_clear_pending = False
+                self._lidar_preview_clear_pending = False
+            else:
+                self._reachability_clear_pending = True
+                self._schedule_reachability_cloud_publish()
             self.get_logger().info(
                 f"Reachability cloud {'enabled' if enabled else 'disabled'}")
         elif cmd.startswith("set_lidar_scan_preview "):
@@ -846,7 +892,9 @@ class UR10eCuroboMoveIt(Node):
             enabled = val in ("true", "1", "yes", "on")
             self.cfg.lidar_scan.semicircle_preview_enabled = enabled
             if not enabled:
+                self._lidar_preview_clear_pending = True
                 markers_mod.publish_lidar_scan_preview(self, [], valid=False)
+                self._lidar_preview_clear_pending = False
             self.get_logger().info(
                 f"LiDAR scan preview {'enabled' if enabled else 'disabled'}")
         elif cmd == "debug_world":
@@ -1544,10 +1592,18 @@ class UR10eCuroboMoveIt(Node):
             recovery_cap = float(getattr(
                 self.cfg.planner, "goal_recovery_max_ik_delta_deg", 100.0))
             recovery_allowed = (
-                reach_delta is None
-                or math.isfinite(reach_delta) and reach_delta <= recovery_cap
+                not current_joint_failed
+                and (
+                    reach_delta is None
+                    or math.isfinite(reach_delta) and reach_delta <= recovery_cap
+                )
             )
-            if not ok and not getattr(self, 'stop_requested', False) and not recovery_allowed:
+            if (
+                not ok
+                and not current_joint_failed
+                and not getattr(self, 'stop_requested', False)
+                and not recovery_allowed
+            ):
                 self.get_logger().warn(
                     f"GOAL{idx}: nearest IK delta {reach_delta:.1f}deg exceeds "
                     f"recovery cap {recovery_cap:.0f}deg; skipping staging/posture "

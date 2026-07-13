@@ -3,9 +3,96 @@
 import pyzed.sl as sl
 
 
-def apply_zed_one_settings(zed):
+ZED_ONE_LAB_PRESET = {
+    "aec_agc": 1,
+    "exposure": 0,
+    "gain": None,
+    "description": "lab auto exposure",
+}
+
+ZED_ONE_OUTDOOR_PRESET = {
+    "aec_agc": 0,
+    "exposure": 8,
+    "gain": 0,
+    "description": "outdoor manual low exposure",
+}
+
+
+def _set_if_available(zed, setting, value):
+    if value is None:
+        return
+    try:
+        zed.set_camera_settings(setting, value)
+    except Exception:
+        pass
+
+
+def _print_zed_one_settings(zed, label="[ZedOne]"):
+    try:
+        print(f"{label} sat:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SATURATION))
+        print(f"{label} sharp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS))
+        print(f"{label} gamma:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAMMA))
+        print(f"{label} wb_auto:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO))
+        print(f"{label} wb_temp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE))
+        print(f"{label} aec_agc:", zed.get_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC))
+        print(f"{label} gain:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAIN))
+        print(f"{label} exp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE))
+        print(f"{label} denoise:", zed.get_camera_settings(sl.VIDEO_SETTINGS.DENOISING))
+        print(f"{label} hdr:", zed.get_camera_settings(sl.VIDEO_SETTINGS.HDR))
+        print(f"{label} brightness:", zed.get_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS))
+        print(f"{label} contrast:", zed.get_camera_settings(sl.VIDEO_SETTINGS.CONTRAST))
+    except Exception:
+        pass
+
+
+def apply_zed_one_exposure_preset(zed, preset_name="lab", verify=True):
+    """Apply a runtime exposure preset to the already-open ZED X One camera."""
+    preset_key = str(preset_name or "lab").strip().lower()
+    if preset_key == "outdoor":
+        preset = ZED_ONE_OUTDOOR_PRESET
+    else:
+        preset_key = "lab"
+        preset = ZED_ONE_LAB_PRESET
+
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, preset["aec_agc"])
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, preset["exposure"])
+        _set_if_available(zed, sl.VIDEO_SETTINGS.GAIN, preset["gain"])
+    except Exception:
+        pass
+
+    print(
+        f"[ZedOne] exposure preset: {preset_key} "
+        f"({preset['description']}, exposure={preset['exposure']}, gain={preset['gain']})")
+    if verify:
+        _print_zed_one_settings(zed)
+    return preset_key
+
+
+def apply_zed_one_manual_exposure(zed, auto_exposure=False, exposure=8, gain=0, verify=True):
+    """Apply live exposure controls from the RViz panel."""
+    auto_value = 1 if auto_exposure else 0
+    exposure_value = int(max(0, min(100, exposure)))
+    gain_value = int(max(0, min(100, gain)))
+
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, auto_value)
+        if not auto_exposure:
+            zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, exposure_value)
+            _set_if_available(zed, sl.VIDEO_SETTINGS.GAIN, gain_value)
+    except Exception:
+        pass
+
+    print(
+        f"[ZedOne] manual exposure control: auto={auto_value} "
+        f"exposure={exposure_value} gain={gain_value}")
+    if verify:
+        _print_zed_one_settings(zed)
+
+
+def apply_zed_one_settings(zed, preset_name="lab"):
     """Apply ZED X One Mono settings optimised for HDR date-fruit detection."""
-    # HDR is enabled via InitParametersOne.enable_hdr = True before open() — no runtime call needed.
+    # HDR is enabled via InitParametersOne.enable_hdr = True before open(); no runtime call needed.
     print("[ZedOne] HDR active (set via InitParametersOne.enable_hdr)")
 
     #zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, 7)   # 0-8
@@ -14,35 +101,14 @@ def apply_zed_one_settings(zed):
     zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 4)    # 0-8
     # zed.set_camera_settings(sl.VIDEO_SETTINGS.GAMMA, 7)        # 1-9
 
-    # Lock manual exposure so image doesn't go dark when robot moves
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)    # 0=manual, 1=auto
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 28)  # 0-100 — tune for your lighting
-        #zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 40)      # 0-100
-    except Exception:
-        pass
+    apply_zed_one_exposure_preset(zed, preset_name, verify=False)
 
     try:
         zed.set_camera_settings(sl.VIDEO_SETTINGS.DENOISING, 100)
     except Exception:
         pass
 
-    # Verify settings
-    try:
-        print("[ZedOne] sat:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SATURATION))
-        print("[ZedOne] sharp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS))
-        print("[ZedOne] gamma:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAMMA))
-        print("[ZedOne] wb_auto:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO))
-        print("[ZedOne] wb_temp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE))
-        print("[ZedOne] aec_agc:", zed.get_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC))
-        print("[ZedOne] gain:", zed.get_camera_settings(sl.VIDEO_SETTINGS.GAIN))
-        print("[ZedOne] exp:", zed.get_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE))
-        print("[ZedOne] denoise:", zed.get_camera_settings(sl.VIDEO_SETTINGS.DENOISING))
-        print("[ZedOne] hdr:", zed.get_camera_settings(sl.VIDEO_SETTINGS.HDR))
-        print("[ZedOne] brightness:", zed.get_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS))
-        print("[ZedOne] contrast:", zed.get_camera_settings(sl.VIDEO_SETTINGS.CONTRAST))
-    except Exception:
-        pass
+    _print_zed_one_settings(zed)
 
 
 # Backward-compat alias (existing callers that use the old name still work)

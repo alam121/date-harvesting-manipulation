@@ -408,6 +408,46 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   goal_tab_layout->addWidget(goal_group);
 
+  // Safe-zone controls. These mirror the interactive-marker right-click menu so the
+  // operator can control the box even when RViz marker interaction is awkward.
+  auto * safe_zone_group = new QGroupBox("Safe Zone");
+  auto * safe_zone_layout = new QGridLayout(safe_zone_group);
+  safe_zone_layout->setSpacing(4);
+
+  auto * safe_enable_btn = new QPushButton("Enable");
+  safe_enable_btn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;");
+  safe_enable_btn->setToolTip("Enable safe-zone enforcement using the visible box");
+  connect(safe_enable_btn, &QPushButton::clicked, this, [this]() {
+    publishCmd("safe_zone_enable");
+  });
+  safe_zone_layout->addWidget(safe_enable_btn, 0, 0);
+
+  auto * safe_disable_btn = new QPushButton("Disable");
+  safe_disable_btn->setStyleSheet("background-color: #757575; color: white; font-weight: bold;");
+  safe_disable_btn->setToolTip("Disable safe-zone enforcement");
+  connect(safe_disable_btn, &QPushButton::clicked, this, [this]() {
+    publishCmd("safe_zone_disable");
+  });
+  safe_zone_layout->addWidget(safe_disable_btn, 0, 1);
+
+  auto * safe_snap_btn = new QPushButton("Snap TCP");
+  safe_snap_btn->setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;");
+  safe_snap_btn->setToolTip("Center a compact safe zone around the current TCP");
+  connect(safe_snap_btn, &QPushButton::clicked, this, [this]() {
+    publishCmd("safe_zone_snap");
+  });
+  safe_zone_layout->addWidget(safe_snap_btn, 1, 0);
+
+  auto * safe_snap_deep_btn = new QPushButton("Snap Outdoor");
+  safe_snap_deep_btn->setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;");
+  safe_snap_deep_btn->setToolTip("Build a deeper outdoor safe zone around the current TCP");
+  connect(safe_snap_deep_btn, &QPushButton::clicked, this, [this]() {
+    publishCmd("safe_zone_snap_deep");
+  });
+  safe_zone_layout->addWidget(safe_snap_deep_btn, 1, 1);
+
+  goal_tab_layout->addWidget(safe_zone_group);
+
   // Capture
   auto * capture_group = new QGroupBox("Capture");
   auto * capture_layout = new QHBoxLayout(capture_group);
@@ -478,33 +518,97 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * camera_layout = new QGridLayout(camera_group);
   camera_layout->setSpacing(6);
 
+  auto * preset_label = new QLabel("Exposure Preset");
+  preset_label->setStyleSheet("font-weight: bold; color: #37474f;");
+  preset_label->setAlignment(Qt::AlignCenter);
+  camera_layout->addWidget(preset_label, 0, 0, 1, 2);
+
+  auto * lab_preset_btn = new QPushButton("Lab");
+  lab_preset_btn->setStyleSheet("background-color: #455a64; color: white; font-weight: bold;");
+  lab_preset_btn->setToolTip("Use lab camera settings: auto exposure / auto gain");
+  connect(lab_preset_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraPresetLab);
+  camera_layout->addWidget(lab_preset_btn, 1, 0);
+
+  auto * outdoor_preset_btn = new QPushButton("Outdoor");
+  outdoor_preset_btn->setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;");
+  outdoor_preset_btn->setToolTip("Use outdoor camera settings: manual low exposure and low gain");
+  connect(outdoor_preset_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraPresetOutdoor);
+  camera_layout->addWidget(outdoor_preset_btn, 1, 1);
+
+  auto * auto_exposure_cb = new QCheckBox("Auto Exposure");
+  auto_exposure_cb->setChecked(true);
+  auto_exposure_cb->setToolTip("When checked, the ZED controls exposure/gain automatically");
+  camera_layout->addWidget(auto_exposure_cb, 2, 0, 1, 2);
+
+  auto * exposure_label = new QLabel("Exposure");
+  exposure_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  camera_layout->addWidget(exposure_label, 3, 0);
+
+  auto * exposure_spin = new QSpinBox();
+  exposure_spin->setRange(0, 100);
+  exposure_spin->setValue(8);
+  exposure_spin->setEnabled(false);
+  exposure_spin->setToolTip("Manual exposure, 0-100. Try 5-12 outdoors.");
+  camera_layout->addWidget(exposure_spin, 3, 1);
+
+  auto * gain_label = new QLabel("Gain");
+  gain_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  camera_layout->addWidget(gain_label, 4, 0);
+
+  auto * gain_spin = new QSpinBox();
+  gain_spin->setRange(0, 100);
+  gain_spin->setValue(0);
+  gain_spin->setEnabled(false);
+  gain_spin->setToolTip("Manual gain, 0-100. Keep low outdoors to avoid noise.");
+  camera_layout->addWidget(gain_spin, 4, 1);
+
+  connect(auto_exposure_cb, &QCheckBox::toggled, this,
+    [exposure_spin, gain_spin](bool checked) {
+      exposure_spin->setEnabled(!checked);
+      gain_spin->setEnabled(!checked);
+    });
+
+  auto * apply_camera_settings_btn = new QPushButton("Apply Exposure");
+  apply_camera_settings_btn->setStyleSheet(
+    "background-color: #00897b; color: white; font-weight: bold;");
+  apply_camera_settings_btn->setToolTip("Apply the exposure controls to the live ZED camera");
+  connect(apply_camera_settings_btn, &QPushButton::clicked, this,
+    [this, auto_exposure_cb, exposure_spin, gain_spin]() {
+      std::ostringstream cmd;
+      cmd << "camera_settings auto=" << (auto_exposure_cb->isChecked() ? 1 : 0)
+          << " exposure=" << exposure_spin->value()
+          << " gain=" << gain_spin->value();
+      publishCmd(cmd.str());
+    });
+  camera_layout->addWidget(apply_camera_settings_btn, 5, 0, 1, 2);
+
   auto * snapshot_btn = new QPushButton("Save Image");
   snapshot_btn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;");
   snapshot_btn->setToolTip("Save the latest /vision/display frame to ~/camera_recordings");
   connect(snapshot_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraSnapshot);
-  camera_layout->addWidget(snapshot_btn, 0, 0, 1, 2);
+  camera_layout->addWidget(snapshot_btn, 6, 0, 1, 2);
 
   auto * video_start_btn = new QPushButton("Start Video");
   video_start_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
   video_start_btn->setToolTip("Start recording /vision/display to ~/camera_recordings");
   connect(video_start_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStart);
-  camera_layout->addWidget(video_start_btn, 1, 0);
+  camera_layout->addWidget(video_start_btn, 7, 0);
 
   auto * video_stop_btn = new QPushButton("Stop Video");
   video_stop_btn->setStyleSheet("background-color: #c62828; color: white; font-weight: bold;");
   video_stop_btn->setToolTip("Stop the current camera video recording");
   connect(video_stop_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStop);
-  camera_layout->addWidget(video_stop_btn, 1, 1);
+  camera_layout->addWidget(video_stop_btn, 7, 1);
 
   auto * camera_refresh_btn = new QPushButton("Refresh Camera");
   camera_refresh_btn->setStyleSheet("background-color: #607d8b; color: white;");
   connect(camera_refresh_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshCamera);
-  camera_layout->addWidget(camera_refresh_btn, 2, 0, 1, 2);
+  camera_layout->addWidget(camera_refresh_btn, 8, 0, 1, 2);
 
   auto * camera_note = new QLabel("Saved to ~/camera_recordings");
   camera_note->setStyleSheet("font-size: 9pt; color: #455a64; padding: 3px;");
   camera_note->setAlignment(Qt::AlignCenter);
-  camera_layout->addWidget(camera_note, 3, 0, 1, 2);
+  camera_layout->addWidget(camera_note, 9, 0, 1, 2);
 
   camera_tab_layout->addWidget(camera_group);
   camera_tab_layout->addStretch(1);
@@ -1189,6 +1293,8 @@ void UR10ePanel::onExit()
 }
 void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
 void UR10ePanel::onRefreshCamera() { publishCmd("refresh_camera"); }
+void UR10ePanel::onCameraPresetLab() { publishCmd("camera_preset_lab"); }
+void UR10ePanel::onCameraPresetOutdoor() { publishCmd("camera_preset_outdoor"); }
 void UR10ePanel::onCameraSnapshot() { publishCmd("camera_snapshot"); }
 void UR10ePanel::onCameraVideoStart() { publishCmd("camera_video_start"); }
 void UR10ePanel::onCameraVideoStop() { publishCmd("camera_video_stop"); }

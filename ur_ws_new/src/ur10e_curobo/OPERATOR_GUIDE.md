@@ -98,9 +98,23 @@ paths and scan paths are checked against the box.
 
 Expected behavior:
 
+- The Goal tab has Safe Zone buttons: `Enable`, `Disable`, `Snap TCP`, and
+  `Snap Outdoor`.
+- Use the RViz `Interact` tool to manipulate the safe-zone handles.
+- Drag the yellow center handle to move the whole box.
+- Drag the blue/orange corner handles to resize the box.
 - Safe-zone walls remain enabled until you explicitly disable or clear them.
 - HOME and recovery motions do not automatically clear safe-zone walls.
 - If a path leaves the box, the node rejects it before execution.
+- The default box extends below `base_link` so outdoor low fruit poses can be
+  enclosed.
+
+Useful right-click menu actions on either safe-zone corner handle:
+
+- `Snap box around robot`: centers a compact box around the current TCP.
+- `Snap outdoor/deep box`: builds a deeper outdoor box around the current TCP,
+  including low poses below the RViz ground grid.
+- `Enable safe zone`: applies the visible box as cuRobo keep-out walls.
 
 Common message:
 
@@ -184,10 +198,27 @@ The Camera tab records the `/vision/display` image stream.
 
 Buttons:
 
+- `Lab`: applies the lab exposure preset live. This keeps the current auto
+  exposure / auto gain behavior.
+- `Outdoor`: applies the outdoor exposure preset live. This uses manual low
+  exposure and low gain to reduce overexposure in sunlight.
+- `Auto Exposure`: when checked, the ZED controls exposure/gain automatically.
+- `Exposure` and `Gain`: manual values used when `Auto Exposure` is unchecked.
+- `Apply Exposure`: sends the current exposure controls to the live camera.
 - `Save Image`: saves the latest frame as a PNG.
 - `Start Video`: starts MP4 recording.
 - `Stop Video`: stops MP4 recording.
 - `Refresh Camera`: asks the vision process to refresh the camera.
+
+Use `Lab` indoors. Use `Outdoor` before moving outside or whenever the image
+looks washed out. The preset change is runtime-only; it does not require
+restarting the camera.
+
+Manual starting points:
+
+- Bright direct sun: uncheck `Auto Exposure`, set `Exposure` to `5-8`, `Gain` to `0`.
+- Outdoor shade: uncheck `Auto Exposure`, set `Exposure` to `10-15`, `Gain` to `0-10`.
+- Lab/indoor: use `Lab` or leave `Auto Exposure` checked.
 
 Output directory:
 
@@ -303,4 +334,3 @@ source install/setup.bash
 ```
 
 Restart RViz after sourcing.
-

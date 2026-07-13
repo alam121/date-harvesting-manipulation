@@ -91,6 +91,7 @@ class YoloThread:
 
                 dt = time() - t0
                 self.net_fps = (1.0 / dt) if dt > 0 else 0.0
+                self._log_inference_time(dt)
 
                 fruit_dets, trunk_boxes, bunch_boxes = detections_to_custom_masks(
                     det, trunk_class_ids=self._trunk_class_ids,
@@ -115,6 +116,30 @@ class YoloThread:
         with self.lock:
             self.image_net = image
             self.run_event.set()
+
+    def _log_inference_time(self, dt: float) -> None:
+        """Append inference time (ms) to CSV when UR10E_YOLO_TIMING_CSV is set.
+        No-op (and no overhead beyond one attribute check) when unset. Used only
+        for benchmarking the GPU handoff — safe to leave in place."""
+        path = getattr(self, "_timing_csv_path", -1)
+        if path == -1:
+            import os
+            path = os.getenv("UR10E_YOLO_TIMING_CSV")
+            self._timing_csv_path = path
+            self._timing_t0 = time()
+            if path:
+                try:
+                    with open(path, "w") as fh:
+                        fh.write("t_rel_s,inference_ms\n")
+                except Exception:
+                    self._timing_csv_path = None
+        if not path:
+            return
+        try:
+            with open(path, "a") as fh:
+                fh.write(f"{time() - self._timing_t0:.4f},{dt * 1000.0:.3f}\n")
+        except Exception:
+            pass
 
     def wait_until_idle(self, timeout: float = 0.5) -> bool:
         """Block until no inference is pending or in flight, so the GPU is free

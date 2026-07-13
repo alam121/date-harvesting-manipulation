@@ -75,6 +75,8 @@ private Q_SLOTS:
   void onExit();
   void onRefreshMain();
   void onRefreshCamera();
+  void onCameraPresetLab();
+  void onCameraPresetOutdoor();
   void onCameraSnapshot();
   void onCameraVideoStart();
   void onCameraVideoStop();

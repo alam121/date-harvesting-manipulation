@@ -383,8 +383,8 @@ class Planner:
     safe_zone_verified_interp_max_delta_deg: float = 80.0
     safe_zone_verified_interp_step_deg: float = 1.0
     reachability_cloud_enabled: bool = True            # RViz cloud of TCP positions reachable from the current posture
-    reachability_cloud_period_s: float = 1.0
-    reachability_cloud_samples: int = 1000
+    reachability_cloud_period_s: float = 1.5
+    reachability_cloud_samples: int = 320
     reachability_cloud_point_size_m: float = 0.025
     reachability_cloud_max_delta_deg: float = 100.0
     reachability_cloud_validate_green: bool = True
@@ -392,7 +392,7 @@ class Planner:
     reachability_direction_axis: List[float] = field(
         default_factory=lambda: [0.0, 0.0, 1.0])       # TCP local +Z matches approach-axis helpers
     reachability_direction_length_m: float = 0.08
-    reachability_direction_stride: int = 1             # draw every Nth green direction ray; 1 shows every green point
+    reachability_direction_stride: int = 2             # draw every Nth green direction ray; 1 shows every green point
     reachability_click_max_distance_m: float = 0.06  # RViz /clicked_point must be this close to a green sample
     reachability_click_green_only: bool = True        # only queue clicks in the fast-success green band
     reachability_goal_speed_factor: float = 0.20      # very slow execution for reachability-click goals
@@ -553,7 +553,7 @@ class LidarScan:
     speed_factor: float = 0.08
     use_semicircle: bool = True
     semicircle_points: int = 7
-    semicircle_radius_m: float = 0.22
+    semicircle_radius_m: float = 0.35
     semicircle_arc_deg: float = 180.0
     semicircle_use_base_angles: bool = True           # use fixed base-frame scan angles instead of centering arc on current TCP
     semicircle_start_deg: float = 0.0                 # front half in base frame; 0=+X, 90=+Y
@@ -564,8 +564,13 @@ class LidarScan:
         default_factory=lambda: [0.0, 0.0, 1.0])
     semicircle_adaptive_scan: bool = True             # allow skipped angles/variable radius instead of forcing a perfect arc
     semicircle_radius_candidates_m: List[float] = field(
-        default_factory=lambda: [0.12, 0.22])
+        default_factory=lambda: [0.22, 0.35])
     semicircle_min_points: int = 3
+    semicircle_preflight_direction: str = "reverse"   # reverse is usually smoother for the base-frame front arc
+    semicircle_preflight_fallback_opposite: bool = True
+    semicircle_preview_cache_enabled: bool = True     # lidar_scan can reuse the most recent validated preview targets
+    semicircle_preview_cache_max_age_s: float = 8.0
+    semicircle_preview_cache_max_joint_delta_deg: float = 3.0
     local_close_fallback_enabled: bool = True          # if arc fails, scan a small local reachable sweep
     local_close_first: bool = False                    # keep the scan arc-shaped; use local fallback only if the arc cannot run
     local_close_offsets_m: List[float] = field(

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime
 import math
@@ -12,7 +13,56 @@ from .config import PLAN_CFG_SCAN_PREFLIGHT
 from .goals import yaw_only_align_local_axis
 
 
+def _stop_bag_recording_async(node, bag_proc, bag_path: str):
+    """Stop rosbag without delaying the robot return motion."""
+    if bag_proc is None:
+        return
+    try:
+        bag_proc.terminate()
+    except Exception as e:
+        node.get_logger().warn(f"Lidar scan: failed to stop bag recorder: {e}")
+        return
+
+    def wait_for_bag_stop():
+        try:
+            bag_proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                bag_proc.kill()
+                bag_proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            node.get_logger().info(f"Lidar scan: bag recorder finalized at {bag_path}")
+        except Exception:
+            pass
+
+    threading.Thread(target=wait_for_bag_stop, daemon=True).start()
+
+
+def _current_tcp_pose(node, *, attempts: int = 3, sleep_s: float = 0.05):
+    """Return the best available current TCP pose, allowing brief FK/cache hiccups."""
+    for i in range(max(1, attempts)):
+        cur = node.get_end_effector_pose()
+        if cur is not None and len(cur) >= 7:
+            return [float(v) for v in cur[:7]]
+        cached = getattr(getattr(node, "_motion_mgr", None), "_last_ee_pose", None)
+        if cached is not None and len(cached) >= 7:
+            return [float(v) for v in cached[:7]]
+        cached = getattr(node, "_last_ee_pose", None)
+        if cached is not None and len(cached) >= 7:
+            return [float(v) for v in cached[:7]]
+        if i + 1 < attempts:
+            time.sleep(max(0.0, float(sleep_s)))
+    return None
+
+
 def _scan_center(node):
+    cur = _current_tcp_pose(node)
+    if cur is not None and len(cur) >= 7:
+        return [float(v) for v in cur[:3]], list(cur[3:7]), "current TCP"
     goals = (
         node.goal_poses.snapshot()
         if hasattr(node.goal_poses, "snapshot")
@@ -20,16 +70,13 @@ def _scan_center(node):
     )
     if goals:
         return list(goals[0][:3]), list(goals[0][3:7]) if len(goals[0]) >= 7 else None, "queued goal"
-    cur = node.get_end_effector_pose()
-    if cur is not None and len(cur) >= 7:
-        return [float(v) for v in cur[:3]], list(cur[3:7]), "current TCP"
     latest = getattr(node, "latest_goal_pose", None)
     if latest is not None and len(latest) >= 3:
         quat = list(latest[3:7]) if len(latest) >= 7 else None
         return [float(v) for v in latest[:3]], quat, "latest goal"
     best = getattr(node, "best_goal_xyz", None)
     if best is not None and len(best) >= 3:
-        cur = node.get_end_effector_pose()
+        cur = _current_tcp_pose(node)
         quat = list(cur[3:7]) if cur and len(cur) >= 7 else None
         return [float(v) for v in best[:3]], quat, "best tracked goal"
     return None, None, "none"
@@ -48,7 +95,7 @@ def arc_descriptor(node):
     points that sit on/near the arc. The reachability cloud is computed from the current
     posture, so the arc is centered on the TCP to share that one reference. Returns None if
     the TCP pose is unavailable."""
-    cur = node.get_end_effector_pose()
+    cur = _current_tcp_pose(node)
     if cur is None or len(cur) < 3:
         return None
     cfg = node.cfg.lidar_scan
@@ -119,7 +166,7 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
             node.get_logger().error("Lidar scan: no scan center available")
         return []
 
-    cur = node.get_end_effector_pose()
+    cur = _current_tcp_pose(node)
     if cur is None or len(cur) < 7:
         if log:
             node.get_logger().error("Lidar scan: current TCP pose unavailable")
@@ -413,12 +460,30 @@ def _filter_adaptive_cartesian_scan_sequence(node, candidate_rows, *, log: bool 
             failed = 0
         return kept, total_score
 
-    fwd, fwd_score = evaluate(candidate_rows, "FWD")
-    rev, rev_score = evaluate(list(reversed(candidate_rows)), "REV")
-    if len(rev) > len(fwd) or (len(rev) == len(fwd) and rev_score < fwd_score):
-        kept, direction, score = rev, "reverse", rev_score
+    preferred = str(getattr(cfg, "semicircle_preflight_direction", "reverse")).strip().lower()
+    if preferred not in ("forward", "reverse", "both"):
+        preferred = "reverse"
+
+    if preferred == "both":
+        fwd, fwd_score = evaluate(candidate_rows, "FWD")
+        rev, rev_score = evaluate(list(reversed(candidate_rows)), "REV")
+        if len(rev) > len(fwd) or (len(rev) == len(fwd) and rev_score < fwd_score):
+            kept, direction, score = rev, "reverse", rev_score
+        else:
+            kept, direction, score = fwd, "forward", fwd_score
     else:
-        kept, direction, score = fwd, "forward", fwd_score
+        primary_rows = list(reversed(candidate_rows)) if preferred == "reverse" else candidate_rows
+        kept, score = evaluate(primary_rows, preferred[:3].upper())
+        direction = preferred
+        if (
+            len(kept) < min_points
+            and bool(getattr(cfg, "semicircle_preflight_fallback_opposite", True))
+        ):
+            opposite = "forward" if preferred == "reverse" else "reverse"
+            opposite_rows = candidate_rows if opposite == "forward" else list(reversed(candidate_rows))
+            alt, alt_score = evaluate(opposite_rows, opposite[:3].upper())
+            if len(alt) > len(kept) or (len(alt) == len(kept) and alt_score < score):
+                kept, direction, score = alt, opposite, alt_score
 
     if len(kept) < min_points:
         if log:
@@ -523,9 +588,36 @@ def publish_lidar_scan_preview(node):
     if getattr(node, "motion_phase", "IDLE") != "IDLE":
         return
     try:
-        _semicircle_scan_poses(node, publish_preview=True, log=False)
+        poses = _semicircle_scan_poses(node, publish_preview=True, log=False)
+        if poses and all(isinstance(t, dict) and _target_states(t) is not None for t in poses):
+            node._latest_lidar_scan_targets = poses
+            node._latest_lidar_scan_joint_seed = (
+                list(node.current_joint_positions)
+                if node.current_joint_positions is not None else None
+            )
+            node._latest_lidar_scan_targets_time = time.time()
     except Exception as e:
         node.get_logger().debug(f"Lidar scan preview skipped: {e}")
+
+
+def _cached_scan_targets(node):
+    cfg = node.cfg.lidar_scan
+    if not bool(getattr(cfg, "semicircle_preview_cache_enabled", True)):
+        return None
+    targets = getattr(node, "_latest_lidar_scan_targets", None)
+    seed = getattr(node, "_latest_lidar_scan_joint_seed", None)
+    stamp = float(getattr(node, "_latest_lidar_scan_targets_time", 0.0) or 0.0)
+    if not targets or seed is None or node.current_joint_positions is None:
+        return None
+    max_age = float(getattr(cfg, "semicircle_preview_cache_max_age_s", 8.0))
+    if time.time() - stamp > max_age:
+        return None
+    max_delta = math.radians(float(getattr(
+        cfg, "semicircle_preview_cache_max_joint_delta_deg", 3.0)))
+    cur = list(node.current_joint_positions)
+    if max(abs(float(a) - float(b)) for a, b in zip(cur, seed)) > max_delta:
+        return None
+    return targets
 
 
 def _target_pose(target):
@@ -783,7 +875,20 @@ def run_lidar_scan(node):
     """
     cfg = node.cfg.lidar_scan
     use_semicircle = bool(getattr(cfg, "use_semicircle", True))
-    targets = _semicircle_scan_poses(node) if use_semicircle else cfg.scan_waypoints
+    targets = _cached_scan_targets(node) if use_semicircle else None
+    if targets:
+        node.get_logger().info(
+            f"Lidar scan: using cached validated preview ({len(targets)} poses)")
+    else:
+        targets = _semicircle_scan_poses(node) if use_semicircle else cfg.scan_waypoints
+        if use_semicircle and targets and all(
+                isinstance(t, dict) and _target_states(t) is not None for t in targets):
+            node._latest_lidar_scan_targets = targets
+            node._latest_lidar_scan_joint_seed = (
+                list(node.current_joint_positions)
+                if node.current_joint_positions is not None else None
+            )
+            node._latest_lidar_scan_targets_time = time.time()
 
     if not targets:
         node.get_logger().error("Lidar scan: no scan targets available")
@@ -842,18 +947,14 @@ def run_lidar_scan(node):
                 _execute_scan_joint(node, target, f"SCAN_{i}", cfg.speed_factor)
             time.sleep(0.3)  # brief dwell at each waypoint for full LiDAR sweep
 
-        node.get_logger().info(f"Lidar scan complete — bag saved at {bag_path}")
+        node.get_logger().info(f"Lidar scan motion complete — stopping bag at {bag_path}")
 
     except Exception as e:
         node.get_logger().error(f"Lidar scan error: {e}")
 
     finally:
         if bag_proc is not None:
-            bag_proc.terminate()
-            try:
-                bag_proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                bag_proc.kill()
+            _stop_bag_recording_async(node, bag_proc, bag_path)
         if not node.stop_requested:
             node.motion_phase = "LIDAR_SCAN_HOME"
             node.get_logger().info("Lidar scan: returning HOME")
