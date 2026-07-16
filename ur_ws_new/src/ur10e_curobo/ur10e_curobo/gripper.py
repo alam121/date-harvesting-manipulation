@@ -4,11 +4,129 @@ from .delto_gripper_controller import DeltoGripperController
 from . import grasp_visualizer as grasp_viz_mod
 
 from ur_msgs.srv import SetIO
+from sensor_msgs.msg import JointState
 import time
+import math
 
 # Gripper aperture constants (meters)
 GRIPPER_MAX_APERTURE = 0.070   # 80mm total opening at full open
 APERTURE_MARGIN = 0.010        # 15mm extra clearance beyond fruit diameter
+
+
+class FakeGripperController:
+    """No-hardware stand-in used when the robot is running fake ros2_control."""
+
+    joint_names = [
+        "F1M1", "F1M2", "F1M3", "F1M4",
+        "F2M1", "F2M2", "F2M3", "F2M4",
+        "F3M1", "F3M2", "F3M3", "F3M4",
+    ]
+
+    def __init__(self, node, suction: bool = False, steps: int = 10, step_delay: float = 0.0):
+        self.node = node
+        self.fake = True
+        # Keep suction off in fake mode so OPEN/CLOSE never touches UR IO.
+        self.suction = False
+        self.configured_suction = bool(suction)
+        self.steps = int(steps)
+        self.step_delay = float(step_delay)
+
+        self.force_data = [2.25, 2.55, 3.15]
+        self.baseline_force = self.force_data.copy()
+        self.frozen_fingers = set()
+        self.current_step = 0
+        self.state = "IDLE"
+
+        self.closure_stopped_early = False
+        self.closure_step_stopped = self.steps
+        self.closure_first_contact_step = self.steps
+        self.closure_force_profile = []
+        self.closure_deltas = [0.0, 0.0, 0.0]
+        self.closed = False
+
+        # Mirror DeltoGripperController's calibrated old DG-3F-B posture values
+        # so fake mode/RViz and hardware mode show the same open/close pose.
+        if self.configured_suction:
+            self.finger_joint_idx = {0: 2, 1: 7, 2: 10}
+        else:
+            self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
+        self.finger_joint_indices = {
+            ch: (idx,) for ch, idx in self.finger_joint_idx.items()
+        }
+        self.open_position = [
+            -0.0942, -0.1500, 2.1260, -0.5062,
+            -1.6318, 0.1309, 1.6953, -0.4887,
+            0.3333, 0.2234, 2.1260, -0.4311,
+        ]
+        self.closed_position = self.open_position.copy()
+        self.closed_position[self.finger_joint_idx[0]] = 2.5673
+        self.closed_position[self.finger_joint_idx[1]] = 2.3753
+        self.closed_position[self.finger_joint_idx[2]] = 2.5673
+        self.current_position = self.open_position.copy()
+        self.joint_state_pub = node.create_publisher(JointState, "/joint_states", 10)
+        self.joint_state_timer = node.create_timer(0.2, self.publish_joint_state)
+        self.publish_joint_state()
+
+    def publish_joint_state(self):
+        msg = JointState()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.name = self.joint_names
+        msg.position = [float(v) for v in self.current_position]
+        self.joint_state_pub.publish(msg)
+
+    def _feed_classifier(self):
+        if hasattr(self.node, "classifier"):
+            self.node.classifier.on_force(self.force_data[:3])
+
+    def open_gripper(self):
+        self.state = "OPENING"
+        self.closed = False
+        self.current_step = 0
+        self.current_position = self.open_position.copy()
+        self.force_data = [2.25, 2.55, 3.15]
+        self.baseline_force = self.force_data.copy()
+        self.frozen_fingers.clear()
+        self.publish_joint_state()
+        self._feed_classifier()
+        self.state = "IDLE"
+        self.node.get_logger().info("Fake gripper: OPEN")
+
+    def open_gripper_to(self, alpha: float = 0.0):
+        alpha = max(0.0, min(1.0, float(alpha)))
+        self.state = "OPENING"
+        self.closed = alpha >= 0.95
+        self.current_step = int(round(alpha * self.steps))
+        position = self.open_position.copy()
+        for ch in (0, 1, 2):
+            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+                position[j_idx] = (
+                    (1.0 - alpha) * self.open_position[j_idx]
+                    + alpha * self.closed_position[j_idx]
+                )
+        self.current_position = position
+        self.force_data = [2.25, 2.55, 3.15]
+        self.baseline_force = self.force_data.copy()
+        self.frozen_fingers.clear()
+        self.publish_joint_state()
+        self._feed_classifier()
+        self.state = "IDLE"
+        self.node.get_logger().info(f"Fake gripper: OPEN alpha={alpha:.2f}")
+
+    def run_closure_loop(self):
+        self.state = "CLOSING"
+        self.closed = True
+        self.current_step = self.steps
+        self.current_position = self.closed_position.copy()
+        self.closure_stopped_early = False
+        self.closure_step_stopped = self.steps
+        self.closure_first_contact_step = self.steps
+        self.closure_force_profile = [[0.3, 0.3, 0.0], [2.75, 2.95, 1.85]]
+        self.closure_deltas = self.closure_force_profile[-1]
+        self.force_data = [5.0, 5.5, 5.0]
+        self.publish_joint_state()
+        self._feed_classifier()
+        self.state = "IDLE"
+        self.node.get_logger().info("Fake gripper: CLOSE")
 
 
 # ============================================================
@@ -25,13 +143,25 @@ def init_gripper(node, suction: bool = None):
     if suction is None:
         suction = node.cfg.gripper.use_suction
 
-    node.gripper_controller = DeltoGripperController(
-        node,
-        suction=suction,
-        min_fingers_for_stop=node.cfg.gripper.min_fingers_for_stop,
-        steps=node.cfg.gripper.closing_steps,
-        step_delay=node.cfg.gripper.step_delay_s,
-    )
+    if getattr(node.cfg.planner, "use_fake_hardware", False):
+        node.gripper_controller = FakeGripperController(
+            node,
+            suction=suction,
+            steps=node.cfg.gripper.closing_steps,
+            step_delay=node.cfg.gripper.step_delay_s,
+        )
+        node.get_logger().info(
+            "Fake hardware enabled: using fake gripper controller (no Delto topics or UR IO)."
+        )
+    else:
+        node.gripper_controller = DeltoGripperController(
+            node,
+            suction=suction,
+            min_fingers_for_stop=node.cfg.gripper.min_fingers_for_stop,
+            steps=node.cfg.gripper.closing_steps,
+            step_delay=node.cfg.gripper.step_delay_s,
+        )
+        node.gripper_controller.fake = False
 
     node.gripper_closed = False
     node.slip_detection = False
@@ -63,7 +193,7 @@ def control_gripper(node, action: str, fruit_radius: float = None):
     if act == "OPEN":
 
         # Only disable suction if suction-mode is active
-        if node.gripper_controller.suction:
+        if node.gripper_controller.suction and not getattr(node.gripper_controller, "fake", False):
             activate_suction(node, False)
 
         if fruit_radius is not None and fruit_radius > 0:
@@ -89,7 +219,7 @@ def control_gripper(node, action: str, fruit_radius: float = None):
     elif act == "CLOSE":
 
         # Only enable suction if suction-mode is active
-        if node.gripper_controller.suction:
+        if node.gripper_controller.suction and not getattr(node.gripper_controller, "fake", False):
             activate_suction(node, True)
 
         node.classifier.start_closing()

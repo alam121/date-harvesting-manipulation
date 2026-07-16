@@ -29,12 +29,20 @@ class Communication:
         self.slaveID = 0
         self.dummy = dummy
         self.lock = threading.Lock()
+        # DG-3F-M register map from tesollodelto/dg3f_m_ros2.
+        # The old DG-3F-B map used current position at input register 2 and
+        # target position at holding register 72. DG-3F-M reads at 6 and
+        # commands at 7, with the same deg*10 integer scale.
+        self.control_start_register = 0
+        self.current_position_register = 6
+        self.target_position_register = 7
+        self.current_register = 26
 
     def __del__(self):
         self.disconnect()
 
     def write_registers(self, address, values):
-        self.client.write_registers(
+        return self.client.write_registers(
             address=address, values=values, slave=self.slaveID)
 
     def connect(self, ip, port, slaveID=1):
@@ -51,7 +59,14 @@ class Communication:
             return
 
         self.client = ModbusTcpClient(host=ip, port=port)
-        return self.client.connect()
+        connected = self.client.connect()
+        if connected:
+            # DG-3F-M requires this before target position commands execute.
+            return self.client.write_register(
+                address=self.control_start_register,
+                value=1,
+                slave=self.slaveID)
+        return connected
 
     def disconnect(self):
         '''
@@ -77,7 +92,7 @@ class Communication:
 
         # status = []
         status = self.client.read_input_registers(
-            address=Delto3FInputRegisters.MOTOR1_CURRENT_POSITION.value,
+            address=self.current_position_register,
             count=Delto3F.MOTOR_NUM.value,
             slave=self.slaveID).registers
 
@@ -130,8 +145,18 @@ class Communication:
 
             intPosion = list(map(lambda x: struct.unpack(
                 'H', struct.pack('h', int((x*10))))[0], position))
-            self.client.write_registers(
-                address=72, values=intPosion, slave=self.slaveID)
+            return self.client.write_registers(
+                address=self.target_position_register,
+                values=intPosion,
+                slave=self.slaveID)
+
+    def start_control(self):
+        if self.dummy:
+            return
+        return self.client.write_register(
+            address=self.control_start_register,
+            value=1,
+            slave=self.slaveID)
 
     def get_pgain(self):
         if self.dummy:

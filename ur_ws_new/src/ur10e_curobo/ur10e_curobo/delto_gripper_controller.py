@@ -1,5 +1,6 @@
 # delto_gripper_controller.py
 import time
+import math
 from std_msgs.msg import Float32MultiArray
 
 class DeltoGripperController:
@@ -30,29 +31,29 @@ class DeltoGripperController:
         # FSM state
         self.state = 'IDLE'  # IDLE | OPENING | CLOSING
 
-        # ----------------------------------------------------
-        # SUCTION MODE → USE VERSION A joint mapping
-        # NON-SUCTION MODE → USE VERSION B joint mapping
-        # ----------------------------------------------------
+        # Keep the calibrated DG-3F-B open/close posture values. The DG-3F-M
+        # driver accepts the same 12-radian target array; only its Modbus
+        # register map changed.
         if self.suction:
-            self.finger_joint_idx = {0: 2, 1: 7, 2: 10}  # Version A
-            self.node.get_logger().debug("Delto Gripper: SUCTION MODE (center joint=7)")
+            self.finger_joint_idx = {0: 2, 1: 7, 2: 10}
+            self.node.get_logger().debug("Delto Gripper: old suction posture map active")
         else:
-            self.finger_joint_idx = {0: 2, 1: 6, 2: 10}  # Version B
-            self.node.get_logger().debug("Delto Gripper: NON-SUCTION MODE (center joint=6)")
+            self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
+            self.node.get_logger().debug("Delto Gripper: old non-suction posture map active")
+        self.finger_joint_indices = {
+            ch: (idx,) for ch, idx in self.finger_joint_idx.items()
+        }
 
-        # Positions (shared)
         self.open_position = [
             -0.0942, -0.1500, 2.1260, -0.5062,
             -1.6318, 0.1309, 1.6953, -0.4887,
-            0.3333, 0.2234, 2.1260, -0.4311
+            0.3333, 0.2234, 2.1260, -0.4311,
         ]
 
         self.closed_position = self.open_position.copy()
-        # Fingers
-        self.closed_position[self.finger_joint_idx[0]] = 2.5673  # left finger
-        self.closed_position[self.finger_joint_idx[1]] = 2.3753  # center finger
-        self.closed_position[self.finger_joint_idx[2]] = 2.5673  # right finger
+        self.closed_position[self.finger_joint_idx[0]] = 2.5673
+        self.closed_position[self.finger_joint_idx[1]] = 2.3753
+        self.closed_position[self.finger_joint_idx[2]] = 0.5673
 
         self.current_position = self.open_position.copy()
 
@@ -185,12 +186,12 @@ class DeltoGripperController:
         for ch in fingers_to_move:
             if ch in self.frozen_fingers:
                 continue
-            j_idx = self.finger_joint_idx[ch]
             start = getattr(self, 'close_start_position', self.open_position)
-            self.current_position[j_idx] = (
-                (1 - alpha) * start[j_idx] +
-                alpha * self.closed_position[j_idx]
-            )
+            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+                self.current_position[j_idx] = (
+                    (1 - alpha) * start[j_idx] +
+                    alpha * self.closed_position[j_idx]
+                )
 
         msg = Float32MultiArray()
         msg.data = self.current_position
@@ -289,11 +290,11 @@ class DeltoGripperController:
         # Compute partial open position
         position = self.open_position.copy()
         for ch in [0, 1, 2]:
-            j_idx = self.finger_joint_idx[ch]
-            position[j_idx] = (
-                (1 - alpha) * self.open_position[j_idx] +
-                alpha * self.closed_position[j_idx]
-            )
+            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+                position[j_idx] = (
+                    (1 - alpha) * self.open_position[j_idx] +
+                    alpha * self.closed_position[j_idx]
+                )
 
         self.current_position = position
         self.close_start_position = position.copy()
