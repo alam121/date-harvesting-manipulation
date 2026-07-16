@@ -152,6 +152,8 @@ class UIManager:
             self._node._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._node._set_current_as_home()
+        elif cmd == "set_dropoff_current":
+            self._node._set_current_as_dropoff()
         elif cmd in (
             "grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera",
             "camera_preset_lab", "camera_preset_outdoor",

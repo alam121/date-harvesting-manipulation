@@ -9,7 +9,7 @@ import sys
 # -------------------------------------------------------
 
 # Change this to your SVO/SVO2 file
-SVO_PATH = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/QHD+_SN318493032_03-46-26.svo2"
+SVO_PATH = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/HD1080_SN57931814_03-41-49.svo2"
 
 # Folder where extracted images will be stored
 OUTPUT_DIR = "svo_images"

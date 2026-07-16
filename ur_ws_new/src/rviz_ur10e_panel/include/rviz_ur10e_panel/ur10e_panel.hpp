@@ -55,10 +55,14 @@ private Q_SLOTS:
   void onHomeLeft();
   void onHomeRight();
   void onSetHomeCurrent();
+  void onSetDropoffCurrent();
   void onDropoff();
   void onExecute();
   void onExecuteMoves();
   void onAddCurrentGoal();
+  void onReuseLastGoalQueue();
+  void onQueueGripperOpen();
+  void onQueueGripperClose();
   void onClear();
   void onCheckCalibration();
   void onGripperOpen();
@@ -175,6 +179,7 @@ private:
   int goal_count_ = 0;
   std::string latest_goal_;
   std::string goal_coords_str_;
+  std::string home_joints_str_;
   std::string calib_check_result_;
   std::string robot_config_text_;
   bool plan_waiting_confirm_ = false;
@@ -209,6 +214,7 @@ private:
   QLabel * goal_count_label_;
   QLabel * latest_goal_label_;
   QLabel * goal_coords_label_;
+  QLabel * home_joints_label_;
   QLabel * calib_result_label_;
   QSlider * velocity_slider_;
   QLabel * joint_labels_[6];

@@ -219,11 +219,115 @@ _TRUNK_OBSTACLE = {
     ),
     "color": (0.55, 0.27, 0.07, 1.0),  # Brown
 }
+_TRUNK_VISUAL = {
+    # RViz-only trunk helper. The real cuRobo trunk obstacle above stays small;
+    # this wider translucent marker makes the trunk easy to see outdoors.
+    "name": "trunk_visual",
+    "type": "cylinder",
+    "radius": 0.08,
+    "height": _TRUNK_OBSTACLE["height"],
+    "pose": list(_TRUNK_OBSTACLE["pose"]),
+    "color": (0.80, 0.42, 0.12, 0.72),
+    "collision": False,
+}
+
+_GOLFCART_BASE_PLATE_OBSTACLE = {
+    # Outdoor-only robot mounting plate extracted from
+    # ~/Downloads/Golfcart_pallet.step. The four STEP screw circles are centered
+    # at CAD (670, 1920) mm, so base_link is treated as that mounting center.
+    # Local plate bbox in the CAD: x/y +/-150 mm, z roughly -50..0 mm below the
+    # mounting surface.
+    "name": "golfcart_robot_base_plate",
+    "type": "cuboid",
+    "dims": [0.30, 0.30, 0.06],
+    "pose": [0.0, 0.0, -0.03, 1, 0, 0, 0],
+    "color": (0.18, 0.32, 0.42, 0.25),
+}
+
+_GOLFCART_BASE_PLATE_VISUAL = {
+    # RViz-only top overlay for the robot mounting plate. The collision plate
+    # above stays below z=0 where the CAD places it; this overlay is raised so
+    # it remains visible instead of disappearing under the RViz grid/UR base.
+    "name": "golfcart_robot_base_plate_visual",
+    "type": "cuboid",
+    "dims": [0.34, 0.34, 0.040],
+    "pose": [0.0, 0.0, 0.035, 1, 0, 0, 0],
+    "color": (0.12, 0.26, 0.34, 0.95),
+    "collision": False,
+}
+
+_GOLFCART_BASE_PLATE_OUTLINE = {
+    "name": "golfcart_robot_base_plate_outline",
+    "type": "cuboid_outline",
+    "dims": [0.36, 0.36, 0.08],
+    "pose": [0.0, 0.0, 0.085, 1, 0, 0, 0],
+    "line_width": 0.018,
+    "color": (0.0, 0.95, 1.0, 1.0),
+    "collision": False,
+}
+
+_GOLFCART_PALLET_VISUAL = {
+    # Full visible pallet envelope from the STEP bbox, relative to the screw
+    # pattern center. Visual-only: this shows the golf-cart/pallet footprint in
+    # RViz without adding a huge planning obstacle.
+    "name": "golfcart_pallet_visual",
+    "type": "cuboid",
+    "dims": [0.93, 2.47, 0.035],
+    "pose": [-0.265, -0.715, 0.035, 1, 0, 0, 0],
+    "color": (0.05, 0.55, 1.0, 0.82),
+    "collision": False,
+}
+
+_GOLFCART_PALLET_OUTLINE = {
+    "name": "golfcart_pallet_outline",
+    "type": "cuboid_outline",
+    "dims": [0.93, 2.47, 0.05],
+    "pose": [-0.265, -0.715, 0.095, 1, 0, 0, 0],
+    "line_width": 0.020,
+    "color": (0.0, 0.95, 1.0, 1.0),
+    "collision": False,
+}
+
+_GOLFCART_BASE_SCREW_MARKERS = [
+    {
+        "name": f"golfcart_base_screw_{i + 1}",
+        "type": "cylinder",
+        # STEP CIRCLE radius = 4.25 mm. Draw larger in RViz so the mounting
+        # pattern is visible under/around the UR base. Visual-only.
+        "radius": 0.025,
+        "height": 0.018,
+        "pose": [x, y, 0.070, 1, 0, 0, 0],
+        "color": (1.0, 0.82, 0.12, 1.0),
+        "collision": False,
+    }
+    for i, (x, y) in enumerate(
+        [
+            (0.0601040764, -0.0601040764),
+            (-0.0601040764, 0.0601040764),
+            (-0.0601040764, -0.0601040764),
+            (0.0601040764, 0.0601040764),
+        ]
+    )
+]
+
+_GOLFCART_PALLET_OBSTACLE = {
+    # Outdoor pallet collision approximation for cuRobo. This follows the
+    # current RViz pallet orientation: the visible split STL footprint is about
+    # x=[-0.53, 0.59], y=[-0.20, 0.73] in base_link. Keep the top slightly below
+    # z=0 so the UR base can sit on the pallet without start-state collision.
+    "name": "golfcart_pallet",
+    "type": "cuboid",
+    "dims": [1.12, 0.93, 0.12],
+    "pose": [0.03, 0.265, -0.08, 1, 0, 0, 0],
+    "color": (0.20, 0.45, 0.75, 0.28),
+}
 
 # The lab has a physical table under the arm; outdoor (field/orchard) does not — drop the
 # table obstacle outdoors so it doesn't block low approaches. Applies to both cuRobo
 # planning (WORLD_CONFIG) and RViz visualization, which both derive from STATIC_OBSTACLES.
-STATIC_OBSTACLES = ([] if ENVIRONMENT == "outdoor" else [_TABLE_OBSTACLE]) + [_TRUNK_OBSTACLE]
+STATIC_OBSTACLES = (
+    [_GOLFCART_PALLET_OBSTACLE] if ENVIRONMENT == "outdoor" else [_TABLE_OBSTACLE]
+) + [_TRUNK_OBSTACLE, _TRUNK_VISUAL]
 
 # Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES.
 # cuRobo's OBB collision checker only reads "cuboid" — cylinders are not loaded.
@@ -236,7 +340,11 @@ def _to_curobo_cuboid(obs: dict) -> dict:
     return {"dims": obs["dims"], "pose": obs["pose"]}
 
 WORLD_CONFIG = {
-    "cuboid": {obs["name"]: _to_curobo_cuboid(obs) for obs in STATIC_OBSTACLES}
+    "cuboid": {
+        obs["name"]: _to_curobo_cuboid(obs)
+        for obs in STATIC_OBSTACLES
+        if obs.get("collision", True)
+    }
 }
 
 # Voxel grid configuration for depth-based obstacle avoidance

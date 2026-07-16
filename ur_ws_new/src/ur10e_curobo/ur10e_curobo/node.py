@@ -1,5 +1,6 @@
 # ruff: noqa
 import json
+import copy
 import threading
 import rclpy
 import os
@@ -92,7 +93,8 @@ class UR10eCuroboMoveIt(Node):
 
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
-        self.create_subscription(Image, "/vision/display", self._camera_image_cb, 10)
+        self.create_subscription(Image, "/vision/raw", self._camera_raw_image_cb, 10)
+        self.create_subscription(Image, "/vision/display", self._camera_display_image_cb, 10)
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
@@ -183,6 +185,9 @@ class UR10eCuroboMoveIt(Node):
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")
         self.goal_seed_xy = None
+        self._last_goal_queue_items = []
+        self._last_goal_queue_metadata = {}
+        self._home_joints_display = ""
 
         self.last_frames = [] # last few frames for stability checking
 
@@ -198,7 +203,8 @@ class UR10eCuroboMoveIt(Node):
         # System control publishers
         self._refresh_camera_pub = self.create_publisher(String, "/camera_command", 10)
         self._camera_lock = threading.Lock()
-        self._camera_latest_msg = None
+        self._camera_latest_raw_msg = None
+        self._camera_latest_display_msg = None
         self._camera_bridge = None
         self._camera_video_writer = None
         self._camera_video_path = ""
@@ -512,6 +518,77 @@ class UR10eCuroboMoveIt(Node):
     def _goal_meta_key(goal):
         return tuple(round(float(v), 4) for v in goal[:7])
 
+    @staticmethod
+    def _is_gripper_queue_item(item):
+        return isinstance(item, dict) and item.get("type") == "gripper"
+
+    @staticmethod
+    def _is_pose_queue_item(item):
+        return isinstance(item, (list, tuple)) and len(item) >= 7
+
+    def _snapshot_goal_queue(self, reason: str = "manual"):
+        items = self.goal_poses.snapshot()
+        if not items:
+            return False
+        self._last_goal_queue_items = copy.deepcopy(items)
+        metadata = {}
+        for item in items:
+            if not self._is_pose_queue_item(item):
+                continue
+            key = self._goal_meta_key(item)
+            meta = getattr(self, "_reachability_goal_metadata", {}).get(key)
+            if meta is not None:
+                metadata[key] = copy.deepcopy(meta)
+        self._last_goal_queue_metadata = metadata
+        self.get_logger().info(
+            f"Saved last goal queue ({len(items)} item(s), reason={reason}).")
+        return True
+
+    def _restore_last_goal_queue(self):
+        items = copy.deepcopy(getattr(self, "_last_goal_queue_items", []) or [])
+        if not items:
+            self.get_logger().warn("No previous goal queue to reuse.")
+            return
+        self.goal_poses.clear()
+        getattr(self, "_reachability_goal_metadata", {}).clear()
+        markers_mod.clear_goal_markers(self)
+        for item in items:
+            self.goal_poses.append(item)
+            if self._is_pose_queue_item(item):
+                key = self._goal_meta_key(item)
+                meta = getattr(self, "_last_goal_queue_metadata", {}).get(key)
+                if meta is not None:
+                    self._reachability_goal_metadata[key] = copy.deepcopy(meta)
+                markers_mod.publish_goal_marker(self, item[:3])
+        self.get_logger().info(
+            f"Restored previous goal queue ({len(items)} item(s)).")
+
+    def _queue_gripper_action(self, action: str, position: str):
+        action = action.upper()
+        if action not in ("OPEN", "CLOSE"):
+            self.get_logger().warn(f"Invalid queued gripper action: {action}")
+            return
+        item = {"type": "gripper", "action": action}
+        if position == "front":
+            items = self.goal_poses.snapshot()
+            self.goal_poses.clear()
+            self.goal_poses.append(item)
+            for existing in items:
+                self.goal_poses.append(existing)
+        else:
+            self.goal_poses.append(item)
+        where = "start" if position == "front" else "end"
+        self.get_logger().info(
+            f"Queued gripper {action.lower()} at {where} of current goal queue.")
+
+    def _show_home_joints(self):
+        joints = [float(v) for v in self.home_joints]
+        deg = [math.degrees(v) for v in joints]
+        rad_str = ", ".join(f"{v:.4f}" for v in joints)
+        deg_str = ", ".join(f"{v:.1f}" for v in deg)
+        self._home_joints_display = f"rad=[{rad_str}] deg=[{deg_str}]"
+        self.get_logger().info(f"Current HOME joints: {self._home_joints_display}")
+
     def reset_goal_tracking(self):
         """Reset all goal tracking state for a fresh cycle."""
         self.goal_seed_xy = None
@@ -559,53 +636,68 @@ class UR10eCuroboMoveIt(Node):
         bridge = self._get_camera_bridge()
         return bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
-    def _camera_image_cb(self, msg):
+    def _record_camera_frame_locked(self, msg):
+        try:
+            import cv2
+            frame = self._camera_msg_to_bgr(msg)
+            if self._camera_video_writer is None:
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self._camera_video_writer = cv2.VideoWriter(
+                    self._camera_video_path,
+                    fourcc,
+                    self._camera_video_fps,
+                    (w, h),
+                )
+                if not self._camera_video_writer.isOpened():
+                    self.get_logger().error(
+                        f"Camera video: failed to open {self._camera_video_path}")
+                    self._camera_video_recording = False
+                    self._camera_video_writer = None
+                    return
+            self._camera_video_writer.write(frame)
+            self._camera_video_frames += 1
+        except Exception as e:
+            self.get_logger().error(f"Camera video recording failed: {e}")
+            if self._camera_video_writer is not None:
+                self._camera_video_writer.release()
+            self._camera_video_writer = None
+            self._camera_video_recording = False
+
+    def _camera_raw_image_cb(self, msg):
         with self._camera_lock:
-            self._camera_latest_msg = msg
-            if not self._camera_video_recording:
-                return
-            try:
-                import cv2
-                frame = self._camera_msg_to_bgr(msg)
-                if self._camera_video_writer is None:
-                    h, w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    self._camera_video_writer = cv2.VideoWriter(
-                        self._camera_video_path,
-                        fourcc,
-                        self._camera_video_fps,
-                        (w, h),
-                    )
-                    if not self._camera_video_writer.isOpened():
-                        self.get_logger().error(
-                            f"Camera video: failed to open {self._camera_video_path}")
-                        self._camera_video_recording = False
-                        self._camera_video_writer = None
-                        return
-                self._camera_video_writer.write(frame)
-                self._camera_video_frames += 1
-            except Exception as e:
-                self.get_logger().error(f"Camera video recording failed: {e}")
-                if self._camera_video_writer is not None:
-                    self._camera_video_writer.release()
-                self._camera_video_writer = None
-                self._camera_video_recording = False
+            self._camera_latest_raw_msg = msg
+            if self._camera_video_recording:
+                self._record_camera_frame_locked(msg)
+
+    def _camera_display_image_cb(self, msg):
+        with self._camera_lock:
+            self._camera_latest_display_msg = msg
 
     def _save_camera_snapshot(self):
         with self._camera_lock:
-            msg = self._camera_latest_msg
+            msg = self._camera_latest_raw_msg
+            source = "raw"
+            if msg is None:
+                msg = self._camera_latest_display_msg
+                source = "display"
         if msg is None:
-            self.get_logger().warn("Camera snapshot: no /vision/display frame received yet")
+            self.get_logger().warn(
+                "Camera snapshot: no /vision/raw or /vision/display frame received yet")
             return
         try:
             import cv2
             frame = self._camera_msg_to_bgr(msg)
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(self._camera_output_dir(), f"camera_{stamp}.png")
+            path = os.path.join(self._camera_output_dir(), f"camera_{source}_{stamp}.png")
             if not cv2.imwrite(path, frame):
                 self.get_logger().error(f"Camera snapshot: failed to save {path}")
                 return
-            self.get_logger().info(f"Camera snapshot saved: {path}")
+            if source != "raw":
+                self.get_logger().warn(
+                    "Camera snapshot used /vision/display fallback; restart the vision "
+                    "node to enable raw /vision/raw snapshots.")
+            self.get_logger().info(f"Camera {source} snapshot saved: {path}")
         except Exception as e:
             self.get_logger().error(f"Camera snapshot failed: {e}")
 
@@ -617,12 +709,12 @@ class UR10eCuroboMoveIt(Node):
                 return
             stamp = time.strftime("%Y%m%d_%H%M%S")
             self._camera_video_path = os.path.join(
-                self._camera_output_dir(), f"camera_video_{stamp}.mp4")
+                self._camera_output_dir(), f"camera_raw_video_{stamp}.mp4")
             self._camera_video_writer = None
             self._camera_video_frames = 0
             self._camera_video_recording = True
         self.get_logger().info(
-            f"Camera video recording started: {self._camera_video_path}")
+            f"Raw camera video recording started: {self._camera_video_path}")
 
     def _stop_camera_video_recording(self):
         with self._camera_lock:
@@ -688,7 +780,16 @@ class UR10eCuroboMoveIt(Node):
                 return
             try:
                 if self.goal_poses:
-                    self._prep_and_execute()
+                    self._snapshot_goal_queue("execute")
+                    if any(
+                        self._is_gripper_queue_item(item)
+                        for item in self.goal_poses.snapshot()
+                    ):
+                        self.get_logger().info(
+                            "Queue contains gripper actions — using ordered queue executor.")
+                        self._execute_goals_no_grasp()
+                    else:
+                        self._prep_and_execute()
             finally:
                 self._motion_lock.release()
 
@@ -698,6 +799,7 @@ class UR10eCuroboMoveIt(Node):
                     "Motion already in progress, ignoring EXECUTE MOVES command")
                 return
             try:
+                self._snapshot_goal_queue("execute_moves")
                 self._execute_goals_no_grasp()
             finally:
                 self._motion_lock.release()
@@ -743,7 +845,16 @@ class UR10eCuroboMoveIt(Node):
             threading.Thread(target=lambda c=cmd: run_side_home(c), daemon=True).start()
         elif cmd == "add_current_goal":
             self._add_current_as_goal()
+        elif cmd == "reuse_last_goal_queue":
+            self._restore_last_goal_queue()
+        elif cmd in ("queue_gripper_open", "queue_gripper_open_start"):
+            self._queue_gripper_action("OPEN", "back")
+        elif cmd in ("queue_gripper_close", "queue_gripper_close_end"):
+            self._queue_gripper_action("CLOSE", "back")
+        elif cmd == "show_home_joints":
+            self._show_home_joints()
         elif cmd == "clear":
+            self._snapshot_goal_queue("clear")
             self.goal_poses.clear()
             getattr(self, "_reachability_goal_metadata", {}).clear()
             markers_mod.clear_goal_markers(self)
@@ -814,6 +925,8 @@ class UR10eCuroboMoveIt(Node):
             self._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._set_current_as_home()
+        elif cmd == "set_dropoff_current":
+            self._set_current_as_dropoff()
         elif cmd == "safe_zone_enable":
             getattr(self, "enable_safe_zone", lambda: None)()
         elif cmd == "safe_zone_disable":
@@ -1042,6 +1155,19 @@ class UR10eCuroboMoveIt(Node):
             f"HOME updated from current joints: [{joints_str}] "
             "(runtime/ROS parameter only; edit config.py to make it permanent)")
 
+    def _set_current_as_dropoff(self):
+        """Set the active DROPOFF joint preset to the latest measured joint state."""
+        joints = self.current_joint_positions
+        if joints is None or len(joints) != len(self.joint_order):
+            self.get_logger().warn(
+                "Cannot set DROPOFF: current joint state is incomplete or unavailable.")
+            return
+        self._config_mgr.set_dropoff_joints(joints)
+        joints_str = ", ".join(f"{v:.6f}" for v in joints)
+        self.get_logger().info(
+            f"DROPOFF updated from current joints: [{joints_str}] "
+            "(runtime/ROS parameter only; edit config.py to make it permanent)")
+
     def _publish_goal_info(self):
         """Publish goal information for GUI consumption."""
         # Convert ThreadSafeGoalList to a list safely
@@ -1058,9 +1184,31 @@ class UR10eCuroboMoveIt(Node):
             except Exception:
                 safe_goals = []
 
+        goal_summary = []
+        goal_display_lines = []
+        for i, item in enumerate(safe_goals[:8], 1):
+            if self._is_gripper_queue_item(item):
+                action = str(item.get("action", "GRIPPER")).upper()
+                goal_summary.append(action)
+                goal_display_lines.append(f"{i}: GRIPPER {action}")
+            elif self._is_pose_queue_item(item):
+                xyz = [round(float(v), 4) for v in item[:3]]
+                goal_summary.append(xyz)
+                goal_display_lines.append(
+                    f"G{i}: [{xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}]")
+            else:
+                goal_summary.append("UNKNOWN")
+                goal_display_lines.append(f"{i}: UNKNOWN")
+
+        home_joints = [float(v) for v in self.home_joints]
+        home_rad_str = ", ".join(f"{v:.4f}" for v in home_joints)
+        home_deg_str = ", ".join(f"{math.degrees(v):.1f}" for v in home_joints)
+        self._home_joints_display = f"rad=[{home_rad_str}] deg=[{home_deg_str}]"
+
         msg_data = {
             "goal_count": len(safe_goals),
-            "goals": [[round(v, 4) for v in g[:3]] for g in safe_goals[:5]],  # First 5 goals, XYZ only
+            "goals": goal_summary,
+            "goal_display": "\n".join(goal_display_lines),
             "latest_goal": (
                 [round(v, 4) for v in self.latest_goal_pose[:3]]
                 if self.latest_goal_pose else None
@@ -1077,6 +1225,8 @@ class UR10eCuroboMoveIt(Node):
             "speed_dropoff": self.cfg.planner.speed_dropoff,
             "speed_approach": self.cfg.planner.speed_approach,
             "speed_predropoff": self.cfg.planner.speed_predropoff,
+            "home_joints": [round(v, 4) for v in home_joints],
+            "home_joints_display": self._home_joints_display,
             "debug_plan_preview": self.cfg.planner.debug_plan_preview,
             "reachability_cloud_enabled": self.cfg.planner.reachability_cloud_enabled,
             "lidar_scan_preview_enabled": self.cfg.lidar_scan.semicircle_preview_enabled,
@@ -1465,9 +1615,9 @@ class UR10eCuroboMoveIt(Node):
     def _execute_goals_no_grasp(self):
         """Run every queued goal as a plain Cartesian move — no grasp behavior.
 
-        Pops goals in insertion order and plans/executes a direct move to each
-        with ``execute_single_pose`` (the same path as a manual goal), so the
-        arm just visits the poses in sequence with no gripper/harvest logic.
+        Runs queued poses and optional gripper action items. If the queue contains
+        gripper actions, insertion order is strict so OPEN/CLOSE brackets remain
+        where the operator placed them.
         Honors stop_requested and aborts the rest if a move fails.
         """
         if self.goal_capture_active:
@@ -1477,16 +1627,48 @@ class UR10eCuroboMoveIt(Node):
             return
         self.stop_requested = False
         total = len(self.goal_poses)
+        strict_order = any(
+            self._is_gripper_queue_item(item)
+            for item in self.goal_poses.snapshot()
+        )
         idx = 0
         while self.goal_poses and getattr(self, 'running', True):
             if getattr(self, 'stop_requested', False):
                 self.get_logger().warn("Stop requested — aborting goal moves.")
                 break
-            goal, reach_delta = self._pop_next_reachable_goal()
+            if strict_order:
+                goal = self.goal_poses.pop(0)
+                reach_delta = None
+            else:
+                goal, reach_delta = self._pop_next_reachable_goal()
             if goal is None:
                 break
-            goal_key = self._goal_meta_key(goal)
             idx += 1
+            if self._is_gripper_queue_item(goal):
+                action = str(goal.get("action", "")).upper()
+                if action in ("OPEN", "CLOSE"):
+                    self.motion_phase = "GRIPPER"
+                    self.get_logger().info(
+                        f"Queue item {idx}/{total}: gripper {action.lower()}")
+                    if action == "OPEN":
+                        pause_s = 0.5
+                        self.get_logger().info(
+                            f"Queued gripper open: pausing {pause_s:.1f}s before opening")
+                        time.sleep(pause_s)
+                        if getattr(self, 'stop_requested', False):
+                            self.get_logger().warn(
+                                "Stop requested during pre-open pause — aborting goal moves.")
+                            break
+                    gripper_mod.control_gripper(self, action)
+                    continue
+                self.get_logger().warn(
+                    f"Queue item {idx}/{total}: invalid gripper action {action!r}; skipping.")
+                continue
+            if not self._is_pose_queue_item(goal):
+                self.get_logger().warn(
+                    f"Queue item {idx}/{total}: unsupported item; skipping.")
+                continue
+            goal_key = self._goal_meta_key(goal)
             self.motion_phase = "MOVING"
             markers_mod.publish_goal_marker(self, goal[:3])
             self.get_logger().info(

@@ -22,6 +22,8 @@ Panels:
     Splitter Ratio: 0.5
   - Class: rviz_ur10e_panel/UR10ePanel
     Name: UR10e Control
+    lidar_scan_preview: 1
+    reachability_cloud: 1
     velocity_slider: 50
   - Class: rviz_ur10e_panel/LogPanel
     Name: Log Output
@@ -234,14 +236,32 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        F1_01:
+          Value: true
+        F1_02:
+          Value: true
+        F1_03:
+          Value: true
         F1_04:
           Value: false
         F1_TIP:
           Value: false
+        F2_01:
+          Value: true
+        F2_02:
+          Value: true
+        F2_03:
+          Value: true
         F2_04:
           Value: false
         F2_TIP:
           Value: false
+        F3_01:
+          Value: true
+        F3_02:
+          Value: true
+        F3_03:
+          Value: true
         F3_04:
           Value: false
         F3_TIP:
@@ -302,6 +322,24 @@ Visualization Manager:
                           flange:
                             tool0:
                               delto_base_link:
+                                F1_01:
+                                  F1_02:
+                                    F1_03:
+                                      F1_04:
+                                        F1_TIP:
+                                          {}
+                                F2_01:
+                                  F2_02:
+                                    F2_03:
+                                      F2_04:
+                                        F2_TIP:
+                                          {}
+                                F3_01:
+                                  F3_02:
+                                    F3_03:
+                                      F3_04:
+                                        F3_TIP:
+                                          {}
                                 gripper_tip:
                                   {}
                               tool0_to_camera_mount_link:
@@ -344,7 +382,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        environment: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -355,9 +393,23 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
+      Name: Golfcart Pallet STL
+      Namespaces:
+        golfcart_pallet_mount: true
+        golfcart_robot_screws: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /golfcart_pallet_marker
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
       Name: Marker
       Namespaces:
-        robot_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -370,7 +422,9 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        goal_positions: true
+        lidar_scan_preview_labels: true
+        lidar_scan_preview_lines: true
+        lidar_scan_preview_points: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -401,7 +455,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        safe_zone: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -415,6 +469,7 @@ Visualization Manager:
       Name: Marker
       Namespaces:
         reachability_cloud: true
+        reachability_directions: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -452,25 +507,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.8019709587097168
+      Distance: 3.832263231277466
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.14226748049259186
-        Y: -0.37936097383499146
-        Z: 0.7706350088119507
+        X: 0.20429250597953796
+        Y: 0.24112512171268463
+        Z: 0.5924466252326965
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.370398610830307
+      Pitch: 0.2603985667228699
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 5.471750259399414
+      Yaw: 5.231751441955566
     Saved: ~
 Window Geometry:
   Displays:

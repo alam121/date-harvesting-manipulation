@@ -294,6 +294,7 @@ def launch_setup(context, *args, **kwargs):
     urscript_interface = Node(
         package="ur_robot_driver",
         executable="urscript_interface",
+        condition=UnlessCondition(use_fake_hardware),
         parameters=[{"robot_ip": robot_ip}],
         output="screen",
     )
@@ -351,19 +352,20 @@ def launch_setup(context, *args, **kwargs):
     )
     
     delto_launch = IncludeLaunchDescription(
-    PythonLaunchDescriptionSource(
-        PathJoinSubstitution([
-            FindPackageShare("delto_3f_driver"),
-            "launch",
-            "delto_3f_bringup.launch.py"
-        ])
-    ),
-    launch_arguments={
-        "delto_ip": "169.254.186.72",
-        "delto_port": "502",
-        "launch_rviz": "false"    # ✅ disable RViz for gripper
-    }.items(),
-)
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("delto_3f_driver"),
+                "launch",
+                "delto_3f_bringup.launch.py"
+            ])
+        ),
+        condition=UnlessCondition(use_fake_hardware),
+        launch_arguments={
+            "delto_ip": "169.254.186.72",
+            "delto_port": "502",
+            "launch_rviz": "false"
+        }.items(),
+    )
 
 
 

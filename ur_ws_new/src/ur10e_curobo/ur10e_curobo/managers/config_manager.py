@@ -278,6 +278,20 @@ class ConfigManager:
             self._node.get_logger().warn(
                 f"Updated HOME in memory, but failed to update ROS parameter joints.home: {exc}")
 
+    def set_dropoff_joints(self, joints: List[float]) -> None:
+        """Update active DROPOFF joint preset for the running node."""
+        dropoff = [float(v) for v in joints]
+        self.cfg.joints.dropoff = dropoff
+        self.dropoff_joints = self.cfg.joints.dropoff
+        try:
+            self._node.set_parameters([
+                Parameter("joints.dropoff", Parameter.Type.DOUBLE_ARRAY, dropoff)
+            ])
+        except Exception as exc:
+            self._node.get_logger().warn(
+                "Updated DROPOFF in memory, but failed to update ROS parameter "
+                f"joints.dropoff: {exc}")
+
     def _on_parameter_change(self, params) -> SetParametersResult:
         """Handle runtime parameter changes via ros2 param set."""
         # Map ROS param names to (config_obj, attr_name, type_cast)

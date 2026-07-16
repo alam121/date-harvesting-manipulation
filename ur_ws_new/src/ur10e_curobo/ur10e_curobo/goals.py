@@ -63,7 +63,12 @@ class ThreadSafeGoalList:
     def any_within_distance(self, pos, threshold):
         """Check if any goal is within threshold distance of pos[:3]."""
         with self._lock:
-            return any(math.dist(pos[:3], e[:3]) < threshold for e in self._goals)
+            return any(
+                isinstance(e, (list, tuple))
+                and len(e) >= 3
+                and math.dist(pos[:3], e[:3]) < threshold
+                for e in self._goals
+            )
 
     def peek(self, index=0):
         """Return goal at index without removing it, or None if out of range."""

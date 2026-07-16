@@ -74,6 +74,50 @@ const char * ratingName(double score)
   return "Unstable";
 }
 
+std::string unescapeJsonString(const std::string & s)
+{
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '\\' || i + 1 >= s.size()) {
+      out.push_back(s[i]);
+      continue;
+    }
+    const char c = s[++i];
+    if (c == 'n') out.push_back('\n');
+    else if (c == 't') out.push_back('\t');
+    else out.push_back(c);
+  }
+  return out;
+}
+
+std::string jsonStringValue(const std::string & data, const char * key)
+{
+  const std::string needle = std::string("\"") + key + "\"";
+  auto pos = data.find(needle);
+  if (pos == std::string::npos) return "";
+  auto colon = data.find(':', pos);
+  auto q1 = data.find('"', colon + 1);
+  if (colon == std::string::npos || q1 == std::string::npos) return "";
+  std::string raw;
+  bool escaped = false;
+  for (size_t i = q1 + 1; i < data.size(); ++i) {
+    const char c = data[i];
+    if (escaped) {
+      raw.push_back('\\');
+      raw.push_back(c);
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      return unescapeJsonString(raw);
+    } else {
+      raw.push_back(c);
+    }
+  }
+  return "";
+}
+
 }  // namespace
 
 UR10ePanel::UR10ePanel(QWidget * parent)
@@ -228,7 +272,14 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   set_home_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
   set_home_btn->setToolTip("Save the current robot joint position as the active HOME preset");
   connect(set_home_btn, &QPushButton::clicked, this, &UR10ePanel::onSetHomeCurrent);
-  motion_layout->addWidget(set_home_btn, 1, 0, 1, 2);
+  motion_layout->addWidget(set_home_btn, 1, 0);
+
+  auto * set_dropoff_btn = new QPushButton("Set Dropoff = Current");
+  set_dropoff_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
+  set_dropoff_btn->setToolTip(
+    "Save the current robot joint position as the active DROPOFF preset");
+  connect(set_dropoff_btn, &QPushButton::clicked, this, &UR10ePanel::onSetDropoffCurrent);
+  motion_layout->addWidget(set_dropoff_btn, 1, 1);
 
   auto * exec_btn = new QPushButton("Execute");
   exec_btn->setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;");
@@ -584,13 +635,13 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   auto * snapshot_btn = new QPushButton("Save Image");
   snapshot_btn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;");
-  snapshot_btn->setToolTip("Save the latest /vision/display frame to ~/camera_recordings");
+  snapshot_btn->setToolTip("Save the latest raw /vision/raw frame to ~/camera_recordings");
   connect(snapshot_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraSnapshot);
   camera_layout->addWidget(snapshot_btn, 6, 0, 1, 2);
 
   auto * video_start_btn = new QPushButton("Start Video");
   video_start_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
-  video_start_btn->setToolTip("Start recording /vision/display to ~/camera_recordings");
+  video_start_btn->setToolTip("Start recording raw /vision/raw to ~/camera_recordings");
   connect(video_start_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStart);
   camera_layout->addWidget(video_start_btn, 7, 0);
 
@@ -785,11 +836,17 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   goal_coords_label_->setStyleSheet("color: #7b1fa2;");
   goals_layout->addWidget(goal_coords_label_);
 
+  home_joints_label_ = new QLabel("HOME: --");
+  home_joints_label_->setFont(QFont("Courier", 8));
+  home_joints_label_->setWordWrap(true);
+  home_joints_label_->setStyleSheet("color: #00695c;");
+  goals_layout->addWidget(home_joints_label_);
+
   // Queue current robot pose as a goal, then run the whole queue in sequence.
   auto * add_current_btn = new QPushButton("Add Current Pos as Goal (G)");
   add_current_btn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold;");
   add_current_btn->setToolTip(
-    "Append the robot's current end-effector pose to the goal queue.\n"
+    "Append the robot's current joint posture to the goal queue.\n"
     "Move the arm, press again to add more, then Execute to run them in order.");
   connect(add_current_btn, &QPushButton::clicked, this, &UR10ePanel::onAddCurrentGoal);
   goals_layout->addWidget(add_current_btn);
@@ -809,6 +866,34 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(clear_queue_btn, &QPushButton::clicked, this, &UR10ePanel::onClear);
   queue_run_row->addWidget(clear_queue_btn);
   goals_layout->addLayout(queue_run_row);
+
+  auto * queue_reuse_row = new QHBoxLayout();
+  auto * reuse_queue_btn = new QPushButton("Reuse Last Queue");
+  reuse_queue_btn->setStyleSheet("background-color: #5e35b1; color: white; font-weight: bold;");
+  reuse_queue_btn->setToolTip("Replace the current queue with the last cleared or executed queue");
+  connect(reuse_queue_btn, &QPushButton::clicked, this, &UR10ePanel::onReuseLastGoalQueue);
+  queue_reuse_row->addWidget(reuse_queue_btn);
+
+  auto * goal_home_btn = new QPushButton("Go Home");
+  goal_home_btn->setStyleSheet("background-color: #4caf50; color: white; font-weight: bold;");
+  goal_home_btn->setToolTip("Move to the active HOME joint posture");
+  connect(goal_home_btn, &QPushButton::clicked, this, &UR10ePanel::onHome);
+  queue_reuse_row->addWidget(goal_home_btn);
+  goals_layout->addLayout(queue_reuse_row);
+
+  auto * gripper_queue_row = new QHBoxLayout();
+  auto * queue_open_btn = new QPushButton("Add Open");
+  queue_open_btn->setStyleSheet("background-color: #43a047; color: white;");
+  queue_open_btn->setToolTip("Append an OPEN gripper action at the current end of the queue");
+  connect(queue_open_btn, &QPushButton::clicked, this, &UR10ePanel::onQueueGripperOpen);
+  gripper_queue_row->addWidget(queue_open_btn);
+
+  auto * queue_close_btn = new QPushButton("Add Close");
+  queue_close_btn->setStyleSheet("background-color: #e53935; color: white;");
+  queue_close_btn->setToolTip("Append a CLOSE gripper action at the current end of the queue");
+  connect(queue_close_btn, &QPushButton::clicked, this, &UR10ePanel::onQueueGripperClose);
+  gripper_queue_row->addWidget(queue_close_btn);
+  goals_layout->addLayout(gripper_queue_row);
 
   goal_tab_layout->addWidget(goals_group);
 
@@ -999,6 +1084,16 @@ void UR10ePanel::setupRos()
           latest_goal_ = data.substr(quote1 + 1, quote2 - quote1 - 1);
         }
       }
+      const auto goal_display = jsonStringValue(data, "goal_display");
+      if (!goal_display.empty()) {
+        goal_coords_str_ = goal_display;
+      } else if (data.find("\"goal_display\": \"\"") != std::string::npos) {
+        goal_coords_str_.clear();
+      }
+      const auto home_display = jsonStringValue(data, "home_joints_display");
+      if (!home_display.empty()) {
+        home_joints_str_ = home_display;
+      }
       // Extract plan_waiting_confirm
       pos = data.find("\"plan_waiting_confirm\"");
       if (pos != std::string::npos) {
@@ -1098,9 +1193,10 @@ void UR10ePanel::setupRos()
           last_end_ = last_end;
         }
       }
-      // Extract goals array for coordinate display
+      // Extract goals array for coordinate display when older nodes do not publish
+      // the formatted goal_display string.
       pos = data.find("\"goals\"");
-      if (pos != std::string::npos) {
+      if (goal_display.empty() && pos != std::string::npos) {
         auto bracket = data.find('[', pos);
         if (bracket != std::string::npos) {
           // Find matching outer bracket
@@ -1257,10 +1353,25 @@ void UR10ePanel::onSetHomeCurrent()
     publishCmd("set_home_current");
   }
 }
+void UR10ePanel::onSetDropoffCurrent()
+{
+  auto reply = QMessageBox::question(
+    this,
+    "Set Dropoff",
+    "Use the robot's current joint position as the new DROPOFF for this running node?",
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (reply == QMessageBox::Yes) {
+    publishCmd("set_dropoff_current");
+  }
+}
 void UR10ePanel::onDropoff() { publishCmd("dropoff"); }
 void UR10ePanel::onExecute() { publishCmd("execute"); }
 void UR10ePanel::onExecuteMoves() { publishCmd("execute_moves"); }
 void UR10ePanel::onAddCurrentGoal() { publishCmd("add_current_goal"); }
+void UR10ePanel::onReuseLastGoalQueue() { publishCmd("reuse_last_goal_queue"); }
+void UR10ePanel::onQueueGripperOpen() { publishCmd("queue_gripper_open"); }
+void UR10ePanel::onQueueGripperClose() { publishCmd("queue_gripper_close"); }
 void UR10ePanel::onClear() { publishCmd("clear"); }
 void UR10ePanel::onCheckCalibration() { publishCmd("check_calibration"); }
 void UR10ePanel::onGripperOpen() { publishCmd("open"); }
@@ -1975,6 +2086,10 @@ void UR10ePanel::updateDisplay()
     latest_goal_label_->setText(QString("Latest: %1").arg(
       QString::fromStdString(latest_goal_)));
   }
+  if (!home_joints_str_.empty()) {
+    home_joints_label_->setText(QString("HOME: %1").arg(
+      QString::fromStdString(home_joints_str_)));
+  }
   // Plan confirm/cancel visibility
   plan_confirm_btn_->setVisible(plan_waiting_confirm_);
   plan_cancel_btn_->setVisible(plan_waiting_confirm_);
@@ -2013,6 +2128,10 @@ void UR10ePanel::updateDisplay()
 
   // Show goal coordinates
   if (!goal_coords_str_.empty() && goal_coords_str_ != "[]") {
+    if (!goal_coords_str_.empty() && goal_coords_str_[0] != '[') {
+      goal_coords_label_->setText(QString::fromStdString(goal_coords_str_));
+      return;
+    }
     // Format: [[x,y,z],[x,y,z],...] → readable lines
     QString coords_text;
     // Simple parsing: split by ],[

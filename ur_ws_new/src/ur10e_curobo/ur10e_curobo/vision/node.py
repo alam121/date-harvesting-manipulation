@@ -193,6 +193,7 @@ class VisionNode:
         self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
+        self.raw_image_pub = self.node.create_publisher(ROSImage, "/vision/raw", 10)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
         from std_msgs.msg import String as _Str
         self.score_pub = self.node.create_publisher(_Str, "/vision/fruit_score", 10)
@@ -542,6 +543,14 @@ class VisionNode:
                 img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps, viz_only, uv_lidar, pts_lidar = frame_data
                 try:
                     _vt0 = time()
+                    stamp = self.node.get_clock().now().to_msg()
+                    if len(img_ocv.shape) == 3 and img_ocv.shape[2] == 4:
+                        raw_pub_image = cv2.cvtColor(img_ocv, cv2.COLOR_BGRA2BGR)
+                    else:
+                        raw_pub_image = img_ocv
+                    raw_msg = self.cv_bridge.cv2_to_imgmsg(raw_pub_image, encoding="bgr8")
+                    raw_msg.header.stamp = stamp
+                    self.raw_image_pub.publish(raw_msg)
                     if not getattr(self, "_printed_bottom_pixel_pre_render", False):
                         _bottom = img_ocv[-12:, :, :3]
                         print(
@@ -590,7 +599,7 @@ class VisionNode:
                         self._printed_bottom_pixel_pub_image = True
                     img_msg = self.cv_bridge.cv2_to_imgmsg(pub_image, encoding="bgr8")
                     _vt3 = time()
-                    img_msg.header.stamp = self.node.get_clock().now().to_msg()
+                    img_msg.header.stamp = stamp
                     self.image_pub.publish(img_msg)
                     _vt4 = time()
                     _viz_count = getattr(self, '_viz_perf_count', 0) + 1

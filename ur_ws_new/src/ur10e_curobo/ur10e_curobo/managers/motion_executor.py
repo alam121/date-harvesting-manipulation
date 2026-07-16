@@ -15,7 +15,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 from curobo.util_file import get_assets_path, get_robot_configs_path, join_path, load_yaml
 
-from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES
+from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES, ENVIRONMENT
 from ..dynamic_obstacle import DynamicObstacleManager
 from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
@@ -46,6 +46,7 @@ class MotionExecutor:
         # Publishers
         self.trajectory_pub = None
         self.env_marker_pub = None
+        self.golfcart_pallet_marker_pub = None
 
         # Motion lock (prevents concurrent motions)
         self._motion_lock = threading.Lock()
@@ -74,6 +75,11 @@ class MotionExecutor:
         self.env_marker_pub = self._node.create_publisher(
             Marker,
             "/env_marker",
+            10
+        )
+        self.golfcart_pallet_marker_pub = self._node.create_publisher(
+            Marker,
+            "/golfcart_pallet_marker",
             10
         )
 
@@ -145,6 +151,7 @@ class MotionExecutor:
         # Timers
         self._node.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
         self._node.create_timer(1.0, self._publish_static_obstacles)
+        self._node.create_timer(1.0, self._publish_golfcart_pallet_marker)
 
         if vision_enabled:
             # Take the initial snapshot once the depth stream is available.
@@ -230,7 +237,7 @@ class MotionExecutor:
                 world_config["cuboid"]["trunk"]["pose"][1] = ty
             # Also update static obstacles for RViz
             for obs in STATIC_OBSTACLES:
-                if obs["name"] == "trunk":
+                if obs["name"] in ("trunk", "trunk_visual"):
                     obs["pose"][0] = tx
                     obs["pose"][1] = ty
         else:
@@ -583,6 +590,114 @@ class MotionExecutor:
             frame_id="base_link",
             specs=self.static_obstacles,
         )
+        stamp = self._node.get_clock().now().to_msg()
+        for marker_id in range(len(self.static_obstacles), 10):
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = "environment"
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            self.env_marker_pub.publish(marker)
+
+    def _publish_golfcart_pallet_marker(self) -> None:
+        """Publish the outdoor pallet STL as a standalone RViz marker."""
+        if ENVIRONMENT != "outdoor" or self.golfcart_pallet_marker_pub is None:
+            return
+
+        stamp = self._node.get_clock().now().to_msg()
+
+        # Clear previous experimental marker namespaces if RViz still has them cached.
+        stale_markers = (
+            (0, "golfcart_pallet_stl"),
+            (10, "golfcart_pallet_base"),
+            (11, "golfcart_robot_mount"),
+            (20, "golfcart_robot_screws"),
+            (21, "golfcart_robot_screws"),
+            (22, "golfcart_robot_screws"),
+            (23, "golfcart_robot_screws"),
+        )
+        for marker_id, ns in stale_markers:
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = ns
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            self.golfcart_pallet_marker_pub.publish(marker)
+
+        pallet_z = -0.140
+        meshes = (
+            (
+                0,
+                "golfcart_pallet_front",
+                "package://ur10e_curobo/meshes/Golfcart_pallet_front.stl",
+                (0.34, 0.55, 0.72, 0.45),
+                (-0.500, 0.670, pallet_z),
+            ),
+            (
+                1,
+                "golfcart_pallet_mount",
+                "package://ur10e_curobo/meshes/Golfcart_pallet_mount.stl",
+                (0.45, 0.72, 0.95, 0.78),
+                (-1.920, 0.670, pallet_z),
+            ),
+        )
+        for marker_id, ns, resource, color, xyz in meshes:
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = ns
+            marker.id = marker_id
+            marker.type = Marker.MESH_RESOURCE
+            marker.action = Marker.ADD
+            marker.mesh_resource = resource
+            marker.mesh_use_embedded_materials = False
+            marker.pose.position.x = xyz[0]
+            marker.pose.position.y = xyz[1]
+            marker.pose.position.z = xyz[2]
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = -0.7071068
+            marker.pose.orientation.w = 0.7071068
+            marker.scale.x = 0.001
+            marker.scale.y = 0.001
+            marker.scale.z = 0.001
+            marker.color.r = color[0]
+            marker.color.g = color[1]
+            marker.color.b = color[2]
+            marker.color.a = color[3]
+            self.golfcart_pallet_marker_pub.publish(marker)
+
+        screw_z = pallet_z + 0.350 + 0.004
+        for i, (x, y) in enumerate(
+            (
+                (0.0601040764, -0.0601040764),
+                (-0.0601040764, 0.0601040764),
+                (-0.0601040764, -0.0601040764),
+                (0.0601040764, 0.0601040764),
+            ),
+            start=1,
+        ):
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = "golfcart_robot_screws"
+            marker.id = i
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.position.z = screw_z
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.030
+            marker.scale.y = 0.030
+            marker.scale.z = 0.008
+            marker.color.r = 1.0
+            marker.color.g = 0.82
+            marker.color.b = 0.12
+            marker.color.a = 1.0
+            self.golfcart_pallet_marker_pub.publish(marker)
 
     def shutdown(self) -> None:
         """Clean shutdown of motion executor."""

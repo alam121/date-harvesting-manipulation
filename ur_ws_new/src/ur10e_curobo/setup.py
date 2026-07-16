@@ -22,6 +22,11 @@ setup(
             "launch/bringup.launch.py",
             "launch/combined.launch.py",
         ]),
+        (f"share/{package_name}/meshes", [
+            "meshes/Golfcart_pallet.stl",
+            "meshes/Golfcart_pallet_front.stl",
+            "meshes/Golfcart_pallet_mount.stl",
+        ]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
