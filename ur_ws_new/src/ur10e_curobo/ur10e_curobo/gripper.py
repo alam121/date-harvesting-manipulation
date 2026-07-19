@@ -6,7 +6,13 @@ from . import grasp_visualizer as grasp_viz_mod
 from ur_msgs.srv import SetIO
 from sensor_msgs.msg import JointState
 import time
-import math
+import os
+from .gripper_profiles import (
+    FINGER_JOINT_INDICES,
+    make_closed_position,
+    make_open_position,
+    new_gripper_open_extra_deg,
+)
 
 # Gripper aperture constants (meters)
 GRIPPER_MAX_APERTURE = 0.070   # 80mm total opening at full open
@@ -44,25 +50,24 @@ class FakeGripperController:
         self.closure_deltas = [0.0, 0.0, 0.0]
         self.closed = False
 
-        # Mirror DeltoGripperController's calibrated old DG-3F-B posture values
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        if self.gripper_profile not in ("old", "new"):
+            self.node.get_logger().warn(
+                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using old"
+            )
+            self.gripper_profile = "old"
+
+        # Mirror DeltoGripperController's DG-3F-M paired-motor posture values
         # so fake mode/RViz and hardware mode show the same open/close pose.
-        if self.configured_suction:
-            self.finger_joint_idx = {0: 2, 1: 7, 2: 10}
-        else:
-            self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
-        self.finger_joint_indices = {
-            ch: (idx,) for ch, idx in self.finger_joint_idx.items()
-        }
-        self.open_position = [
-            -0.0942, -0.1500, 2.1260, -0.5062,
-            -1.6318, 0.1309, 1.6953, -0.4887,
-            0.3333, 0.2234, 2.1260, -0.4311,
-        ]
-        self.closed_position = self.open_position.copy()
-        self.closed_position[self.finger_joint_idx[0]] = 2.5673
-        self.closed_position[self.finger_joint_idx[1]] = 2.3753
-        self.closed_position[self.finger_joint_idx[2]] = 2.5673
+        self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
+        self.finger_joint_indices = FINGER_JOINT_INDICES
+        self.open_position = make_open_position(self.gripper_profile)
+        self.closed_position = make_closed_position()
         self.current_position = self.open_position.copy()
+        self.node.get_logger().info(
+            f"Fake gripper profile: {self.gripper_profile} "
+            f"(new open extra={new_gripper_open_extra_deg():.1f}deg)"
+        )
         self.joint_state_pub = node.create_publisher(JointState, "/joint_states", 10)
         self.joint_state_timer = node.create_timer(0.2, self.publish_joint_state)
         self.publish_joint_state()
