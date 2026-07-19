@@ -23,6 +23,10 @@ def main():
         help=f"YOLO confidence threshold (default: {DEFAULT_CONF_THRES})"
     )
     parser.add_argument(
+        "--hdr", type=int, default=1,
+        help="Enable ZED X One HDR at camera open, 1=on, 0=off"
+    )
+    parser.add_argument(
         "--use_lidar", action="store_true",
         help="Use Livox LiDAR for depth instead of ZED stereo depth"
     )

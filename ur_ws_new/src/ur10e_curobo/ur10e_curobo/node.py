@@ -580,6 +580,7 @@ class UR10eCuroboMoveIt(Node):
         where = "start" if position == "front" else "end"
         self.get_logger().info(
             f"Queued gripper {action.lower()} at {where} of current goal queue.")
+        self._snapshot_goal_queue(f"queue_gripper_{action.lower()}")
 
     def _show_home_joints(self):
         joints = [float(v) for v in self.home_joints]
@@ -965,6 +966,9 @@ class UR10eCuroboMoveIt(Node):
         elif cmd.startswith("camera_settings "):
             self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
             self.get_logger().info(f"Camera settings requested: {cmd}")
+        elif cmd.startswith("camera_model "):
+            self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
+            self.get_logger().info(f"Camera model requested: {cmd}")
         elif cmd == "camera_snapshot":
             self._save_camera_snapshot()
         elif cmd == "camera_video_start":
@@ -1651,7 +1655,7 @@ class UR10eCuroboMoveIt(Node):
                     self.get_logger().info(
                         f"Queue item {idx}/{total}: gripper {action.lower()}")
                     if action == "OPEN":
-                        pause_s = 0.5
+                        pause_s = 1.5
                         self.get_logger().info(
                             f"Queued gripper open: pausing {pause_s:.1f}s before opening")
                         time.sleep(pause_s)

@@ -21,6 +21,23 @@ SCRIPT_SENDER_PORT = "50002"
 ROBOT_CONFIG_SOURCE = (
     Path(WS) / "src" / "ur10e_curobo" / "ur10e_curobo" / "config.py"
 )
+PRESETS = {
+    "harvest": ["main", "vision", "zed_mini"],
+    "field": ["main", "vision", "zed_mini"],
+}
+
+
+def expand_presets(args):
+    expanded = []
+    for arg in args:
+        preset = PRESETS.get(arg)
+        if preset is None:
+            expanded.append(arg)
+            continue
+        for item in preset:
+            if item not in expanded:
+                expanded.append(item)
+    return expanded
 
 
 def load_robot_profile() -> str:
@@ -377,7 +394,7 @@ def update_config(
 
 def main():
     valid = ["bringup", "ur", "main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye"]
-    args = sys.argv[1:]
+    args = expand_presets(sys.argv[1:])
 
     # Extract modifier flags
     fake_hardware = "fake" in args
@@ -397,7 +414,11 @@ def main():
     nodes = [arg for arg in args if arg in valid and arg not in ("bringup", "ur")]
 
     if not nodes and not bringup_only:
-        print("Usage: launch_ur10e [fake] [lidar|zed_mini] [charuco|chessboard] [qhdplus|4k] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye]")
+        print("Usage: launch_ur10e [fake] [harvest|field] [lidar|zed_mini] [charuco|chessboard] [qhdplus|4k] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye]")
+        print()
+        print("Presets:")
+        print("  harvest  - Real robot + main + vision with ZED Mini depth")
+        print("  field    - Alias for harvest")
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
@@ -417,10 +438,13 @@ def main():
         print("  hand_eye  - ChArUco hand-eye camera calibration")
         print()
         print("Examples:")
+        print("  launch_ur10e_gui                     # Dialog launcher for robot/camera/depth choices")
         print("  launch_ur10e bringup                 # Real robot bringup only")
         print("  launch_ur10e main                    # Real robot + main + RViz with panel")
         print("  launch_ur10e main vision             # Real robot + main + vision (ZED stereo)")
         print("  launch_ur10e main vision zed_mini    # Real robot + main + vision (ZED Mini depth)")
+        print("  launch_ur10e harvest                 # Same as: main vision zed_mini")
+        print("  launch_harvest                       # Short wrapper for the harvest preset")
         print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
         print("  launch_ur10e fake main               # Fake hardware + main")
         print("  launch_ur10e main teleop             # Real robot + main + teleop")

@@ -1,8 +1,11 @@
 """Main VisionNode class for date fruit detection."""
 
 import math
+import os
 import queue
+import sys
 from collections import deque
+from pathlib import Path
 from threading import Lock, Thread
 from time import sleep, time
 from typing import List, Optional, Dict, Any
@@ -16,7 +19,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
-from std_msgs.msg import Float32, Float32MultiArray
+from std_msgs.msg import Float32, Float32MultiArray, String as StdString
 from sensor_msgs.msg import PointCloud2, Image as ROSImage
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
@@ -43,6 +46,7 @@ from .ros_utils import wait_for_transform, create_pointcloud2_msg
 from .zed_utils import (
     apply_zed_one_manual_exposure,
     apply_zed_one_exposure_preset,
+    apply_zed_one_hdr,
     apply_zed_one_settings,
     apply_zed_mini_settings,
     apply_zed_stereo_settings,
@@ -146,6 +150,15 @@ class VisionNode:
         # Open ZED cameras. _zed is the live image camera; _zed_mini is depth-only.
         self._zed = None
         self._zed_mini = None
+        self._camera_type = "not open"
+        self._camera_resolution = "-"
+        self._camera_mode = "-"
+        self._camera_fps = "-"
+        self._camera_hdr_enabled = bool(int(getattr(self.args, "hdr", 1)))
+        self._depth_camera_text = "-"
+        self._camera_status_pub = None
+        self._refresh_argv = None
+        self._refresh_reason = "camera refresh"
 
         # Components
         self.tracker = FruitTracker()
@@ -158,6 +171,31 @@ class VisionNode:
         self.node = None
         self.executor = None
         self.tf_buffer = None
+
+    @staticmethod
+    def _argv_with_option(argv, option, value):
+        updated = list(argv)
+        if option in updated:
+            idx = updated.index(option)
+            if idx + 1 < len(updated):
+                updated[idx + 1] = value
+            else:
+                updated.append(value)
+            return updated
+        insert_at = updated.index("--ros-args") if "--ros-args" in updated else len(updated)
+        updated[insert_at:insert_at] = [option, value]
+        return updated
+
+    def _request_vision_restart(self, reason: str, argv=None):
+        if argv is None:
+            argv = self._argv_with_option(sys.argv, "--weights", str(getattr(self.args, "weights", "")))
+            argv = self._argv_with_option(argv, "--hdr", str(int(self._camera_hdr_enabled)))
+        self._refresh_requested = True
+        self._refresh_reason = reason
+        self._refresh_argv = list(argv)
+        self.exit_signal = True
+        _exec = self.executor
+        Thread(target=_exec.shutdown, daemon=True).start()
 
     def run(self):
         """Main entry point."""
@@ -194,6 +232,8 @@ class VisionNode:
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.raw_image_pub = self.node.create_publisher(ROSImage, "/vision/raw", 10)
+        self._camera_status_pub = self.node.create_publisher(StdString, "/camera_status", 10)
+        self.node.create_timer(2.0, self._publish_camera_status)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
         from std_msgs.msg import String as _Str
         self.score_pub = self.node.create_publisher(_Str, "/vision/fruit_score", 10)
@@ -246,16 +286,15 @@ class VisionNode:
 
         # Detection mode — "full" (approach) or "reacquire" (lightweight).
         # Main node publishes to /vision/mode to switch modes on the fly.
-        from std_msgs.msg import String as _String
         def _mode_cb(msg):
             mode = msg.data.strip()
             if mode in ("full", "reacquire", "paused"):
                 self.detection_mode = mode
-        self.node.create_subscription(_String, "/vision/mode", _mode_cb, 10)
+        self.node.create_subscription(StdString, "/vision/mode", _mode_cb, 10)
         # Report the effective detection state back to the motion node. Used for a
         # deterministic GPU handoff: we publish "paused" only after in-flight YOLO
         # inference has drained, so cuRobo can plan without a fixed guess delay.
-        self._mode_state_pub = self.node.create_publisher(_String, "/vision/mode_state", 10)
+        self._mode_state_pub = self.node.create_publisher(StdString, "/vision/mode_state", 10)
 
         # Runtime visualization overlays. Kept separate from /vision/mode so
         # debugging UI does not change detection behavior.
@@ -281,7 +320,7 @@ class VisionNode:
                 if self.visualizer is not None:
                     self.visualizer.show_gap_debug = False
                 self.node.get_logger().info("[vision] branch-gap debug overlay OFF")
-        self.node.create_subscription(_String, "/vision/overlay_command", _overlay_cb, 10)
+        self.node.create_subscription(StdString, "/vision/overlay_command", _overlay_cb, 10)
 
         self.node.create_timer(5.0, self.tracker.cleanup_old_fruit_ids)
 
@@ -292,12 +331,7 @@ class VisionNode:
             cmd = msg.data.strip()
             if cmd == "refresh":
                 self.node.get_logger().info("Camera refresh requested — restarting process...")
-                self.exit_signal = True
-                self._refresh_requested = True
-                # Shut down executor from a separate thread — calling shutdown()
-                # from inside a callback that runs on this executor would deadlock.
-                _exec = self.executor
-                Thread(target=_exec.shutdown, daemon=True).start()
+                self._request_vision_restart("camera refresh")
             elif cmd in ("preset lab", "preset outdoor"):
                 preset = cmd.split()[1]
                 if self._zed is None:
@@ -320,16 +354,48 @@ class VisionNode:
                     values[key.strip().lower()] = value.strip()
                 try:
                     auto = values.get("auto", "0").lower() in ("1", "true", "yes", "on")
+                    hdr = values.get("hdr", str(int(self._camera_hdr_enabled))).lower() in (
+                        "1", "true", "yes", "on")
                     exposure = int(values.get("exposure", "8"))
                     gain = int(values.get("gain", "0"))
                 except ValueError:
                     self.node.get_logger().warn(f"Camera settings ignored: bad command '{cmd}'")
                     return
+                self._camera_hdr_enabled = bool(hdr)
+                self.args.hdr = int(hdr)
                 apply_zed_one_manual_exposure(self._zed, auto, exposure, gain)
+                hdr_ok = apply_zed_one_hdr(self._zed, hdr)
+                if not hdr_ok:
+                    self.node.get_logger().warn(
+                        "Camera HDR runtime toggle may require Refresh Camera to take effect.")
                 self.node.get_logger().info(
-                    f"Camera settings applied: auto={int(auto)} exposure={exposure} gain={gain}")
+                    f"Camera settings applied: auto={int(auto)} hdr={int(hdr)} "
+                    f"exposure={exposure} gain={gain}")
+                self._publish_camera_status()
+            elif cmd.startswith("model "):
+                values = {}
+                for token in cmd.split()[1:]:
+                    if "=" not in token:
+                        continue
+                    key, value = token.split("=", 1)
+                    values[key.strip().lower()] = value.strip()
+                model_path = values.get("path", "")
+                if not model_path:
+                    self.node.get_logger().warn(f"Camera model ignored: bad command '{cmd}'")
+                    return
+                path = Path(model_path).expanduser()
+                allowed = {".engine", ".pt", ".onnx"}
+                if not path.exists() or path.suffix.lower() not in allowed:
+                    self.node.get_logger().warn(
+                        f"Camera model ignored: not a valid model file: {path}")
+                    return
+                self.args.weights = str(path)
+                argv = self._argv_with_option(sys.argv, "--weights", str(path))
+                argv = self._argv_with_option(argv, "--hdr", str(int(self._camera_hdr_enabled)))
+                self.node.get_logger().info(
+                    f"Camera model change requested: {path.name}; restarting vision.")
+                self._request_vision_restart(f"model change to {path.name}", argv=argv)
 
-        from std_msgs.msg import String as StdString
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
 
         # TF listener
@@ -968,10 +1034,12 @@ class VisionNode:
                 zed.close()
             rclpy.shutdown()
             if getattr(self, '_refresh_requested', False):
-                import os, sys
-                print("[Vision] Restarting process for camera refresh...")
+                import os
+                restart_argv = getattr(self, "_refresh_argv", None) or sys.argv
+                reason = getattr(self, "_refresh_reason", "camera refresh")
+                print(f"[Vision] Restarting process for {reason}...")
                 sleep(4.0)  # let ZED/Argus driver release fully before exec
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                os.execv(sys.executable, [sys.executable] + restart_argv)
 
     def _init_zed_and_yolo(self):
         """Initialize ZED camera then start YOLO thread. Returns zed or None on failure.
@@ -990,7 +1058,7 @@ class VisionNode:
             init_params.camera_fps = 15
             init_params.coordinate_units = sl.UNIT.METER
             init_params.sdk_verbose = 1
-            init_params.enable_hdr = True  # HDR at QHDPLUS caps hardware to ~6fps
+            init_params.enable_hdr = bool(self._camera_hdr_enabled)
 
             # Retry loop — daemon may need time to settle after restart
             for attempt in range(1, 11):
@@ -1004,6 +1072,15 @@ class VisionNode:
                 return None
             print("ZED X One Mono initialized")
             self._zed = zed
+            self._camera_type = "ZED X One Mono"
+            self._camera_resolution = "QHDPLUS"
+            self._camera_fps = "15 requested"
+            if use_lidar:
+                self._camera_mode = "mono RGB + Livox depth"
+            elif use_zed_mini:
+                self._camera_mode = "mono RGB + ZED X Mini depth"
+            else:
+                self._camera_mode = "mono RGB"
             apply_zed_camera_settings(zed)
 
             if use_zed_mini:
@@ -1035,6 +1112,9 @@ class VisionNode:
                 apply_zed_mini_settings(zed_mini)
                 print("ZED X Mini initialized")
                 self._zed_mini = zed_mini
+                self._depth_camera_text = f"ZED X Mini HD1080 @ {ZEDMINI_DEPTH_FPS}fps"
+            else:
+                self._depth_camera_text = "Livox" if use_lidar else "-"
 
         else:
             # ZED stereo — standard Camera API
@@ -1056,6 +1136,12 @@ class VisionNode:
                 return None
             print("Camera Initialized")
             self._zed = zed
+            self._camera_type = "ZED stereo"
+            self._camera_resolution = "HD1080"
+            self._camera_fps = "camera default"
+            self._camera_mode = "stereo RGB + ZED depth"
+            self._camera_hdr_enabled = False
+            self._depth_camera_text = "ZED stereo depth"
             apply_zed_stereo_settings(zed)
             zed.enable_positional_tracking(sl.PositionalTrackingParameters())
             obj_param = sl.ObjectDetectionParameters()
@@ -1071,15 +1157,34 @@ class VisionNode:
             conf_thres=self.args.conf_thres,
         )
         Thread(target=self.yolo_thread.run, daemon=True).start()
+        self._publish_camera_status()
         return zed
+
+    def _publish_camera_status(self) -> None:
+        pub = getattr(self, "_camera_status_pub", None)
+        if pub is None:
+            return
+        model_path = str(getattr(self.args, "weights", ""))
+        model_name = Path(model_path).name if model_path else "-"
+        status = (
+            f"Camera: {self._camera_type}\n"
+            f"Resolution: {self._camera_resolution}  FPS: {self._camera_fps}\n"
+            f"Mode: {self._camera_mode}\n"
+            f"HDR: {'ON' if self._camera_hdr_enabled else 'OFF'}\n"
+            f"Depth: {self._depth_camera_text}\n"
+            f"Model: {model_name}\n"
+            f"Path: {model_path}"
+        )
+        msg = StdString()
+        msg.data = status
+        pub.publish(msg)
 
     def _publish_mode_state(self, state: str) -> None:
         """Report the effective detection state to the motion node (GPU handoff ack)."""
         pub = getattr(self, "_mode_state_pub", None)
         if pub is None:
             return
-        from std_msgs.msg import String as _String
-        msg = _String()
+        msg = StdString()
         msg.data = state
         pub.publish(msg)
 

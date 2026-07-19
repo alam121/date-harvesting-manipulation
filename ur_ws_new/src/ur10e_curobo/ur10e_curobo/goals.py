@@ -1,6 +1,7 @@
 # ruff: noqa
 import time, math, torch
 import threading
+import copy
 import numpy as np
 from geometry_msgs.msg import Pose as ROSPose, PoseStamped, PointStamped
 from curobo.types.math import Pose
@@ -74,13 +75,13 @@ class ThreadSafeGoalList:
         """Return goal at index without removing it, or None if out of range."""
         with self._lock:
             if index < len(self._goals):
-                return list(self._goals[index])
+                return copy.deepcopy(self._goals[index])
             return None
 
     def snapshot(self):
-        """Return a shallow copy of the current goals."""
+        """Return a copy of the current goals, preserving non-pose queue items."""
         with self._lock:
-            return [list(g) for g in self._goals]
+            return copy.deepcopy(self._goals)
 
     def sort(self, key=None, reverse=False):
         """Sort goals in place with optional key function."""

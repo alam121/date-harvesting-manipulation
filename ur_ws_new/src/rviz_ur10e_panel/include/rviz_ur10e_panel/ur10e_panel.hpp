@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -152,6 +153,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_scale_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr calib_check_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr config_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr camera_status_sub_;
   rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     controller_state_sub_;
@@ -182,6 +184,7 @@ private:
   std::string home_joints_str_;
   std::string calib_check_result_;
   std::string robot_config_text_;
+  std::string camera_status_text_;
   bool plan_waiting_confirm_ = false;
   bool debug_plan_preview_ = true;
   bool reachability_cloud_enabled_ = true;
@@ -229,6 +232,8 @@ private:
   QCheckBox * debug_preview_cb_;
   QCheckBox * reachability_cloud_cb_;
   QCheckBox * lidar_scan_preview_cb_;
+  QComboBox * camera_model_combo_;
+  QLabel * camera_status_label_;
   QPushButton * zone_overlay_btn_;
   QPushButton * plan_confirm_btn_;
   QPushButton * plan_cancel_btn_;

@@ -7,7 +7,9 @@
 #include <QTabWidget>
 #include <QFont>
 #include <QApplication>
+#include <QComboBox>
 #include <QDir>
+#include <QFileInfo>
 #include <QMessageBox>
 
 #include <algorithm>
@@ -591,27 +593,32 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto_exposure_cb->setToolTip("When checked, the ZED controls exposure/gain automatically");
   camera_layout->addWidget(auto_exposure_cb, 2, 0, 1, 2);
 
+  auto * hdr_cb = new QCheckBox("HDR");
+  hdr_cb->setChecked(true);
+  hdr_cb->setToolTip("Toggle ZED HDR. Some cameras apply this only after camera refresh.");
+  camera_layout->addWidget(hdr_cb, 3, 0, 1, 2);
+
   auto * exposure_label = new QLabel("Exposure");
   exposure_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-  camera_layout->addWidget(exposure_label, 3, 0);
+  camera_layout->addWidget(exposure_label, 4, 0);
 
   auto * exposure_spin = new QSpinBox();
   exposure_spin->setRange(0, 100);
   exposure_spin->setValue(8);
   exposure_spin->setEnabled(false);
   exposure_spin->setToolTip("Manual exposure, 0-100. Try 5-12 outdoors.");
-  camera_layout->addWidget(exposure_spin, 3, 1);
+  camera_layout->addWidget(exposure_spin, 4, 1);
 
   auto * gain_label = new QLabel("Gain");
   gain_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-  camera_layout->addWidget(gain_label, 4, 0);
+  camera_layout->addWidget(gain_label, 5, 0);
 
   auto * gain_spin = new QSpinBox();
   gain_spin->setRange(0, 100);
   gain_spin->setValue(0);
   gain_spin->setEnabled(false);
   gain_spin->setToolTip("Manual gain, 0-100. Keep low outdoors to avoid noise.");
-  camera_layout->addWidget(gain_spin, 4, 1);
+  camera_layout->addWidget(gain_spin, 5, 1);
 
   connect(auto_exposure_cb, &QCheckBox::toggled, this,
     [exposure_spin, gain_spin](bool checked) {
@@ -624,42 +631,84 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "background-color: #00897b; color: white; font-weight: bold;");
   apply_camera_settings_btn->setToolTip("Apply the exposure controls to the live ZED camera");
   connect(apply_camera_settings_btn, &QPushButton::clicked, this,
-    [this, auto_exposure_cb, exposure_spin, gain_spin]() {
+    [this, auto_exposure_cb, hdr_cb, exposure_spin, gain_spin]() {
       std::ostringstream cmd;
       cmd << "camera_settings auto=" << (auto_exposure_cb->isChecked() ? 1 : 0)
+          << " hdr=" << (hdr_cb->isChecked() ? 1 : 0)
           << " exposure=" << exposure_spin->value()
           << " gain=" << gain_spin->value();
       publishCmd(cmd.str());
     });
-  camera_layout->addWidget(apply_camera_settings_btn, 5, 0, 1, 2);
+  camera_layout->addWidget(apply_camera_settings_btn, 6, 0, 1, 2);
+
+  auto * model_label = new QLabel("YOLO Model");
+  model_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  camera_layout->addWidget(model_label, 7, 0);
+
+  camera_model_combo_ = new QComboBox();
+  camera_model_combo_->setToolTip("Models found in ur_ws_new/src/zed_date_detector/models");
+  const QDir model_dir("/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models");
+  const QStringList filters = {"*.engine", "*.pt", "*.onnx"};
+  const auto files = model_dir.entryInfoList(filters, QDir::Files, QDir::Name);
+  for (const QFileInfo & file : files) {
+    camera_model_combo_->addItem(file.fileName(), file.absoluteFilePath());
+  }
+  if (camera_model_combo_->count() == 0) {
+    camera_model_combo_->addItem("No models found", "");
+    camera_model_combo_->setEnabled(false);
+  }
+  camera_layout->addWidget(camera_model_combo_, 7, 1);
+
+  auto * apply_model_btn = new QPushButton("Apply Model");
+  apply_model_btn->setStyleSheet("background-color: #5e35b1; color: white; font-weight: bold;");
+  apply_model_btn->setToolTip("Restart vision with the selected model from the models folder");
+  connect(apply_model_btn, &QPushButton::clicked, this,
+    [this]() {
+      if (!camera_model_combo_ || camera_model_combo_->count() == 0) {
+        return;
+      }
+      const QString model_path = camera_model_combo_->currentData().toString();
+      if (model_path.isEmpty()) {
+        return;
+      }
+      publishCmd(std::string("camera_model path=") + model_path.toStdString());
+    });
+  camera_layout->addWidget(apply_model_btn, 8, 0, 1, 2);
 
   auto * snapshot_btn = new QPushButton("Save Image");
   snapshot_btn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;");
   snapshot_btn->setToolTip("Save the latest raw /vision/raw frame to ~/camera_recordings");
   connect(snapshot_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraSnapshot);
-  camera_layout->addWidget(snapshot_btn, 6, 0, 1, 2);
+  camera_layout->addWidget(snapshot_btn, 9, 0, 1, 2);
 
   auto * video_start_btn = new QPushButton("Start Video");
   video_start_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
   video_start_btn->setToolTip("Start recording raw /vision/raw to ~/camera_recordings");
   connect(video_start_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStart);
-  camera_layout->addWidget(video_start_btn, 7, 0);
+  camera_layout->addWidget(video_start_btn, 10, 0);
 
   auto * video_stop_btn = new QPushButton("Stop Video");
   video_stop_btn->setStyleSheet("background-color: #c62828; color: white; font-weight: bold;");
   video_stop_btn->setToolTip("Stop the current camera video recording");
   connect(video_stop_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStop);
-  camera_layout->addWidget(video_stop_btn, 7, 1);
+  camera_layout->addWidget(video_stop_btn, 10, 1);
 
   auto * camera_refresh_btn = new QPushButton("Refresh Camera");
   camera_refresh_btn->setStyleSheet("background-color: #607d8b; color: white;");
   connect(camera_refresh_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshCamera);
-  camera_layout->addWidget(camera_refresh_btn, 8, 0, 1, 2);
+  camera_layout->addWidget(camera_refresh_btn, 11, 0, 1, 2);
+
+  camera_status_label_ = new QLabel("Camera: waiting for /camera_status");
+  camera_status_label_->setWordWrap(true);
+  camera_status_label_->setStyleSheet(
+    "font-size: 9pt; color: #263238; background: #eceff1; padding: 6px; "
+    "border-radius: 4px;");
+  camera_layout->addWidget(camera_status_label_, 12, 0, 1, 2);
 
   auto * camera_note = new QLabel("Saved to ~/camera_recordings");
   camera_note->setStyleSheet("font-size: 9pt; color: #455a64; padding: 3px;");
   camera_note->setAlignment(Qt::AlignCenter);
-  camera_layout->addWidget(camera_note, 9, 0, 1, 2);
+  camera_layout->addWidget(camera_note, 13, 0, 1, 2);
 
   camera_tab_layout->addWidget(camera_group);
   camera_tab_layout->addStretch(1);
@@ -1050,6 +1099,13 @@ void UR10ePanel::setupRos()
     [this](std_msgs::msg::Bool::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(data_mutex_);
       robot_running_ = msg->data;
+    });
+
+  camera_status_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/camera_status", 10,
+    [this](std_msgs::msg::String::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      camera_status_text_ = msg->data;
     });
 
   goal_info_sub_ = node_->create_subscription<std_msgs::msg::String>(
@@ -1969,6 +2025,9 @@ void UR10ePanel::updateDisplay()
 
   if (!robot_config_text_.empty()) {
     config_label_->setText(QString::fromStdString(robot_config_text_));
+  }
+  if (camera_status_label_ && !camera_status_text_.empty()) {
+    camera_status_label_->setText(QString::fromStdString(camera_status_text_));
   }
 
   // Motion phase badge

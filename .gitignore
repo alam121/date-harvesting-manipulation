@@ -24,6 +24,7 @@ ur_ws_new/src/zed_date_detector/models/yolov8m-seg.pt
 
 # Videos / data / databases
 *.mp4
+*.svo2
 *.bag
 *.db
 

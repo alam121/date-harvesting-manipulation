@@ -90,10 +90,27 @@ def apply_zed_one_manual_exposure(zed, auto_exposure=False, exposure=8, gain=0, 
         _print_zed_one_settings(zed)
 
 
+def apply_zed_one_hdr(zed, enabled=True, verify=True):
+    """Apply runtime HDR when supported by the active ZED camera."""
+    enabled_value = 1 if enabled else 0
+    ok = False
+    try:
+        zed.set_camera_settings(sl.VIDEO_SETTINGS.HDR, enabled_value)
+        ok = True
+    except Exception:
+        pass
+
+    print(f"[ZedOne] HDR requested: {enabled_value} runtime_ok={int(ok)}")
+    if verify:
+        _print_zed_one_settings(zed)
+    return ok
+
+
 def apply_zed_one_settings(zed, preset_name="lab"):
     """Apply ZED X One Mono settings optimised for HDR date-fruit detection."""
-    # HDR is enabled via InitParametersOne.enable_hdr = True before open(); no runtime call needed.
-    print("[ZedOne] HDR active (set via InitParametersOne.enable_hdr)")
+    # HDR is controlled via InitParametersOne.enable_hdr before open, and may
+    # also be toggled at runtime on SDK/camera combinations that support it.
+    print("[ZedOne] applying colour/exposure settings")
 
     #zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, 7)   # 0-8
     zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, 5)     # 0-8

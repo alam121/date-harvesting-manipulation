@@ -90,31 +90,44 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-Launch real robot with main control, vision, teleop, and GUI:
+Open the launch dialog:
 
 ```bash
-launch_ur10e main vision teleop gui
+launch_ur10e_gui
 ```
+
+Or launch the normal outdoor/harvest stack directly:
+
+```bash
+launch_harvest
+```
+
+This is the same as `launch_ur10e harvest`, which expands to `launch_ur10e main vision zed_mini`.
 
 Launch fake hardware for testing:
 
 ```bash
-launch_ur10e fake main vision teleop gui
+launch_ur10e fake harvest
 ```
 
 ## Common Launch Options
 
 ```bash
-launch_ur10e [fake] [main] [vision] [teleop] [gui]
+launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|lidar] [teleop] [gui]
 ```
 
 Options:
 
 | Option | Description |
 | --- | --- |
+| `launch_ur10e_gui` | Opens a dialog for real/fake robot, camera/depth, and optional panes. |
+| `harvest` | Preset for `main vision zed_mini`. |
+| `field` | Alias for `harvest`. |
 | `fake` | Use fake/simulated hardware. |
 | `main` | Start the main `ur10e_curobo` control node. |
 | `vision` | Start the ZED/YOLO vision node. |
+| `zed_mini` | Use ZED X Mini depth with ZED X One detection. |
+| `lidar` | Use Livox LiDAR depth with ZED X One detection. |
 | `teleop` | Start joystick teleop. |
 | `gui` | Start the desktop GUI panel. |
 

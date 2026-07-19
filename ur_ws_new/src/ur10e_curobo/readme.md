@@ -14,14 +14,20 @@ OPERATOR_GUIDE.md
 ## Quick Start
 
 ```bash
-# Launch with real robot (main + vision)
-launch_ur10e main vision
+# Open a dialog and choose robot/camera/depth options
+launch_ur10e_gui
+
+# Launch the normal outdoor/harvest stack
+launch_harvest
+
+# Same command using the explicit preset
+launch_ur10e harvest
 
 # Launch with fake/simulated hardware for testing
-launch_ur10e fake main vision
+launch_ur10e fake harvest
 
 # Launch all nodes
-launch_ur10e main vision teleop gui
+launch_ur10e harvest teleop gui
 ```
 
 ## Command Setup (One-Time Per Machine)
@@ -55,40 +61,46 @@ Note: Use `--symlink-install` so Python changes take effect immediately without 
 ## Launch Options
 
 The `launch_ur10e` command opens a terminator window with split panes for each component.
+Use `launch_ur10e_gui` when you want a dialog for real/fake robot, camera/depth,
+and optional panes.
 
 ### Usage
 
 ```bash
-launch_ur10e [fake] [main] [vision] [teleop] [gui]
+launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|lidar] [teleop] [gui]
 ```
 
 ### Options
 
 | Option   | Description                                    |
 |----------|------------------------------------------------|
+| `harvest` | Preset for main + vision using ZED Mini depth |
+| `field` | Alias for `harvest` |
 | `fake`   | Use simulated hardware (no real robot needed)  |
 | `main`   | Main control node with cuRobo motion planning  |
 | `vision` | ZED camera + YOLO detection node               |
+| `zed_mini` | Use ZED X Mini depth with ZED X One detection |
+| `lidar` | Use Livox LiDAR depth with ZED X One detection |
 | `teleop` | Joystick teleop control                        |
 | `gui`    | Desktop GUI control panel                      |
 
 ### Examples
 
 ```bash
-# Real robot + main control
-launch_ur10e main
+# Normal outdoor stack
+launch_harvest
 
-# Real robot + main + vision
-launch_ur10e main vision
+# Same thing, explicit preset
+launch_ur10e harvest
 
-# Real robot + all nodes
-launch_ur10e main vision teleop gui
+# Outdoor stack + teleop + GUI
+launch_ur10e harvest teleop gui
 
 # Fake hardware for testing (no robot needed)
-launch_ur10e fake main
+launch_ur10e fake harvest
 
-# Fake hardware + main + vision
-launch_ur10e fake main vision
+# Real robot + main + vision with ZED stereo instead of ZED Mini
+launch_ur10e main vision
 ```
 
 ### What Happens
