@@ -48,19 +48,25 @@ def load_robot_profile() -> str:
             continue
         if any(isinstance(target, ast.Name) and target.id == "ROBOT_PROFILE"
                for target in node.targets):
-            profile = ast.literal_eval(node.value)
+            try:
+                profile = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                profile = os.environ.get("UR10E_ROBOT_PROFILE", "old")
             if profile not in ("new", "old"):
                 raise ValueError(f"ROBOT_PROFILE must be 'new' or 'old', got {profile!r}")
             return profile
     raise RuntimeError(f"ROBOT_PROFILE not found in {ROBOT_CONFIG_SOURCE}")
 
 
-ROBOT_PROFILE = load_robot_profile()
-KINEMATICS_FILE = (
-    Path(WS) / "install" / "ur_description" / "share" / "ur_description"
-    / "config" / "ur10e"
-    / ("default_kinematics.yaml" if ROBOT_PROFILE == "new" else "old_kinematics.yaml")
-)
+DEFAULT_ROBOT_PROFILE = load_robot_profile()
+
+
+def kinematics_file_for(robot_profile: str) -> Path:
+    return (
+        Path(WS) / "install" / "ur_description" / "share" / "ur_description"
+        / "config" / "ur10e"
+        / ("default_kinematics.yaml" if robot_profile == "new" else "old_kinematics.yaml")
+    )
 
 RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
 
@@ -72,7 +78,15 @@ def get_commands(
     use_vision=False,
     hand_eye_target="charuco",
     hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    gripper_profile="old",
 ):
+    robot_profile = robot_profile or DEFAULT_ROBOT_PROFILE
+    kinematics_file = kinematics_file_for(robot_profile)
+    profile_source = (
+        f"{SOURCE} && export UR10E_ROBOT_PROFILE={robot_profile} "
+        f"&& export UR10E_GRIPPER_PROFILE={gripper_profile}"
+    )
     hw = "true" if fake_hardware else "false"
     vision = "true" if use_vision else "false"
     # Skip unet.sh for fake hardware since no real robot
@@ -90,12 +104,12 @@ def get_commands(
             f'{ur_prefix}{SOURCE} && ros2 launch ur_bringup ur_control.launch.py '
             f'ur_type:=ur10e robot_ip:={ROBOT_IP} reverse_ip:={ROBOT_PC_IP} '
             f'script_sender_port:={SCRIPT_SENDER_PORT} '
-            f'robot_profile:={ROBOT_PROFILE} '
-            f'kinematics_params_file:={KINEMATICS_FILE} '
+            f'robot_profile:={robot_profile} '
+            f'kinematics_params_file:={kinematics_file} '
             f'use_fake_hardware:={hw} launch_rviz:={launch_rviz}'
         ),
         "main": (
-            f'sleep 15 && {SOURCE} && ros2 run ur10e_curobo main --ros-args '
+            f'sleep 15 && {profile_source} && ros2 run ur10e_curobo main --ros-args '
             f'-p planner.use_fake_hardware:={hw} '
             f'-p perception.enabled:={vision}'
         ),
@@ -103,9 +117,9 @@ def get_commands(
         "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
         "rqt": f'sleep 8 && {SOURCE} && rqt --force-discover --standalone rqt_ur10e_panel',
-        "calibrate": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo calibrate',
+        "calibrate": f'sleep 6 && {profile_source} && ros2 run ur10e_curobo calibrate',
         "hand_eye": (
-            f'sleep 4 && {SOURCE} && '
+            f'sleep 4 && {profile_source} && '
             f'ros2 run ur10e_curobo hand_eye '
             f'--target {hand_eye_target} --resolution {hand_eye_resolution}'
         ),
@@ -148,10 +162,12 @@ def build_layout(
     use_vision=False,
     hand_eye_target="charuco",
     hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    gripper_profile="old",
 ):
     COMMANDS = get_commands(
         fake_hardware, use_panel, use_lidar, use_zed_mini, use_vision,
-        hand_eye_target, hand_eye_resolution,
+        hand_eye_target, hand_eye_resolution, robot_profile, gripper_profile,
     )
     """Build the dynamic layout section."""
     all_nodes = ["ur"] + nodes
@@ -354,6 +370,8 @@ def update_config(
     use_vision=False,
     hand_eye_target="charuco",
     hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    gripper_profile="old",
 ):
     """Update terminator config with dynamic layout."""
     with open(CONFIG_PATH, 'r') as f:
@@ -379,7 +397,7 @@ def update_config(
     # Build new layout
     new_layout = build_layout(
         nodes, fake_hardware, use_panel, use_lidar, use_zed_mini, use_vision,
-        hand_eye_target, hand_eye_resolution,
+        hand_eye_target, hand_eye_resolution, robot_profile, gripper_profile,
     )
 
     # Find [plugins] and insert before it
@@ -398,6 +416,16 @@ def main():
 
     # Extract modifier flags
     fake_hardware = "fake" in args
+    robot_profile = DEFAULT_ROBOT_PROFILE
+    if any(a in args for a in ("robot_new", "new_robot")):
+        robot_profile = "new"
+    elif any(a in args for a in ("robot_old", "old_robot")):
+        robot_profile = "old"
+    gripper_profile = "old"
+    if any(a in args for a in ("gripper_new", "new_gripper")):
+        gripper_profile = "new"
+    elif any(a in args for a in ("gripper_old", "old_gripper")):
+        gripper_profile = "old"
     use_lidar     = "lidar" in args
     use_zed_mini  = "zed_mini" in args
     hand_eye_target = "chessboard" if "chessboard" in args else "charuco"
@@ -407,6 +435,8 @@ def main():
         if a not in (
             "fake", "lidar", "zed_mini", "charuco", "aruco", "chessboard",
             "qhdplus", "qhd+", "4k",
+            "robot_old", "robot_new", "old_robot", "new_robot",
+            "gripper_old", "gripper_new", "old_gripper", "new_gripper",
         )
     ]
 
@@ -414,7 +444,7 @@ def main():
     nodes = [arg for arg in args if arg in valid and arg not in ("bringup", "ur")]
 
     if not nodes and not bringup_only:
-        print("Usage: launch_ur10e [fake] [harvest|field] [lidar|zed_mini] [charuco|chessboard] [qhdplus|4k] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye]")
+        print("Usage: launch_ur10e [fake] [robot_old|robot_new] [gripper_old|gripper_new] [harvest|field] [lidar|zed_mini] [charuco|chessboard] [qhdplus|4k] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye]")
         print()
         print("Presets:")
         print("  harvest  - Real robot + main + vision with ZED Mini depth")
@@ -422,6 +452,10 @@ def main():
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
+        print("  robot_old - Use old UR10e mounting/kinematics profile")
+        print("  robot_new - Use new UR10e mounting/kinematics profile")
+        print("  gripper_old - Use old calibrated gripper open/close postures")
+        print("  gripper_new - Use DG-3F-M native paired-motor open/close postures")
         print("  lidar     - Use Livox Mid-70 LiDAR for depth (adds LiDAR pane, passes --use_lidar to vision)")
         print("  zed_mini  - Use ZED X Mini for depth + ZED One Mono for detection (passes --use_zed_mini to vision)")
         print("  charuco   - Use ChArUco target for hand-eye calibration (default)")
@@ -447,6 +481,7 @@ def main():
         print("  launch_harvest                       # Short wrapper for the harvest preset")
         print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
         print("  launch_ur10e fake main               # Fake hardware + main")
+        print("  launch_ur10e robot_new gripper_new fake main # New robot/gripper profiles in fake mode")
         print("  launch_ur10e main teleop             # Real robot + main + teleop")
         print("  launch_ur10e calibrate               # Grasp force calibration only")
         print("  launch_ur10e hand_eye                # Hand-eye calibration")
@@ -478,7 +513,7 @@ def main():
     panel_note = " (RViz with control panel)" if use_panel else ""
     print(
         f"Launching {len(ordered) + 1} panes "
-        f"(robot={ROBOT_PROFILE}, {hw_mode}{depth_note}): "
+        f"(robot={robot_profile}, gripper={gripper_profile}, {hw_mode}{depth_note}): "
         f"ur_bringup + {', '.join(ordered)}{panel_note}")
 
     # Update config with dynamic layout
@@ -491,6 +526,8 @@ def main():
         use_vision,
         hand_eye_target,
         hand_eye_resolution,
+        robot_profile,
+        gripper_profile,
     )
 
     # Launch terminator with the layout

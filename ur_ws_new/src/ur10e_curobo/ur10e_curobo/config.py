@@ -26,8 +26,9 @@ LOW_Z_THRESH = 0.94
 LATERAL_THRESH = 0.03
 
 # Change these when moving the software between robots / locations.
-ROBOT_PROFILE = "old"  # "new" or "old"  — robot mounting / kinematics convention
-ENVIRONMENT   = "outdoor"  # "lab" or "outdoor" — workspace layout (home/dropoff positions)
+# The launcher can override these with UR10E_ROBOT_PROFILE / UR10E_ENVIRONMENT.
+ROBOT_PROFILE = os.environ.get("UR10E_ROBOT_PROFILE", "old").strip().lower()
+ENVIRONMENT   = os.environ.get("UR10E_ENVIRONMENT", "outdoor").strip().lower()
 
 # Joint configs depend on BOTH the robot (mounting/kinematics) and the environment (where
 # the tree and dropoff bin are), so they are defined per (robot, environment).
@@ -642,7 +643,11 @@ class Gripper:
     min_fingers_for_stop: int = 2
     closing_steps: int = 10
     step_delay_s: float = 0.05
+    opening_steps: int = 8
+    opening_step_delay_s: float = 0.08
     open_settle_s: float = 0.15
+    open_hold_repeats: int = 8
+    open_hold_interval_s: float = 0.10
 
 @dataclass
 class Grasp:

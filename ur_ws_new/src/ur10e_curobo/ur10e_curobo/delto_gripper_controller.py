@@ -1,6 +1,14 @@
 # delto_gripper_controller.py
 import time
+import math
+import os
 from std_msgs.msg import Float32MultiArray
+from .gripper_profiles import (
+    FINGER_JOINT_INDICES,
+    make_closed_position,
+    make_open_position,
+    new_gripper_open_extra_deg,
+)
 
 class DeltoGripperController:
     def __init__(self, node,
@@ -30,31 +38,26 @@ class DeltoGripperController:
         # FSM state
         self.state = 'IDLE'  # IDLE | OPENING | CLOSING
 
-        # ----------------------------------------------------
-        # SUCTION MODE → USE VERSION A joint mapping
-        # NON-SUCTION MODE → USE VERSION B joint mapping
-        # ----------------------------------------------------
-        if self.suction:
-            self.finger_joint_idx = {0: 2, 1: 7, 2: 10}  # Version A
-            self.node.get_logger().debug("Delto Gripper: SUCTION MODE (center joint=7)")
-        else:
-            self.finger_joint_idx = {0: 2, 1: 6, 2: 10}  # Version B
-            self.node.get_logger().debug("Delto Gripper: NON-SUCTION MODE (center joint=6)")
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        if self.gripper_profile not in ("old", "new"):
+            self.node.get_logger().warn(
+                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using old"
+            )
+            self.gripper_profile = "old"
 
-        # Positions (shared)
-        self.open_position = [
-            -0.0942, -0.1500, 2.1260, -0.5062,
-            -1.6318, 0.1309, 1.6953, -0.4887,
-            0.3333, 0.2234, 2.1260, -0.4311
-        ]
+        # DG-3F-M paired curling motors:
+        # F1=M3/M4, F2=M7/M8, F3=M11/M12.
+        self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
+        self.finger_joint_indices = FINGER_JOINT_INDICES
 
-        self.closed_position = self.open_position.copy()
-        # Fingers
-        self.closed_position[self.finger_joint_idx[0]] = 2.5673  # left finger
-        self.closed_position[self.finger_joint_idx[1]] = 2.3753  # center finger
-        self.closed_position[self.finger_joint_idx[2]] = 2.5673  # right finger
+        self.open_position = make_open_position(self.gripper_profile)
+        self.closed_position = make_closed_position()
 
         self.current_position = self.open_position.copy()
+        self.node.get_logger().info(
+            f"Delto gripper profile: {self.gripper_profile} "
+            f"(new open extra={new_gripper_open_extra_deg():.1f}deg)"
+        )
 
         # Freeze memory
         self.first_contact_index = None
@@ -87,6 +90,43 @@ class DeltoGripperController:
     # --------------------------------------------------------
     # Utility functions
     # --------------------------------------------------------
+    def publish_position(self, position):
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in position]
+        self.publisher.publish(msg)
+
+    def active_joint_degrees(self, position):
+        indices = [idx for joints in self.finger_joint_indices.values() for idx in joints]
+        return [round(math.degrees(float(position[idx])), 1) for idx in indices]
+
+    def move_to_position(self, target_position, steps=None, delay=None):
+        start_position = self.current_position.copy()
+        steps = max(1, int(steps if steps is not None else getattr(
+            self.node.cfg.gripper, "opening_steps", min(self.steps, 6))))
+        delay = float(delay if delay is not None else getattr(
+            self.node.cfg.gripper, "opening_step_delay_s", min(self.step_delay, 0.08)))
+
+        for step in range(1, steps + 1):
+            alpha = step / steps
+            self.current_position = [
+                (1.0 - alpha) * start_position[i] + alpha * target_position[i]
+                for i in range(len(target_position))
+            ]
+            self.publish_position(self.current_position)
+            if step < steps and delay > 0.0:
+                time.sleep(delay)
+
+    def hold_position(self, position, repeats=None, interval=None):
+        repeats = max(1, int(repeats if repeats is not None else getattr(
+            self.node.cfg.gripper, "open_hold_repeats", 8)))
+        interval = float(interval if interval is not None else getattr(
+            self.node.cfg.gripper, "open_hold_interval_s", 0.10))
+        self.current_position = position.copy()
+        for repeat in range(repeats):
+            self.publish_position(self.current_position)
+            if repeat < repeats - 1 and interval > 0.0:
+                time.sleep(interval)
+
     def set_state(self, new_state):
         if new_state != self.state:
             self.state = new_state
@@ -166,7 +206,7 @@ class DeltoGripperController:
             self.set_state('IDLE')
             return False
 
-        alpha = self.current_step / self.steps
+        alpha = (self.current_step + 1) / self.steps
 
         # --------------------------------------------------------
         # SUCTION MODE: center-first closing (Version A behavior)
@@ -185,12 +225,12 @@ class DeltoGripperController:
         for ch in fingers_to_move:
             if ch in self.frozen_fingers:
                 continue
-            j_idx = self.finger_joint_idx[ch]
             start = getattr(self, 'close_start_position', self.open_position)
-            self.current_position[j_idx] = (
-                (1 - alpha) * start[j_idx] +
-                alpha * self.closed_position[j_idx]
-            )
+            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+                self.current_position[j_idx] = (
+                    (1 - alpha) * start[j_idx] +
+                    alpha * self.closed_position[j_idx]
+                )
 
         msg = Float32MultiArray()
         msg.data = self.current_position
@@ -252,17 +292,14 @@ class DeltoGripperController:
     def open_gripper(self):
         self.set_state('OPENING')
         self.current_step = 0
-        self.current_position = self.open_position.copy()
+        self.move_to_position(self.open_position)
         self.close_start_position = self.open_position.copy()
-
-        msg = Float32MultiArray()
-        msg.data = self.open_position
-        self.publisher.publish(msg)
 
         # The command is non-blocking, but 150ms is sufficient for release and
         # baseline capture while avoiding a fixed 300ms delay in every cycle.
         time.sleep(float(getattr(
             self.node.cfg.gripper, "open_settle_s", 0.15)))
+        self.hold_position(self.open_position)
 
         # Capture baseline force when gripper is fully open
         self.baseline_force = self.force_data.copy()
@@ -272,6 +309,9 @@ class DeltoGripperController:
                 f"Gripper opened fully (baseline=[{self.baseline_force[0]:.2f}, "
                 f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
             )
+        self.node.get_logger().info(
+            f"Gripper OPEN command active_joint_deg={self.active_joint_degrees(self.open_position)}"
+        )
 
         # Debounce window after open
         self.ignore_contacts_until = time.time() + 0.25
@@ -289,21 +329,18 @@ class DeltoGripperController:
         # Compute partial open position
         position = self.open_position.copy()
         for ch in [0, 1, 2]:
-            j_idx = self.finger_joint_idx[ch]
-            position[j_idx] = (
-                (1 - alpha) * self.open_position[j_idx] +
-                alpha * self.closed_position[j_idx]
-            )
+            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+                position[j_idx] = (
+                    (1 - alpha) * self.open_position[j_idx] +
+                    alpha * self.closed_position[j_idx]
+                )
 
-        self.current_position = position
+        self.move_to_position(position)
         self.close_start_position = position.copy()
-
-        msg = Float32MultiArray()
-        msg.data = position
-        self.publisher.publish(msg)
 
         time.sleep(float(getattr(
             self.node.cfg.gripper, "open_settle_s", 0.15)))
+        self.hold_position(position)
         self.baseline_force = self.force_data.copy()
 
         if getattr(self.node.cfg.planner, "log_gripper_force_profile", False):
@@ -311,6 +348,9 @@ class DeltoGripperController:
                 f"Gripper opened to alpha={alpha:.2f} (baseline=[{self.baseline_force[0]:.2f}, "
                 f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
             )
+        self.node.get_logger().info(
+            f"Gripper OPEN alpha={alpha:.2f} command active_joint_deg={self.active_joint_degrees(position)}"
+        )
 
         self.ignore_contacts_until = time.time() + 0.25
         self.need_rearm = True

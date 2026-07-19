@@ -55,7 +55,8 @@ class DeltoROSDriver(Node):
 
         self.joint_state_feedback = JointTrajectoryPoint()
         self.vel = []
-        self.delto_client = delto_TCP.Communication()
+        self.is_dummy = bool(self.get_parameter('dummy').value)
+        self.delto_client = delto_TCP.Communication(dummy=self.is_dummy)
         self.stop_thread = False
         self.lock = threading.Lock()
         self.is_connected = False
@@ -63,9 +64,7 @@ class DeltoROSDriver(Node):
         # Too high frequency will cause blocking sub/pub
         self.publish_rate = 100
         print('publish late : '+str(self.publish_rate))
-        
-        
-        self.is_dummy = False  # bool(self.get_parameter('dummy').value)
+        self.get_logger().info(f"Delto driver dummy mode: {self.is_dummy}")
         self.is_connected = False
         # Action Server
         self.jcm_action_server = ActionServer(
@@ -190,6 +189,18 @@ class DeltoROSDriver(Node):
                                          self.get_parameter('port').value,
                                          self.get_parameter('slaveID').value)
         self.is_connected = is_connected
+        if is_connected:
+            try:
+                # DG-3F-M requires control-start before target register writes
+                # execute. Keep the public ROS topics unchanged for the rest of
+                # this application.
+                response = self.delto_client.start_control()
+                if hasattr(response, "isError") and response.isError():
+                    self.get_logger().error(f"DG-3F-M control mode start failed: {response}")
+                else:
+                    self.get_logger().info("DG-3F-M control mode started")
+            except Exception as e:
+                self.get_logger().warn(f"Could not start DG-3F-M control mode: {e}")
         
         return is_connected
         
@@ -391,12 +402,23 @@ class DeltoROSDriver(Node):
             self.get_logger().error("Connection lost")
             return
         
-        msg.data = [self._rad2deg(x) for x in msg.data]
-
-        self.target_joint_state = msg.data
-        # print("target_joint_state: ", self.target_joint_state)
+        target_deg = [self._rad2deg(x) for x in msg.data]
+        self.target_joint_state = target_deg
+        nonzero = [
+            f"m{i + 1}={v:.1f}deg"
+            for i, v in enumerate(target_deg)
+            if abs(v) > 0.01
+        ]
+        self.get_logger().info(
+            "DG-3F-M target_joint received: "
+            + (", ".join(nonzero) if nonzero else "all motors 0.0deg")
+        )
         try:
-            self.delto_client.set_position(self.target_joint_state)
+            response = self.delto_client.set_position(self.target_joint_state)
+            if hasattr(response, "isError") and response.isError():
+                self.get_logger().error(f"DG-3F-M target write failed: {response}")
+            else:
+                self.get_logger().info("DG-3F-M target write OK")
         except Exception as e:
             self.get_logger().error("Failed to set target joint state: {0}".format(e))
             self.is_connected = False
@@ -512,7 +534,10 @@ class DeltoROSDriver(Node):
         
         try:
             # Read motor currents (12 motors total)
-            raw_current = self.delto_client.client.read_input_registers(address=0x0E, count=12, slave=self.delto_client.slaveID).registers
+            raw_current = self.delto_client.client.read_input_registers(
+                address=self.delto_client.current_register,
+                count=12,
+                slave=self.delto_client.slaveID).registers
             
             # Extract only 4th (index 3), 8th (index 7), and 12th (index 11)
             selected_currents = [self.convert_to_signed(raw_current[i]) for i in [3, 7, 11]]

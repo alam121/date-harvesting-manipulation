@@ -17,13 +17,30 @@ class LaunchDialog(QtWidgets.QDialog):
         super().__init__()
         self.setWindowTitle("Launch UR10e")
         self.setMinimumWidth(560)
+        self.settings = QtCore.QSettings("DatePalm", "UR10eLauncher")
 
-        self.robot_group = QtWidgets.QButtonGroup(self)
         self.real_radio = QtWidgets.QRadioButton("Real robot")
         self.fake_radio = QtWidgets.QRadioButton("Fake hardware")
         self.real_radio.setChecked(True)
-        self.robot_group.addButton(self.real_radio)
-        self.robot_group.addButton(self.fake_radio)
+        self.hardware_group = QtWidgets.QButtonGroup(self)
+        self.hardware_group.addButton(self.real_radio)
+        self.hardware_group.addButton(self.fake_radio)
+
+        self.robot_profile_combo = QtWidgets.QComboBox()
+        self.robot_profile_combo.addItem("Old robot", "old")
+        self.robot_profile_combo.addItem("New robot", "new")
+        self._set_combo_data(
+            self.robot_profile_combo,
+            self.settings.value("robot_profile", "old"),
+        )
+
+        self.gripper_profile_combo = QtWidgets.QComboBox()
+        self.gripper_profile_combo.addItem("Old gripper", "old")
+        self.gripper_profile_combo.addItem("New DG-3F-M gripper", "new")
+        self._set_combo_data(
+            self.gripper_profile_combo,
+            self.settings.value("gripper_profile", "old"),
+        )
 
         self.main_cb = QtWidgets.QCheckBox("Main cuRobo control + RViz panel")
         self.vision_cb = QtWidgets.QCheckBox("Vision")
@@ -31,7 +48,6 @@ class LaunchDialog(QtWidgets.QDialog):
         self.gui_cb = QtWidgets.QCheckBox("Desktop GUI")
         self.calibrate_cb = QtWidgets.QCheckBox("Grasp force calibration")
         self.hand_eye_cb = QtWidgets.QCheckBox("Hand-eye calibration")
-
         self.main_cb.setChecked(True)
         self.vision_cb.setChecked(True)
 
@@ -59,7 +75,11 @@ class LaunchDialog(QtWidgets.QDialog):
         close_btn = QtWidgets.QPushButton("Close")
         start_btn.setDefault(True)
 
-        robot_box = self._group_box("Robot", self._vbox(self.real_radio, self.fake_radio))
+        hardware_box = self._group_box("Hardware", self._vbox(self.real_radio, self.fake_radio))
+        profile_layout = QtWidgets.QFormLayout()
+        profile_layout.addRow("Robot", self.robot_profile_combo)
+        profile_layout.addRow("Gripper", self.gripper_profile_combo)
+        profile_box = self._group_box("Profiles", profile_layout)
         node_box = self._group_box(
             "Nodes",
             self._vbox(
@@ -94,7 +114,8 @@ class LaunchDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(preset_row)
-        layout.addWidget(robot_box)
+        layout.addWidget(hardware_box)
+        layout.addWidget(profile_box)
         layout.addWidget(node_box)
         layout.addWidget(camera_box)
         layout.addWidget(hand_eye_box)
@@ -105,6 +126,8 @@ class LaunchDialog(QtWidgets.QDialog):
         for widget in (
             self.real_radio,
             self.fake_radio,
+            self.robot_profile_combo,
+            self.gripper_profile_combo,
             self.main_cb,
             self.vision_cb,
             self.teleop_cb,
@@ -123,6 +146,8 @@ class LaunchDialog(QtWidgets.QDialog):
         self.camera_combo.currentIndexChanged.connect(self._sync_camera_choice)
         self.vision_cb.toggled.connect(self._sync_vision_enabled)
         self.hand_eye_cb.toggled.connect(self._sync_hand_eye_enabled)
+        self.robot_profile_combo.currentIndexChanged.connect(self._remember_profiles)
+        self.gripper_profile_combo.currentIndexChanged.connect(self._remember_profiles)
         harvest_btn.clicked.connect(self.apply_harvest_preset)
         lab_btn.clicked.connect(self.apply_lab_preset)
         start_btn.clicked.connect(self.start_system)
@@ -138,6 +163,12 @@ class LaunchDialog(QtWidgets.QDialog):
         for widget in widgets:
             layout.addWidget(widget)
         return layout
+
+    @staticmethod
+    def _set_combo_data(combo, value):
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     @staticmethod
     def _group_box(title, layout):
@@ -188,11 +219,17 @@ class LaunchDialog(QtWidgets.QDialog):
         self.res_combo.setEnabled(enabled)
         self.update_command()
 
+    def _remember_profiles(self):
+        self.settings.setValue("robot_profile", self.robot_profile_combo.currentData())
+        self.settings.setValue("gripper_profile", self.gripper_profile_combo.currentData())
+        self.update_command()
+
     def build_args(self):
         args = []
+        args.append(f"robot_{self.robot_profile_combo.currentData()}")
+        args.append(f"gripper_{self.gripper_profile_combo.currentData()}")
         if self.fake_radio.isChecked():
             args.append("fake")
-
         if self.main_cb.isChecked():
             args.append("main")
 
@@ -212,12 +249,10 @@ class LaunchDialog(QtWidgets.QDialog):
             args.append("hand_eye")
             args.append(self.target_combo.currentData())
             args.append(self.res_combo.currentData())
-
         return args
 
     def update_command(self):
-        parts = ["launch_ur10e"] + self.build_args()
-        self.command_edit.setText(" ".join(parts))
+        self.command_edit.setText(" ".join(["launch_ur10e"] + self.build_args()))
 
     def copy_command(self):
         QtWidgets.QApplication.clipboard().setText(self.command_edit.text())
@@ -240,6 +275,7 @@ class LaunchDialog(QtWidgets.QDialog):
             )
             return
 
+        self._remember_profiles()
         subprocess.Popen([str(LAUNCHER)] + args)
         self.accept()
 
