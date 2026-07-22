@@ -1,11 +1,65 @@
-# ManipulatorsDatePalm
+# Date Harvesting Manipulation
 
-Main repository for the UR10e date-palm harvesting system.
+Professional ROS 2 workspace for selective date-palm harvesting with a UR10e
+manipulator, cuRobo motion planning, ZED vision, LiDAR-assisted scene capture,
+and a Delto 3-finger gripper.
 
-This repo contains the ROS 2 Humble workspace, UR10e/cuRobo control stack,
-RViz operator panel, vision pipeline, Delto gripper integration, LiDAR scan
-workflow, camera recording tools, and supporting robot-driver changes used for
-date harvesting experiments.
+This repository is the integration point for field-ready harvesting experiments:
+goal localization, safe motion planning, operator supervision in RViz, gripper
+control, grasp/slip feedback, and data collection workflows used during KAUST
+farm testing.
+
+> Field videos and experiment evidence are kept as KAUST GitLab work-item
+> uploads rather than committed as large binary files.
+
+## System Snapshot
+
+| Layer | What it provides |
+| --- | --- |
+| Manipulator | UR10e control through ROS 2 control and the Universal Robots driver. |
+| Planning | cuRobo GPU planning, safe-zone constraints, reachability clouds, and short-path regrip motions. |
+| Perception | ZED date localization, trunk detection, depth fusion, gap analysis, and camera calibration profiles. |
+| End effector | Delto gripper integration with grasp commands, force feedback, grip checks, and slip analysis. |
+| Operator UI | RViz panel for launch workflow, goals, monitoring, camera capture, heat/current status, LiDAR scan, and safe-zone controls. |
+| Field data | Videos, screenshots, bags, camera recordings, and stability logs for harvesting validation. |
+
+## Field Results
+
+Recent KAUST outdoor tests focused on making the harvesting workflow practical
+outside the lab: selecting reachable goals, moving safely near real bunches,
+checking grip quality, and documenting success, weak-grip, and slip cases.
+
+| Experiment | Evidence | Result / takeaway |
+| --- | --- | --- |
+| KAUST Field Test, 2 July 2026 | [Work item #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_88034) | Safety-envelope and range-of-motion testing around selected trees. |
+| Farm experiment attempts | [Videos in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_88849) | Six labeled harvesting attempts: three success labels, one weak-grip case, and two slipped cases for gripper tuning. |
+| 16 July 2026 field experiment | [Video in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_89123) | Additional outdoor motion evidence for gripper motion planning and harvesting workflow review. |
+| 22 July 2026 field experiment | [Video in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_89252) | Additional 720p field video for approach behavior, grip alignment, and workflow validation. |
+| Date harvesting development | [Technique update #17](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/17#note_89254) | Consolidates field videos for regrip logic, proper grip checks, slip detection, and harvesting reliability. |
+| Y2 field testing | [Data-collection update #15](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/15#note_89253) | Tracks the field videos as part of Y2 outdoor testing and data collection. |
+
+## Harvesting Pipeline
+
+```mermaid
+flowchart LR
+    A[ZED / LiDAR sensing] --> B[Date and trunk localization]
+    B --> C[Goal scoring and gap analysis]
+    C --> D[Reachability and safe-zone check]
+    D --> E[cuRobo motion planning]
+    E --> F[UR10e execution]
+    F --> G[Delto grip and slip feedback]
+    G --> H[Field logs, videos, and results]
+```
+
+## What This System Can Do
+
+- Localize date targets and trunk obstacles from RGB/depth sensing.
+- Score candidate fruit goals and expose selected targets to the operator.
+- Visualize reachability clouds and safe-zone boxes before motion execution.
+- Plan bounded UR10e motions with cuRobo for outdoor harvesting.
+- Execute gripper approach, grasp, regrip, and dropoff workflows.
+- Record field evidence through RViz camera capture, logs, videos, and issue-linked results.
+- Compare successful grasps against weak-grip and slipped cases to improve harvesting reliability.
 
 ## Start Here
 
@@ -102,7 +156,7 @@ Or launch the normal outdoor/harvest stack directly:
 launch_harvest
 ```
 
-This is the same as `launch_ur10e harvest`, which expands to `launch_ur10e main vision zed_mini`.
+This is the same as `launch_ur10e harvest`, which expands to `launch_ur10e main vision zedx_mini`.
 
 Launch fake hardware for testing:
 
@@ -113,7 +167,7 @@ launch_ur10e fake harvest
 ## Common Launch Options
 
 ```bash
-launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|lidar] [teleop] [gui]
+launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|zedx_mini|lidar] [teleop] [gui]
 ```
 
 Options:
@@ -121,15 +175,46 @@ Options:
 | Option | Description |
 | --- | --- |
 | `launch_ur10e_gui` | Opens a dialog for real/fake robot, camera/depth, and optional panes. |
-| `harvest` | Preset for `main vision zed_mini`. |
+| `harvest` | Preset for `main vision zedx_mini`. |
 | `field` | Alias for `harvest`. |
 | `fake` | Use fake/simulated hardware. |
 | `main` | Start the main `ur10e_curobo` control node. |
 | `vision` | Start the ZED/YOLO vision node. |
 | `zed_mini` | Use ZED X Mini depth with ZED X One detection. |
+| `zedx_mini` | Use ZED X Mini for both RGB detection and native stereo depth. |
 | `lidar` | Use Livox LiDAR depth with ZED X One detection. |
 | `teleop` | Start joystick teleop. |
 | `gui` | Start the desktop GUI panel. |
+
+## Camera Calibration Profiles
+
+Camera mode selects the matching calibration profile automatically:
+
+| Mode | Command | Calibration profile |
+| --- | --- | --- |
+| ZED X Mini RGBD | `launch_ur10e main vision zedx_mini` | `zedx_mini_rgbd.yaml` |
+| ZED X One RGB + ZED X Mini depth | `launch_ur10e main vision zed_mini` | `zed_one_rgb_zedx_mini_depth.yaml` |
+
+Run hand-eye for the active mode:
+
+```bash
+launch_ur10e main hand_eye zedx_mini
+launch_ur10e main hand_eye zed_mini
+```
+
+Run dual-camera extrinsic calibration for ZED X One RGB + ZED X Mini depth:
+
+```bash
+launch_ur10e extrinsic
+```
+
+In `launch_ur10e_gui`, select **ZED One ↔ ZED Mini extrinsic calibration**.
+
+After launch, confirm the active profile:
+
+```bash
+ros2 topic echo /camera_status --once
+```
 
 For detailed launch and manual terminal commands, see:
 
@@ -162,6 +247,9 @@ Runtime logs and recordings are saved under the user home directory:
 | Camera snapshots/videos | `~/camera_recordings` |
 | Stability/tracking CSVs | `~/ur10e_stability` |
 | Grasp learning data | `~/grasp_learning_data` |
+
+Collected golf-cart stability validation data is summarized in
+[UR10e Golf Cart Stability Validation](docs/GOLFCART_STABILITY_VALIDATION.md).
 
 ## Hardware Notes
 
