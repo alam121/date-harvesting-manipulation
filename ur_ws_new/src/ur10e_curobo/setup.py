@@ -12,7 +12,10 @@ setup(
         f"{package_name}.teleop",
     ],
     package_data={
-        f"{package_name}.vision": ["charuco_7x24_30mm_22mm_dict5x5_100.png"],
+        f"{package_name}.vision": [
+            "charuco_7x24_30mm_22mm_dict5x5_100.png",
+            "calibration_profiles/*.yaml",
+        ],
     },
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
@@ -42,6 +45,7 @@ setup(
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control
             "calibrate = ur10e_curobo.grasp_calibrate:main",  # Grasp force calibration
             "hand_eye = ur10e_curobo.vision.hand_eye_calibration:main",  # Hand-eye calibration
+            "zed_extrinsic = ur10e_curobo.vision.zed_extrinsic_calibration:main",
             "dg3fm_finger_test = ur10e_curobo.dg3fm_finger_test:main",
         ],
     },

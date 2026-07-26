@@ -64,6 +64,7 @@ def launch_setup(context, *args, **kwargs):
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     tf_prefix = LaunchConfiguration("tf_prefix")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    launch_gripper = LaunchConfiguration("launch_gripper")
     fake_sensor_commands = LaunchConfiguration("fake_sensor_commands")
     controller_spawner_timeout = LaunchConfiguration("controller_spawner_timeout")
     initial_joint_controller = LaunchConfiguration("initial_joint_controller")
@@ -359,7 +360,6 @@ def launch_setup(context, *args, **kwargs):
                 "delto_3f_bringup.launch.py"
             ])
         ),
-        condition=UnlessCondition(use_fake_hardware),
         launch_arguments={
             "delto_ip": "169.254.186.72",
             "delto_port": "502",
@@ -427,8 +427,13 @@ def launch_setup(context, *args, **kwargs):
         robot_state_publisher_node,
         rviz_node,
         trajectory_until_node,
-        delto_launch,
     ] + controller_spawners
+
+    if (
+        use_fake_hardware.perform(context) != "true" and
+        launch_gripper.perform(context) == "true"
+    ):
+        nodes_to_start.append(delto_launch)
 
     return nodes_to_start
 
@@ -551,6 +556,13 @@ def generate_launch_description():
             "use_fake_hardware",
             default_value="false",
             description="Start robot with fake hardware mirroring command to its states.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "launch_gripper",
+            default_value="true",
+            description="Launch the Delto gripper driver when not using fake hardware.",
         )
     )
     declared_arguments.append(

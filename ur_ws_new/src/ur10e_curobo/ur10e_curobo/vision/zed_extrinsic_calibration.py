@@ -26,6 +26,19 @@ import numpy as np
 import pyzed.sl as sl
 from scipy.spatial.transform import Rotation
 
+try:
+    from .calibration_profiles import (
+        active_profile_path,
+        load_camera_profile,
+        save_camera_profile,
+    )
+except ImportError:
+    from calibration_profiles import (  # type: ignore
+        active_profile_path,
+        load_camera_profile,
+        save_camera_profile,
+    )
+
 # ── Checkerboard parameters ────────────────────────────────────────────────────
 BOARD_ROWS   = 10      # inner corners along the long edge  (11 squares - 1)
 BOARD_COLS   = 7       # inner corners along the short edge (8 squares - 1)
@@ -286,6 +299,21 @@ def main():
 
     OUTPUT_FILE.write_text(config_block + "\n")
     print(f"Result saved to: {OUTPUT_FILE}")
+
+    profile = load_camera_profile("zed_mini")
+    profile["camera_profile"] = profile.get("camera_profile") or "zed_one_rgb_zedx_mini_depth"
+    profile["mode"] = "zed_mini"
+    profile["rgb_frame"] = profile.get("rgb_frame") or "zed2_left_camera_frame"
+    profile["depth_frame"] = profile.get("depth_frame") or "zed_mini_left_camera_frame"
+    profile["depth_to_rgb"] = {
+        "parent_frame": profile["rgb_frame"],
+        "child_frame": profile["depth_frame"],
+        "convention": "camera_from_depth",
+        "matrix": rows,
+        "num_pairs": len(T_one_mini_list),
+    }
+    profile_path = save_camera_profile(profile, active_profile_path("zed_mini"))
+    print(f"Camera profile updated: {profile_path}")
 
 
 if __name__ == "__main__":

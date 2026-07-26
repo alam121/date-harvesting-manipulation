@@ -179,6 +179,12 @@ def lock_target(node, position_xyz):
         node.get_logger().info(f"Target lock sent: [{position_xyz[0]:.3f}, {position_xyz[1]:.3f}, {position_xyz[2]:.3f}]")
 
 
+def _set_goal_rejection(node, reason: str, detail: str = ""):
+    setter = getattr(node, "set_goal_rejection", None)
+    if callable(setter):
+        setter(reason, detail)
+
+
 def unlock_target(node):
     """
     Release target lock, allowing vision to select the best target again.
@@ -308,6 +314,8 @@ def side_low_wrist3_orientation(node, base_quat, desired_dir, max_delta_deg=45.0
 
 def image_lateral_side(node, cx_norm, cy_norm, *, force_very_low_center=False):
     """Classify fruit side from bunch-relative position when available, else image position."""
+    if not bool(getattr(node.cfg.planner, "side_approach_enabled", False)):
+        return "CENTER"
     is_low = cy_norm > 0.60
     rel_y = getattr(node, "fruit_bunch_rel_y", None)
     lower_band = getattr(node.cfg.planner, "bunch_lower_center_band", 0.80)
@@ -742,6 +750,10 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     # Safety: if IK solution is too far, fall back
     if best_delta > _MAX_DIRECT_DELTA_RAD:
+        _set_goal_rejection(
+            node,
+            "IK jump too large",
+            f"{best_delta*57.3:.1f}deg")
         node.get_logger().warn(f"[DIRECT] {label}: IK too far ({best_delta*57.3:.1f}deg)"); return False
 
     # 3) Cartesian IK waypoints → per-segment S-curve interpolation
@@ -898,12 +910,20 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     _is_approach = label.startswith("APPROACH")
     _is_final = label.startswith("FINAL")
     if _is_final and _clamp_mm < _clamp_threshold:
+        _set_goal_rejection(
+            node,
+            f"clamp clearance below {_clamp_threshold:.0f} mm",
+            f"min={_clamp_mm:.1f}mm")
         node.get_logger().error(
             f"[CLAMP] {label}: unsafe FINAL clearance "
             f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
             f"required={_clamp_threshold:.1f}mm) — skipping goal")
         return False
     if _is_approach and _clamp_mm < _clamp_threshold:
+        _set_goal_rejection(
+            node,
+            f"clamp clearance below {_clamp_threshold:.0f} mm",
+            f"min={_clamp_mm:.1f}mm")
         node.get_logger().error(
             f"[CLAMP] {label}: rejecting complete APPROACH "
             f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
@@ -1283,6 +1303,10 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
                 break
 
     if not candidates:
+        _set_goal_rejection(
+            node,
+            f"clamp clearance below {threshold_mm:.0f} mm",
+            f"best={best_observed_clearance:.1f}mm")
         node.get_logger().error(
             f"[PREFLIGHT] No safe IK branch found for VERY LOW approach "
             f"(best={best_observed_clearance:.1f}mm, required={threshold_mm:.1f}mm)")
@@ -1527,6 +1551,10 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                 max_ratio = float(getattr(
                     node.cfg.planner, "approach_max_path_ratio", 2.5))
                 if straight > 0.02 and final_ratio > max_ratio:
+                    _set_goal_rejection(
+                        node,
+                        "approach path too roundabout",
+                        f"{final_ratio:.1f}x > {max_ratio:.1f}x")
                     node.get_logger().error(
                         f"[PATH] {label}: rejecting roundabout approach "
                         f"({best_path_len*100:.1f}cm, {final_ratio:.1f}x > {max_ratio:.1f}x)")
@@ -1568,12 +1596,20 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     _is_approach = label.startswith("APPROACH")
     _is_final = label.startswith("FINAL")
     if _is_final and _clamp_mm < _clamp_threshold:
+        _set_goal_rejection(
+            node,
+            f"clamp clearance below {_clamp_threshold:.0f} mm",
+            f"min={_clamp_mm:.1f}mm")
         node.get_logger().error(
             f"[CLAMP] {label}: rejecting cuRobo FINAL "
             f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
             f"required={_clamp_threshold:.1f}mm)")
         return False
     if _is_approach and _clamp_mm < _clamp_threshold:
+        _set_goal_rejection(
+            node,
+            f"clamp clearance below {_clamp_threshold:.0f} mm",
+            f"min={_clamp_mm:.1f}mm")
         node.get_logger().error(
             f"[CLAMP] {label}: rejecting complete cuRobo APPROACH "
             f"(min={_clamp_mm:.1f}mm, destination={_dest_mm:.1f}mm, "
@@ -2271,7 +2307,9 @@ def subscribe_to_goal_pose(node):
                 trunk_lat = trunk_lateral(node)
                 fruit_lat = lateral_value(new_xyz[0], new_xyz[1])
                 lateral_dist = abs(fruit_lat - trunk_lat)
-                if lateral_dist > LATERAL_THRESH:
+                if not bool(getattr(node.cfg.planner, "side_approach_enabled", False)):
+                    lateral_type = "CENTER"
+                elif lateral_dist > LATERAL_THRESH:
                     lateral_type = "LEFT" if fruit_lat > trunk_lat else "RIGHT"
                 else:
                     lateral_type = "CENTER"
@@ -2789,6 +2827,8 @@ def plan_and_execute(node):
             node.cfg.planner, "mid_center_approach_depth_offset",
             "mid_center_approach_y_offset", 0.10)
         d_blend = blend_approach_direction(node, x, y, z)
+        side_approach_enabled = bool(getattr(
+            node.cfg.planner, "side_approach_enabled", False))
 
         if is_low:
             # Low-hanging: original master_new approach (no d_blend for position)
@@ -2803,7 +2843,9 @@ def plan_and_execute(node):
         else:
             # Mid/high: standoff directly behind fruit along the configured depth axis.
             # Right-side fruits get a larger standoff to improve approach angle
-            _is_right = lateral_value(x, y) < trunk_lateral(node)
+            _is_right = (
+                lateral_value(x, y) < trunk_lateral(node)
+                if side_approach_enabled else False)
             _midhi_standoff = 0.12 if _is_right else standoff
             _midhi_z_offset = getattr(node.cfg.planner, "mid_center_approach_z_offset", 0.0)
             ax, ay = add_axis_offsets(x, y, depth=_midhi_standoff)
@@ -2826,18 +2868,29 @@ def plan_and_execute(node):
         side_home_reacquired = False
         trunk_lat = trunk_lateral(node)
         fruit_lat = lateral_value(x, y)
+        _low_side_home_min_z = float(
+            getattr(node.cfg.planner, "low_side_home_min_goal_z_m", 0.55))
+        _small_tree_low_target = bool(is_low and z < _low_side_home_min_z)
+        if _small_tree_low_target and not is_very_low_center:
+            is_very_low_center = True
+            if _log_cycle_start:
+                node.get_logger().info(
+                    f"Small-tree low target z={z:.2f}m < {_low_side_home_min_z:.2f}m — "
+                    "using target-local very-low approach instead of fixed side-low HOME")
         _img_norm = getattr(node, 'fruit_image_norm', None)
         _img_side = None
-        _force_center_low = False
+        _force_center_low = _small_tree_low_target
         if cur_pose is not None:
             lateral_dist = abs(fruit_lat - trunk_lat)
+            if not side_approach_enabled:
+                _img_side = "CENTER"
             # If image-based classification said CENTER, respect it — skip side home
             # even if 3D coordinate check would say lateral. If it said LEFT/RIGHT,
             # use that side so preview and execution do not disagree.
             _img_lateral = True  # default: trust 3D
             if _img_norm is not None:
                 _cx, _cy = _img_norm
-                _force_center_low = is_very_low_center
+                _force_center_low = is_very_low_center or _small_tree_low_target
                 # Reuse the lateral classification from acceptance — avoids threshold boundary
                 # flips between acceptance and execution (the fruit's side doesn't change).
                 _img_side = getattr(node, 'goal_lateral_side', None)
@@ -2845,15 +2898,24 @@ def plan_and_execute(node):
                     _img_side = image_lateral_side(
                         node, _cx, _cy, force_very_low_center=_force_center_low)
                 _img_lateral = _img_side in ("LEFT", "RIGHT")
+            if not side_approach_enabled:
+                _img_side = "CENTER"
+                _img_lateral = False
             if _log_cycle_start:
                 node.get_logger().info(
                     f"Fruit lateral distance: {lateral_dist:.2f}m, "
                     f"trunk_lateral={trunk_lat:.3f}"
                     + (f", img_side={_img_side}" if _img_norm is not None else "")
                     + (", very_low_center=True" if _force_center_low else ""))
+            if not side_approach_enabled:
+                if _log_cycle_start:
+                    node.get_logger().info(
+                        "Side approach disabled by config — using center/local approach")
+                _img_lateral = False
             if _force_center_low:
                 if _log_cycle_start:
                     node.get_logger().info("Very low fruit — using center HOME, skipping side-low HOME")
+                _img_lateral = False
             # Front-zone override: if the fruit's image cx is within the front band the
             # fruit is facing the robot directly — use center approach regardless of
             # bunch_rx lateral classification.  bunch_rx=0.12 can say LEFT while
@@ -2868,7 +2930,9 @@ def plan_and_execute(node):
                     node.get_logger().info(
                         f"Front-zone override: cx={_cx_raw:.2f} in [{_fz_min:.2f},{_fz_max:.2f}] "
                         f"— using center approach instead of {_img_side}")
-            if (_img_norm is not None and _img_lateral) or (_img_norm is None and lateral_dist > LATERAL_THRESH):
+            if (side_approach_enabled and not _force_center_low and
+                    ((_img_norm is not None and _img_lateral) or
+                     (_img_norm is None and lateral_dist > LATERAL_THRESH))):
                 _side_is_left = (
                     (_img_side == "LEFT")
                     if _img_side in ("LEFT", "RIGHT")
@@ -3069,7 +3133,9 @@ def plan_and_execute(node):
 
         elif is_low:
             fruit_lat = lateral_value(x, y)
-            is_low_lateral = abs(fruit_lat - trunk_lat) > LATERAL_THRESH
+            is_low_lateral = (
+                side_approach_enabled and
+                abs(fruit_lat - trunk_lat) > LATERAL_THRESH)
             if is_low_lateral and is_side_approach:
                 # Side approach: combine configured depth and lateral standoffs.
                 # Use one lateral direction for both APPROACH and FINAL so the wrist is already
@@ -3202,7 +3268,10 @@ def plan_and_execute(node):
                 height_label = "LOW"
             else:
                 height_label = "MID/HIGH"
-            lateral_label = getattr(node, 'goal_lateral_side', None)
+            lateral_label = (
+                "CENTER"
+                if not side_approach_enabled
+                else getattr(node, 'goal_lateral_side', None))
             if lateral_label is None:
                 _img_norm = getattr(node, 'fruit_image_norm', None)
                 if _img_norm is not None:

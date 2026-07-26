@@ -67,22 +67,44 @@ and optional panes.
 ### Usage
 
 ```bash
-launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|lidar] [teleop] [gui]
+launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|zedx_mini|lidar] [teleop] [gui]
 ```
 
 ### Options
 
 | Option   | Description                                    |
 |----------|------------------------------------------------|
-| `harvest` | Preset for main + vision using ZED Mini depth |
+| `harvest` | Preset for main + vision using ZED X Mini RGBD |
 | `field` | Alias for `harvest` |
 | `fake`   | Use simulated hardware (no real robot needed)  |
 | `main`   | Main control node with cuRobo motion planning  |
 | `vision` | ZED camera + YOLO detection node               |
 | `zed_mini` | Use ZED X Mini depth with ZED X One detection |
+| `zedx_mini` | Use ZED X Mini for both RGB detection and native stereo depth |
 | `lidar` | Use Livox LiDAR depth with ZED X One detection |
 | `teleop` | Joystick teleop control                        |
 | `gui`    | Desktop GUI control panel                      |
+
+### Camera Calibration Profiles
+
+The launcher exports an explicit camera calibration profile for each camera mode.
+
+| Camera mode | Launch option | Profile YAML |
+|-------------|---------------|--------------|
+| ZED X Mini RGBD | `zedx_mini` | `ur10e_curobo/vision/calibration_profiles/zedx_mini_rgbd.yaml` |
+| ZED X One RGB + ZED X Mini depth | `zed_mini` | `ur10e_curobo/vision/calibration_profiles/zed_one_rgb_zedx_mini_depth.yaml` |
+
+Use the same mode when calibrating:
+
+```bash
+launch_ur10e main hand_eye zedx_mini
+launch_ur10e main hand_eye zed_mini
+launch_ur10e extrinsic
+```
+
+The calibration tool saves the result to the selected profile and still offers
+the existing URDF update prompt for the matching camera frame. The extrinsic
+tool updates the dual-camera profile's `depth_to_rgb` matrix automatically.
 
 ### Examples
 

@@ -14,6 +14,7 @@ The result (4x4 camera-to-gripper transform) is saved to a YAML file.
 """
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -28,6 +29,21 @@ import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 from scipy.spatial.transform import Rotation
+
+try:
+    from .calibration_profiles import (
+        active_profile_path,
+        frame_from_profile,
+        load_camera_profile,
+        save_camera_profile,
+    )
+except ImportError:
+    from calibration_profiles import (  # type: ignore
+        active_profile_path,
+        frame_from_profile,
+        load_camera_profile,
+        save_camera_profile,
+    )
 
 # ── URDFs to update when calibration is confirmed ─────────────────────────────
 URDF_FILES = [
@@ -154,9 +170,18 @@ def main():
     )
     parser.add_argument(
         "--resolution",
-        choices=("qhdplus", "4k"),
+        choices=("qhdplus", "4k", "hd1080"),
         default="qhdplus",
-        help="ZED X One capture resolution (default: qhdplus)",
+        help="hand-eye capture resolution; ZED X Mini uses HD1080 (default: qhdplus)",
+    )
+    parser.add_argument(
+        "--camera-mode",
+        choices=("zedx_mini", "zed_mini", "stereo", "lidar"),
+        default=None,
+        help=(
+            "camera calibration profile to update: zedx_mini = Mini RGBD, "
+            "zed_mini/lidar = ZED X One RGB frame"
+        ),
     )
     parser.add_argument(
         "--generate-board",
@@ -166,6 +191,16 @@ def main():
         help="generate the selected print-ready target and exit",
     )
     args = parser.parse_args()
+    camera_mode = args.camera_mode or os.getenv("UR10E_CAMERA_MODE", "zedx_mini")
+    if camera_mode in ("lidar", "stereo"):
+        camera_mode = "zed_mini"
+    camera_profile = load_camera_profile(camera_mode)
+    child_frame = (
+        frame_from_profile(camera_profile, "rgb_frame", "zed_mini_left_camera_frame")
+        if camera_mode == "zedx_mini"
+        else frame_from_profile(camera_profile, "rgb_frame", "zed2_left_camera_frame")
+    )
+    profile_path = active_profile_path(camera_mode)
     if args.generate_board:
         if args.generate_board == "AUTO":
             filename = (
@@ -210,31 +245,50 @@ def main():
         return
     print()
 
-    # ── ZED X One Mono setup (CameraOne API) ─────────────────────────
-    zed = sl.CameraOne()
-    init_params = sl.InitParametersOne()
-    if args.resolution == "4k":
-        init_params.camera_resolution = sl.RESOLUTION.HD4K
+    # ── Camera setup ─────────────────────────────────────────────────
+    use_zedx_mini = camera_mode == "zedx_mini"
+    if use_zedx_mini:
+        zed = sl.Camera()
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.HD1080
         init_params.camera_fps = 15
-        init_params.enable_hdr = False
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.depth_mode = sl.DEPTH_MODE.NONE
+        camera_label = "ZED X Mini"
+        if args.resolution != "hd1080":
+            node.get_logger().warn(
+                f"ZED X Mini does not support {args.resolution} here; using HD1080.")
+        resolution_label = "HD1080"
+        hdr_label = "off"
     else:
-        init_params.camera_resolution = sl.RESOLUTION.QHDPLUS
-        init_params.camera_fps = 30
-        init_params.enable_hdr = True
-    init_params.coordinate_units = sl.UNIT.METER
+        zed = sl.CameraOne()
+        init_params = sl.InitParametersOne()
+        if args.resolution == "4k":
+            init_params.camera_resolution = sl.RESOLUTION.HD4K
+            init_params.camera_fps = 15
+            init_params.enable_hdr = False
+        else:
+            init_params.camera_resolution = sl.RESOLUTION.QHDPLUS
+            init_params.camera_fps = 30
+            init_params.enable_hdr = True
+        init_params.coordinate_units = sl.UNIT.METER
+        camera_label = "ZED X One Mono"
+        resolution_label = args.resolution
+        hdr_label = "on" if init_params.enable_hdr else "off"
 
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
-        node.get_logger().error(f"ZED X One Mono open failed: {status}")
+        node.get_logger().error(f"{camera_label} open failed: {status}")
         return
     node.get_logger().info(
-        f"ZED X One Mono opened for hand-eye calibration "
-        f"({args.resolution}, HDR={'on' if init_params.enable_hdr else 'off'})."
+        f"{camera_label} opened for hand-eye calibration "
+        f"({resolution_label}, HDR={hdr_label}, child_frame={child_frame})."
     )
 
-    # CameraOne: calibration_parameters is the mono calibration directly (no .left_cam)
+    # CameraOne: mono calibration directly. Stereo Camera: use left camera.
     cam_info = zed.get_camera_information()
-    cam_params = cam_info.camera_configuration.calibration_parameters
+    cal_params = cam_info.camera_configuration.calibration_parameters
+    cam_params = cal_params.left_cam if use_zedx_mini else cal_params
     camera_matrix = np.array([
         [cam_params.fx, 0, cam_params.cx],
         [0, cam_params.fy, cam_params.cy],
@@ -322,10 +376,13 @@ def main():
     )
 
     while True:
-        if zed.grab() != sl.ERROR_CODE.SUCCESS:  # CameraOne: no RuntimeParameters arg
+        if zed.grab() != sl.ERROR_CODE.SUCCESS:
             continue
 
-        zed.retrieve_image(image_mat)  # CameraOne: no VIEW arg
+        if use_zedx_mini:
+            zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+        else:
+            zed.retrieve_image(image_mat)  # CameraOne: no VIEW arg
         frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel (BGRA→BGR)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -571,7 +628,7 @@ def main():
     result = {
         "hand_eye_calibration": {
             "parent_frame": EE_FRAME,
-            "child_frame": "zed2_left_camera_frame",
+            "child_frame": child_frame,
             "translation": {
                 "x": float(t_cam2gripper[0, 0]),
                 "y": float(t_cam2gripper[1, 0]),
@@ -587,11 +644,50 @@ def main():
             "method": best_method_name,
             "num_samples": sample_count,
             "calibrated_at": timestamp,
+            "camera_mode": camera_mode,
+            "camera_profile": camera_profile.get("camera_profile"),
         }
     }
 
     OUTPUT_FILE.write_text(yaml.dump(result, default_flow_style=False))
     node.get_logger().info(f"Calibration saved to {OUTPUT_FILE}")
+
+    profile_out = dict(camera_profile)
+    profile_out["camera_profile"] = profile_out.get("camera_profile") or profile_path.stem
+    profile_out["mode"] = camera_mode
+    profile_out["parent_frame"] = EE_FRAME
+    profile_out["rgb_frame"] = child_frame
+    if use_zedx_mini:
+        profile_out["depth_frame"] = child_frame
+    else:
+        profile_out.setdefault("depth_frame", "zed_mini_left_camera_frame")
+    profile_out["hand_eye"] = {
+        "parent_frame": EE_FRAME,
+        "child_frame": child_frame,
+        "translation": {
+            "x": float(t_cam2gripper[0, 0]),
+            "y": float(t_cam2gripper[1, 0]),
+            "z": float(t_cam2gripper[2, 0]),
+        },
+        "quaternion": {
+            "x": float(quat[0]),
+            "y": float(quat[1]),
+            "z": float(quat[2]),
+            "w": float(quat[3]),
+        },
+        "rpy": {
+            "roll": float(rpy[0]),
+            "pitch": float(rpy[1]),
+            "yaw": float(rpy[2]),
+        },
+        "matrix": T_cam2gripper.tolist(),
+        "method": best_method_name,
+        "mean_error_m": float(best_error),
+        "num_samples": sample_count,
+        "calibrated_at": timestamp,
+    }
+    saved_profile = save_camera_profile(profile_out, profile_path)
+    node.get_logger().info(f"Camera profile saved to {saved_profile}")
 
     print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
     print("=" * 60)
@@ -600,7 +696,9 @@ def main():
     print("\n" + "=" * 60)
     print("UPDATE URDFs?")
     print("=" * 60)
-    print(f"  New transform (tool0 → zed2_left_camera_frame):")
+    print(f"  Camera profile: {profile_out['camera_profile']}")
+    print(f"  Profile YAML: {saved_profile}")
+    print(f"  New transform ({EE_FRAME} → {child_frame}):")
     print(f"    xyz=\"{t_cam2gripper[0,0]:.6f} {t_cam2gripper[1,0]:.6f} {t_cam2gripper[2,0]:.6f}\"")
     print(f"    rpy=\"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}\"")
     print(f"\n  Files to update:")
@@ -620,14 +718,16 @@ def main():
     confirm = input("Apply to URDFs? [y/N]: ").strip().lower()
     print(f"  (input received: {repr(confirm)})")
     if confirm == "y":
-        _update_urdfs(t_cam2gripper, rpy, best_method_name, best_error, sample_count, timestamp)
+        _update_urdfs(
+            t_cam2gripper, rpy, best_method_name, best_error, sample_count,
+            timestamp, child_frame)
     else:
         print("URDFs not updated. Values saved to YAML only.")
 
     rclpy.shutdown()
 
 
-def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp):
+def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp, child_frame):
     """Update the tool0→camera joint origin in each URDF/xacro file."""
     xyz_str = f"{t[0,0]:.6f} {t[1,0]:.6f} {t[2,0]:.6f}"
     rpy_str = f"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}"
@@ -651,7 +751,7 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp):
     repl_rpy_first = rf'\g<1>{rpy_str}\g<2>{xyz_str}\g<3><!-- {comment} -->'
 
     joint_pattern = re.compile(
-        r'(joint name="tool0_to_zed2_left_camera_frame".*?</joint>)',
+        rf'(joint name="tool0_to_{re.escape(child_frame)}".*?</joint>)',
         re.DOTALL,
     )
 

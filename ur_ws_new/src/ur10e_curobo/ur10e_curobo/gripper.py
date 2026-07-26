@@ -8,7 +8,7 @@ from sensor_msgs.msg import JointState
 import time
 import os
 from .gripper_profiles import (
-    FINGER_JOINT_INDICES,
+    finger_joint_indices_for_profile,
     make_closed_position,
     make_open_position,
     new_gripper_open_extra_deg,
@@ -49,6 +49,7 @@ class FakeGripperController:
         self.closure_force_profile = []
         self.closure_deltas = [0.0, 0.0, 0.0]
         self.closed = False
+        self.current_open_alpha = 0.0
 
         self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
         if self.gripper_profile not in ("old", "new"):
@@ -57,13 +58,14 @@ class FakeGripperController:
             )
             self.gripper_profile = "old"
 
-        # Mirror DeltoGripperController's DG-3F-M paired-motor posture values
-        # so fake mode/RViz and hardware mode show the same open/close pose.
+        # Mirror DeltoGripperController's selected profile values so fake
+        # mode/RViz and hardware mode show the same open/close pose.
         self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
-        self.finger_joint_indices = FINGER_JOINT_INDICES
+        self.finger_joint_indices = finger_joint_indices_for_profile(self.gripper_profile)
         self.open_position = make_open_position(self.gripper_profile)
-        self.closed_position = make_closed_position()
+        self.closed_position = make_closed_position(self.gripper_profile)
         self.current_position = self.open_position.copy()
+        self.current_open_alpha = 0.0
         self.node.get_logger().info(
             f"Fake gripper profile: {self.gripper_profile} "
             f"(new open extra={new_gripper_open_extra_deg():.1f}deg)"
@@ -97,9 +99,10 @@ class FakeGripperController:
         self.node.get_logger().info("Fake gripper: OPEN")
 
     def open_gripper_to(self, alpha: float = 0.0):
-        alpha = max(0.0, min(1.0, float(alpha)))
+        alpha = max(-0.10, min(1.0, float(alpha)))
         self.state = "OPENING"
         self.closed = alpha >= 0.95
+        self.current_open_alpha = alpha
         self.current_step = int(round(alpha * self.steps))
         position = self.open_position.copy()
         for ch in (0, 1, 2):
@@ -134,6 +137,40 @@ class FakeGripperController:
         self.node.get_logger().info("Fake gripper: CLOSE")
 
 
+class DisabledGripperController:
+    """No-op controller used when the launcher disables gripper hardware."""
+
+    def __init__(self, node):
+        self.node = node
+        self.fake = True
+        self.disabled = True
+        self.suction = False
+        self.steps = 0
+        self.closure_stopped_early = False
+        self.closure_step_stopped = -1
+        self.closure_first_contact_step = -1
+        self.closure_force_profile = []
+        self.closure_deltas = [0.0, 0.0, 0.0]
+        self.closed = False
+        self.current_open_alpha = 0.0
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        self.state = "DISABLED"
+
+    def open_gripper(self):
+        self.closed = False
+        self.current_open_alpha = 0.0
+        self.node.get_logger().info("Gripper disabled: OPEN ignored")
+
+    def open_gripper_to(self, alpha: float = 0.0):
+        self.closed = False
+        self.current_open_alpha = max(-0.10, min(1.0, float(alpha)))
+        self.node.get_logger().info(f"Gripper disabled: OPEN alpha={alpha:.2f} ignored")
+
+    def run_closure_loop(self):
+        self.closed = True
+        self.node.get_logger().info("Gripper disabled: CLOSE ignored")
+
+
 # ============================================================
 # INITIALIZATION
 # ============================================================
@@ -148,7 +185,12 @@ def init_gripper(node, suction: bool = None):
     if suction is None:
         suction = node.cfg.gripper.use_suction
 
-    if getattr(node.cfg.planner, "use_fake_hardware", False):
+    gripper_enabled = os.environ.get("UR10E_GRIPPER_ENABLED", "true").strip().lower()
+    if gripper_enabled in ("0", "false", "no", "off"):
+        node.gripper_controller = DisabledGripperController(node)
+        node.get_logger().info(
+            "Gripper disabled by UR10E_GRIPPER_ENABLED=false: no Delto topics or UR IO.")
+    elif getattr(node.cfg.planner, "use_fake_hardware", False):
         node.gripper_controller = FakeGripperController(
             node,
             suction=suction,
@@ -191,6 +233,14 @@ def control_gripper(node, action: str, fruit_radius: float = None):
     """
 
     act = action.upper()
+    if getattr(node.gripper_controller, "disabled", False):
+        if act == "OPEN":
+            node.gripper_controller.open_gripper()
+            node.gripper_closed = False
+        elif act == "CLOSE":
+            node.gripper_controller.run_closure_loop()
+            node.gripper_closed = True
+        return
 
     # --------------------------------------------------------
     # OPEN

@@ -34,6 +34,10 @@ def main():
         "--use_zed_mini", action="store_true",
         help="Dual-camera mode: ZED X One Mono for detection, ZED X Mini for depth"
     )
+    parser.add_argument(
+        "--use_zedx_mini_only", action="store_true",
+        help="Use ZED X Mini stereo camera for both RGB detection and depth"
+    )
     args = parser.parse_args()
 
     node = VisionNode(args)

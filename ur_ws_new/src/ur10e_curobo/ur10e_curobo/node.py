@@ -8,6 +8,8 @@ import time
 import numpy as np
 import math
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 from rclpy.timer import Timer
 from rclpy.qos import QoSProfile
@@ -63,6 +65,13 @@ class UR10eCuroboMoveIt(Node):
         self._reachability_worker_active = False
         self._reachability_clear_pending = True
         self._lidar_preview_clear_pending = True
+        self.session_recording = False
+        self.session_items = []
+        self.session_metadata = {}
+        self.session_saved_path = ""
+        self.session_loaded_path = ""
+        self.session_dir = Path.home() / "ur10e_sessions"
+        self._redo_goal_items = []
 
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
@@ -181,6 +190,8 @@ class UR10eCuroboMoveIt(Node):
         self.motion_phase: str = "IDLE"                   # current robot phase for GUI
         self.grasp_history: deque = deque(maxlen=15)      # last 15 grasp outcomes for GUI
         self.reacquire_result: str = ""                   # "OK" | "NUDGE" | "FAIL" | ""
+        self.last_goal_rejection: str = ""
+        self.last_goal_rejection_time: float = 0.0
 
         self.best_goal_xyz = None
         self.best_goal_score = float("inf")
@@ -204,6 +215,7 @@ class UR10eCuroboMoveIt(Node):
         self._refresh_camera_pub = self.create_publisher(String, "/camera_command", 10)
         self._camera_lock = threading.Lock()
         self._camera_latest_raw_msg = None
+        self._camera_latest_raw_wall_time = 0.0
         self._camera_latest_display_msg = None
         self._camera_bridge = None
         self._camera_video_writer = None
@@ -563,6 +575,232 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info(
             f"Restored previous goal queue ({len(items)} item(s)).")
 
+    def _session_meta_key_str(self, item):
+        return ",".join(f"{float(v):.4f}" for v in item[:7])
+
+    def _serialize_session_item(self, item):
+        if self._is_gripper_queue_item(item):
+            data = {
+                "type": "gripper",
+                "action": str(item.get("action", "")).upper(),
+            }
+            if "alpha" in item:
+                data["alpha"] = float(item["alpha"])
+            return data
+        if self._is_pose_queue_item(item):
+            data = {"type": "pose", "pose": [float(v) for v in item[:7]]}
+            key = self._goal_meta_key(item)
+            meta = getattr(self, "_reachability_goal_metadata", {}).get(key)
+            if meta is not None:
+                data["metadata"] = copy.deepcopy(meta)
+            return data
+        return {"type": "unknown", "value": copy.deepcopy(item)}
+
+    def _deserialize_session_item(self, item):
+        typ = item.get("type") if isinstance(item, dict) else None
+        if typ == "gripper":
+            action = str(item.get("action", "")).upper()
+            if action in ("OPEN", "CLOSE", "OPEN_ALPHA"):
+                data = {"type": "gripper", "action": action}
+                if action == "OPEN_ALPHA":
+                    data["alpha"] = max(-0.10, min(1.0, float(item.get("alpha", 0.0))))
+                return data, None
+        if typ == "pose":
+            pose = item.get("pose", [])
+            if isinstance(pose, list) and len(pose) >= 7:
+                goal = [float(v) for v in pose[:7]]
+                return goal, copy.deepcopy(item.get("metadata"))
+        return None, None
+
+    def _session_record_queue_items(self, items, reason: str):
+        if not self.session_recording:
+            return
+        serialized = []
+        for item in items:
+            data = self._serialize_session_item(item)
+            if data.get("type") in ("pose", "gripper"):
+                data["record_reason"] = reason
+                serialized.append(data)
+        if serialized:
+            self.session_items.extend(serialized)
+            self.get_logger().info(
+                f"Session recorder: captured {len(serialized)} item(s) ({reason}); "
+                f"total={len(self.session_items)}")
+
+    def _session_record_gripper_action(self, action: str, reason: str, alpha=None):
+        if not self.session_recording:
+            return
+        action = str(action).upper()
+        if action not in ("OPEN", "CLOSE", "OPEN_ALPHA"):
+            return
+        item = {
+            "type": "gripper",
+            "action": action,
+            "record_reason": reason,
+        }
+        if alpha is not None:
+            item["alpha"] = max(-0.10, min(1.0, float(alpha)))
+        self.session_items.append(item)
+        self.get_logger().info(
+            f"Session recorder: captured gripper {action.lower()} ({reason}); "
+            f"total={len(self.session_items)}")
+
+    def _session_start(self):
+        self.session_recording = True
+        self.session_items = []
+        self.session_metadata = {
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "robot_profile": ROBOT_PROFILE,
+            "environment": ENVIRONMENT,
+        }
+        self.session_saved_path = ""
+        self.get_logger().info("Session recorder STARTED.")
+
+    def _session_stop_save(self):
+        if not self.session_recording and not self.session_items:
+            self.get_logger().warn("Session recorder: nothing to save.")
+            return
+        if self.goal_poses:
+            self._session_record_queue_items(self.goal_poses.snapshot(), "stop_current_queue")
+        self.session_recording = False
+        if not self.session_items:
+            self.get_logger().warn("Session recorder: no items captured.")
+            return
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.session_dir / f"ur10e_session_{stamp}.json"
+        data = {
+            **self.session_metadata,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "item_count": len(self.session_items),
+            "items": self.session_items,
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.session_saved_path = str(path)
+        self.session_loaded_path = str(path)
+        self.get_logger().info(
+            f"Session recorder SAVED {len(self.session_items)} item(s): {path}")
+
+    def _session_latest_file(self):
+        if self.session_saved_path and Path(self.session_saved_path).exists():
+            return Path(self.session_saved_path)
+        if not self.session_dir.exists():
+            return None
+        files = sorted(self.session_dir.glob("ur10e_session_*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+
+    def _session_load_last(self):
+        path = self._session_latest_file()
+        if path is None:
+            self.get_logger().warn("Session replay: no saved session found.")
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.get_logger().warn(f"Session replay: failed to read {path}: {exc}")
+            return False
+
+        items = data.get("items", [])
+        restored = []
+        metadata = {}
+        for raw in items:
+            item, meta = self._deserialize_session_item(raw)
+            if item is None:
+                continue
+            restored.append(item)
+            if meta is not None and self._is_pose_queue_item(item):
+                metadata[self._goal_meta_key(item)] = meta
+        if not restored:
+            self.get_logger().warn(f"Session replay: {path} contains no usable items.")
+            return False
+
+        self.goal_poses.clear()
+        getattr(self, "_reachability_goal_metadata", {}).clear()
+        markers_mod.clear_goal_markers(self)
+        for item in restored:
+            self.goal_poses.append(item)
+            if self._is_pose_queue_item(item):
+                key = self._goal_meta_key(item)
+                if key in metadata:
+                    self._reachability_goal_metadata[key] = metadata[key]
+                markers_mod.publish_goal_marker(self, item[:3])
+        self.session_items = [self._serialize_session_item(item) for item in restored]
+        self.session_loaded_path = str(path)
+        self.get_logger().info(
+            f"Session replay: loaded {len(restored)} item(s) from {path}")
+        return True
+
+    def _session_replay_loaded(self):
+        if not self.goal_poses:
+            if not self._session_load_last():
+                return
+        self._snapshot_goal_queue("session_replay")
+        self._execute_goals_no_grasp()
+
+    def _redo_goal_label(self, item, index: int):
+        if not isinstance(item, dict):
+            return f"R{index}: UNKNOWN"
+        typ = item.get("type")
+        if typ == "pose":
+            pose = item.get("pose", [])
+            if isinstance(pose, list) and len(pose) >= 3:
+                meta = item.get("metadata") or {}
+                source = str(meta.get("source", "pose"))
+                if source == "current_joint":
+                    source = "current"
+                elif source == "reachability":
+                    source = "green"
+                return (
+                    f"R{index}: {source} "
+                    f"[{float(pose[0]):.3f}, {float(pose[1]):.3f}, {float(pose[2]):.3f}]")
+        if typ == "gripper":
+            action = str(item.get("action", "")).upper()
+            if action == "OPEN_ALPHA":
+                alpha = float(item.get("alpha", 0.0))
+                return f"R{index}: GRIPPER OPEN {(1.0 - alpha) * 100.0:.0f}%"
+            return f"R{index}: GRIPPER {action}"
+        return f"R{index}: UNKNOWN"
+
+    def _remember_redo_goal_item(self, item, reason: str = "execute"):
+        data = self._serialize_session_item(item)
+        if data.get("type") not in ("pose", "gripper"):
+            return
+        data["redo_reason"] = reason
+        data["redo_time"] = datetime.now().isoformat(timespec="seconds")
+        self._redo_goal_items.insert(0, data)
+        self._redo_goal_items = self._redo_goal_items[:25]
+
+    def _redo_goal_display(self):
+        return "\n".join(
+            self._redo_goal_label(item, i)
+            for i, item in enumerate(getattr(self, "_redo_goal_items", [])[:25], 1)
+        )
+
+    def _execute_redo_goal(self, index: int):
+        items = getattr(self, "_redo_goal_items", [])
+        if index < 1 or index > len(items):
+            self.get_logger().warn(f"Redo goal: invalid selection {index}")
+            return
+        item, meta = self._deserialize_session_item(copy.deepcopy(items[index - 1]))
+        if item is None:
+            self.get_logger().warn(f"Redo goal: selected item {index} is not usable")
+            return
+        if self.goal_poses:
+            self._snapshot_goal_queue("redo_replace_current_queue")
+        self.goal_poses.clear()
+        getattr(self, "_reachability_goal_metadata", {}).clear()
+        markers_mod.clear_goal_markers(self)
+        self.goal_poses.append(item)
+        if self._is_pose_queue_item(item):
+            if meta is not None:
+                self._reachability_goal_metadata[self._goal_meta_key(item)] = meta
+            markers_mod.publish_goal_marker(self, item[:3])
+        self.get_logger().info(
+            f"Redo goal: executing selected item {index}: "
+            f"{self._redo_goal_label(items[index - 1], index)}")
+        self._execute_goals_no_grasp()
+
     def _queue_gripper_action(self, action: str, position: str):
         action = action.upper()
         if action not in ("OPEN", "CLOSE"):
@@ -589,6 +827,57 @@ class UR10eCuroboMoveIt(Node):
         deg_str = ", ".join(f"{v:.1f}" for v in deg)
         self._home_joints_display = f"rad=[{rad_str}] deg=[{deg_str}]"
         self.get_logger().info(f"Current HOME joints: {self._home_joints_display}")
+
+    def _current_joint_goal_preflight_start(self):
+        """Return a likely replay start for a newly saved current-joint goal."""
+        for item in reversed(self.goal_poses.snapshot()):
+            if not self._is_pose_queue_item(item):
+                continue
+            meta = getattr(self, "_reachability_goal_metadata", {}).get(
+                self._goal_meta_key(item))
+            if meta is not None and meta.get("source") == "current_joint":
+                joints = list(meta.get("joints", []))
+                if len(joints) == len(self.home_joints):
+                    return joints, "previous saved current-joint goal"
+        return [float(v) for v in self.home_joints], "HOME"
+
+    def _preflight_current_joint_goal_async(self, goal_key, target_joints, *,
+                                            start_joints, start_label, goal_index):
+        def worker():
+            try:
+                target = motions_mod.nearest_joint_config(
+                    list(start_joints), list(target_joints))
+                planned = motions_mod.preplan_js(
+                    self,
+                    target,
+                    list(start_joints),
+                    label=f"GOAL{goal_index}_SAVE_PREFLIGHT",
+                    motion_type="manual")
+                meta = getattr(self, "_reachability_goal_metadata", {}).get(goal_key)
+                if meta is not None:
+                    meta["preflight_start"] = start_label
+                    meta["preflight_reachable"] = planned is not None
+                if planned is None:
+                    self.set_goal_rejection(
+                        "saved current goal not replay-reachable",
+                        f"from {start_label}")
+                    self.get_logger().warn(
+                        f"GOAL{goal_index}: saved current joint posture is NOT "
+                        f"replay-reachable from {start_label}; it will be skipped "
+                        "and HOME recovery will continue if execution fails.")
+                else:
+                    _, states = planned
+                    max_delta = max(
+                        abs(t - c) for c, t in zip(target, start_joints))
+                    self.get_logger().info(
+                        f"GOAL{goal_index}: saved current joint posture preflight OK "
+                        f"from {start_label} ({len(states)} pts, "
+                        f"max_delta={math.degrees(max_delta):.1f}deg).")
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"GOAL{goal_index}: saved current joint posture preflight failed: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reset_goal_tracking(self):
         """Reset all goal tracking state for a fresh cycle."""
@@ -637,6 +926,11 @@ class UR10eCuroboMoveIt(Node):
         bridge = self._get_camera_bridge()
         return bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
+    def _request_camera_raw_stream(self, command: str):
+        msg = String()
+        msg.data = command
+        self._refresh_camera_pub.publish(msg)
+
     def _record_camera_frame_locked(self, msg):
         try:
             import cv2
@@ -668,6 +962,7 @@ class UR10eCuroboMoveIt(Node):
     def _camera_raw_image_cb(self, msg):
         with self._camera_lock:
             self._camera_latest_raw_msg = msg
+            self._camera_latest_raw_wall_time = time.time()
             if self._camera_video_recording:
                 self._record_camera_frame_locked(msg)
 
@@ -676,12 +971,26 @@ class UR10eCuroboMoveIt(Node):
             self._camera_latest_display_msg = msg
 
     def _save_camera_snapshot(self):
+        request_time = time.time()
+        self._request_camera_raw_stream("raw_stream snapshot duration=1.2")
+        deadline = request_time + 1.2
+        msg = None
+        source = "raw"
+        while time.time() < deadline:
+            with self._camera_lock:
+                if (self._camera_latest_raw_msg is not None and
+                        self._camera_latest_raw_wall_time >= request_time):
+                    msg = self._camera_latest_raw_msg
+                    source = "raw"
+                    break
+            time.sleep(0.04)
         with self._camera_lock:
-            msg = self._camera_latest_raw_msg
-            source = "raw"
             if msg is None:
                 msg = self._camera_latest_display_msg
                 source = "display"
+            if msg is None and self._camera_latest_raw_msg is not None:
+                msg = self._camera_latest_raw_msg
+                source = "raw_stale"
         if msg is None:
             self.get_logger().warn(
                 "Camera snapshot: no /vision/raw or /vision/display frame received yet")
@@ -714,6 +1023,7 @@ class UR10eCuroboMoveIt(Node):
             self._camera_video_writer = None
             self._camera_video_frames = 0
             self._camera_video_recording = True
+        self._request_camera_raw_stream("raw_stream on")
         self.get_logger().info(
             f"Raw camera video recording started: {self._camera_video_path}")
 
@@ -733,6 +1043,7 @@ class UR10eCuroboMoveIt(Node):
             if writer is not None:
                 writer.release()
         finally:
+            self._request_camera_raw_stream("raw_stream off")
             self.get_logger().info(
                 f"Camera video recording stopped: {path} ({frames} frames)")
 
@@ -781,6 +1092,8 @@ class UR10eCuroboMoveIt(Node):
                 return
             try:
                 if self.goal_poses:
+                    self._session_record_queue_items(
+                        self.goal_poses.snapshot(), "execute")
                     self._snapshot_goal_queue("execute")
                     if any(
                         self._is_gripper_queue_item(item)
@@ -800,8 +1113,30 @@ class UR10eCuroboMoveIt(Node):
                     "Motion already in progress, ignoring EXECUTE MOVES command")
                 return
             try:
+                self._session_record_queue_items(
+                    self.goal_poses.snapshot(), "execute_moves")
                 self._snapshot_goal_queue("execute_moves")
                 self._execute_goals_no_grasp()
+            finally:
+                self._motion_lock.release()
+
+        def run_session_replay():
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn(
+                    "Motion already in progress, ignoring SESSION REPLAY command")
+                return
+            try:
+                self._session_replay_loaded()
+            finally:
+                self._motion_lock.release()
+
+        def run_redo_goal(index):
+            if not self._motion_lock.acquire(blocking=False):
+                self.get_logger().warn(
+                    "Motion already in progress, ignoring REDO GOAL command")
+                return
+            try:
+                self._execute_redo_goal(index)
             finally:
                 self._motion_lock.release()
 
@@ -848,6 +1183,23 @@ class UR10eCuroboMoveIt(Node):
             self._add_current_as_goal()
         elif cmd == "reuse_last_goal_queue":
             self._restore_last_goal_queue()
+        elif cmd == "session_record_start":
+            self._session_start()
+        elif cmd == "session_record_stop":
+            self._session_stop_save()
+        elif cmd == "session_load_last":
+            self._session_load_last()
+        elif cmd == "session_replay":
+            threading.Thread(target=run_session_replay, daemon=True).start()
+        elif cmd.startswith("redo_goal "):
+            try:
+                redo_index = int(cmd.split()[1])
+            except (ValueError, IndexError):
+                self.get_logger().warn(f"Invalid redo_goal command: {cmd!r}")
+            else:
+                threading.Thread(
+                    target=lambda i=redo_index: run_redo_goal(i),
+                    daemon=True).start()
         elif cmd in ("queue_gripper_open", "queue_gripper_open_start"):
             self._queue_gripper_action("OPEN", "back")
         elif cmd in ("queue_gripper_close", "queue_gripper_close_end"):
@@ -863,9 +1215,25 @@ class UR10eCuroboMoveIt(Node):
             markers_mod.clear_plan_preview(self)
             self.get_logger().info("Goals cleared")
         elif cmd == "open":
+            self._session_record_gripper_action("OPEN", "direct_open")
             gripper_mod.control_gripper(self, 'OPEN')
         elif cmd == "close":
+            self._session_record_gripper_action("CLOSE", "direct_close")
             gripper_mod.control_gripper(self, 'CLOSE')
+        elif cmd.startswith("gripper_open_alpha "):
+            try:
+                alpha = float(cmd.split()[1])
+                alpha = max(-0.10, min(1.0, alpha))
+                if hasattr(self, "gripper_controller"):
+                    self._session_record_gripper_action(
+                        "OPEN_ALPHA", "direct_partial_open", alpha=alpha)
+                    self.gripper_controller.open_gripper_to(alpha)
+                    self.gripper_closed = False
+                    self.get_logger().info(
+                        f"Gripper partial open set: alpha={alpha:.2f} "
+                        f"(open_amount={(1.0 - alpha) * 100.0:.0f}%)")
+            except (ValueError, IndexError) as e:
+                self.get_logger().warn(f"Invalid gripper_open_alpha command: {e}")
         elif cmd == "stop":
             self.stop_requested = True
             motions_mod.publish_stop_trajectory(self)
@@ -1209,6 +1577,7 @@ class UR10eCuroboMoveIt(Node):
         home_deg_str = ", ".join(f"{math.degrees(v):.1f}" for v in home_joints)
         self._home_joints_display = f"rad=[{home_rad_str}] deg=[{home_deg_str}]"
 
+        gripper = getattr(self, 'gripper_controller', None)
         msg_data = {
             "goal_count": len(safe_goals),
             "goals": goal_summary,
@@ -1238,14 +1607,45 @@ class UR10eCuroboMoveIt(Node):
             "motion_phase": self.motion_phase,
             "grasp_history": list(self.grasp_history),
             "reacquire_result": self.reacquire_result,
+            "last_goal_rejection": self.last_goal_rejection,
             "gripper_stopped_early": getattr(getattr(self, 'gripper_controller', None), 'closure_stopped_early', False),
-            "gripper_first_contact": getattr(getattr(self, 'gripper_controller', None), 'closure_first_contact_step', -1),
-            "gripper_steps": getattr(getattr(self, 'gripper_controller', None), 'steps', 10),
-            "gripper_closure_step": getattr(getattr(self, 'gripper_controller', None), 'closure_step_stopped', -1),
+            "gripper_first_contact": getattr(gripper, 'closure_first_contact_step', -1),
+            "gripper_steps": getattr(gripper, 'steps', 10),
+            "gripper_closure_step": getattr(gripper, 'closure_step_stopped', -1),
+            "gripper_profile": getattr(gripper, 'gripper_profile', "unknown"),
+            "gripper_state": getattr(gripper, 'state', "UNKNOWN"),
+            "gripper_open_alpha": round(float(getattr(gripper, 'current_open_alpha', 0.0)), 3),
+            "gripper_fake": bool(getattr(gripper, 'fake', False)),
+            "gripper_disabled": bool(getattr(gripper, 'disabled', False)),
+            "gripper_suction": bool(getattr(gripper, 'suction', False)),
+            "session_recording": bool(getattr(self, "session_recording", False)),
+            "session_item_count": len(getattr(self, "session_items", []) or []),
+            "session_saved_path": getattr(self, "session_saved_path", ""),
+            "session_loaded_path": getattr(self, "session_loaded_path", ""),
+            "redo_goal_count": len(getattr(self, "_redo_goal_items", []) or []),
+            "redo_goal_display": self._redo_goal_display(),
         }
         msg = String()
         msg.data = json.dumps(msg_data)
         self.goal_info_pub.publish(msg)
+
+    def set_goal_rejection(self, reason: str, detail: str = ""):
+        """Publish a concise goal-safety rejection reason for RViz."""
+        reason = str(reason).strip()
+        detail = str(detail).strip()
+        self.last_goal_rejection = (
+            f"Rejected: {reason}{f' ({detail})' if detail else ''}"
+            if reason else ""
+        )
+        self.last_goal_rejection_time = time.time() if self.last_goal_rejection else 0.0
+        try:
+            self._publish_goal_info()
+        except Exception:
+            pass
+
+    def clear_goal_rejection(self):
+        self.last_goal_rejection = ""
+        self.last_goal_rejection_time = 0.0
 
     # Note: _publish_static_obstacles moved to MotionExecutor
 
@@ -1593,6 +1993,7 @@ class UR10eCuroboMoveIt(Node):
                 "Cannot add current joint posture as goal: end-effector pose unavailable")
             return
         joints = [float(v) for v in self.current_joint_positions]
+        preflight_start, preflight_start_label = self._current_joint_goal_preflight_start()
         for meta in getattr(self, "_reachability_goal_metadata", {}).values():
             if meta.get("source") != "current_joint":
                 continue
@@ -1606,15 +2007,32 @@ class UR10eCuroboMoveIt(Node):
                     return
         goal = [float(v) for v in cur[:7]]
         self.goal_poses.append(goal)
-        self._reachability_goal_metadata[self._goal_meta_key(goal)] = {
+        goal_key = self._goal_meta_key(goal)
+        self._reachability_goal_metadata[goal_key] = {
             "joints": joints,
             "delta_deg": 0.0,
             "source": "current_joint",
+            "preflight_start": preflight_start_label,
+            "preflight_reachable": None,
         }
         markers_mod.publish_goal_marker(self, goal[:3])
+        preflight_enabled = bool(getattr(
+            self.cfg.planner, "current_joint_goal_preflight_enabled", False))
+        suffix = (
+            f"checking replay reachability from {preflight_start_label}"
+            if preflight_enabled else
+            "replay preflight disabled to preserve vision FPS")
         self.get_logger().info(
             f"Added current joint posture as goal #{len(self.goal_poses)}: "
-            f"tcp=[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
+            f"tcp=[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] "
+            f"({suffix})")
+        if preflight_enabled:
+            self._preflight_current_joint_goal_async(
+                goal_key,
+                joints,
+                start_joints=preflight_start,
+                start_label=preflight_start_label,
+                goal_index=len(self.goal_poses))
 
     def _execute_goals_no_grasp(self):
         """Run every queued goal as a plain Cartesian move — no grasp behavior.
@@ -1622,7 +2040,8 @@ class UR10eCuroboMoveIt(Node):
         Runs queued poses and optional gripper action items. If the queue contains
         gripper actions, insertion order is strict so OPEN/CLOSE brackets remain
         where the operator placed them.
-        Honors stop_requested and aborts the rest if a move fails.
+        Honors stop_requested. Saved current-joint goals that fail are skipped;
+        the arm returns HOME before continuing with the remaining queue.
         """
         if self.goal_capture_active:
             self.stop_goal_capture()
@@ -1650,8 +2069,17 @@ class UR10eCuroboMoveIt(Node):
             idx += 1
             if self._is_gripper_queue_item(goal):
                 action = str(goal.get("action", "")).upper()
-                if action in ("OPEN", "CLOSE"):
+                if action in ("OPEN", "CLOSE", "OPEN_ALPHA"):
+                    self._remember_redo_goal_item(goal, "execute_gripper")
                     self.motion_phase = "GRIPPER"
+                    if action == "OPEN_ALPHA":
+                        alpha = max(-0.10, min(1.0, float(goal.get("alpha", 0.0))))
+                        self.get_logger().info(
+                            f"Queue item {idx}/{total}: gripper partial open "
+                            f"alpha={alpha:.2f} open_amount={(1.0 - alpha) * 100.0:.0f}%")
+                        self.gripper_controller.open_gripper_to(alpha)
+                        self.gripper_closed = False
+                        continue
                     self.get_logger().info(
                         f"Queue item {idx}/{total}: gripper {action.lower()}")
                     if action == "OPEN":
@@ -1673,12 +2101,17 @@ class UR10eCuroboMoveIt(Node):
                     f"Queue item {idx}/{total}: unsupported item; skipping.")
                 continue
             goal_key = self._goal_meta_key(goal)
+            self._remember_redo_goal_item(goal, "execute_goal")
             self.motion_phase = "MOVING"
+            self.clear_goal_rejection()
             markers_mod.publish_goal_marker(self, goal[:3])
             self.get_logger().info(
                 f"Move {idx}/{total} → "
                 f"[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
             if not getattr(self, "in_safe_zone", lambda _x: True)(goal[:3]):
+                self.set_goal_rejection(
+                    "target outside safe zone",
+                    f"[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}]")
                 self.get_logger().warn(
                     f"GOAL{idx}: target [{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] is "
                     f"OUTSIDE the safe zone — skipping.")
@@ -1687,6 +2120,9 @@ class UR10eCuroboMoveIt(Node):
             skip_delta = float(getattr(
                 self.cfg.planner, "goal_reachability_skip_delta_deg", 100.0))
             if reach_delta is not None and reach_delta > skip_delta:
+                self.set_goal_rejection(
+                    "IK jump too large",
+                    f"{reach_delta:.1f}deg > {skip_delta:.0f}deg")
                 self.get_logger().warn(
                     f"GOAL{idx}: skipped because nearest IK delta "
                     f"{reach_delta:.1f}deg exceeds {skip_delta:.0f}deg.")
@@ -1894,6 +2330,22 @@ class UR10eCuroboMoveIt(Node):
                     self.get_logger().warn(
                         f"GOAL{idx}: recovery posture move failed; not retrying.")
             if not ok:
+                if current_joint_failed and not getattr(self, 'stop_requested', False):
+                    self.get_logger().warn(
+                        f"Move {idx}/{total} failed; skipping this saved "
+                        "current-joint goal, returning HOME, then continuing.")
+                    getattr(self, "_reachability_goal_metadata", {}).pop(goal_key, None)
+                    self.motion_phase = "HOME"
+                    home_ok = motions_mod.move_to_home_position(self)
+                    if getattr(self, 'stop_requested', False):
+                        self.get_logger().warn(
+                            "Stop requested during HOME recovery — aborting remaining goals.")
+                        break
+                    if not home_ok:
+                        self.get_logger().warn(
+                            "HOME recovery failed after skipped goal — aborting remaining goals.")
+                        break
+                    continue
                 self.get_logger().warn(
                     f"Move {idx}/{total} failed or stopped; "
                     f"aborting remaining goals.")
@@ -1937,8 +2389,12 @@ class UR10eCuroboMoveIt(Node):
         skip_delta = float(getattr(
             self.cfg.planner, "goal_reachability_skip_delta_deg", 100.0))
         if status == "outside":
+            self.set_goal_rejection("target outside safe zone")
             self.get_logger().warn("All queued goals are outside the safe zone.")
         elif best_delta > skip_delta:
+            self.set_goal_rejection(
+                "IK jump too large",
+                f"{best_delta:.1f}deg > {skip_delta:.0f}deg")
             self.get_logger().warn(
                 f"Best queued goal still needs {best_delta:.1f}deg IK delta "
                 f"(cap {skip_delta:.0f}deg); skipping instead of grinding recovery.")

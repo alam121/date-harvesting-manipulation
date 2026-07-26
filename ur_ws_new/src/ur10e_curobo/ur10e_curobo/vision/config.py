@@ -3,6 +3,12 @@
 import os
 from pathlib import Path
 
+from .calibration_profiles import (
+    frame_from_profile,
+    load_camera_profile,
+    matrix_from_profile,
+)
+
 # Model paths — resolve from source tree (works from both src and install)
 _SRC_MODELS = Path(__file__).resolve().parents[3] / "zed_date_detector" / "models"
 if not _SRC_MODELS.exists():
@@ -20,7 +26,10 @@ DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
 
 # YOLO inference parameters
 DEFAULT_CONF_THRES = 0.5          # confidence threshold (lower = more detections)
-DEFAULT_IMG_SIZE = 1248             # must match compiled TRT engine exactly
+DEFAULT_IMG_SIZE = 1248            # fallback only; for .engine weights the real
+                                   # size is read from the engine at load time
+                                   # (see engine_imgsz in yolo_thread.py) and
+                                   # this value is overridden to match.
 
 # Scoring System Weights (tune these for your application)
 SCORE_WEIGHTS = {
@@ -84,8 +93,18 @@ CLASS_ZONE_LOW_RIGHT_THRESH = 0.68
 # Z limit in base_link frame
 Z_MAX = 1.50
 
-# Camera frame name
-CAM_FRAME = "zed2_left_camera_frame"
+# Camera frame name. The active calibration profile is selected by the launcher
+# via UR10E_CAMERA_PROFILE / UR10E_CAMERA_MODE. Explicit frame env vars remain
+# as emergency overrides for field debugging.
+CAMERA_PROFILE = load_camera_profile()
+CAM_FRAME = os.getenv(
+    "UR10E_CAM_FRAME",
+    frame_from_profile(CAMERA_PROFILE, "rgb_frame", "zed2_left_camera_frame"),
+)
+ZEDMINI_CAM_FRAME = os.getenv(
+    "UR10E_ZEDMINI_CAM_FRAME",
+    frame_from_profile(CAMERA_PROFILE, "depth_frame", "zed_mini_left_camera_frame"),
+)
 
 # Class filtering
 # When enabled, only GOAL_CLASS_NAME is used as a grasp target.
@@ -133,15 +152,18 @@ T_CAM_LIDAR = [
 # ZED X Mini is opened in-process (depth-only) to supply the point cloud.
 # Both cameras are grabbed simultaneously; no LiDAR subscription is needed.
 ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN to pin
-ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera
+ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED One (15 max at QHDPLUS)
+ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
 ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
 ZEDMINI_DEPTH_Z_MAX = 5.0    # maximum valid ZED Mini depth (m)
 ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.
-T_CAM_ZEDMINI = [
+_T_CAM_ZEDMINI_DEFAULT = [
     [  0.99997176,  -0.00567234,  -0.00492976,  -0.02432635],
     [  0.00516021,   0.99514099,  -0.09832485,   0.03795027],
     [  0.00546354,   0.09829664,   0.99514216,  -0.01018928],
     [  0.00000000,   0.00000000,   0.00000000,   1.00000000],
 ]  # extrinsic calibration 2026-04-26, 42 pairs, max residual 0.5mm
+T_CAM_ZEDMINI = matrix_from_profile(
+    CAMERA_PROFILE, "depth_to_rgb", _T_CAM_ZEDMINI_DEFAULT)

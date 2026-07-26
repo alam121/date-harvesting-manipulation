@@ -1,0 +1,18 @@
+camera_profile: zedx_mini_rgbd
+mode: zedx_mini
+description: ZED X Mini used as both RGB camera and native stereo depth camera.
+parent_frame: tool0
+rgb_frame: zed_mini_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed_mini_left_camera_frame
+  translation:
+    x: -0.000596
+    y: -0.146103
+    z: 0.079483
+  rpy:
+    roll: -0.121254
+    pitch: -0.002856
+    yaw: -0.017912
+  note: Seeded from the current URDF. Replace by running hand-eye with camera mode zedx_mini.

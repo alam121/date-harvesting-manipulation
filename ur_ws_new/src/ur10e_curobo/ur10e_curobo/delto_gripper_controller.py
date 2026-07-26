@@ -4,7 +4,7 @@ import math
 import os
 from std_msgs.msg import Float32MultiArray
 from .gripper_profiles import (
-    FINGER_JOINT_INDICES,
+    finger_joint_indices_for_profile,
     make_closed_position,
     make_open_position,
     new_gripper_open_extra_deg,
@@ -45,15 +45,15 @@ class DeltoGripperController:
             )
             self.gripper_profile = "old"
 
-        # DG-3F-M paired curling motors:
-        # F1=M3/M4, F2=M7/M8, F3=M11/M12.
+        # Primary curl joint fallback: F1=M3, F2=M7, F3=M11.
         self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
-        self.finger_joint_indices = FINGER_JOINT_INDICES
+        self.finger_joint_indices = finger_joint_indices_for_profile(self.gripper_profile)
 
         self.open_position = make_open_position(self.gripper_profile)
-        self.closed_position = make_closed_position()
+        self.closed_position = make_closed_position(self.gripper_profile)
 
         self.current_position = self.open_position.copy()
+        self.current_open_alpha = 0.0
         self.node.get_logger().info(
             f"Delto gripper profile: {self.gripper_profile} "
             f"(new open extra={new_gripper_open_extra_deg():.1f}deg)"
@@ -292,6 +292,7 @@ class DeltoGripperController:
     def open_gripper(self):
         self.set_state('OPENING')
         self.current_step = 0
+        self.current_open_alpha = 0.0
         self.move_to_position(self.open_position)
         self.close_start_position = self.open_position.copy()
 
@@ -321,10 +322,15 @@ class DeltoGripperController:
         self.set_state('IDLE')
 
     def open_gripper_to(self, alpha: float = 0.0):
-        """Open gripper to a partial position. alpha=0.0 is fully open, alpha=1.0 is fully closed."""
-        alpha = max(0.0, min(1.0, alpha))
+        """Open gripper to a partial position.
+
+        alpha=0.0 is the calibrated open posture, alpha=1.0 is fully closed.
+        A small negative alpha allows a slight over-open beyond calibration.
+        """
+        alpha = max(-0.10, min(1.0, alpha))
         self.set_state('OPENING')
         self.current_step = 0
+        self.current_open_alpha = alpha
 
         # Compute partial open position
         position = self.open_position.copy()

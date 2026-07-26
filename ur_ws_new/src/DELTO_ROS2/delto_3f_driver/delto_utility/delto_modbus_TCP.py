@@ -5,6 +5,7 @@ import sys
 import os
 import threading
 import struct
+import math
 from typing import List
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,6 +38,7 @@ class Communication:
         self.current_position_register = 6
         self.target_position_register = 7
         self.current_register = 26
+        self.velocity_register = 46
 
     def __del__(self):
         self.disconnect()
@@ -108,6 +110,29 @@ class Communication:
             # status.append(struct.unpack('h', struct.pack('H', stats[0]))[0]/10)
             # status.append(stats)
         return status
+
+    def _read_signed_input_registers(self, address, count):
+        if self.dummy:
+            return [0] * count
+        values = self.client.read_input_registers(
+            address=address,
+            count=count,
+            slave=self.slaveID).registers
+        return [value if value < 32768 else value - 65536 for value in values]
+
+    def get_current_raw(self):
+        return self._read_signed_input_registers(
+            self.current_register,
+            Delto3F.MOTOR_NUM.value)
+
+    def get_current(self):
+        return [value * 0.001 for value in self.get_current_raw()]
+
+    def get_velocity(self):
+        velocity_values = self._read_signed_input_registers(
+            self.velocity_register,
+            Delto3F.MOTOR_NUM.value)
+        return [value * (math.pi / 30.0) for value in velocity_values]
 
     def get_high_force(self):
 

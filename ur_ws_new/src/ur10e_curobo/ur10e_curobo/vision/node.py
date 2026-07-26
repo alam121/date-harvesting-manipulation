@@ -26,13 +26,13 @@ from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 
 from .config import (
-    CAM_FRAME, Z_MAX,
+    CAMERA_PROFILE, CAM_FRAME, ZEDMINI_CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
     TRUNK_DEPTH_OFFSET,
     USE_LIDAR, LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDXONE_IMAGE_TOPIC, ZEDXONE_WIDTH, ZEDXONE_HEIGHT,
     ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
-    ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS,
+    ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
 )
@@ -134,6 +134,13 @@ class VisionNode:
         self._latest_depth_map_orig: Optional[np.ndarray] = None
         self._depth_map_lock = Lock()
 
+        # Active camera frame for TF and published camera-frame points.
+        self.cam_frame = (
+            ZEDMINI_CAM_FRAME
+            if getattr(self.args, "use_zedx_mini_only", False)
+            else CAM_FRAME
+        )
+
         # Raw ZED Mini points + UV in ZED One image (no EDT fill).
         # pts_one: ZED One (CAM_FRAME) coordinates — used for centroid so TF to base_link is correct.
         # pts_mini: ZED Mini frame — kept for depth_map visualisation only.
@@ -159,6 +166,8 @@ class VisionNode:
         self._camera_status_pub = None
         self._refresh_argv = None
         self._refresh_reason = "camera refresh"
+        self._raw_stream_enabled = bool(int(os.getenv("UR10E_RAW_IMAGE_STREAM", "0")))
+        self._raw_stream_until = 0.0
 
         # Components
         self.tracker = FruitTracker()
@@ -395,6 +404,27 @@ class VisionNode:
                 self.node.get_logger().info(
                     f"Camera model change requested: {path.name}; restarting vision.")
                 self._request_vision_restart(f"model change to {path.name}", argv=argv)
+            elif cmd.startswith("raw_stream "):
+                parts = cmd.split()
+                mode = parts[1].lower() if len(parts) > 1 else ""
+                if mode in ("on", "true", "1", "start"):
+                    self._raw_stream_enabled = True
+                    self.node.get_logger().info("Raw camera stream ON")
+                elif mode in ("off", "false", "0", "stop"):
+                    self._raw_stream_enabled = False
+                    self._raw_stream_until = 0.0
+                    self.node.get_logger().info("Raw camera stream OFF")
+                elif mode in ("snapshot", "burst"):
+                    duration = 1.0
+                    for token in parts[2:]:
+                        if token.startswith("duration="):
+                            try:
+                                duration = max(0.2, min(5.0, float(token.split("=", 1)[1])))
+                            except ValueError:
+                                pass
+                    self._raw_stream_until = max(self._raw_stream_until, time() + duration)
+                    self.node.get_logger().info(
+                        f"Raw camera stream burst requested ({duration:.1f}s)")
 
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
 
@@ -403,12 +433,13 @@ class VisionNode:
         TransformListener(self.tf_buffer, self.node)
 
         # Wait for TFs
-        required_tfs = [("base_link", CAM_FRAME), ("gripper_tip", CAM_FRAME)]
+        required_tfs = [("base_link", self.cam_frame), ("gripper_tip", self.cam_frame)]
         for target, source in required_tfs:
             wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
         use_lidar   = getattr(self.args, "use_lidar",    False)
         use_zed_mini = getattr(self.args, "use_zed_mini", False)
+        use_zedx_mini_only = getattr(self.args, "use_zedx_mini_only", False)
         use_mono_depth = use_lidar or use_zed_mini  # ZED One Mono + external depth source
         _pending_depth_thread = None  # set to a callable if ZED Mini warp thread is needed
         zed = self._init_zed_and_yolo()
@@ -544,7 +575,7 @@ class VisionNode:
                                 self._mini_pts_buffer.pop(0)
                 _pending_depth_thread = _zed_mini_depth_thread
         else:
-            # ── ZED stereo path ─────────────────────────────────────────────
+            # ── ZED stereo path, including ZED X Mini-only RGBD mode ────────
             if zed is None:
                 rclpy.shutdown()
                 return
@@ -610,13 +641,16 @@ class VisionNode:
                 try:
                     _vt0 = time()
                     stamp = self.node.get_clock().now().to_msg()
-                    if len(img_ocv.shape) == 3 and img_ocv.shape[2] == 4:
-                        raw_pub_image = cv2.cvtColor(img_ocv, cv2.COLOR_BGRA2BGR)
-                    else:
-                        raw_pub_image = img_ocv
-                    raw_msg = self.cv_bridge.cv2_to_imgmsg(raw_pub_image, encoding="bgr8")
-                    raw_msg.header.stamp = stamp
-                    self.raw_image_pub.publish(raw_msg)
+                    raw_stream_active = (
+                        self._raw_stream_enabled or time() < self._raw_stream_until)
+                    if raw_stream_active:
+                        if len(img_ocv.shape) == 3 and img_ocv.shape[2] == 4:
+                            raw_pub_image = cv2.cvtColor(img_ocv, cv2.COLOR_BGRA2BGR)
+                        else:
+                            raw_pub_image = img_ocv
+                        raw_msg = self.cv_bridge.cv2_to_imgmsg(raw_pub_image, encoding="bgr8")
+                        raw_msg.header.stamp = stamp
+                        self.raw_image_pub.publish(raw_msg)
                     if not getattr(self, "_printed_bottom_pixel_pre_render", False):
                         _bottom = img_ocv[-12:, :, :3]
                         print(
@@ -777,12 +811,12 @@ class VisionNode:
                 # one per detection (was 8+ tf_buffer.transform calls at ~20ms each).
                 try:
                     self._cached_tf_base = _tf_stamped_to_Rt(
-                        self.tf_buffer.lookup_transform("base_link", CAM_FRAME, rclpyTime()))
+                        self.tf_buffer.lookup_transform("base_link", self.cam_frame, rclpyTime()))
                 except Exception:
                     pass  # keep previous cached value
                 try:
                     self._cached_tf_grip = _tf_stamped_to_Rt(
-                        self.tf_buffer.lookup_transform("gripper_tip", CAM_FRAME, rclpyTime()))
+                        self.tf_buffer.lookup_transform("gripper_tip", self.cam_frame, rclpyTime()))
                 except Exception:
                     pass
 
@@ -1047,6 +1081,7 @@ class VisionNode:
         simultaneous TRT initialization causes a segfault."""
         use_lidar    = getattr(self.args, "use_lidar",    False)
         use_zed_mini = getattr(self.args, "use_zed_mini", False)
+        use_zedx_mini_only = getattr(self.args, "use_zedx_mini_only", False)
         use_mono_depth = use_lidar or use_zed_mini
 
         if use_mono_depth:
@@ -1117,31 +1152,58 @@ class VisionNode:
                 self._depth_camera_text = "Livox" if use_lidar else "-"
 
         else:
-            # ZED stereo — standard Camera API
+            # ZED stereo — standard Camera API. In Mini-only mode this opens the
+            # ZED X Mini as the image and depth camera, so RGB/depth are native
+            # to the same sensor and no ZED X One warp is used.
             input_type = sl.InputType()
             if self.args.svo:
                 input_type.set_from_svo_file(self.args.svo)
             zed = sl.Camera()
             init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
+            if use_zedx_mini_only and ZEDMINI_SERIAL > 0:
+                init_params.input.set_from_serial_number(ZEDMINI_SERIAL)
             init_params.camera_resolution = sl.RESOLUTION.HD1080
+            if use_zedx_mini_only:
+                init_params.camera_fps = ZEDMINI_RGBD_FPS
             init_params.coordinate_units = sl.UNIT.METER
             init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
-            init_params.depth_minimum_distance = 0.15
-            init_params.depth_maximum_distance = 50.0
+            init_params.depth_minimum_distance = (
+                ZEDMINI_DEPTH_Z_MIN if use_zedx_mini_only else 0.15
+            )
+            init_params.depth_maximum_distance = (
+                ZEDMINI_DEPTH_Z_MAX if use_zedx_mini_only else 50.0
+            )
+            init_params.sdk_verbose = 1
 
-            print("Initializing Camera...")
+            print(
+                "Initializing ZED X Mini RGBD camera..."
+                if use_zedx_mini_only else
+                "Initializing Camera..."
+            )
             status = zed.open(init_params)
             if status != sl.ERROR_CODE.SUCCESS:
                 print(repr(status))
                 return None
-            print("Camera Initialized")
+            print("ZED X Mini RGBD initialized" if use_zedx_mini_only else "Camera Initialized")
             self._zed = zed
-            self._camera_type = "ZED stereo"
+            self._camera_type = "ZED X Mini" if use_zedx_mini_only else "ZED stereo"
             self._camera_resolution = "HD1080"
-            self._camera_fps = "camera default"
-            self._camera_mode = "stereo RGB + ZED depth"
+            self._camera_fps = (
+                f"{ZEDMINI_RGBD_FPS} requested"
+                if use_zedx_mini_only else
+                "camera default"
+            )
+            self._camera_mode = (
+                "ZED X Mini stereo RGB + ZED X Mini depth"
+                if use_zedx_mini_only else
+                "stereo RGB + ZED depth"
+            )
             self._camera_hdr_enabled = False
-            self._depth_camera_text = "ZED stereo depth"
+            self._depth_camera_text = (
+                "ZED X Mini native stereo depth"
+                if use_zedx_mini_only else
+                "ZED stereo depth"
+            )
             apply_zed_stereo_settings(zed)
             zed.enable_positional_tracking(sl.PositionalTrackingParameters())
             obj_param = sl.ObjectDetectionParameters()
@@ -1170,6 +1232,8 @@ class VisionNode:
             f"Camera: {self._camera_type}\n"
             f"Resolution: {self._camera_resolution}  FPS: {self._camera_fps}\n"
             f"Mode: {self._camera_mode}\n"
+            f"Calibration: {CAMERA_PROFILE.get('camera_profile', '-')}\n"
+            f"RGB frame: {CAM_FRAME}  Depth frame: {ZEDMINI_CAM_FRAME}\n"
             f"HDR: {'ON' if self._camera_hdr_enabled else 'OFF'}\n"
             f"Depth: {self._depth_camera_text}\n"
             f"Model: {model_name}\n"
@@ -1207,7 +1271,7 @@ class VisionNode:
 
                 pc_msg = create_pointcloud2_msg(
                     valid_points,
-                    CAM_FRAME,
+                    self.cam_frame,
                     self.node.get_clock().now().to_msg()
                 )
                 depth_pub.publish(pc_msg)
@@ -1278,7 +1342,7 @@ class VisionNode:
             _trunk_xyz_cam = _trunk_xyz_cam + _trunk_radius * (_trunk_xyz_cam / _cam_dist)
         if trunk_cam_pub is not None:
             cam_msg = PointStamped()
-            cam_msg.header.frame_id = CAM_FRAME
+            cam_msg.header.frame_id = self.cam_frame
             cam_msg.header.stamp = rclpyTime().to_msg()
             cam_msg.point.x = float(_trunk_xyz_cam[0])
             cam_msg.point.y = float(_trunk_xyz_cam[1])
@@ -1300,7 +1364,7 @@ class VisionNode:
                 pt_base.point.z = float(_xyz_b[2])
             else:
                 point_msg = PointStamped()
-                point_msg.header.frame_id = CAM_FRAME
+                point_msg.header.frame_id = self.cam_frame
                 point_msg.header.stamp = rclpyTime().to_msg()
                 point_msg.point.x = _trunk_xyz_cam[0]
                 point_msg.point.y = _trunk_xyz_cam[1]
@@ -1633,6 +1697,34 @@ class VisionNode:
             roi_xyz = pc_np[y1:y2, x1:x2, :]
             valid = np.isfinite(roi_xyz[:, :, 2]) & mask_bool
 
+            # Visibility ratio
+            vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
+            mask_pixels = np.count_nonzero(vis_mask)
+            vis_ratio = (
+                float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
+                if mask_pixels > 0 else 0.0
+            )
+            vis_ratio = max(0.0, min(vis_ratio, 1.0))
+
+            if np.count_nonzero(valid) < 10:
+                mark_reject("Too few depth pts")
+                return None
+
+            pts = roi_xyz[valid]
+            zs = pts[:, 2]
+            k = max(10, int(0.2 * len(zs)))
+            idx = np.argpartition(zs, k - 1)[:k]
+            pts_front = pts[idx]
+
+            depth_std = np.std(pts_front[:, 2])
+            Xc = float(np.mean(pts_front[:, 0]))
+            Yc = float(np.mean(pts_front[:, 1]))
+            Zc = float(np.mean(pts_front[:, 2]))
+
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+                mark_reject("Z out of range")
+                return None
+
             # Only compute heatmap for the previous best fruit (same as ZED Mini path).
             target_key = (x1 // 16 * 16, y1 // 16 * 16, x2 // 16 * 16, y2 // 16 * 16)
             _prev = self.best_target_prev
@@ -1655,40 +1747,12 @@ class VisionNode:
                 else:
                     heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
 
-            # Visibility ratio
-            vis_mask = cv2.erode(mask_clean, np.ones((3, 3), np.uint8), iterations=1) > 0
-            mask_pixels = np.count_nonzero(vis_mask)
-            vis_ratio = (
-                float(np.count_nonzero(valid & vis_mask)) / float(mask_pixels)
-                if mask_pixels > 0 else 0.0
-            )
-            vis_ratio = max(0.0, min(vis_ratio, 1.0))
-
-            if np.count_nonzero(valid) < 10:
-                mark_reject("Too few depth pts")
-                return None
-
-            pts = roi_xyz[valid]
-            zs = pts[:, 2]
-            k = max(10, int(0.2 * len(zs)))
-            idx = np.argpartition(zs, k - 1)[:k]
-            pts_front = pts[idx]
-
-            depth_std = np.std(pts_front[:, 2])
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
 
             # Don't hard-reject on high depth variance — include as low-quality candidate.
             # The depth_quality score component will naturally rank it lower until depth
             # stabilises over the first few frames. Hard-rejecting causes the fruit to
             # flash between "rejected" and "best" on first appearance.
-
-            Xc = float(np.mean(pts_front[:, 0]))
-            Yc = float(np.mean(pts_front[:, 1]))
-            Zc = float(np.mean(pts_front[:, 2]))
-
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
-                mark_reject("Z out of range")
-                return None
 
             # Branch gap detection (depth ring sampling around fruit)
             gap_target = {"bb": (x1, y1, x2, y2), "Zc": Zc}
@@ -1702,7 +1766,7 @@ class VisionNode:
 
         # Transform to base_link
         point_msg = PointStamped()
-        point_msg.header.frame_id = CAM_FRAME
+        point_msg.header.frame_id = self.cam_frame
         point_msg.header.stamp = rclpyTime().to_msg()
         point_msg.point.x = Xc
         point_msg.point.y = Yc

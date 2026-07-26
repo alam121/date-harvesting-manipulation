@@ -1,7 +1,8 @@
 """YOLO inference thread for background processing."""
 
+import json
 from threading import Lock, Event
-from time import sleep, time
+from time import time
 from typing import Optional
 
 import cv2
@@ -10,6 +11,29 @@ import torch
 from ultralytics import YOLO
 
 from .detection import detections_to_custom_masks
+
+
+def engine_imgsz(weights: str) -> Optional[int]:
+    """Return the square input size a TensorRT .engine was compiled for, read
+    from the JSON metadata header ultralytics prepends to the file. Returns
+    None for non-engine weights (.pt/.onnx are size-flexible) or if the header
+    can't be parsed. A TRT engine's input size is fixed at export time and
+    cannot be changed at inference — passing any other imgsz raises an
+    AssertionError deep in the backend, so this is the authoritative size."""
+    if not str(weights).endswith(".engine"):
+        return None
+    try:
+        with open(weights, "rb") as fh:
+            meta_len = int.from_bytes(fh.read(4), "little")
+            meta = json.loads(fh.read(meta_len).decode("utf-8"))
+        imgsz = meta.get("imgsz")
+        if isinstance(imgsz, (list, tuple)):
+            return int(imgsz[0])
+        if imgsz is not None:
+            return int(imgsz)
+    except Exception:
+        pass
+    return None
 
 
 class YoloThread:
@@ -24,6 +48,11 @@ class YoloThread:
         self.run_event = Event()
         self.dets_ready = Event()
         self.stopped = Event()  # set when run() loop exits
+        # Set whenever no inference is queued or in flight; cleared for the
+        # duration of a predict() call. Lets wait_until_idle() block instead
+        # of polling for the GPU-handoff check before cuRobo moves the arm.
+        self.idle_event = Event()
+        self.idle_event.set()
         # Held during active GPU inference — cuRobo acquires this before planning
         # to prevent concurrent CUDA ops that corrupt shared GPU memory on Jetson.
         self.inference_lock = Lock()
@@ -46,6 +75,18 @@ class YoloThread:
             raise RuntimeError("CUDA is required for YOLO; GPU not available.")
 
         device = torch.device("cuda")
+
+        # A TRT engine's input size is baked in at export and cannot be resized
+        # at inference. Force img_size to the engine's compiled size so a stale
+        # DEFAULT_IMG_SIZE can never trigger the "input size N not equal to max
+        # model size M" AssertionError. .pt/.onnx return None here and keep the
+        # configured size (they resize freely).
+        native = engine_imgsz(self.weights)
+        if native is not None and native != self.img_size:
+            print(f"[YoloThread] img_size {self.img_size} does not match engine "
+                  f"'{self.weights}' (compiled for {native}); using {native}.")
+            self.img_size = native
+
         self._model = YOLO(self.weights, task='segment')
         self.class_names = getattr(self._model, 'names', {})
 
@@ -70,42 +111,44 @@ class YoloThread:
         print(f"  Bunch class IDs: {self._bunch_class_ids}")
 
         while not self.exit_signal:
-            if self.run_event.is_set():
-                with self.lock:
-                    img = cv2.cvtColor(self.image_net, cv2.COLOR_RGBA2RGB)
+            if not self.run_event.wait(timeout=0.1):
+                continue
 
-                t0 = time()
-                with self.inference_lock:
-                    det = self._model.predict(
-                         img,
-                         save=False,
-                         retina_masks=False,
-                         imgsz=self.img_size,
-                         conf=self.conf_thres,
-                         iou=0.3,
-                         max_det=10,
-                         device=device,
-                         verbose=False,
-                         classes=self._detect_class_ids if self._detect_class_ids else None,
-                     )[0]
+            self.idle_event.clear()
+            with self.lock:
+                img = cv2.cvtColor(self.image_net, cv2.COLOR_RGBA2RGB)
 
-                dt = time() - t0
-                self.net_fps = (1.0 / dt) if dt > 0 else 0.0
-                self._log_inference_time(dt)
+            t0 = time()
+            with self.inference_lock:
+                det = self._model.predict(
+                     img,
+                     save=False,
+                     retina_masks=False,
+                     imgsz=self.img_size,
+                     conf=self.conf_thres,
+                     iou=0.3,
+                     max_det=10,
+                     device=device,
+                     verbose=False,
+                     classes=self._detect_class_ids if self._detect_class_ids else None,
+                 )[0]
 
-                fruit_dets, trunk_boxes, bunch_boxes = detections_to_custom_masks(
-                    det, trunk_class_ids=self._trunk_class_ids,
-                    bunch_class_ids=self._bunch_class_ids
-                )
-                with self.lock:
-                    self.detections = fruit_dets
-                    self.trunk_boxes = trunk_boxes
-                    self.bunch_boxes = bunch_boxes
+            dt = time() - t0
+            self.net_fps = (1.0 / dt) if dt > 0 else 0.0
+            self._log_inference_time(dt)
 
-                self.run_event.clear()
-                self.dets_ready.set()
+            fruit_dets, trunk_boxes, bunch_boxes = detections_to_custom_masks(
+                det, trunk_class_ids=self._trunk_class_ids,
+                bunch_class_ids=self._bunch_class_ids
+            )
+            with self.lock:
+                self.detections = fruit_dets
+                self.trunk_boxes = trunk_boxes
+                self.bunch_boxes = bunch_boxes
 
-            sleep(0.005)
+            self.run_event.clear()
+            self.dets_ready.set()
+            self.idle_event.set()
 
         self.stopped.set()  # signal that the loop has fully exited
 
@@ -144,14 +187,7 @@ class YoloThread:
     def wait_until_idle(self, timeout: float = 0.5) -> bool:
         """Block until no inference is pending or in flight, so the GPU is free
         for cuRobo. Returns True once idle, False if still busy after timeout."""
-        deadline = time() + timeout
-        while time() < deadline:
-            # No queued job and not mid-inference (inference_lock is free).
-            if not self.run_event.is_set() and self.inference_lock.acquire(blocking=False):
-                self.inference_lock.release()
-                return True
-            sleep(0.002)
-        return False
+        return self.idle_event.wait(timeout=timeout)
 
     def get_detections(self):
         """Get latest fruit detections (thread-safe). Trunk is excluded."""

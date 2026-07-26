@@ -8,9 +8,12 @@
 #include <QFont>
 #include <QApplication>
 #include <QComboBox>
+#include <QDate>
+#include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
 #include <QMessageBox>
+#include <QRegularExpression>
 
 #include <algorithm>
 #include <array>
@@ -51,6 +54,153 @@ int panelJointIndex(const std::string & name)
     }
   }
   return -1;
+}
+
+QDate modelDateFromName(const QString & name)
+{
+  static const QRegularExpression yyyymmdd_re(
+    R"((20\d{2})[-_]?([01]\d)[-_]?([0-3]\d))");
+  QRegularExpressionMatch match = yyyymmdd_re.match(name);
+  if (match.hasMatch()) {
+    const QDate date(
+      match.captured(1).toInt(),
+      match.captured(2).toInt(),
+      match.captured(3).toInt());
+    if (date.isValid()) {
+      return date;
+    }
+  }
+
+  static const QRegularExpression dmy_re(
+    R"((^|[_-])([0-3]?\d)[_-]([01]?\d)[_-](\d{2,4})(?=([_.-]|$)))");
+  match = dmy_re.match(name);
+  if (match.hasMatch()) {
+    int year = match.captured(4).toInt();
+    if (year < 100) {
+      year += 2000;
+    }
+    const QDate date(year, match.captured(3).toInt(), match.captured(2).toInt());
+    if (date.isValid()) {
+      return date;
+    }
+  }
+
+  return QDate();
+}
+
+bool modelFileNewerFirst(const QFileInfo & lhs, const QFileInfo & rhs)
+{
+  if (lhs.lastModified() != rhs.lastModified()) {
+    return lhs.lastModified() > rhs.lastModified();
+  }
+
+  const QDate lhs_date = modelDateFromName(lhs.fileName());
+  const QDate rhs_date = modelDateFromName(rhs.fileName());
+  if (lhs_date.isValid() || rhs_date.isValid()) {
+    if (lhs_date.isValid() != rhs_date.isValid()) {
+      return lhs_date.isValid();
+    }
+    if (lhs_date != rhs_date) {
+      return lhs_date > rhs_date;
+    }
+  }
+  return QString::localeAwareCompare(lhs.fileName(), rhs.fileName()) < 0;
+}
+
+std::string trimCopy(const std::string & value)
+{
+  const auto start = value.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) {
+    return "";
+  }
+  const auto end = value.find_last_not_of(" \t\r\n");
+  return value.substr(start, end - start + 1);
+}
+
+std::string lineValue(const std::string & text, const std::string & prefix)
+{
+  std::istringstream stream(text);
+  std::string line;
+  while (std::getline(stream, line)) {
+    if (line.rfind(prefix, 0) == 0) {
+      return trimCopy(line.substr(prefix.size()));
+    }
+  }
+  return "";
+}
+
+std::string lineContaining(const std::string & text, const std::string & token)
+{
+  std::istringstream stream(text);
+  std::string line;
+  while (std::getline(stream, line)) {
+    if (line.find(token) != std::string::npos) {
+      return line;
+    }
+  }
+  return "";
+}
+
+std::string cameraProfileSummary(const std::string & status_text)
+{
+  std::string profile = lineValue(status_text, "Calibration:");
+  std::string mode = lineValue(status_text, "Camera mode:");
+  if (mode.empty()) {
+    if (profile == "zedx_mini_rgbd" || profile == "zedx_mini_rgbd.yaml") {
+      mode = "zedx_mini";
+    } else if (
+      profile == "zed_one_rgb_zedx_mini_depth" ||
+      profile == "zed_one_rgb_zedx_mini_depth.yaml")
+    {
+      mode = "zed_mini";
+    } else {
+      mode = lineValue(status_text, "Mode:");
+    }
+  }
+
+  if (!profile.empty() &&
+    (profile.size() < 5 || profile.substr(profile.size() - 5) != ".yaml"))
+  {
+    profile += ".yaml";
+  }
+
+  std::string rgb_frame = lineValue(status_text, "RGB frame:");
+  std::string depth_frame;
+  const std::string frame_line = lineContaining(status_text, "Depth frame:");
+  const std::string depth_prefix = "Depth frame:";
+  const auto depth_pos = frame_line.find(depth_prefix);
+  if (depth_pos != std::string::npos) {
+    depth_frame = trimCopy(frame_line.substr(depth_pos + depth_prefix.size()));
+  }
+  if (!rgb_frame.empty()) {
+    const auto inline_depth = rgb_frame.find(depth_prefix);
+    if (inline_depth != std::string::npos) {
+      if (depth_frame.empty()) {
+        depth_frame = trimCopy(rgb_frame.substr(inline_depth + depth_prefix.size()));
+      }
+      rgb_frame = trimCopy(rgb_frame.substr(0, inline_depth));
+    }
+  }
+
+  if (mode.empty()) {
+    mode = "--";
+  }
+  if (profile.empty()) {
+    profile = "--";
+  }
+  if (rgb_frame.empty()) {
+    rgb_frame = "--";
+  }
+  if (depth_frame.empty()) {
+    depth_frame = "--";
+  }
+
+  std::ostringstream out;
+  out << "Camera mode: " << mode << "\n"
+      << "Profile: " << profile << "\n"
+      << "RGB frame: " << rgb_frame << "\n"
+      << "Depth frame: " << depth_frame;
+  return out.str();
 }
 
 double metricScore(double value, double excellent, double poor)
@@ -118,6 +268,30 @@ std::string jsonStringValue(const std::string & data, const char * key)
     }
   }
   return "";
+}
+
+double jsonNumberValue(const std::string & data, const char * key, double fallback)
+{
+  const std::string needle = std::string("\"") + key + "\"";
+  auto pos = data.find(needle);
+  if (pos == std::string::npos) return fallback;
+  auto colon = data.find(':', pos);
+  if (colon == std::string::npos) return fallback;
+  return std::atof(data.c_str() + colon + 1);
+}
+
+bool jsonBoolValue(const std::string & data, const char * key, bool fallback)
+{
+  const std::string needle = std::string("\"") + key + "\"";
+  auto pos = data.find(needle);
+  if (pos == std::string::npos) return fallback;
+  auto colon = data.find(':', pos);
+  if (colon == std::string::npos) return fallback;
+  auto val_start = data.find_first_not_of(" \t\r\n", colon + 1);
+  if (val_start == std::string::npos) return fallback;
+  if (data.compare(val_start, 4, "true") == 0) return true;
+  if (data.compare(val_start, 5, "false") == 0) return false;
+  return fallback;
 }
 
 }  // namespace
@@ -332,7 +506,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   motion_layout->addWidget(debug_preview_cb_, 7, 0, 1, 2);
 
   reachability_cloud_cb_ = new QCheckBox("Reachability Cloud");
-  reachability_cloud_cb_->setChecked(true);
+  reachability_cloud_cb_->setChecked(false);
   reachability_cloud_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
   reachability_cloud_cb_->setToolTip(
     "Show/hide the sampled green/yellow reachability cloud and LiDAR scan preview in RViz");
@@ -383,15 +557,47 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   // Gripper
   auto * gripper_group = new QGroupBox("Gripper");
-  auto * gripper_layout = new QHBoxLayout(gripper_group);
+  auto * gripper_layout = new QVBoxLayout(gripper_group);
+
+  gripper_info_label_ = new QLabel("Profile: --\nState: --\nMode: --");
+  gripper_info_label_->setWordWrap(true);
+  gripper_info_label_->setStyleSheet(
+    "font-family: monospace; color: #263238; background: #eceff1; "
+    "padding: 6px; border-radius: 4px;");
+  gripper_layout->addWidget(gripper_info_label_);
+
+  auto * gripper_button_row = new QHBoxLayout();
 
   auto * open_btn = new QPushButton("Open");
   connect(open_btn, &QPushButton::clicked, this, &UR10ePanel::onGripperOpen);
-  gripper_layout->addWidget(open_btn);
+  gripper_button_row->addWidget(open_btn);
 
   auto * close_btn = new QPushButton("Close");
   connect(close_btn, &QPushButton::clicked, this, &UR10ePanel::onGripperClose);
-  gripper_layout->addWidget(close_btn);
+  gripper_button_row->addWidget(close_btn);
+  gripper_layout->addLayout(gripper_button_row);
+
+  auto * gripper_slider_row = new QHBoxLayout();
+  auto * gripper_open_label = new QLabel("Open amount");
+  gripper_slider_row->addWidget(gripper_open_label);
+  gripper_open_slider_ = new QSlider(Qt::Horizontal);
+  gripper_open_slider_->setRange(20, 110);
+  gripper_open_slider_->setValue(100);
+  gripper_open_slider_->setToolTip(
+    "Set partial gripper opening. 100% is calibrated open; 110% is a slight over-open.");
+  connect(
+    gripper_open_slider_, &QSlider::valueChanged,
+    this, &UR10ePanel::onGripperOpenSliderChanged);
+  connect(
+    gripper_open_slider_, &QSlider::sliderReleased,
+    this, &UR10ePanel::onGripperOpenSliderReleased);
+  gripper_slider_row->addWidget(gripper_open_slider_, 1);
+  gripper_open_value_label_ = new QLabel("100%");
+  gripper_open_value_label_->setMinimumWidth(44);
+  gripper_open_value_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  gripper_open_value_label_->setFont(QFont("Courier", 10, QFont::Bold));
+  gripper_slider_row->addWidget(gripper_open_value_label_);
+  gripper_layout->addLayout(gripper_slider_row);
 
   motion_tab_layout->addWidget(gripper_group);
 
@@ -566,6 +772,21 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   goal_tab_layout->addWidget(lidar_group);
 
+  auto * camera_profile_group = new QGroupBox("Camera Profile");
+  auto * camera_profile_layout = new QVBoxLayout(camera_profile_group);
+  camera_profile_label_ = new QLabel(
+    "Camera mode: zedx_mini\n"
+    "Profile: zedx_mini_rgbd.yaml\n"
+    "RGB frame: zed_mini_left_camera_frame\n"
+    "Depth frame: zed_mini_left_camera_frame");
+  camera_profile_label_->setWordWrap(true);
+  camera_profile_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  camera_profile_label_->setStyleSheet(
+    "font-size: 9pt; color: #102027; background: #e0f2f1; padding: 7px; "
+    "border: 1px solid #80cbc4; border-radius: 4px;");
+  camera_profile_layout->addWidget(camera_profile_label_);
+  camera_tab_layout->addWidget(camera_profile_group);
+
   // Camera recording
   auto * camera_group = new QGroupBox("Camera Feed Recording");
   auto * camera_layout = new QGridLayout(camera_group);
@@ -649,7 +870,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   camera_model_combo_->setToolTip("Models found in ur_ws_new/src/zed_date_detector/models");
   const QDir model_dir("/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models");
   const QStringList filters = {"*.engine", "*.pt", "*.onnx"};
-  const auto files = model_dir.entryInfoList(filters, QDir::Files, QDir::Name);
+  auto files = model_dir.entryInfoList(filters, QDir::Files, QDir::NoSort);
+  std::sort(files.begin(), files.end(), modelFileNewerFirst);
   for (const QFileInfo & file : files) {
     camera_model_combo_->addItem(file.fileName(), file.absoluteFilePath());
   }
@@ -700,6 +922,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   camera_status_label_ = new QLabel("Camera: waiting for /camera_status");
   camera_status_label_->setWordWrap(true);
+  camera_status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   camera_status_label_->setStyleSheet(
     "font-size: 9pt; color: #263238; background: #eceff1; padding: 6px; "
     "border-radius: 4px;");
@@ -879,6 +1102,13 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   latest_goal_label_->setWordWrap(true);
   goals_layout->addWidget(latest_goal_label_);
 
+  goal_rejection_label_ = new QLabel("Safety: --");
+  goal_rejection_label_->setWordWrap(true);
+  goal_rejection_label_->setStyleSheet(
+    "font-size: 9pt; color: #455a64; background: #eceff1; padding: 5px; "
+    "border-radius: 4px;");
+  goals_layout->addWidget(goal_rejection_label_);
+
   goal_coords_label_ = new QLabel("");
   goal_coords_label_->setFont(QFont("Courier", 8));
   goal_coords_label_->setWordWrap(true);
@@ -943,6 +1173,57 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(queue_close_btn, &QPushButton::clicked, this, &UR10ePanel::onQueueGripperClose);
   gripper_queue_row->addWidget(queue_close_btn);
   goals_layout->addLayout(gripper_queue_row);
+
+  auto * redo_group = new QGroupBox("Redo Goals");
+  auto * redo_layout = new QVBoxLayout(redo_group);
+  redo_goal_combo_ = new QComboBox();
+  redo_goal_combo_->addItem("No redo goals yet", 0);
+  redo_goal_combo_->setToolTip("Recently executed goals. Select one and redo only that item.");
+  redo_layout->addWidget(redo_goal_combo_);
+  auto * redo_btn = new QPushButton("Redo Selected");
+  redo_btn->setStyleSheet("background-color: #3949ab; color: white; font-weight: bold;");
+  redo_btn->setToolTip("Execute only the selected recent goal through the normal planner");
+  connect(redo_btn, &QPushButton::clicked, this, &UR10ePanel::onRedoSelectedGoal);
+  redo_layout->addWidget(redo_btn);
+  goals_layout->addWidget(redo_group);
+
+  auto * session_group = new QGroupBox("Session Recorder");
+  auto * session_layout = new QVBoxLayout(session_group);
+  session_status_label_ = new QLabel("Session: idle");
+  session_status_label_->setWordWrap(true);
+  session_status_label_->setStyleSheet(
+    "font-size: 9pt; color: #37474f; background: #eceff1; padding: 5px; "
+    "border-radius: 4px;");
+  session_layout->addWidget(session_status_label_);
+
+  auto * session_row_1 = new QHBoxLayout();
+  auto * session_start_btn = new QPushButton("Start Recording");
+  session_start_btn->setStyleSheet("background-color: #1565c0; color: white; font-weight: bold;");
+  session_start_btn->setToolTip("Start recording queued goals and gripper actions");
+  connect(session_start_btn, &QPushButton::clicked, this, &UR10ePanel::onSessionRecordStart);
+  session_row_1->addWidget(session_start_btn);
+
+  auto * session_stop_btn = new QPushButton("Stop && Save");
+  session_stop_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
+  session_stop_btn->setToolTip("Stop recording and save the session JSON in ~/ur10e_sessions");
+  connect(session_stop_btn, &QPushButton::clicked, this, &UR10ePanel::onSessionRecordStop);
+  session_row_1->addWidget(session_stop_btn);
+  session_layout->addLayout(session_row_1);
+
+  auto * session_row_2 = new QHBoxLayout();
+  auto * session_load_btn = new QPushButton("Load Last");
+  session_load_btn->setStyleSheet("background-color: #546e7a; color: white;");
+  session_load_btn->setToolTip("Load the newest saved session into the current queue");
+  connect(session_load_btn, &QPushButton::clicked, this, &UR10ePanel::onSessionLoadLast);
+  session_row_2->addWidget(session_load_btn);
+
+  auto * session_replay_btn = new QPushButton("Replay Session");
+  session_replay_btn->setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;");
+  session_replay_btn->setToolTip("Load/replay the saved session through the normal planner-safe queue executor");
+  connect(session_replay_btn, &QPushButton::clicked, this, &UR10ePanel::onSessionReplay);
+  session_row_2->addWidget(session_replay_btn);
+  session_layout->addLayout(session_row_2);
+  goals_layout->addWidget(session_group);
 
   goal_tab_layout->addWidget(goals_group);
 
@@ -1150,6 +1431,28 @@ void UR10ePanel::setupRos()
       if (!home_display.empty()) {
         home_joints_str_ = home_display;
       }
+      goal_rejection_str_ = jsonStringValue(data, "last_goal_rejection");
+      const auto gripper_profile = jsonStringValue(data, "gripper_profile");
+      if (!gripper_profile.empty()) {
+        gripper_profile_ = gripper_profile;
+      }
+      const auto gripper_state = jsonStringValue(data, "gripper_state");
+      if (!gripper_state.empty()) {
+        gripper_state_ = gripper_state;
+      }
+      gripper_open_alpha_ = jsonNumberValue(data, "gripper_open_alpha", gripper_open_alpha_);
+      gripper_open_alpha_ = std::max(-0.10, std::min(1.0, gripper_open_alpha_));
+      gripper_fake_ = jsonBoolValue(data, "gripper_fake", gripper_fake_);
+      gripper_disabled_ = jsonBoolValue(data, "gripper_disabled", gripper_disabled_);
+      gripper_suction_ = jsonBoolValue(data, "gripper_suction", gripper_suction_);
+      session_recording_ = jsonBoolValue(data, "session_recording", session_recording_);
+      session_item_count_ = static_cast<int>(
+        jsonNumberValue(data, "session_item_count", session_item_count_));
+      session_saved_path_ = jsonStringValue(data, "session_saved_path");
+      session_loaded_path_ = jsonStringValue(data, "session_loaded_path");
+      redo_goal_count_ = static_cast<int>(
+        jsonNumberValue(data, "redo_goal_count", redo_goal_count_));
+      redo_goal_display_ = jsonStringValue(data, "redo_goal_display");
       // Extract plan_waiting_confirm
       pos = data.find("\"plan_waiting_confirm\"");
       if (pos != std::string::npos) {
@@ -1428,10 +1731,39 @@ void UR10ePanel::onAddCurrentGoal() { publishCmd("add_current_goal"); }
 void UR10ePanel::onReuseLastGoalQueue() { publishCmd("reuse_last_goal_queue"); }
 void UR10ePanel::onQueueGripperOpen() { publishCmd("queue_gripper_open"); }
 void UR10ePanel::onQueueGripperClose() { publishCmd("queue_gripper_close"); }
+void UR10ePanel::onSessionRecordStart() { publishCmd("session_record_start"); }
+void UR10ePanel::onSessionRecordStop() { publishCmd("session_record_stop"); }
+void UR10ePanel::onSessionLoadLast() { publishCmd("session_load_last"); }
+void UR10ePanel::onSessionReplay() { publishCmd("session_replay"); }
+void UR10ePanel::onRedoSelectedGoal()
+{
+  if (!redo_goal_combo_) return;
+  const int index = redo_goal_combo_->currentData().toInt();
+  if (index <= 0) {
+    status_label_->setText("No redo goal selected");
+    return;
+  }
+  publishCmd("redo_goal " + std::to_string(index));
+}
 void UR10ePanel::onClear() { publishCmd("clear"); }
 void UR10ePanel::onCheckCalibration() { publishCmd("check_calibration"); }
 void UR10ePanel::onGripperOpen() { publishCmd("open"); }
 void UR10ePanel::onGripperClose() { publishCmd("close"); }
+void UR10ePanel::onGripperOpenSliderChanged(int value)
+{
+  if (gripper_open_value_label_) {
+    gripper_open_value_label_->setText(QString("%1%").arg(value));
+  }
+}
+void UR10ePanel::onGripperOpenSliderReleased()
+{
+  if (!gripper_open_slider_) return;
+  const int open_pct = std::max(20, std::min(110, gripper_open_slider_->value()));
+  const double alpha = 1.0 - static_cast<double>(open_pct) / 100.0;
+  std::ostringstream cmd;
+  cmd << "gripper_open_alpha " << std::fixed << std::setprecision(3) << alpha;
+  publishCmd(cmd.str());
+}
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
@@ -2026,6 +2358,9 @@ void UR10ePanel::updateDisplay()
   if (!robot_config_text_.empty()) {
     config_label_->setText(QString::fromStdString(robot_config_text_));
   }
+  if (camera_profile_label_ && !camera_status_text_.empty()) {
+    camera_profile_label_->setText(QString::fromStdString(cameraProfileSummary(camera_status_text_)));
+  }
   if (camera_status_label_ && !camera_status_text_.empty()) {
     camera_status_label_->setText(QString::fromStdString(camera_status_text_));
   }
@@ -2099,6 +2434,29 @@ void UR10ePanel::updateDisplay()
   for (int i = 0; i < 3; i++) {
     force_labels_[i]->setText(QString("%1 N").arg(gripper_forces_[i], 0, 'f', 2));
   }
+  if (gripper_info_label_) {
+    const QString mode = gripper_disabled_ ? "disabled" :
+      (gripper_fake_ ? "fake" : "hardware");
+    const QString suction = gripper_suction_ ? "on" : "off";
+    const int open_pct = static_cast<int>(std::round((1.0 - gripper_open_alpha_) * 100.0));
+    gripper_info_label_->setText(QString(
+      "Profile: %1\nState: %2\nMode: %3 | suction: %4\n"
+      "Forces: F1=%5 F2=%6 F3=%7 N")
+      .arg(QString::fromStdString(gripper_profile_))
+      .arg(QString::fromStdString(gripper_state_))
+      .arg(mode)
+      .arg(suction)
+      .arg(gripper_forces_[0], 0, 'f', 2)
+      .arg(gripper_forces_[1], 0, 'f', 2)
+      .arg(gripper_forces_[2], 0, 'f', 2));
+    if (gripper_open_slider_ && !gripper_open_slider_->isSliderDown()) {
+      const int clamped_open_pct = std::max(20, std::min(110, open_pct));
+      gripper_open_slider_->setValue(clamped_open_pct);
+      if (gripper_open_value_label_) {
+        gripper_open_value_label_->setText(QString("%1%").arg(clamped_open_pct));
+      }
+    }
+  }
 
   // Heat tab: real per-joint temperature (degC) when published, colour-graded.
   for (int i = 0; i < 6; i++) {
@@ -2145,9 +2503,72 @@ void UR10ePanel::updateDisplay()
     latest_goal_label_->setText(QString("Latest: %1").arg(
       QString::fromStdString(latest_goal_)));
   }
+  if (goal_rejection_label_) {
+    if (goal_rejection_str_.empty()) {
+      goal_rejection_label_->setText("Safety: --");
+      goal_rejection_label_->setStyleSheet(
+        "font-size: 9pt; color: #455a64; background: #eceff1; padding: 5px; "
+        "border-radius: 4px;");
+    } else {
+      goal_rejection_label_->setText(QString("Safety: %1").arg(
+        QString::fromStdString(goal_rejection_str_)));
+      goal_rejection_label_->setStyleSheet(
+        "font-size: 9pt; color: #b71c1c; background: #ffebee; padding: 5px; "
+        "border: 1px solid #ef9a9a; border-radius: 4px; font-weight: bold;");
+    }
+  }
   if (!home_joints_str_.empty()) {
     home_joints_label_->setText(QString("HOME: %1").arg(
       QString::fromStdString(home_joints_str_)));
+  }
+  if (session_status_label_) {
+    QString path = QString::fromStdString(
+      !session_loaded_path_.empty() ? session_loaded_path_ : session_saved_path_);
+    if (path.isEmpty()) {
+      path = "--";
+    }
+    if (session_recording_) {
+      session_status_label_->setText(QString(
+        "Session: RECORDING\nItems: %1\nSaved: %2")
+        .arg(session_item_count_)
+        .arg(path));
+      session_status_label_->setStyleSheet(
+        "font-size: 9pt; color: #0d47a1; background: #e3f2fd; padding: 5px; "
+        "border: 1px solid #64b5f6; border-radius: 4px; font-weight: bold;");
+    } else {
+      session_status_label_->setText(QString(
+        "Session: idle\nItems: %1\nFile: %2")
+        .arg(session_item_count_)
+        .arg(path));
+      session_status_label_->setStyleSheet(
+        "font-size: 9pt; color: #37474f; background: #eceff1; padding: 5px; "
+        "border-radius: 4px;");
+    }
+  }
+  if (redo_goal_combo_ &&
+      (redo_goal_display_ != rendered_redo_goal_display_ ||
+       redo_goal_count_ != rendered_redo_goal_count_))
+  {
+    const int previous = redo_goal_combo_->currentData().toInt();
+    redo_goal_combo_->blockSignals(true);
+    redo_goal_combo_->clear();
+    if (redo_goal_display_.empty() || redo_goal_count_ <= 0) {
+      redo_goal_combo_->addItem("No redo goals yet", 0);
+    } else {
+      const QStringList lines = QString::fromStdString(redo_goal_display_)
+        .split('\n', Qt::SkipEmptyParts);
+      int idx = 1;
+      for (const QString & line : lines) {
+        redo_goal_combo_->addItem(line, idx++);
+      }
+      const int restore = redo_goal_combo_->findData(previous);
+      if (restore >= 0) {
+        redo_goal_combo_->setCurrentIndex(restore);
+      }
+    }
+    redo_goal_combo_->blockSignals(false);
+    rendered_redo_goal_display_ = redo_goal_display_;
+    rendered_redo_goal_count_ = redo_goal_count_;
   }
   // Plan confirm/cancel visibility
   plan_confirm_btn_->setVisible(plan_waiting_confirm_);
@@ -2233,7 +2654,9 @@ void UR10ePanel::load(const rviz_common::Config & config)
   if (config.mapGetInt("reachability_cloud", &val)) {
     reachability_cloud_enabled_ = (val != 0);
     if (reachability_cloud_cb_) {
+      reachability_cloud_cb_->blockSignals(true);
       reachability_cloud_cb_->setChecked(reachability_cloud_enabled_);
+      reachability_cloud_cb_->blockSignals(false);
     }
   }
   if (config.mapGetInt("lidar_scan_preview", &val)) {

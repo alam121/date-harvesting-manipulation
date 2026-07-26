@@ -50,6 +50,9 @@ class DeltoROSDriver(Node):
 
         self.joint_state_list = [0.0]*12
         self.current_joint_state = [0.0]*12
+        self.current_joint_velocity = [0.0]*12
+        self.current_joint_effort = [0.0]*12
+        self.raw_current_state = [0]*12
         self.target_joint_state = [0.0]*12
         self.fixed_joint_state = [0]*12
 
@@ -63,7 +66,9 @@ class DeltoROSDriver(Node):
         
         # Too high frequency will cause blocking sub/pub
         self.publish_rate = 100
+        self.feedback_read_rate = 20
         print('publish late : '+str(self.publish_rate))
+        self.get_logger().info(f"Delto feedback read rate: {self.feedback_read_rate} Hz")
         self.get_logger().info(f"Delto driver dummy mode: {self.is_dummy}")
         self.is_connected = False
         # Action Server
@@ -96,7 +101,7 @@ class DeltoROSDriver(Node):
         self.joint_state_timer = self.create_timer(
             1/self.publish_rate, self.timer_callback)
         self.read_joint_timer = self.create_timer(
-            1/self.publish_rate, self.read_joint_callback)
+            1/self.feedback_read_rate, self.read_joint_callback)
             
             # Start the force reading timer
         self.force_timer = self.create_timer(0.5, self.publish_force_data)
@@ -215,6 +220,9 @@ class DeltoROSDriver(Node):
         try:
             position_tmp = self.get_position()
             self.current_joint_state = [float(self._deg2rad(x)) for x in position_tmp]
+            self.raw_current_state = self.delto_client.get_current_raw()
+            self.current_joint_effort = [float(x * 0.001) for x in self.raw_current_state]
+            self.current_joint_velocity = [float(x) for x in self.delto_client.get_velocity()]
         except Exception as e:
             self.get_logger().error("Failed to read joint state: {0}".format(e))
             self.is_connected = False
@@ -243,6 +251,8 @@ class DeltoROSDriver(Node):
                                 'F3M1', 'F3M2', 'F3M3', 'F3M4']
 
         joint_state_msg.position = self.current_joint_state
+        joint_state_msg.velocity = self.current_joint_velocity
+        joint_state_msg.effort = self.current_joint_effort
         self.joint_state_feedback.positions = joint_state_msg.position
         self.joint_state_pub.publish(joint_state_msg)
     # Get current position
@@ -533,14 +543,14 @@ class DeltoROSDriver(Node):
             return
         
         try:
-            # Read motor currents (12 motors total)
-            raw_current = self.delto_client.client.read_input_registers(
-                address=self.delto_client.current_register,
-                count=12,
-                slave=self.delto_client.slaveID).registers
-            
+            raw_current = list(self.raw_current_state)
+            if not any(raw_current):
+                raw_current = self.delto_client.get_current_raw()
+                self.raw_current_state = list(raw_current)
+                self.current_joint_effort = [float(x * 0.001) for x in raw_current]
+
             # Extract only 4th (index 3), 8th (index 7), and 12th (index 11)
-            selected_currents = [self.convert_to_signed(raw_current[i]) for i in [3, 7, 11]]
+            selected_currents = [raw_current[i] for i in [3, 7, 11]]
             estimated_forces = [self.estimate_force(c) for c in selected_currents]
 
             # Publish as a Float32MultiArray ROS message

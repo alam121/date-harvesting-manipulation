@@ -221,11 +221,11 @@ _TRUNK_OBSTACLE = {
     "color": (0.55, 0.27, 0.07, 1.0),  # Brown
 }
 _TRUNK_VISUAL = {
-    # RViz-only trunk helper. The real cuRobo trunk obstacle above stays small;
-    # this wider translucent marker makes the trunk easy to see outdoors.
+    # RViz-only trunk helper. Drawn at the real trunk radius so it matches the
+    # cuRobo obstacle (as it appeared before the wider outdoor marker was added).
     "name": "trunk_visual",
     "type": "cylinder",
-    "radius": 0.08,
+    "radius": _TRUNK_OBSTACLE["radius"],
     "height": _TRUNK_OBSTACLE["height"],
     "pose": list(_TRUNK_OBSTACLE["pose"]),
     "color": (0.80, 0.42, 0.12, 0.72),
@@ -491,7 +491,7 @@ class Planner:
     safe_zone_verified_interp_first: bool = True       # for nearby IK goals, validate/execute direct joint interpolation before slow Cartesian trajopt
     safe_zone_verified_interp_max_delta_deg: float = 80.0
     safe_zone_verified_interp_step_deg: float = 1.0
-    reachability_cloud_enabled: bool = True            # RViz cloud of TCP positions reachable from the current posture
+    reachability_cloud_enabled: bool = False           # RViz cloud of TCP positions reachable from the current posture
     reachability_cloud_period_s: float = 1.5
     reachability_cloud_samples: int = 320
     reachability_cloud_point_size_m: float = 0.025
@@ -505,6 +505,7 @@ class Planner:
     reachability_click_max_distance_m: float = 0.06  # RViz /clicked_point must be this close to a green sample
     reachability_click_green_only: bool = True        # only queue clicks in the fast-success green band
     reachability_goal_speed_factor: float = 0.20      # very slow execution for reachability-click goals
+    current_joint_goal_preflight_enabled: bool = False # cuRobo replay check for "Add Current Pos"; off keeps vision FPS stable
 
     # === DIRECT IK TUNING ===
     direct_branch_retry_min_dist: float = 0.15  # m; skip expensive branch search for close moves
@@ -525,6 +526,8 @@ class Planner:
     very_low_preflight_pitch_steps: int = 3
     very_low_clearance_window_mm: float = 8.0   # choose path cost only among near-safest IK branches
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
+    side_approach_enabled: bool = False         # enable LEFT/RIGHT side-home and side-low approach routing
+    low_side_home_min_goal_z_m: float = 0.55    # below this, skip fixed side-low HOME; use target-local very-low approach
     # Offset names below are semantic. They are mapped through ROBOT_PROFILE:
     # - new robot: depth -> X, lateral -> Y
     # - old robot: depth -> Y, lateral -> X
