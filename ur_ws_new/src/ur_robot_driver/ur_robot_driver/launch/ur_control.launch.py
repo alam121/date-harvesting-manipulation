@@ -29,6 +29,8 @@
 #
 # Author: Denis Stogl
 
+import os
+
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -61,6 +63,7 @@ def launch_setup(context, *args, **kwargs):
     description_package = LaunchConfiguration("description_package")
     description_file = LaunchConfiguration("description_file")
     robot_profile = LaunchConfiguration("robot_profile")
+    environment = LaunchConfiguration("environment")
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     tf_prefix = LaunchConfiguration("tf_prefix")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
@@ -114,6 +117,9 @@ def launch_setup(context, *args, **kwargs):
             " ",
             "robot_profile:=",
             robot_profile,
+            " ",
+            "environment:=",
+            environment,
             " ",
             "robot_ip:=",
             robot_ip,
@@ -523,9 +529,17 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "robot_profile",
-            default_value="new",
+            default_value=os.getenv("UR10E_ROBOT_PROFILE", "new"),
             choices=["new", "old"],
             description="Selects robot-specific camera and mount transforms.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "environment",
+            default_value=os.getenv("UR10E_ENVIRONMENT", "outdoor"),
+            choices=["lab", "outdoor"],
+            description="Selects environment-specific hand-eye calibration.",
         )
     )
     declared_arguments.append(

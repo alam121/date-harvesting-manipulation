@@ -414,21 +414,10 @@ class DeltoROSDriver(Node):
         
         target_deg = [self._rad2deg(x) for x in msg.data]
         self.target_joint_state = target_deg
-        nonzero = [
-            f"m{i + 1}={v:.1f}deg"
-            for i, v in enumerate(target_deg)
-            if abs(v) > 0.01
-        ]
-        self.get_logger().info(
-            "DG-3F-M target_joint received: "
-            + (", ".join(nonzero) if nonzero else "all motors 0.0deg")
-        )
         try:
             response = self.delto_client.set_position(self.target_joint_state)
             if hasattr(response, "isError") and response.isError():
                 self.get_logger().error(f"DG-3F-M target write failed: {response}")
-            else:
-                self.get_logger().info("DG-3F-M target write OK")
         except Exception as e:
             self.get_logger().error("Failed to set target joint state: {0}".format(e))
             self.is_connected = False

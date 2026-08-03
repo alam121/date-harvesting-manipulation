@@ -75,6 +75,9 @@ private Q_SLOTS:
   void onGripperClose();
   void onGripperOpenSliderChanged(int value);
   void onGripperOpenSliderReleased();
+  void onGripperJointSliderReleased();
+  void onSetGripperOpenFromSliders();
+  void onReloadGripperJointSliders();
   void onSendGoal();
   void onVelocitySliderChanged(int value);
   void onApplyVelocity();
@@ -152,8 +155,10 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr overlay_cmd_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_target_pub_;
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr gripper_joint_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr force_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr running_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_info_sub_;
@@ -177,6 +182,8 @@ private:
   double tracking_errors_[6] = {};
   double tcp_wrench_[6] = {};
   double gripper_forces_[3] = {};
+  double gripper_joint_positions_[12] = {};
+  bool have_gripper_joint_positions_ = false;
   double tool_temperature_ = 0.0;  // tool/wrist flange temperature (degC)
   bool have_tool_temp_ = false;
   double joint_temperatures_[6] = {};  // per-joint temperature (degC) from /joint_temperatures
@@ -250,6 +257,9 @@ private:
   QLabel * gripper_info_label_;
   QLabel * gripper_open_value_label_;
   QSlider * gripper_open_slider_;
+  QSlider * gripper_joint_sliders_[12] = {};
+  QLabel * gripper_joint_value_labels_[12] = {};
+  bool gripper_joint_sliders_initialized_ = false;
   QLabel * joint_current_labels_[6];
   QLabel * joint_temp_labels_[6];
   QLabel * gripper_heat_labels_[3];

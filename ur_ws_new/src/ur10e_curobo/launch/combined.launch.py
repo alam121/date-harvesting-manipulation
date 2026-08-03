@@ -1,12 +1,18 @@
 # launch/combined.launch.py
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    SetEnvironmentVariable,
+    TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.parameter_descriptions import ParameterValue
+import os
 
 
 def generate_launch_description():
@@ -39,6 +45,14 @@ def generate_launch_description():
         'launch_rviz', default_value='true',
         description='Launch RViz'
     )
+    robot_profile_arg = DeclareLaunchArgument(
+        'robot_profile', default_value=os.getenv('UR10E_ROBOT_PROFILE', 'new'),
+        choices=['new', 'old'], description='Physical robot profile'
+    )
+    environment_arg = DeclareLaunchArgument(
+        'environment', default_value=os.getenv('UR10E_ENVIRONMENT', 'outdoor'),
+        choices=['lab', 'outdoor'], description='Calibration/environment profile'
+    )
 
     # UR Bringup
     ur_bringup = IncludeLaunchDescription(
@@ -50,6 +64,8 @@ def generate_launch_description():
             'robot_ip': LaunchConfiguration('robot_ip'),
             'use_fake_hardware': LaunchConfiguration('use_fake_hardware'),
             'launch_rviz': LaunchConfiguration('launch_rviz'),
+            'robot_profile': LaunchConfiguration('robot_profile'),
+            'environment': LaunchConfiguration('environment'),
         }.items()
     )
 
@@ -116,6 +132,12 @@ def generate_launch_description():
         robot_ip_arg,
         use_fake_hardware_arg,
         launch_rviz_arg,
+        robot_profile_arg,
+        environment_arg,
+        SetEnvironmentVariable(
+            'UR10E_ROBOT_PROFILE', LaunchConfiguration('robot_profile')),
+        SetEnvironmentVariable(
+            'UR10E_ENVIRONMENT', LaunchConfiguration('environment')),
         # Nodes
         ur_bringup,
         main_node,

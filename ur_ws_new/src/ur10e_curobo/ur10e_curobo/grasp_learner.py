@@ -11,7 +11,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional, List
+from typing import Optional
 
 from . import grasp_learning_config as cfg
 

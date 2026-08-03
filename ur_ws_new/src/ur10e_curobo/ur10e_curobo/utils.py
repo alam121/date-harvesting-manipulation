@@ -6,7 +6,6 @@ import numpy as np
 import rclpy
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
-from tf2_ros import Buffer, TransformListener
 
 
 def read_key(timeout=0.1):
@@ -107,7 +106,9 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     _prog_was_off = False
 
     try:
-        node.get_logger().info(f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
+        if not getattr(node.cfg.planner, "concise_console_logs", False):
+            node.get_logger().info(
+                f"Waiting for EE → {[round(x, 3) for x in target_xyz]} (tol={tol})")
         _start_pose = node.get_end_effector_pose()
         _start_xyz = _start_pose[:3] if _start_pose else None
         if _start_xyz is None:
@@ -191,7 +192,9 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                     elif time.time() - _at_tol_since < 1.0:
                         time.sleep(0.05)
                         continue
-                node.get_logger().info(f"End-effector reached target. dist={dist*100:.1f}cm")
+                if not getattr(node.cfg.planner, "concise_console_logs", False):
+                    node.get_logger().info(
+                        f"End-effector reached target. dist={dist*100:.1f}cm")
                 break
             else:
                 _at_tol_since = None

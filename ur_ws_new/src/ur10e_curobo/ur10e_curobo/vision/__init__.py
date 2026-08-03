@@ -1,12 +1,20 @@
 """Vision module for date fruit detection using ZED camera and YOLO."""
 
-from .node import VisionNode
 from .config import DEFAULT_WEIGHTS, DEFAULT_CONF_THRES, DEFAULT_IMG_SIZE
+
+
+def __getattr__(name):
+    """Keep VisionNode available without loading CUDA for calibration tools."""
+    if name == "VisionNode":
+        from .node import VisionNode
+        return VisionNode
+    raise AttributeError(name)
 
 
 def main():
     """Entry point for ros2 run ur10e_curobo vision."""
     import argparse
+    from .node import VisionNode
 
     parser = argparse.ArgumentParser(description="Date fruit vision detection node")
     parser.add_argument(

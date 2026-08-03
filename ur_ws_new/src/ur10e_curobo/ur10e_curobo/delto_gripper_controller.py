@@ -3,6 +3,7 @@ import time
 import math
 import os
 from std_msgs.msg import Float32MultiArray
+from rclpy.callback_groups import ReentrantCallbackGroup
 from .gripper_profiles import (
     finger_joint_indices_for_profile,
     make_closed_position,
@@ -38,12 +39,12 @@ class DeltoGripperController:
         # FSM state
         self.state = 'IDLE'  # IDLE | OPENING | CLOSING
 
-        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "new").strip().lower()
         if self.gripper_profile not in ("old", "new"):
             self.node.get_logger().warn(
-                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using old"
+                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using new"
             )
-            self.gripper_profile = "old"
+            self.gripper_profile = "new"
 
         # Primary curl joint fallback: F1=M3, F2=M7, F3=M11.
         self.finger_joint_idx = {0: 2, 1: 6, 2: 10}
@@ -70,8 +71,13 @@ class DeltoGripperController:
 
         # ROS pub/sub
         self.publisher  = node.create_publisher(Float32MultiArray, target_topic, 10)
+        # Closure runs synchronously from a GUI/service callback. The force
+        # subscriber must use a separate re-entrant group so MultiThreadedExecutor
+        # can continue updating force_data during that loop.
+        self.force_callback_group = ReentrantCallbackGroup()
         self.subscriber = node.create_subscription(
-            Float32MultiArray, force_topic, self.force_callback, 10)
+            Float32MultiArray, force_topic, self.force_callback, 10,
+            callback_group=self.force_callback_group)
 
         # Schedule baseline capture after a short delay to allow force data to arrive
         import threading
@@ -263,11 +269,13 @@ class DeltoGripperController:
         self.closure_force_profile = []  # force deltas at each step
 
         while self.step_close():
-            # Record force profile at each step (atomic snapshot before the delay)
+            # Allow the hardware and force subscriber to respond to this step
+            # before sampling it. Sampling immediately after publish records the
+            # previous command and can produce an all-zero calibration profile.
+            time.sleep(self.step_delay)
             current_force = list(self.force_data)
             deltas = [abs(current_force[i] - self.baseline_force[i]) for i in range(3)]
             self.closure_force_profile.append(deltas)
-            time.sleep(self.step_delay)
 
         # Compute early contact step: first step where any finger delta > 0.5N
         self.closure_first_contact_step = len(self.closure_force_profile)  # default: no early contact
@@ -282,9 +290,11 @@ class DeltoGripperController:
                 for i, d in enumerate(self.closure_force_profile)
             )
             self.node.get_logger().info(f"🔒 Force profile: {profile_str}")
-        self.node.get_logger().info(
-            f"🔒 First contact: {self.closure_first_contact_step}/{len(self.closure_force_profile)}"
-        )
+        if not getattr(self.node.cfg.planner, "concise_console_logs", False):
+            self.node.get_logger().info(
+                f"🔒 First contact: "
+                f"{self.closure_first_contact_step}/{len(self.closure_force_profile)}"
+            )
 
     # --------------------------------------------------------
     # OPENING
@@ -310,9 +320,11 @@ class DeltoGripperController:
                 f"Gripper opened fully (baseline=[{self.baseline_force[0]:.2f}, "
                 f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
             )
-        self.node.get_logger().info(
-            f"Gripper OPEN command active_joint_deg={self.active_joint_degrees(self.open_position)}"
-        )
+        if not getattr(self.node.cfg.planner, "concise_console_logs", False):
+            self.node.get_logger().info(
+                f"Gripper OPEN command "
+                f"active_joint_deg={self.active_joint_degrees(self.open_position)}"
+            )
 
         # Debounce window after open
         self.ignore_contacts_until = time.time() + 0.25

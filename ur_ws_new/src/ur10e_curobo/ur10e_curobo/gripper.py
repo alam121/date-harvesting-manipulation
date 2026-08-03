@@ -1,11 +1,9 @@
 # ruff: noqa
 from .grasp_outcome_classifier import GraspOutcomeClassifier
 from .delto_gripper_controller import DeltoGripperController
-from . import grasp_visualizer as grasp_viz_mod
 
 from ur_msgs.srv import SetIO
 from sensor_msgs.msg import JointState
-import time
 import os
 from .gripper_profiles import (
     finger_joint_indices_for_profile,
@@ -51,12 +49,12 @@ class FakeGripperController:
         self.closed = False
         self.current_open_alpha = 0.0
 
-        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "new").strip().lower()
         if self.gripper_profile not in ("old", "new"):
             self.node.get_logger().warn(
-                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using old"
+                f"Unknown UR10E_GRIPPER_PROFILE={self.gripper_profile!r}; using new"
             )
-            self.gripper_profile = "old"
+            self.gripper_profile = "new"
 
         # Mirror DeltoGripperController's selected profile values so fake
         # mode/RViz and hardware mode show the same open/close pose.
@@ -153,7 +151,7 @@ class DisabledGripperController:
         self.closure_deltas = [0.0, 0.0, 0.0]
         self.closed = False
         self.current_open_alpha = 0.0
-        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "old").strip().lower()
+        self.gripper_profile = os.environ.get("UR10E_GRIPPER_PROFILE", "new").strip().lower()
         self.state = "DISABLED"
 
     def open_gripper(self):
@@ -251,7 +249,9 @@ def control_gripper(node, action: str, fruit_radius: float = None):
         if node.gripper_controller.suction and not getattr(node.gripper_controller, "fake", False):
             activate_suction(node, False)
 
-        if fruit_radius is not None and fruit_radius > 0:
+        adaptive_aperture = bool(getattr(
+            node.cfg.gripper, "adaptive_aperture_enabled", False))
+        if adaptive_aperture and fruit_radius is not None and fruit_radius > 0:
             # Adaptive aperture: open only enough for this fruit
             desired_aperture = (fruit_radius * 2) + APERTURE_MARGIN
             open_alpha = max(0.0, 1.0 - desired_aperture / GRIPPER_MAX_APERTURE)

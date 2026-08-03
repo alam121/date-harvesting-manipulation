@@ -9,6 +9,7 @@
    <!-- the default value should raise an error in case this was called without defining the type -->
    <xacro:arg name="ur_type" default="ur5x"/>
    <xacro:arg name="robot_profile" default="new"/>
+   <xacro:arg name="environment" default="outdoor"/>
 
    <!-- parameters -->
    <xacro:arg name="tf_prefix" default="" />
@@ -90,6 +91,7 @@
    <xacro:ur_robot
      name="$(arg name)"
      robot_profile="$(arg robot_profile)"
+     environment="$(arg environment)"
      tf_prefix="$(arg tf_prefix)"
      parent="world"
      joint_limits_parameters_file="$(arg joint_limit_params)"

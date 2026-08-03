@@ -29,19 +29,16 @@ from .config import (
     CAMERA_PROFILE, CAM_FRAME, ZEDMINI_CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
     TRUNK_DEPTH_OFFSET,
-    USE_LIDAR, LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
-    ZEDXONE_IMAGE_TOPIC, ZEDXONE_WIDTH, ZEDXONE_HEIGHT,
-    ZEDXONE_FX, ZEDXONE_FY, ZEDXONE_CX, ZEDXONE_CY, ZEDXONE_DIST,
+    LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
 )
 from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
-    lidar_pts_in_mask, centroid_from_lidar_pts,
 )
 from ..config import X_FORWARD_Y_LATERAL
-from .math_utils import unit_vector, quat_rotate_vec, quat_align_x_to_axis
+from .math_utils import quat_align_x_to_axis
 from .ros_utils import wait_for_transform, create_pointcloud2_msg
 from .zed_utils import (
     apply_zed_one_manual_exposure,
@@ -54,8 +51,12 @@ from .zed_utils import (
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker
 
-# Verbose per-date depth-sampling diagnostics (throttled ~2 Hz). Set False when done.
-DEBUG_DEPTH_SAMPLING = False
+# Per-date depth diagnostics, throttled to ~2 Hz while resolving range-dependent
+# foreground/background selection. Disable after field validation.
+DEBUG_DEPTH_SAMPLING = True
+# Periodic loop/render timing is useful for profiling but too noisy for normal
+# field operation. Enable temporarily when benchmarking perception performance.
+DEBUG_PERFORMANCE = False
 from .scoring import compute_fruit_score, compute_collision_free_direction
 from .yolo_thread import YoloThread
 from .visualization import VisionVisualizer
@@ -122,6 +123,10 @@ class VisionNode:
         # Publishing state
         self.latest_goal_msg: Optional[PoseStamped] = None
         self.latest_dir_msg: Optional[Vector3Stamped] = None
+        # Wall time when perception last produced this goal.  The publishing
+        # timer must never make an old measurement look fresh merely by
+        # replacing its ROS timestamp.
+        self._latest_goal_update_time = 0.0
         self.pub_lock = Lock()
 
         # Sparse point cloud (used when --use_lidar)
@@ -237,6 +242,8 @@ class VisionNode:
         trunk_cam_pub = self.node.create_publisher(PointStamped, "/trunk_position_cam", 10)
         self.radius_pub = self.node.create_publisher(Float32, "/fruit_radius", 10)
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
+        self.depth_diag_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/depth_diagnostics", 10)
         self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
@@ -251,11 +258,15 @@ class VisionNode:
         # Timer-based publishing callback (50Hz)
         def publish_timer_cb():
             with self.pub_lock:
-                if self.latest_goal_msg is not None:
-                    self.latest_goal_msg.header.stamp = self.node.get_clock().now().to_msg()
+                goal_age = time() - self._latest_goal_update_time
+                if self.latest_goal_msg is not None and goal_age <= 0.25:
                     goal_pub.publish(self.latest_goal_msg)
-                if self.latest_dir_msg is not None:
-                    self.latest_dir_msg.header.stamp = self.node.get_clock().now().to_msg()
+                elif self.latest_goal_msg is not None:
+                    # Perception has not refreshed this target for several
+                    # camera frames.  Remove it instead of replaying it.
+                    self.latest_goal_msg = None
+                    self.latest_dir_msg = None
+                if self.latest_dir_msg is not None and goal_age <= 0.25:
                     dir_pub.publish(self.latest_dir_msg)
 
         self.node.create_timer(0.02, publish_timer_cb)
@@ -704,7 +715,7 @@ class VisionNode:
                     _vt4 = time()
                     _viz_count = getattr(self, '_viz_perf_count', 0) + 1
                     self._viz_perf_count = _viz_count
-                    if _viz_count % 20 == 0:
+                    if DEBUG_PERFORMANCE and _viz_count % 20 == 0:
                         print(f"[VIZ_PERF] render={(_vt1-_vt0)*1000:.0f}ms  "
                               f"cvt={(_vt2-_vt1)*1000:.0f}ms  "
                               f"encode={(_vt3-_vt2)*1000:.0f}ms  "
@@ -844,7 +855,6 @@ class VisionNode:
                     self.yolo_thread.dets_ready.clear()
                     current_dets = self.yolo_thread.get_detections()
                     trunk_boxes  = self.yolo_thread.get_trunk_boxes()
-                    bunch_boxes  = self.yolo_thread.get_bunch_boxes()
                     # Record where the camera was when this result was accepted
                     self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
                 elif current_dets is None:
@@ -897,8 +907,14 @@ class VisionNode:
                     # ── ZED stereo depth path ─────────────────────────────
                     pts_cam_l = np.empty((0, 3), np.float32)
                     uv_l = np.empty((0, 2), np.float32)
-                    zed.ingest_custom_mask_objects(current_dets)
-                    zed.retrieve_custom_objects(objects, obj_runtime_param)
+                    # Mini-only RGBD is already pixel-aligned and YOLO already
+                    # supplies the fruit boxes and masks.  Sending those masks
+                    # through ZED custom-object ingestion/tracking adds another
+                    # per-object pass and makes loop time grow with date count.
+                    # Keep that SDK path only for the legacy stereo mode.
+                    if not use_zedx_mini_only:
+                        zed.ingest_custom_mask_objects(current_dets)
+                        zed.retrieve_custom_objects(objects, obj_runtime_param)
                     zed.retrieve_measure(point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
                                         sl.Resolution(disp_w, disp_h))
                     pc_np = point_cloud.get_data()[:, :, :3]
@@ -910,11 +926,12 @@ class VisionNode:
                 # correct invalidation trigger when the robot repositions.
                 _t2 = time()
                 targets, rejected_targets, viz_only = self._process_objects(
-                    current_dets if use_mono_depth else objects,
+                    current_dets if (use_mono_depth or use_zedx_mini_only) else objects,
                     pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
                     pts_cam=pts_cam_l, uv=uv_l,
                     use_lidar=use_lidar,       # True only for actual LiDAR
                     use_zed_mini=use_zed_mini, # raw dets + dense depth heatmap
+                    use_raw_detections=use_zedx_mini_only,
 
                 )
                 _t3 = time()
@@ -930,7 +947,7 @@ class VisionNode:
                 # Publish trunk position every 5 frames — skip in reacquire mode
                 trunk_published = False
                 if not _reacquire and self._heatmap_frame_count % 5 == 0:
-                    trunk_published = self._publish_trunk_position(
+                    self._publish_trunk_position(
                         trunk_boxes, pc_np, image_scale, image_left_ocv, trunk_pub,
                         pts_cam=pts_cam_l, uv=uv_l, use_lidar=use_lidar,
                         trunk_cam_pub=trunk_cam_pub,
@@ -983,10 +1000,13 @@ class VisionNode:
                     _af_msg.data = _all_flat
                     self.all_fruits_pub.publish(_af_msg)
 
-                if best_idx is None and self.excluded_positions:
-                    # All visible targets are excluded — stop publishing stale position
+                if best_idx is None:
+                    # No valid target exists in this frame.  Stop publishing the
+                    # previous target regardless of whether exclusions are active.
                     with self.pub_lock:
                         self.latest_goal_msg = None
+                        self.latest_dir_msg = None
+                        self._latest_goal_update_time = 0.0
 
                 # Build viz entries — skip heavy overlays in reacquire mode but still
                 # publish the live frame so the display doesn't freeze.
@@ -1029,7 +1049,8 @@ class VisionNode:
                     trunk_viz.append({"bb": (tx1, ty1, tx2, ty2), "class": "bunch", "conf": b["conf"], "polygon": polygon_scaled})
 
                 _t4 = time()
-                if getattr(self, '_perf_count', 0) % 30 == 0:
+                if (DEBUG_PERFORMANCE and
+                        getattr(self, '_perf_count', 0) % 30 == 0):
                     print(f"[PERF] retrieve={(_t1-_t0)*1000:.0f}ms  "
                           f"process={(_t3-_t2)*1000:.0f}ms  "
                           f"post={(_t4-_t3)*1000:.0f}ms"
@@ -1166,7 +1187,16 @@ class VisionNode:
             if use_zedx_mini_only:
                 init_params.camera_fps = ZEDMINI_RGBD_FPS
             init_params.coordinate_units = sl.UNIT.METER
-            init_params.depth_mode = sl.DEPTH_MODE.NEURAL_LIGHT
+            # Mini-only mode previously achieved reliable front-view date depth
+            # with the full NEURAL model. NEURAL_LIGHT was introduced with the
+            # dual-camera performance work and produced multi-layer depth jumps
+            # on overlapping front views. Keep this change isolated to native
+            # ZED X Mini RGBD; ZED One + external-depth modes are unaffected.
+            init_params.depth_mode = (
+                sl.DEPTH_MODE.NEURAL
+                if use_zedx_mini_only
+                else sl.DEPTH_MODE.NEURAL_LIGHT
+            )
             init_params.depth_minimum_distance = (
                 ZEDMINI_DEPTH_Z_MIN if use_zedx_mini_only else 0.15
             )
@@ -1206,11 +1236,12 @@ class VisionNode:
             )
             apply_zed_stereo_settings(zed)
             zed.enable_positional_tracking(sl.PositionalTrackingParameters())
-            obj_param = sl.ObjectDetectionParameters()
-            obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
-            obj_param.enable_tracking = True
-            obj_param.enable_segmentation = False
-            zed.enable_object_detection(obj_param)
+            if not use_zedx_mini_only:
+                obj_param = sl.ObjectDetectionParameters()
+                obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
+                obj_param.enable_tracking = True
+                obj_param.enable_segmentation = False
+                zed.enable_object_detection(obj_param)
 
         # ZED fully initialized — now safe to load YOLO TRT engine
         self.yolo_thread = YoloThread(
@@ -1392,6 +1423,7 @@ class VisionNode:
         uv: Optional[np.ndarray] = None,
         use_lidar: bool = False,
         use_zed_mini: bool = False,
+        use_raw_detections: bool = False,
     ) -> tuple:
         """Process detected objects and extract 3D information.
         use_lidar=True  — sparse LiDAR depth, iterate raw YOLO CustomMaskObjectData list.
@@ -1403,7 +1435,11 @@ class VisionNode:
         viz_only = []  # kept for API compat but always empty now
 
         # use_zed_mini also iterates raw YOLO dets (ZED One has no object-detection API)
-        obj_list = objects_or_dets if (use_lidar or use_zed_mini) else objects_or_dets.object_list
+        obj_list = (
+            objects_or_dets
+            if (use_lidar or use_zed_mini or use_raw_detections)
+            else objects_or_dets.object_list
+        )
         for o in obj_list:
             bb = o.bounding_box_2d
             x1 = int(bb[0][0] * image_scale[0])
@@ -1463,6 +1499,7 @@ class VisionNode:
         use_zed_mini: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Extract 3D information from a detected object."""
+        depth_diag = None
         mask_local = mask_mat.get_data()
         if mask_local.ndim == 3:
             mask_local = mask_local[:, :, 0]
@@ -1515,6 +1552,7 @@ class VisionNode:
             Xc = float(np.median(pts_front[:, 0]))
             Yc = float(np.median(pts_front[:, 1]))
             Zc = float(np.median(pts_front[:, 2]))
+
             depth_std = float(np.std(pts_front[:, 2]))
             vis_ratio = min(1.0, in_mask_pts.shape[0] / max(1, int(0.1 * mask_bool.sum())))
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
@@ -1547,10 +1585,9 @@ class VisionNode:
                 mark_reject("No depth data")
                 return None
             _depth_age = abs(zed_one_ts - mini_ts)
-            if _depth_age > 0.15:
-                self.node.get_logger().debug(
-                    f"[DEPTH] best match age {_depth_age*1000:.0f}ms — Mini may be falling behind"
-                )
+            if _depth_age > 0.12:
+                mark_reject(f"RGB/depth desync ({_depth_age*1000:.0f}ms)")
+                return None
 
             # Filter to bbox
             u = uv_all[:, 0]
@@ -1570,9 +1607,46 @@ class VisionNode:
             pts = pts_bbox[in_mask]
             uv_in_mask = uv_bbox[in_mask]
 
-            if pts.shape[0] < 10:
-                mark_reject("Too few depth pts")
-                return None
+            # A small inter-camera projection error can put the nearby fruit
+            # points just outside the segmentation mask while leaving distant
+            # background inside it. Build a conservative fallback from the
+            # central 60% of the detection box and select its nearest coherent
+            # depth layer. This repairs mild mask/depth misalignment without
+            # accepting arbitrary points from the padded surroundings.
+            _bw = max(1.0, float(x2 - x1))
+            _bh = max(1.0, float(y2 - y1))
+            _central = (
+                (uv_bbox[:, 0] >= x1 + 0.20 * _bw)
+                & (uv_bbox[:, 0] <= x2 - 0.20 * _bw)
+                & (uv_bbox[:, 1] >= y1 + 0.20 * _bh)
+                & (uv_bbox[:, 1] <= y2 - 0.20 * _bh)
+            )
+            _fallback_pts = pts_bbox[_central]
+            _fallback_uv = uv_bbox[_central]
+            if _fallback_pts.shape[0] < 10:
+                _fallback_pts = pts_bbox
+                _fallback_uv = uv_bbox
+
+            _use_fallback = pts.shape[0] < 10
+            if not _use_fallback and _fallback_pts.shape[0] >= 10:
+                _mask_p5 = float(np.percentile(pts[:, 2], 5))
+                _fallback_p5 = float(np.percentile(_fallback_pts[:, 2], 5))
+                # A foreground layer at least 20cm nearer than the mask layer is
+                # strong evidence that projected fruit depth missed the mask.
+                _use_fallback = _fallback_p5 + 0.20 < _mask_p5
+
+            if _use_fallback:
+                if _fallback_pts.shape[0] < 10:
+                    mark_reject("Too few foreground depth pts")
+                    return None
+                pts = _fallback_pts
+                uv_in_mask = _fallback_uv
+                _now = time()
+                if _now - getattr(self, "_last_depth_recovery_log_t", 0.0) > 1.0:
+                    self._last_depth_recovery_log_t = _now
+                    self.node.get_logger().warn(
+                        "[DEPTH_RECOVERY] Segmentation/depth mismatch; "
+                        "using nearest central foreground layer")
 
             # Depth: use ZED Mini pts (in ZED One frame) for Z only.
             # Use all in-mask points within FRUIT_DEPTH_RANGE of the nearest valid point.
@@ -1595,6 +1669,26 @@ class VisionNode:
 
             Zc = float(np.median(pts_front[:, 2]))
 
+            _p5, _p50, _p95 = (
+                float(p) for p in np.percentile(zs, [5, 50, 95]))
+            _near = int(np.count_nonzero(
+                zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
+            _far = int(zs.shape[0] - _near)
+            _out = pts_bbox[~in_mask]
+            _out_near = (
+                int(np.count_nonzero(
+                    _out[:, 2] <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
+                if _out.shape[0] else 0)
+            _out_p5 = (
+                float(np.percentile(_out[:, 2], 5))
+                if _out.shape[0] else -1.0)
+            _out_p50 = (
+                float(np.percentile(_out[:, 2], 50))
+                if _out.shape[0] else -1.0)
+            depth_diag = (
+                _p5, _p50, _p95, _near, _far,
+                _out_near, int(_out.shape[0]), _out_p5, _out_p50)
+
             # X,Y: reproject from the front-depth pixels, not the full mask
             # centroid. This prevents bunch/background mask leakage from pulling
             # the goal inside the bunch when the date is directly in front.
@@ -1609,15 +1703,9 @@ class VisionNode:
                 _now = time()
                 if _now - getattr(self, "_last_depth_dbg_t", 0.0) > 0.5:
                     self._last_depth_dbg_t = _now
-                    _p5, _p50, _p95 = (float(p) for p in np.percentile(zs, [5, 50, 95]))
-                    _near = int(np.count_nonzero(zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
-                    _far = int(zs.shape[0] - _near)
                     # near-depth points in the bbox but OUTSIDE the mask -> if high while
                     # in-mask near count is ~0, the date depth is landing off the mask
                     # (extrinsic/warp misalignment) rather than being absent (sensor).
-                    _out = pts_bbox[~in_mask]
-                    _out_near = (int(np.count_nonzero(_out[:, 2] <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
-                                 if _out.shape[0] else 0)
                     # Base-frame position via the same cam->base TF used for the goal.
                     # If this jumps with arm pose while cam Zc stays stable -> hand-eye/TF,
                     # not depth.
@@ -1633,7 +1721,7 @@ class VisionNode:
                         f"near_but_OUTSIDE_mask={_out_near}/{int(_out.shape[0])}"
                         f" | cam=[{Xc:.3f},{Yc:.3f},{Zc:.3f}]{_base_str}")
 
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > ZEDMINI_DEPTH_Z_MAX:
                 mark_reject("Z out of range")
                 return None
 
@@ -1687,7 +1775,10 @@ class VisionNode:
                 gap_target["gap_angle_cam"] = 0.0
 
             in_mask_uv = None
-            obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
+            if hasattr(obj, "probability"):
+                obj_confidence = float(obj.probability)
+            else:
+                obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
 
         else:
             # ── ZED stereo depth path (original) ─────────────────────────
@@ -1721,7 +1812,39 @@ class VisionNode:
             Yc = float(np.mean(pts_front[:, 1]))
             Zc = float(np.mean(pts_front[:, 2]))
 
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > 5.0:
+            # Diagnostic-only ring around the segmentation mask. If many valid
+            # pixels just outside the mask are consistently nearer than the
+            # selected in-mask surface, RGB/depth alignment may be excluding the
+            # true date layer. Do not alter the commanded goal yet.
+            _ring = (
+                cv2.dilate(mask_bool.astype(np.uint8),
+                           np.ones((21, 21), np.uint8), iterations=1) > 0
+            ) & (~mask_bool)
+            _ring_valid = (
+                _ring & np.isfinite(roi_xyz[:, :, 2]) &
+                (roi_xyz[:, :, 2] > 0.0)
+            )
+            _outside_z = roi_xyz[:, :, 2][_ring_valid]
+            _outside_near = (
+                int(np.count_nonzero(_outside_z <= Zc - 0.005))
+                if _outside_z.size else 0)
+            _outside_p5 = (
+                float(np.percentile(_outside_z, 5))
+                if _outside_z.size else -1.0)
+            _outside_p50 = (
+                float(np.percentile(_outside_z, 50))
+                if _outside_z.size else -1.0)
+            _p5, _p50, _p95 = (
+                float(p) for p in np.percentile(zs, [5, 50, 95]))
+            _near = int(np.count_nonzero(zs <= Zc + 0.10))
+            _far = int(zs.shape[0] - _near)
+            depth_diag = (
+                _p5, _p50, _p95, _near, _far,
+                _outside_near, int(_outside_z.size),
+                _outside_p5, _outside_p50,
+            )
+
+            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > ZEDMINI_DEPTH_Z_MAX:
                 mark_reject("Z out of range")
                 return None
 
@@ -1762,7 +1885,10 @@ class VisionNode:
                 gap_target["between_branches"] = False
                 gap_target["gap_angle_cam"] = 0.0
 
-            obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
+            if hasattr(obj, "probability"):
+                obj_confidence = float(obj.probability)
+            else:
+                obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
 
         # Transform to base_link
         point_msg = PointStamped()
@@ -1807,6 +1933,19 @@ class VisionNode:
 
             attempt_count = self.tracker.register_fruit(fruit_id, [Xc, Yc, Zc])
 
+            # Every depth backend must provide diagnostics for the selected goal.
+            # ZED Mini supplies full in-mask near/far counts above; LiDAR/stereo
+            # fall back to statistics over the foreground points actually used.
+            if depth_diag is None:
+                _diag_z = np.asarray(pts_front, dtype=np.float64)[:, 2]
+                _p5, _p50, _p95 = (
+                    float(p) for p in np.percentile(_diag_z, [5, 50, 95]))
+                depth_diag = (
+                    _p5, _p50, _p95,
+                    int(_diag_z.shape[0]), 0,
+                    -1, -1, -1.0, -1.0,
+                )
+
             return {
                 "Xc": Xc, "Yc": Yc, "Zc": Zc,
                 "bb": (x1, y1, x2, y2),
@@ -1835,6 +1974,7 @@ class VisionNode:
                 "surface_normal": surface_normal,
                 "score": 0.0,
                 "score_components": {},
+                "depth_diag": depth_diag,
                 "fruit_id": fruit_id,
                 "attempt_count": attempt_count,
                 "between_branches": gap_target.get("between_branches", False),
@@ -2183,6 +2323,18 @@ class VisionNode:
         """Process the best target and publish goal."""
         t_best = targets[best_idx]
 
+        # Publish the camera-frame depth evidence for the exact target selected
+        # for /external_goal_pose. The motion node caches this and prints it only
+        # when an operator accepts a goal.
+        _diag = t_best.get("depth_diag")
+        if _diag is not None:
+            _depth_msg = Float32MultiArray()
+            _depth_msg.data = [
+                float(t_best["Xc"]), float(t_best["Yc"]), float(t_best["Zc"]),
+                *[float(v) for v in _diag],
+            ]
+            self.depth_diag_pub.publish(_depth_msg)
+
         # Use per-frame cached TF — no new lookup needed
         _R_tf: Optional[np.ndarray] = None
         _t_tf: Optional[np.ndarray] = None
@@ -2333,6 +2485,10 @@ class VisionNode:
         if pt_z <= Z_MAX:
             goal = PoseStamped()
             goal.header = pt_base.header
+            # This timestamp identifies a newly computed perception sample.
+            # The 50 Hz publishing timer deliberately preserves it so consumers
+            # can distinguish new samples from repeats of the same sample.
+            goal.header.stamp = self.node.get_clock().now().to_msg()
             goal.pose.position.x = float(pt_x)
             goal.pose.position.y = float(pt_y)
             goal.pose.position.z = float(pt_z)
@@ -2346,6 +2502,7 @@ class VisionNode:
             with self.pub_lock:
                 self.latest_goal_msg = goal
                 self.latest_dir_msg = dir_msg
+                self._latest_goal_update_time = time()
 
             # Publish estimated fruit radius for adaptive gripper
             from .scoring import estimate_fruit_radius

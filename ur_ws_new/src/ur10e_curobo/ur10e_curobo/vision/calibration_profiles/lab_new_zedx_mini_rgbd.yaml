@@ -1,6 +1,8 @@
-camera_profile: zedx_mini_rgbd
+camera_profile: lab_new_zedx_mini_rgbd
+robot_profile: new
+environment: lab
 mode: zedx_mini
-description: ZED X Mini used as both RGB camera and native stereo depth camera.
+description: ZED X Mini RGBD hand-eye calibration preserved for the lab/new robot setup.
 parent_frame: tool0
 rgb_frame: zed_mini_left_camera_frame
 depth_frame: zed_mini_left_camera_frame
@@ -21,24 +23,11 @@ hand_eye:
     pitch: 0.0013822987500131667
     yaw: -1.835627323315375
   matrix:
-  - - -0.261745910353566
-    - 0.9447760064477
-    - 0.1971988236626114
-    - -0.12363350499385707
-  - - -0.965135828608888
-    - -0.2559311419566326
-    - -0.05488244630306026
-    - 0.06206952226915692
-  - - -0.0013822983098088003
-    - -0.20468890594633773
-    - 0.9788261035719643
-    - 0.08489296015881606
-  - - 0.0
-    - 0.0
-    - 0.0
-    - 1.0
+  - [-0.261745910353566, 0.9447760064477, 0.1971988236626114, -0.12363350499385707]
+  - [-0.965135828608888, -0.2559311419566326, -0.05488244630306026, 0.06206952226915692]
+  - [-0.0013822983098088003, -0.20468890594633773, 0.9788261035719643, 0.08489296015881606]
+  - [0.0, 0.0, 0.0, 1.0]
   method: DANIILIDIS
   mean_error_m: 0.002888614788353176
   num_samples: 34
   calibrated_at: '2026-07-28 12:11:30'
-profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/zedx_mini_rgbd.yaml

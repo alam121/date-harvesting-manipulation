@@ -1,7 +1,7 @@
 """Visualization and drawing utilities for vision module."""
 
 import math
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import cv2
 import numpy as np

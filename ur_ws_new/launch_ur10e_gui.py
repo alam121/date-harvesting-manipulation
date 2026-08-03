@@ -37,6 +37,14 @@ class LaunchDialog(QtWidgets.QDialog):
             self.settings.value("robot_profile", "old"),
         )
 
+        self.environment_combo = QtWidgets.QComboBox()
+        self.environment_combo.addItem("Outdoor / field", "outdoor")
+        self.environment_combo.addItem("Lab", "lab")
+        self._set_combo_data(
+            self.environment_combo,
+            self.settings.value("environment", "outdoor"),
+        )
+
         self.gripper_profile_combo = QtWidgets.QComboBox()
         self.gripper_profile_combo.addItem("Old gripper", "old")
         self.gripper_profile_combo.addItem("New DG-3F-M gripper", "new")
@@ -90,6 +98,7 @@ class LaunchDialog(QtWidgets.QDialog):
         hardware_box = self._group_box("Hardware", self._vbox(self.real_radio, self.fake_radio))
         profile_layout = QtWidgets.QFormLayout()
         profile_layout.addRow("Robot", self.robot_profile_combo)
+        profile_layout.addRow("Environment", self.environment_combo)
         profile_layout.addRow("Gripper enabled", self.use_gripper_cb)
         profile_layout.addRow("Gripper", self.gripper_profile_combo)
         profile_box = self._group_box("Profiles", profile_layout)
@@ -155,6 +164,7 @@ class LaunchDialog(QtWidgets.QDialog):
             self.real_radio,
             self.fake_radio,
             self.robot_profile_combo,
+            self.environment_combo,
             self.gripper_profile_combo,
             self.use_gripper_cb,
             self.main_cb,
@@ -176,6 +186,7 @@ class LaunchDialog(QtWidgets.QDialog):
         self.camera_combo.currentIndexChanged.connect(self._remember_camera_mode)
         self.vision_cb.toggled.connect(self._sync_vision_enabled)
         self.robot_profile_combo.currentIndexChanged.connect(self._remember_profiles)
+        self.environment_combo.currentIndexChanged.connect(self._remember_profiles)
         self.gripper_profile_combo.currentIndexChanged.connect(self._on_gripper_profile_changed)
         self.use_gripper_cb.toggled.connect(self._remember_profiles)
         self.use_gripper_cb.toggled.connect(self._sync_gripper_enabled)
@@ -214,6 +225,7 @@ class LaunchDialog(QtWidgets.QDialog):
 
     def apply_harvest_preset(self):
         self.real_radio.setChecked(True)
+        self._set_combo_data(self.environment_combo, "outdoor")
         self.use_gripper_cb.setChecked(True)
         self.main_cb.setChecked(True)
         self.vision_cb.setChecked(True)
@@ -225,6 +237,7 @@ class LaunchDialog(QtWidgets.QDialog):
 
     def apply_lab_preset(self):
         self.real_radio.setChecked(True)
+        self._set_combo_data(self.environment_combo, "lab")
         self.use_gripper_cb.setChecked(True)
         self.main_cb.setChecked(True)
         self.vision_cb.setChecked(True)
@@ -277,6 +290,7 @@ class LaunchDialog(QtWidgets.QDialog):
 
     def _remember_profiles(self):
         self.settings.setValue("robot_profile", self.robot_profile_combo.currentData())
+        self.settings.setValue("environment", self.environment_combo.currentData())
         self.settings.setValue("gripper_profile", self.gripper_profile_combo.currentData())
         self.settings.setValue(
             "use_gripper",
@@ -291,6 +305,7 @@ class LaunchDialog(QtWidgets.QDialog):
     def base_args(self):
         args = [
             f"robot_{self.robot_profile_combo.currentData()}",
+            self.environment_combo.currentData(),
             f"gripper_{self.gripper_profile_combo.currentData()}",
         ]
         if self.fake_radio.isChecked():

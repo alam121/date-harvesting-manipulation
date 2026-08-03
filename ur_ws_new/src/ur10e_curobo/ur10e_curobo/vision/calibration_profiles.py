@@ -18,11 +18,30 @@ PROFILE_DIR = Path(__file__).resolve().parent / "calibration_profiles"
 PROFILE_BY_MODE = {
     "zedx_mini": "zedx_mini_rgbd",
     "zed_mini": "zed_one_rgb_zedx_mini_depth",
+    "lidar": "zed_one_rgb_zedx_mini_depth",
+    "stereo": "zed_one_rgb_zedx_mini_depth",
 }
 
 
 def profile_name_for_mode(mode: str) -> str:
     return PROFILE_BY_MODE.get(mode, "zedx_mini_rgbd")
+
+
+def contextual_profile_name(
+    mode: str,
+    robot_profile: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> str:
+    """Return the robot/environment-specific calibration profile name."""
+    robot = (robot_profile or os.getenv(
+        "UR10E_ROBOT_PROFILE", "old")).strip().lower()
+    env = (environment or os.getenv(
+        "UR10E_ENVIRONMENT", "outdoor")).strip().lower()
+    if robot not in ("new", "old"):
+        raise ValueError(f"unsupported robot profile: {robot!r}")
+    if env not in ("lab", "outdoor"):
+        raise ValueError(f"unsupported environment: {env!r}")
+    return f"{env}_{robot}_{profile_name_for_mode(mode)}"
 
 
 def profile_path_for_name(name: str) -> Path:
@@ -36,9 +55,15 @@ def active_profile_path(mode: Optional[str] = None) -> Path:
 
     name = os.getenv("UR10E_CAMERA_PROFILE", "").strip()
     if not name:
-        # Keep direct `ros2 run ... vision --use_zed_mini` backward-compatible
-        # when the launcher has not exported UR10E_CAMERA_MODE.
-        name = profile_name_for_mode(mode or os.getenv("UR10E_CAMERA_MODE", "zed_mini"))
+        camera_mode = mode or os.getenv("UR10E_CAMERA_MODE", "zed_mini")
+        contextual_name = contextual_profile_name(camera_mode)
+        # Existing installations remain usable until their first contextual
+        # calibration is saved. Once present, the contextual profile wins.
+        name = (
+            contextual_name
+            if profile_path_for_name(contextual_name).exists()
+            else profile_name_for_mode(camera_mode)
+        )
     return profile_path_for_name(name)
 
 

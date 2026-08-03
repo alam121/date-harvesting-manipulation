@@ -11,7 +11,6 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from rclpy.timer import Timer
 from rclpy.qos import QoSProfile
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
@@ -76,6 +75,7 @@ class UR10eCuroboMoveIt(Node):
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
         self._config_mgr.initialize()
+        self.active_environment = ENVIRONMENT
 
         # ========= PHASE 2: StateManager =========
         self._state_mgr = StateManager(self, self._config_mgr)
@@ -99,6 +99,11 @@ class UR10eCuroboMoveIt(Node):
             Float32MultiArray, "/vision/heatmap_3d_data",
             self._heatmap_data_cb, 10
         )
+        self._latest_depth_diagnostics = None
+        self.create_subscription(
+            Float32MultiArray, "/vision/depth_diagnostics",
+            self._depth_diagnostics_cb, 10
+        )
 
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
@@ -118,7 +123,7 @@ class UR10eCuroboMoveIt(Node):
         # the panel shows it regardless of who started first.
         self.robot_config_pub = self.create_publisher(String, "/robot_config_info", 10)
         self.create_timer(2.0, lambda: self.robot_config_pub.publish(
-            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {ENVIRONMENT}")))
+            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {self.active_environment}")))
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
@@ -214,6 +219,7 @@ class UR10eCuroboMoveIt(Node):
         # System control publishers
         self._refresh_camera_pub = self.create_publisher(String, "/camera_command", 10)
         self._camera_lock = threading.Lock()
+        self._camera_snapshot_lock = threading.Lock()
         self._camera_latest_raw_msg = None
         self._camera_latest_raw_wall_time = 0.0
         self._camera_latest_display_msg = None
@@ -223,9 +229,6 @@ class UR10eCuroboMoveIt(Node):
         self._camera_video_recording = False
         self._camera_video_frames = 0
         self._camera_video_fps = 15.0
-
-        # perception disabled - using external date_v1.9.py instead
-        self.perception = None
 
         # Draggable RViz goal marker (3D-viewport counterpart to the panel buttons)
         goal_marker_mod.setup_goal_marker(self)
@@ -552,8 +555,9 @@ class UR10eCuroboMoveIt(Node):
             if meta is not None:
                 metadata[key] = copy.deepcopy(meta)
         self._last_goal_queue_metadata = metadata
-        self.get_logger().info(
-            f"Saved last goal queue ({len(items)} item(s), reason={reason}).")
+        if not getattr(self.cfg.planner, "concise_console_logs", False):
+            self.get_logger().info(
+                f"Saved last goal queue ({len(items)} item(s), reason={reason}).")
         return True
 
     def _restore_last_goal_queue(self):
@@ -897,6 +901,11 @@ class UR10eCuroboMoveIt(Node):
         """Cache latest heatmap 3D points from vision node."""
         self._latest_heatmap_data = list(msg.data)
 
+    def _depth_diagnostics_cb(self, msg):
+        values = list(msg.data)
+        if len(values) >= 10:
+            self._latest_depth_diagnostics = (time.time(), values)
+
     def _force_cb(self, msg): ##Sends force readings to classifier
         if not hasattr(self, 'classifier'):
             return
@@ -970,46 +979,106 @@ class UR10eCuroboMoveIt(Node):
         with self._camera_lock:
             self._camera_latest_display_msg = msg
 
-    def _save_camera_snapshot(self):
+    def capture_grasp_pair_frame(self, attempt_id, phase, timeout=0.45):
+        """Capture one fresh in-memory frame for temporal grasp comparison."""
+        safe_phase = str(phase).strip().lower()
+        if safe_phase not in ("before_reverse", "after_reverse"):
+            raise ValueError(f"invalid grasp-pair phase: {phase}")
+
         request_time = time.time()
-        self._request_camera_raw_stream("raw_stream snapshot duration=1.2")
-        deadline = request_time + 1.2
+        self._request_camera_raw_stream(
+            f"raw_stream snapshot duration={max(0.7, timeout + 0.15):.2f}")
+        deadline = request_time + float(timeout)
         msg = None
-        source = "raw"
         while time.time() < deadline:
             with self._camera_lock:
                 if (self._camera_latest_raw_msg is not None and
                         self._camera_latest_raw_wall_time >= request_time):
                     msg = self._camera_latest_raw_msg
-                    source = "raw"
                     break
-            time.sleep(0.04)
-        with self._camera_lock:
-            if msg is None:
-                msg = self._camera_latest_display_msg
-                source = "display"
-            if msg is None and self._camera_latest_raw_msg is not None:
-                msg = self._camera_latest_raw_msg
-                source = "raw_stale"
+            time.sleep(0.02)
+
         if msg is None:
             self.get_logger().warn(
-                "Camera snapshot: no /vision/raw or /vision/display frame received yet")
+                f"[GRASP_PAIR] {attempt_id} {safe_phase}: no fresh raw frame")
+            return None
+
+        frame = self._camera_msg_to_bgr(msg)
+        return frame.copy()
+
+    def verify_visual_grasp(self, frame_count=5, timeout=0.8):
+        """Collect fresh raw frames and return a logging-only visual grasp result."""
+        from ur10e_curobo.visual_grasp_verifier import (
+            classify_grasp_image,
+            vote_results,
+        )
+
+        request_time = time.time()
+        self._request_camera_raw_stream(
+            f"raw_stream snapshot duration={max(1.0, timeout + 0.2):.1f}")
+        deadline = request_time + timeout
+        results = []
+        last_stamp = -1.0
+        while time.time() < deadline and len(results) < int(frame_count):
+            with self._camera_lock:
+                msg = self._camera_latest_raw_msg
+                stamp = self._camera_latest_raw_wall_time
+            if msg is not None and stamp >= request_time and stamp > last_stamp:
+                results.append(classify_grasp_image(self._camera_msg_to_bgr(msg)))
+                last_stamp = stamp
+            time.sleep(0.025)
+        return vote_results(results)
+
+    def _save_camera_snapshot(self):
+        request_time = time.time()
+        self._request_camera_raw_stream("raw_stream snapshot duration=2.0")
+        deadline = request_time + 2.0
+        msg = None
+        while time.time() < deadline:
+            with self._camera_lock:
+                if (self._camera_latest_raw_msg is not None and
+                        self._camera_latest_raw_wall_time >= request_time):
+                    msg = self._camera_latest_raw_msg
+                    break
+            time.sleep(0.04)
+        if msg is None:
+            self.get_logger().error(
+                "Camera snapshot not saved: no fresh /vision/raw frame received. "
+                "The annotated /vision/display feed will not be used as a fallback.")
             return
         try:
             import cv2
             frame = self._camera_msg_to_bgr(msg)
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(self._camera_output_dir(), f"camera_{source}_{stamp}.png")
-            if not cv2.imwrite(path, frame):
+            path = os.path.join(self._camera_output_dir(), f"camera_raw_{stamp}.png")
+            if not cv2.imwrite(
+                    path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
                 self.get_logger().error(f"Camera snapshot: failed to save {path}")
                 return
-            if source != "raw":
-                self.get_logger().warn(
-                    "Camera snapshot used /vision/display fallback; restart the vision "
-                    "node to enable raw /vision/raw snapshots.")
-            self.get_logger().info(f"Camera {source} snapshot saved: {path}")
+            h, w = frame.shape[:2]
+            self.get_logger().info(
+                f"Raw camera snapshot saved: {path} ({w}x{h}, no overlays)")
         except Exception as e:
             self.get_logger().error(f"Camera snapshot failed: {e}")
+
+    def _start_camera_snapshot(self):
+        """Wait for and save a raw frame without blocking ROS callbacks."""
+        if not self._camera_snapshot_lock.acquire(blocking=False):
+            self.get_logger().warn(
+                "Camera snapshot already in progress; ignoring duplicate request.")
+            return
+
+        def worker():
+            try:
+                self._save_camera_snapshot()
+            finally:
+                self._camera_snapshot_lock.release()
+
+        threading.Thread(
+            target=worker,
+            name="camera_snapshot_worker",
+            daemon=True,
+        ).start()
 
     def _start_camera_video_recording(self):
         with self._camera_lock:
@@ -1049,10 +1118,10 @@ class UR10eCuroboMoveIt(Node):
 
     def _ui_command_cb(self, msg: String):
         """Handle commands from the GUI."""
-        import json
         import threading
         cmd = msg.data.strip()
-        self.get_logger().info(f"UI command received: {cmd}")
+        if not getattr(self.cfg.planner, "concise_console_logs", False):
+            self.get_logger().info(f"UI command received: {cmd}")
 
         # Run blocking motion commands in separate thread to avoid blocking ROS callbacks
         # Use mutex to prevent concurrent execution of motion commands
@@ -1234,6 +1303,36 @@ class UR10eCuroboMoveIt(Node):
                         f"(open_amount={(1.0 - alpha) * 100.0:.0f}%)")
             except (ValueError, IndexError) as e:
                 self.get_logger().warn(f"Invalid gripper_open_alpha command: {e}")
+        elif cmd.startswith("set_gripper_open_positions "):
+            try:
+                values = [float(v) for v in cmd.split()[1:]]
+                if len(values) != 12:
+                    raise ValueError(f"expected 12 joints, got {len(values)}")
+                if not all(math.isfinite(v) and -3.2 <= v <= 3.2 for v in values):
+                    raise ValueError("all joints must be finite and within [-3.2, 3.2] rad")
+                controller = getattr(self, "gripper_controller", None)
+                if controller is None or not hasattr(controller, "open_position"):
+                    raise ValueError("active gripper controller has no configurable posture")
+                if getattr(controller, "state", "IDLE") == "CLOSING":
+                    raise ValueError("cannot calibrate while gripper is closing")
+
+                old_open = list(controller.open_position)
+                old_closed = list(controller.closed_position)
+                travel = [
+                    old_closed[i] - old_open[i] for i in range(12)
+                ]
+                controller.open_position = list(values)
+                controller.closed_position = [
+                    values[i] + travel[i] for i in range(12)
+                ]
+                controller.current_position = list(values)
+                controller.close_start_position = list(values)
+                self.get_logger().info(
+                    "Runtime gripper OPEN updated: ["
+                    + ", ".join(f"{v:.4f}" for v in values)
+                    + "]; existing per-joint close travel preserved")
+            except (ValueError, IndexError) as e:
+                self.get_logger().warn(f"Invalid gripper open calibration: {e}")
         elif cmd == "stop":
             self.stop_requested = True
             motions_mod.publish_stop_trajectory(self)
@@ -1296,6 +1395,21 @@ class UR10eCuroboMoveIt(Node):
             self._set_current_as_home()
         elif cmd == "set_dropoff_current":
             self._set_current_as_dropoff()
+        elif cmd.startswith("set_environment "):
+            requested_environment = cmd.split(maxsplit=1)[1].strip().lower()
+            if self._motion_lock.locked() or self.motion_phase != "IDLE":
+                self.get_logger().warn(
+                    "Cannot switch environment while robot motion is active")
+            else:
+                try:
+                    self._config_mgr.set_environment(requested_environment)
+                except ValueError as exc:
+                    self.get_logger().error(f"Environment switch rejected: {exc}")
+                else:
+                    self.active_environment = requested_environment
+                    self.get_logger().info(
+                        f"Environment switched to {requested_environment!r}; "
+                        "HOME/DROPOFF and all related joint presets updated")
         elif cmd == "safe_zone_enable":
             getattr(self, "enable_safe_zone", lambda: None)()
         elif cmd == "safe_zone_disable":
@@ -1338,7 +1452,9 @@ class UR10eCuroboMoveIt(Node):
             self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
             self.get_logger().info(f"Camera model requested: {cmd}")
         elif cmd == "camera_snapshot":
-            self._save_camera_snapshot()
+            # The wait for a fresh frame must not occupy the default ROS
+            # callback group; /vision/raw is received by that same group.
+            self._start_camera_snapshot()
         elif cmd == "camera_video_start":
             self._start_camera_video_recording()
         elif cmd == "camera_video_stop":
@@ -1417,7 +1533,7 @@ class UR10eCuroboMoveIt(Node):
         of arm motion. We also report the XYZ value so the user can compare
         against a known physical measurement.
         """
-        import math, time
+        import time
         import numpy as np
         from std_msgs.msg import String as StdString
 
@@ -1598,6 +1714,8 @@ class UR10eCuroboMoveIt(Node):
             "speed_dropoff": self.cfg.planner.speed_dropoff,
             "speed_approach": self.cfg.planner.speed_approach,
             "speed_predropoff": self.cfg.planner.speed_predropoff,
+            "robot_profile": ROBOT_PROFILE,
+            "environment": self.active_environment,
             "home_joints": [round(v, 4) for v in home_joints],
             "home_joints_display": self._home_joints_display,
             "debug_plan_preview": self.cfg.planner.debug_plan_preview,
@@ -2024,7 +2142,7 @@ class UR10eCuroboMoveIt(Node):
             "replay preflight disabled to preserve vision FPS")
         self.get_logger().info(
             f"Added current joint posture as goal #{len(self.goal_poses)}: "
-            f"tcp=[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] "
+            f"tcp=[{goal[0]:.6f}, {goal[1]:.6f}, {goal[2]:.6f}] "
             f"({suffix})")
         if preflight_enabled:
             self._preflight_current_joint_goal_async(
@@ -2434,46 +2552,6 @@ class UR10eCuroboMoveIt(Node):
 
     def debug_print_world(self):
         self._motion_mgr.debug_print_world()
-
-    def _start_perception_once(self):
-        # run exactly once
-        self.perception_timer.cancel()
-        try:
-            from .perception import ZedYoloPerception
-
-            # resolve defaults safely (tiny model; no window)
-            weights = os.getenv("UR10E_YOLO_WEIGHTS", "exp_aug.pt")
-            imgsz   = int(os.getenv("UR10E_YOLO_IMGSZ", "640"))
-            conf    = float(os.getenv("UR10E_YOLO_CONF", "0.45"))
-            cam_fr  = os.getenv("UR10E_CAM_FRAME", "zed2_left_camera_frame")
-            show    = bool(int(os.getenv("UR10E_SHOW_VIEW", "1")))
-            cpu_only = os.getenv("CUDA_VISIBLE_DEVICES", "") == ""
-
-            self.get_logger().info(
-                f"Starting perception (weights={weights}, imgsz={imgsz}, conf={conf}, "
-                f"cam={cam_fr}, show={int(show)}, cpu_only={cpu_only})"
-            )
-
-            self.perception = ZedYoloPerception(
-                self,
-                weights=weights,
-                img_size=imgsz,
-                conf_thres=conf,
-                cam_frame=cam_fr,
-                show_view=show,
-            )
-            self.perception.start()
-            self.get_logger().info("Perception started.")
-        except Exception as e:
-            self.get_logger().error(f"Perception failed to start: [{type(e).__name__}] {e}")
-            self.perception = None  # don’t crash the whole node
-
-    def _maybe_start_perception(self):
-        if os.getenv("UR10E_DISABLE_PERCEPTION", "0") == "1":
-            self.get_logger().info("Perception disabled by UR10E_DISABLE_PERCEPTION=1")
-            return
-        # Delay startup to avoid RAM spikes colliding with cuRobo init
-        self.perception_timer: Timer = self.create_timer(5.0, self._start_perception_once)
 
     # Note: _teleop_cb and _teleop_servo_tick moved to MotionExecutor
 

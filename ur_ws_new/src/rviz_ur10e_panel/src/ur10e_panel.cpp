@@ -11,6 +11,7 @@
 #include <QDate>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QRegularExpression>
@@ -327,6 +328,31 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 10pt; font-weight: bold; padding: 2px; color: #1565c0;");
   layout->addWidget(config_label_);
 
+  // Keep environment selection visible above the tabs. Selecting an environment
+  // changes the complete runtime joint-preset family; it does not move the robot.
+  auto * environment_group = new QGroupBox("Robot Environment");
+  auto * environment_layout = new QHBoxLayout(environment_group);
+  auto * environment_combo = new QComboBox();
+  environment_combo->addItem("Lab", QString("lab"));
+  environment_combo->addItem("Outdoor / Field", QString("outdoor"));
+  environment_combo->setCurrentIndex(1);
+  environment_combo->setToolTip(
+    "Select the HOME, DROPOFF, PREDROPOFF and side-home preset family");
+  environment_layout->addWidget(environment_combo, 1);
+
+  auto * environment_apply = new QPushButton("Apply");
+  environment_apply->setStyleSheet(
+    "background-color: #00695c; color: white; font-weight: bold;");
+  environment_apply->setToolTip(
+    "Apply the selected preset family. This does not command robot motion.");
+  connect(environment_apply, &QPushButton::clicked, this, [this, environment_combo]() {
+    const QString environment = environment_combo->currentData().toString();
+    publishCmd("set_environment " + environment.toStdString());
+    status_label_->setText("Environment requested: " + environment);
+  });
+  environment_layout->addWidget(environment_apply);
+  layout->addWidget(environment_group);
+
   // Motion phase + reacquire result (side by side)
   auto * phase_row = new QHBoxLayout();
 
@@ -373,12 +399,73 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * camera_tab = new QWidget();
   auto * camera_tab_layout = new QVBoxLayout(camera_tab);
   camera_tab_layout->setSpacing(6);
+  auto * gripper_joints_tab = new QWidget();
+  auto * gripper_joints_layout = new QVBoxLayout(gripper_joints_tab);
+  gripper_joints_layout->setSpacing(4);
   tabs->addTab(motion_tab, "Motion");
   tabs->addTab(goal_tab, "Goal");
   tabs->addTab(monitor_tab, "Monitor");
   tabs->addTab(camera_tab, "Camera");
   tabs->addTab(heat_tab, "Heat");
+  tabs->addTab(gripper_joints_tab, "Grip Joints");
   tabs->addTab(settings_tab, "Settings");
+
+  auto * gripper_joint_help = new QLabel(
+    "M1–M12 calibration. Release a slider to preview the full posture. "
+    "Use \"Set as Runtime Open\" only after checking every joint.");
+  gripper_joint_help->setWordWrap(true);
+  gripper_joint_help->setStyleSheet(
+    "font-size: 9pt; color: #455a64; background: #eceff1; padding: 5px;");
+  gripper_joints_layout->addWidget(gripper_joint_help);
+
+  auto * gripper_joint_grid = new QGridLayout();
+  gripper_joint_grid->setSpacing(3);
+  for (int i = 0; i < 12; ++i) {
+    auto * name = new QLabel(QString("M%1").arg(i + 1));
+    name->setMinimumWidth(28);
+    gripper_joint_grid->addWidget(name, i, 0);
+
+    gripper_joint_sliders_[i] = new QSlider(Qt::Horizontal);
+    gripper_joint_sliders_[i]->setRange(-3200, 3200);
+    gripper_joint_sliders_[i]->setSingleStep(5);
+    gripper_joint_sliders_[i]->setPageStep(20);
+    gripper_joint_sliders_[i]->setToolTip(
+      QString("Motor M%1 target in radians; 0.005 rad per arrow step").arg(i + 1));
+    connect(
+      gripper_joint_sliders_[i], &QSlider::sliderReleased,
+      this, &UR10ePanel::onGripperJointSliderReleased);
+    gripper_joint_grid->addWidget(gripper_joint_sliders_[i], i, 1);
+
+    gripper_joint_value_labels_[i] = new QLabel("0.000");
+    gripper_joint_value_labels_[i]->setMinimumWidth(55);
+    gripper_joint_value_labels_[i]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    gripper_joint_value_labels_[i]->setFont(QFont("Courier", 9));
+    connect(
+      gripper_joint_sliders_[i], &QSlider::valueChanged,
+      this, [this, i](int value) {
+        gripper_joint_value_labels_[i]->setText(
+          QString::number(static_cast<double>(value) / 1000.0, 'f', 3));
+      });
+    gripper_joint_grid->addWidget(gripper_joint_value_labels_[i], i, 2);
+  }
+  gripper_joints_layout->addLayout(gripper_joint_grid);
+
+  auto * gripper_joint_buttons = new QHBoxLayout();
+  auto * reload_gripper_joints = new QPushButton("Reload Measured");
+  connect(
+    reload_gripper_joints, &QPushButton::clicked,
+    this, &UR10ePanel::onReloadGripperJointSliders);
+  gripper_joint_buttons->addWidget(reload_gripper_joints);
+
+  auto * set_gripper_open = new QPushButton("Set as Runtime Open");
+  set_gripper_open->setStyleSheet(
+    "background-color: #00695c; color: white; font-weight: bold;");
+  connect(
+    set_gripper_open, &QPushButton::clicked,
+    this, &UR10ePanel::onSetGripperOpenFromSliders);
+  gripper_joint_buttons->addWidget(set_gripper_open);
+  gripper_joints_layout->addLayout(gripper_joint_buttons);
+  gripper_joints_layout->addStretch(1);
 
   // Last harvest result banner + session tally
   auto * harvest_group = new QGroupBox("Last Harvest Result");
@@ -1322,6 +1409,8 @@ void UR10ePanel::setupRos()
     "/manual_goal_pose", goal_qos);
 
   stop_pub_ = node_->create_publisher<std_msgs::msg::Bool>("/emergency_stop", 10);
+  gripper_target_pub_ =
+    node_->create_publisher<std_msgs::msg::Float32MultiArray>("/gripper/target_joint", 10);
 
   joint_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
     "/joint_states", 10,
@@ -1346,6 +1435,19 @@ void UR10ePanel::setupRos()
       if (stability_recording_) {
         appendStabilitySampleLocked(std::chrono::steady_clock::now());
       }
+    });
+
+  gripper_joint_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+    "/gripper/joint_states", 10,
+    [this](sensor_msgs::msg::JointState::SharedPtr msg) {
+      if (msg->position.size() < 12) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      for (size_t i = 0; i < 12; ++i) {
+        gripper_joint_positions_[i] = msg->position[i];
+      }
+      have_gripper_joint_positions_ = true;
     });
 
   force_sub_ = node_->create_subscription<std_msgs::msg::Float32MultiArray>(
@@ -1764,6 +1866,75 @@ void UR10ePanel::onGripperOpenSliderReleased()
   cmd << "gripper_open_alpha " << std::fixed << std::setprecision(3) << alpha;
   publishCmd(cmd.str());
 }
+void UR10ePanel::onGripperJointSliderReleased()
+{
+  if (!gripper_target_pub_ || !gripper_joint_sliders_initialized_) return;
+  if (gripper_state_ == "OPENING" || gripper_state_ == "CLOSING") {
+    status_label_->setText("Wait for gripper motion to finish before calibration");
+    onReloadGripperJointSliders();
+    return;
+  }
+
+  int changed_index = -1;
+  auto * changed_slider = qobject_cast<QSlider *>(sender());
+  for (int i = 0; i < 12; ++i) {
+    if (gripper_joint_sliders_[i] == changed_slider) {
+      changed_index = i;
+      break;
+    }
+  }
+  if (changed_index < 0) return;
+
+  std::array<double, 12> target{};
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (!have_gripper_joint_positions_) {
+      status_label_->setText("No measured gripper joint feedback");
+      return;
+    }
+    for (int i = 0; i < 12; ++i) {
+      target[i] = gripper_joint_positions_[i];
+    }
+  }
+  target[changed_index] =
+    static_cast<double>(gripper_joint_sliders_[changed_index]->value()) / 1000.0;
+
+  std_msgs::msg::Float32MultiArray msg;
+  msg.data.reserve(12);
+  for (int i = 0; i < 12; ++i) {
+    msg.data.push_back(static_cast<float>(target[i]));
+  }
+  gripper_target_pub_->publish(msg);
+  status_label_->setText(
+    QString("Previewed M%1 only").arg(changed_index + 1));
+}
+void UR10ePanel::onSetGripperOpenFromSliders()
+{
+  if (!gripper_joint_sliders_initialized_) {
+    status_label_->setText("Wait for measured gripper joints first");
+    return;
+  }
+  const auto reply = QMessageBox::question(
+    this, "Set Runtime Open",
+    "Use all 12 slider values as the runtime OPEN posture?\n"
+    "Existing per-joint closing travel will be preserved.",
+    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+  if (reply != QMessageBox::Yes) return;
+
+  std::ostringstream cmd;
+  cmd << "set_gripper_open_positions";
+  for (int i = 0; i < 12; ++i) {
+    cmd << " " << std::fixed << std::setprecision(4)
+        << static_cast<double>(gripper_joint_sliders_[i]->value()) / 1000.0;
+  }
+  publishCmd(cmd.str());
+  status_label_->setText("Runtime gripper OPEN posture requested");
+}
+void UR10ePanel::onReloadGripperJointSliders()
+{
+  gripper_joint_sliders_initialized_ = false;
+  status_label_->setText("Reloading measured gripper joints...");
+}
 void UR10ePanel::onCapture() { publishCmd("capture 10"); }
 void UR10ePanel::onCaptureStop() { publishCmd("capture_stop"); }
 void UR10ePanel::onSubscribe() { publishCmd("subscribe"); }
@@ -1784,10 +1955,30 @@ void UR10ePanel::onExit()
   // 1. Signal all ROS nodes to shut down cleanly
   publishCmd("exit");
 
-  // 2. Small delay so "exit" message is published before we die
+  // 2. Small delay so "exit" is delivered before closing the launcher session.
   QTimer::singleShot(400, this, []() {
-    // Kill the entire process group — takes RViz and all child processes with it
-    ::kill(-::getpgid(0), SIGTERM);
+    constexpr const char * pid_path = "/tmp/ur10e_dynamic_terminator.pid";
+    QFile pid_file(pid_path);
+    if (pid_file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+      bool ok = false;
+      const qint64 parsed_pid = pid_file.readAll().trimmed().toLongLong(&ok);
+      pid_file.close();
+
+      if (ok && parsed_pid > 1) {
+        const pid_t terminator_pid = static_cast<pid_t>(parsed_pid);
+        // launch_ur10e.py creates a new session, so PID == process-group ID.
+        // Verify that relationship before sending a group-wide signal.
+        if (::getpgid(terminator_pid) == terminator_pid) {
+          ::kill(-terminator_pid, SIGTERM);
+          QFile::remove(pid_path);
+          return;
+        }
+      }
+    }
+
+    // Fallback for sessions started before PID tracking was introduced.
+    // Close RViz cleanly without risking an unrelated process group.
+    QApplication::quit();
   });
 }
 void UR10ePanel::onRefreshMain() { publishCmd("refresh_main"); }
@@ -2357,6 +2548,15 @@ void UR10ePanel::updateDisplay()
 
   if (!robot_config_text_.empty()) {
     config_label_->setText(QString::fromStdString(robot_config_text_));
+  }
+  if (have_gripper_joint_positions_ && !gripper_joint_sliders_initialized_) {
+    for (int i = 0; i < 12; ++i) {
+      const int millirad = static_cast<int>(
+        std::lround(gripper_joint_positions_[i] * 1000.0));
+      gripper_joint_sliders_[i]->setValue(
+        std::max(-3200, std::min(3200, millirad)));
+    }
+    gripper_joint_sliders_initialized_ = true;
   }
   if (camera_profile_label_ && !camera_status_text_.empty()) {
     camera_profile_label_->setText(QString::fromStdString(cameraProfileSummary(camera_status_text_)));

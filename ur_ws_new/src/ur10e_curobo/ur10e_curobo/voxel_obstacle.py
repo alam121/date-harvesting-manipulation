@@ -7,7 +7,7 @@ from typing import Optional, List, TYPE_CHECKING
 from threading import Lock
 import time
 
-from curobo.geom.types import VoxelGrid, WorldConfig
+from curobo.geom.types import VoxelGrid
 from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import PointCloud2
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy

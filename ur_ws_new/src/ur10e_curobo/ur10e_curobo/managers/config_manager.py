@@ -7,7 +7,10 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE, ENVIRONMENT
+from ..config import (
+    AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE, ENVIRONMENT,
+    ROBOT_PROFILES,
+)
 
 if TYPE_CHECKING:
     pass
@@ -291,6 +294,38 @@ class ConfigManager:
             self._node.get_logger().warn(
                 "Updated DROPOFF in memory, but failed to update ROS parameter "
                 f"joints.dropoff: {exc}")
+
+    def set_environment(self, environment: str) -> None:
+        """Switch every runtime joint preset to the selected environment."""
+        environment = str(environment).strip().lower()
+        environments = ROBOT_PROFILES[ROBOT_PROFILE]["environments"]
+        if environment not in environments:
+            raise ValueError(
+                f"Unknown environment {environment!r}; "
+                f"choose one of {sorted(environments)}")
+
+        presets = environments[environment]["joints"]
+        names = (
+            "home", "home_left", "home_left_low", "home_right",
+            "home_right_low", "dropoff", "predropoff",
+        )
+        updates = {}
+        for name in names:
+            joints = [float(v) for v in presets[name]]
+            if len(joints) != len(self.joint_order):
+                raise ValueError(
+                    f"{ROBOT_PROFILE}/{environment} {name} must contain "
+                    f"{len(self.joint_order)} joints, got {len(joints)}")
+            updates[name] = joints
+
+        for name, joints in updates.items():
+            setattr(self.cfg.joints, name, joints)
+            setattr(self, f"{name}_joints", joints)
+
+        self._node.set_parameters([
+            Parameter(f"joints.{name}", Parameter.Type.DOUBLE_ARRAY, joints)
+            for name, joints in updates.items()
+        ])
 
     def _on_parameter_change(self, params) -> SetParametersResult:
         """Handle runtime parameter changes via ros2 param set."""

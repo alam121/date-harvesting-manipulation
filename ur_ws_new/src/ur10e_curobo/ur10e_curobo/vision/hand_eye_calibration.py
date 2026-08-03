@@ -16,7 +16,7 @@ The result (4x4 camera-to-gripper transform) is saved to a YAML file.
 import argparse
 import os
 import re
-import sys
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,38 +32,37 @@ from scipy.spatial.transform import Rotation
 
 try:
     from .calibration_profiles import (
-        active_profile_path,
+        contextual_profile_name,
         frame_from_profile,
         load_camera_profile,
+        profile_path_for_name,
         save_camera_profile,
     )
 except ImportError:
     from calibration_profiles import (  # type: ignore
-        active_profile_path,
+        contextual_profile_name,
         frame_from_profile,
         load_camera_profile,
+        profile_path_for_name,
         save_camera_profile,
     )
 
 # ── URDFs to update when calibration is confirmed ─────────────────────────────
 URDF_FILES = [
     Path(__file__).resolve().parents[4] / "src/universal_robot/urdf/ur_macro.xacro",
-    Path(__file__).resolve().parents[5] / "curobo/src/curobo/content/assets/robot/ur_description/ur10e_curobo.urdf",
-    Path(__file__).resolve().parents[1] / "ur10e_curobo.urdf",
 ]
 
 # ── ChArUco board parameters ──────────────────────────────────────────
-# The supplied "7 x 24" dimensions are inner ChArUco corners, matching common
-# chessboard notation. Therefore the physical board is 8 x 25 squares and has
-# 100 marker positions.
-BOARD_INNER_X = 7
-BOARD_INNER_Y = 24
-BOARD_SQUARES_X = BOARD_INNER_X + 1
-BOARD_SQUARES_Y = BOARD_INNER_Y + 1
+# Calib.io ChArUco board: 17 x 24 physical squares.  ChArUco internal corners
+# are one fewer than the square count along each axis.
+BOARD_SQUARES_X = 17
+BOARD_SQUARES_Y = 24
+BOARD_INNER_X = BOARD_SQUARES_X - 1
+BOARD_INNER_Y = BOARD_SQUARES_Y - 1
 SQUARE_SIZE = 0.030
 MARKER_SIZE = 0.022
-ARUCO_DICTIONARY_ID = cv2.aruco.DICT_5X5_100
-ARUCO_DICTIONARY_NAME = "DICT_5X5_100"
+ARUCO_DICTIONARY_ID = cv2.aruco.DICT_5X5_1000
+ARUCO_DICTIONARY_NAME = "DICT_5X5_1000"
 MIN_CHARUCO_CORNERS = 12
 BOARD_DPI = 300
 
@@ -184,6 +183,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--robot-profile",
+        choices=("new", "old"),
+        default=os.getenv("UR10E_ROBOT_PROFILE", "old").strip().lower(),
+        help="physical robot being calibrated (default: UR10E_ROBOT_PROFILE or old)",
+    )
+    parser.add_argument(
         "--generate-board",
         nargs="?",
         const="AUTO",
@@ -200,7 +205,6 @@ def main():
         if camera_mode == "zedx_mini"
         else frame_from_profile(camera_profile, "rgb_frame", "zed2_left_camera_frame")
     )
-    profile_path = active_profile_path(camera_mode)
     if args.generate_board:
         if args.generate_board == "AUTO":
             filename = (
@@ -322,8 +326,8 @@ def main():
         for squares_x, squares_y, orientation in (
             (BOARD_SQUARES_X, BOARD_SQUARES_Y, "portrait"),
             (BOARD_SQUARES_Y, BOARD_SQUARES_X, "landscape"),
-            (BOARD_INNER_X, BOARD_INNER_Y, "7x24-squares"),
-            (BOARD_INNER_Y, BOARD_INNER_X, "24x7-squares"),
+            (BOARD_INNER_X, BOARD_INNER_Y, "inner-count fallback"),
+            (BOARD_INNER_Y, BOARD_INNER_X, "rotated inner-count fallback"),
         ):
             for legacy_pattern, layout in ((False, "modern"), (True, "legacy")):
                 _, candidate_board = create_charuco_board(
@@ -653,7 +657,8 @@ def main():
     node.get_logger().info(f"Calibration saved to {OUTPUT_FILE}")
 
     profile_out = dict(camera_profile)
-    profile_out["camera_profile"] = profile_out.get("camera_profile") or profile_path.stem
+    profile_out["camera_profile"] = (
+        profile_out.get("camera_profile") or "pending_context_selection")
     profile_out["mode"] = camera_mode
     profile_out["parent_frame"] = EE_FRAME
     profile_out["rgb_frame"] = child_frame
@@ -686,9 +691,6 @@ def main():
         "num_samples": sample_count,
         "calibrated_at": timestamp,
     }
-    saved_profile = save_camera_profile(profile_out, profile_path)
-    node.get_logger().info(f"Camera profile saved to {saved_profile}")
-
     print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
     print("=" * 60)
 
@@ -696,8 +698,8 @@ def main():
     print("\n" + "=" * 60)
     print("UPDATE URDFs?")
     print("=" * 60)
-    print(f"  Camera profile: {profile_out['camera_profile']}")
-    print(f"  Profile YAML: {saved_profile}")
+    print(f"  Robot profile: {args.robot_profile}")
+    print("  Environment/profile: selected after confirmation")
     print(f"  New transform ({EE_FRAME} → {child_frame}):")
     print(f"    xyz=\"{t_cam2gripper[0,0]:.6f} {t_cam2gripper[1,0]:.6f} {t_cam2gripper[2,0]:.6f}\"")
     print(f"    rpy=\"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}\"")
@@ -718,16 +720,90 @@ def main():
     confirm = input("Apply to URDFs? [y/N]: ").strip().lower()
     print(f"  (input received: {repr(confirm)})")
     if confirm == "y":
+        default_environment = os.getenv(
+            "UR10E_ENVIRONMENT", "outdoor").strip().lower()
+        if default_environment not in ("lab", "outdoor"):
+            default_environment = "outdoor"
+        while True:
+            selected = input(
+                f"Save/apply as lab or outdoor? "
+                f"[lab/outdoor] (default: {default_environment}): "
+            ).strip().lower()
+            environment = selected or default_environment
+            if environment in ("lab", "outdoor"):
+                break
+            print("  Please enter 'lab' or 'outdoor'.")
+
+        target_name = contextual_profile_name(
+            camera_mode,
+            robot_profile=args.robot_profile,
+            environment=environment,
+        )
+        target_path = profile_path_for_name(target_name)
+        if target_path.exists():
+            backup_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = target_path.with_suffix(
+                f".yaml.backup_{backup_stamp}")
+            shutil.copy2(target_path, backup_path)
+            print(f"  BACKUP: {backup_path}")
+
+        profile_out["camera_profile"] = target_name
+        profile_out["robot_profile"] = args.robot_profile
+        profile_out["environment"] = environment
+        saved_profile = save_camera_profile(profile_out, target_path)
+        node.get_logger().info(f"Camera profile saved to {saved_profile}")
         _update_urdfs(
             t_cam2gripper, rpy, best_method_name, best_error, sample_count,
-            timestamp, child_frame)
+            timestamp, child_frame, environment, args.robot_profile)
+        print(f"  ACTIVE PROFILE: {target_name}")
+        print("  Restart the full robot + vision system with:")
+        print(f"    UR10E_ROBOT_PROFILE={args.robot_profile}")
+        print(f"    UR10E_ENVIRONMENT={environment}")
     else:
-        print("URDFs not updated. Values saved to YAML only.")
+        print(
+            "Profile and URDFs not changed. The raw result remains in "
+            f"{OUTPUT_FILE}.")
 
     rclpy.shutdown()
 
 
-def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp, child_frame):
+def _replace_environment_value(text, attribute, environment, value):
+    """Replace one branch of an environment-conditional xacro attribute."""
+    pattern = re.compile(
+        rf'''({attribute}="\$\{{')(?P<lab>[^']*)'''
+        rf'''(' if environment == 'lab' else ')'''
+        rf'''(?P<outdoor>[^']*)('}}")'''
+    )
+
+    def replacement(match):
+        lab_value = value if environment == "lab" else match.group("lab")
+        outdoor_value = (
+            value if environment == "outdoor" else match.group("outdoor"))
+        return (
+            f"{match.group(1)}{lab_value}{match.group(3)}"
+            f"{outdoor_value}{match.group(5)}"
+        )
+
+    return pattern.sub(replacement, text, count=1)
+
+
+def _replace_context_property(
+    text, child_frame, attribute, robot_profile, environment, value,
+):
+    """Replace one robot/environment xacro hand-eye property."""
+    property_name = (
+        f"hand_eye_{child_frame}_{robot_profile}_{environment}_{attribute}")
+    pattern = re.compile(
+        rf'(<xacro:property\s+name="{re.escape(property_name)}"\s+value=")'
+        rf'[^\"]*("\s*/>)'
+    )
+    return pattern.sub(rf'\g<1>{value}\g<2>', text, count=1)
+
+
+def _update_urdfs(
+    t, rpy, method, error_m, n_samples, timestamp, child_frame,
+    environment, robot_profile,
+):
     """Update the tool0→camera joint origin in each URDF/xacro file."""
     xyz_str = f"{t[0,0]:.6f} {t[1,0]:.6f} {t[2,0]:.6f}"
     rpy_str = f"{rpy[0]:.6f} {rpy[1]:.6f} {rpy[2]:.6f}"
@@ -759,7 +835,9 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp, child_frame):
         if not urdf_path.exists():
             print(f"  SKIP (not found): {urdf_path}")
             continue
-        text = urdf_path.read_text()
+        # URDF comments may contain UTF-8 symbols (for example arrows or
+        # degree signs).  Do not depend on the shell's ASCII locale.
+        text = urdf_path.read_text(encoding="utf-8")
         match = joint_pattern.search(text)
         if not match:
             print(f"  SKIP (joint not found): {urdf_path}")
@@ -767,19 +845,20 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp, child_frame):
         joint_old = match.group(1)
         joint_new = joint_old
 
-        # The main xacro stores new/old robot camera transforms in one
-        # conditional origin. Update only the new-robot branch.
-        if "robot_profile == 'new'" in joint_old:
-            joint_new = re.sub(
-                r"""(xyz="\$\{')[^']*(' if robot_profile == 'new')""",
-                rf'\g<1>{xyz_str}\g<2>',
-                joint_new,
-            )
-            joint_new = re.sub(
-                r"""(rpy="\$\{')[^']*(' if robot_profile == 'new')""",
-                rf'\g<1>{rpy_str}\g<2>',
-                joint_new,
-            )
+        context_property = (
+            f"hand_eye_{child_frame}_{robot_profile}_{environment}_xyz")
+        if context_property in joint_old:
+            joint_new = _replace_context_property(
+                joint_new, child_frame, "xyz", robot_profile, environment,
+                xyz_str)
+            joint_new = _replace_context_property(
+                joint_new, child_frame, "rpy", robot_profile, environment,
+                rpy_str)
+        elif "environment == 'lab'" in joint_old:
+            joint_new = _replace_environment_value(
+                joint_new, "xyz", environment, xyz_str)
+            joint_new = _replace_environment_value(
+                joint_new, "rpy", environment, rpy_str)
 
         if joint_new == joint_old:
             joint_new = pat_xyz_first.sub(repl_xyz_first, joint_old)
@@ -789,7 +868,7 @@ def _update_urdfs(t, rpy, method, error_m, n_samples, timestamp, child_frame):
             print(f"  SKIP (origin pattern not matched): {urdf_path}")
             continue
         new_text = text[:match.start(1)] + joint_new + text[match.end(1):]
-        urdf_path.write_text(new_text)
+        urdf_path.write_text(new_text, encoding="utf-8")
         print(f"  UPDATED: {urdf_path}")
 
 

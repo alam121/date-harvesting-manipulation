@@ -15,7 +15,6 @@ from .config import (
     APPROACH_CHECK_DIST,
     NUM_CANDIDATE_DIRS,
 )
-from .math_utils import ray_sphere_intersection  # kept for external callers
 
 
 def estimate_fruit_radius(target: Dict[str, Any], fx: Optional[float] = None) -> float:

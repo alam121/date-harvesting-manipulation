@@ -13,12 +13,12 @@ OLD_GRIPPER_CLOSED_POSITION[6] = 2.3753
 OLD_GRIPPER_CLOSED_POSITION[10] = 2.5673
 
 NEW_GRIPPER_OPEN_POSITION = [
-    -0.0942, -0.1500, 2.1260, -0.5062,
-    -1.6318, 0.1309, 1.6953, -0.4887,
-    0.3333, 0.2234, 2.1260, -0.4311,
+    0.2510, -0.1270, 2.152266, -0.235734,
+    -1.1900, 0.0100, 1.707266, -0.362734,
+    0.3300, 0.2020, 1.986266, -0.278734,
 ]
 NEW_GRIPPER_CLOSE_DELTA = 2.5673 - 2.1260
-NEW_GRIPPER_OPEN_EXTRA_DEG = 5.0
+NEW_GRIPPER_OPEN_EXTRA_DEG = 7.0
 
 OLD_FINGER_JOINT_INDICES = {
     0: (2,),
@@ -48,18 +48,18 @@ def new_gripper_open_extra_deg() -> float:
         return NEW_GRIPPER_OPEN_EXTRA_DEG
 
 
-def normalize_gripper_profile(gripper_profile: str = "old") -> str:
-    profile = str(gripper_profile or "old").strip().lower()
-    return profile if profile in ("old", "new") else "old"
+def normalize_gripper_profile(gripper_profile: str = "new") -> str:
+    profile = str(gripper_profile or "new").strip().lower()
+    return profile if profile in ("old", "new") else "new"
 
 
-def finger_joint_indices_for_profile(gripper_profile: str = "old"):
+def finger_joint_indices_for_profile(gripper_profile: str = "new"):
     if normalize_gripper_profile(gripper_profile) == "new":
         return NEW_FINGER_JOINT_INDICES
     return OLD_FINGER_JOINT_INDICES
 
 
-def make_open_position(gripper_profile: str = "old"):
+def make_open_position(gripper_profile: str = "new"):
     profile = normalize_gripper_profile(gripper_profile)
     if profile == "old":
         return OLD_GRIPPER_OPEN_POSITION.copy()

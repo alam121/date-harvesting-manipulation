@@ -1663,7 +1663,27 @@ def plan_execute_js(
                 if lock: lock.release()
         if res is None or not res.success:
             status = getattr(res, 'status', 'unknown') if res is not None else 'None'
-            node.get_logger().warn(f"Joint-space plan to {label} failed. status={status}")
+            valid = getattr(res, 'valid_query', None) if res is not None else None
+            # Diagnostic: flag joints outside cuRobo's usable range (URDF ±2π minus
+            # position_limit_clip in ur10e.yml). goal OOB ⇒ the saved posture has a
+            # joint too near ±360° for cuRobo; valid_query=False ⇒ start/goal invalid
+            # (limits or collision); True ⇒ endpoints OK but no path found.
+            try:
+                _JLIM = 6.283185307 - 0.1
+                names = getattr(node, "joint_order", None) or list(range(len(target_joints)))
+                _sj = list(node.current_joint_positions) if node.current_joint_positions is not None else []
+                start_oob = [f"{names[i]}={_sj[i]:.3f}" for i in range(len(_sj)) if abs(_sj[i]) > _JLIM]
+                goal_oob = [f"{names[i]}={target_joints[i]:.3f}"
+                            for i in range(len(target_joints)) if abs(target_joints[i]) > _JLIM]
+                node.get_logger().warn(
+                    f"[{label}] joint-limit check (usable ±{_JLIM:.3f} rad) — "
+                    f"start OOB: {start_oob or 'none'}; goal OOB: {goal_oob or 'none'}")
+            except Exception:
+                pass
+            node.get_logger().warn(
+                f"Joint-space plan to {label} failed. status={status} valid_query={valid} "
+                "(valid_query=False ⇒ start/goal out of limits or in collision; "
+                "True ⇒ endpoints OK but no collision-free path found)")
     finally:
         if _yolo_lock: _yolo_lock.release()
 
@@ -1696,6 +1716,15 @@ def plan_execute_js(
     # ------------------------------
     # No args allowed
     states = interpolated_positions(res)
+    _raw_start_error = (
+        max(abs(c - s) for c, s in zip(node.current_joint_positions, states[0]))
+        if states else 0.0)
+    states = _prepend_measured_start_bridge(
+        states, list(node.current_joint_positions), label)
+    if _raw_start_error > math.radians(0.25):
+        node.get_logger().info(
+            f"{label}: inserted measured-start bridge "
+            f"({_raw_start_error*57.3:.1f}deg → ≤1.0deg steps)")
     curobo_dt = get_curobo_dt(res)
 
     dt = curobo_dt / max(scale, 1e-6)
@@ -1877,6 +1906,39 @@ def move_to_dropoff_position(node):
     return plan_execute_js(node, target, label="DROP-OFF", motion_type="dropoff")
 
 
+def _prepend_measured_start_bridge(states, measured_start, label,
+                                   max_step_deg: float = 1.0):
+    """Ensure a planned joint trajectory begins at the measured robot posture.
+
+    Some cuRobo interpolation results begin after the mathematical start state.
+    Publishing that first sample directly can make the UR controller see a
+    several-degree discontinuity and reject the trajectory.  Insert a short,
+    linear bridge with at most ``max_step_deg`` per joint; it follows the first
+    local segment of the already collision-checked joint-space plan.
+    """
+    states = [list(q) for q in states]
+    if not states or measured_start is None:
+        return states
+    start_error = max(
+        abs(float(c) - float(s))
+        for c, s in zip(measured_start, states[0]))
+    if start_error <= math.radians(0.25):
+        states[0] = list(measured_start)
+        return states
+
+    steps = max(2, int(math.ceil(
+        start_error / math.radians(max_step_deg))))
+    first = states[0]
+    bridge = []
+    for i in range(steps):
+        alpha = i / float(steps)
+        bridge.append([
+            float(c) + alpha * (float(s) - float(c))
+            for c, s in zip(measured_start, first)
+        ])
+    return bridge + states
+
+
 def preplan_js(node, target_joints: List[float], start_joints: List[float],
                label: str = "PREPLAN", motion_type: str = "default"):
     """Plan a joint-space trajectory without executing it.
@@ -1903,8 +1965,42 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
     finally:
         if _yolo_lock: _yolo_lock.release()
     if not res.success:
+        # ── Diagnostic: why did cuRobo refuse this joint-space plan? ──────────
+        # status      : cuRobo's failure reason (IK/collision/trajopt/limits)
+        # valid_query : False ⇒ the start OR goal itself is invalid (out of joint
+        #               limits or in collision at the endpoint); True ⇒ endpoints
+        #               are fine but no collision-free/limit-respecting PATH found.
+        _status = getattr(res, "status", None)
+        _valid = getattr(res, "valid_query", None)
+        try:
+            # URDF joint limit is ±2π; ur10e.yml clips 0.1 rad off each end
+            # (position_limit_clip), so cuRobo's usable range is ±(2π − 0.1).
+            _JLIM = 6.283185307 - 0.1
+            names = getattr(node, "joint_order", None) or list(range(len(target_joints)))
+
+            def _oob(q):
+                return [f"{names[i]}={q[i]:.3f}" for i in range(len(q)) if abs(q[i]) > _JLIM]
+
+            start_oob, goal_oob = _oob(start_joints), _oob(target_joints)
+            node.get_logger().warn(
+                f"[{label}] joint-limit check (usable ±{_JLIM:.3f} rad) — "
+                f"start OOB: {start_oob or 'none'}; goal OOB: {goal_oob or 'none'}")
+        except Exception:
+            pass
+        node.get_logger().warn(
+            f"[{label}] cuRobo plan_single_js FAILED — status={_status} valid_query={_valid} "
+            "(valid_query=False ⇒ goal/start out of limits or in collision; "
+            "True ⇒ endpoints OK but no collision-free path found)")
         return None
     states = interpolated_positions(res)
+    _raw_start_error = (
+        max(abs(c - s) for c, s in zip(start_joints, states[0]))
+        if states else 0.0)
+    states = _prepend_measured_start_bridge(states, start_joints, label)
+    if _raw_start_error > math.radians(0.25):
+        node.get_logger().info(
+            f"[PREPLAN] {label}: inserted measured-start bridge "
+            f"({_raw_start_error*57.3:.1f}deg → ≤1.0deg steps)")
     curobo_dt = get_curobo_dt(res)
     planner = node.cfg.planner
     speed_map = {
@@ -1938,7 +2034,10 @@ def execute_preplan(node, traj, states, label: str) -> bool:
             f"[PREPLAN] {label}: stale start state "
             f"({math.degrees(start_error):.1f}deg mismatch); replanning required")
         return False
-    node.get_logger().info(f"[PREPLAN] {label}: publishing pre-planned trajectory ({len(traj.points)} pts)")
+    if not getattr(node.cfg.planner, "concise_console_logs", False):
+        node.get_logger().info(
+            f"[PREPLAN] {label}: publishing pre-planned trajectory "
+            f"({len(traj.points)} pts)")
     node.trajectory_pub.publish(traj)
 
     target_joints = states[-1]

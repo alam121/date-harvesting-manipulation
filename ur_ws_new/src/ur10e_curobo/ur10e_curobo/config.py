@@ -102,12 +102,12 @@ _OLD_LAB_JOINTS = {
 # replace each list with the recorded pose. Only the keys you change take effect.
 _NEW_OUTDOOR_JOINTS = {
     "home": [
-        0.2966473698616028, -1.6924630604186, 2.319343153630392,
-        -4.599916835824484, -1.8223055044757288, 2.912656307220459,
+        -0.10284835497011358, -0.7675350469401856, 1.8947790304767054,
+        -4.78630056003713, -1.4767573515521448, 1.9139177799224854,
     ],
     "dropoff": [
-        -1.085060343146324, -1.570564409295553, 2.355928007756368,
-        -2.613685270349020, -1.386652294789450, 2.914407730102539,
+        -0.3758776823626917, -1.1837181013873597, 2.0136449972735804,
+        -2.9486800632872523, -1.5171645323382776, 1.5264148712158203,
     ],
     "predropoff": [
         -0.223708137869835, -1.685942789117330, 2.032441679631368,
@@ -214,7 +214,7 @@ _TRUNK_OBSTACLE = {
     "radius": 0.02,    # 2cm radius = 4cm diameter trunk
     "height": 1.2,     # 1.2m visible trunk section
     "pose": (
-        [1.00, 0.16, 0.6, 1, 0, 0, 0]
+        [1.40, 0.16, 0.6, 1, 0, 0, 0]
         if X_FORWARD_Y_LATERAL
         else [0.16, -1.00, 0.6, 1, 0, 0, 0]
     ),
@@ -451,8 +451,17 @@ class Planner:
     speed_home: float = 0.11        # faster return; effective scale=0.55 with global=5
     speed_dropoff: float = 0.18     # faster carrying move; effective scale=0.90
     speed_predropoff: float = 0.2  # for pre-dropoff reverse
-    speed_approach: float = 1.0    # for approach motion
-    speed_final: float = 0.18       # precise grasp; moderate increase from 0.15
+    speed_approach: float = 0.06   # effective scale=0.30 with global=5
+    speed_final: float = 0.06      # effective scale=0.30 for precise final grasp
+
+    # Final base-frame guard for vision goals. A stable but physically impossible
+    # background-depth estimate must never enter the motion queue.
+    goal_workspace_forward_min_m: float = 0.35
+    goal_workspace_forward_max_m: float = 1.60
+    goal_workspace_lateral_min_m: float = -0.80
+    goal_workspace_lateral_max_m: float = 0.90
+    goal_workspace_z_min_m: float = 0.02
+    goal_workspace_z_max_m: float = 1.40
 
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions
@@ -463,7 +472,8 @@ class Planner:
     # === TRAJECTORY LIMITS ===
     # These control how fast trajectories can actually execute
     min_dt: float = 0.010                # minimum timestep — keep ≥0.010 to avoid UR joint velocity limit faults
-    max_dt: float = 0.05                 # maximum timestep
+    max_dt: float = 0.08                 # allow slow approach/final trajectories
+    approach_endpoint_settle_s: float = 0.25  # let zero-velocity endpoint finish; avoid hold preemption
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
     approach_max_joint_step_deg: float = 12.0  # reject APPROACH plans with abrupt per-waypoint joint jumps
     approach_max_path_ratio: float = 2.5       # reject roundabout approach paths
@@ -519,7 +529,7 @@ class Planner:
     clamp_safety_threshold_mm: float = 45.0
     very_low_preflight_min_clearance_mm: float = 50.0
     very_low_preflight_early_accept_mm: float = 50.0
-    very_low_preflight_preferred_pitch_deg: float = -5.0  # negative pitch tried first on approach (start at -5)
+    very_low_preflight_preferred_pitch_deg: float = 0.0   # straight-on approach tried first
     very_low_preflight_second_pitch_deg: float = -30.0
     very_low_preflight_preferred_wrist_deg: float = 0.0
     very_low_preflight_pitch_step_deg: float = 10.0
@@ -528,12 +538,15 @@ class Planner:
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
     side_approach_enabled: bool = False         # enable LEFT/RIGHT side-home and side-low approach routing
     low_side_home_min_goal_z_m: float = 0.55    # below this, skip fixed side-low HOME; use target-local very-low approach
+
+
     # Offset names below are semantic. They are mapped through ROBOT_PROFILE:
     # - new robot: depth -> X, lateral -> Y
     # - old robot: depth -> Y, lateral -> X
     side_home_lateral_offset: float = 0.16      # m; side-home lateral distance from trunk
     side_home_x_offset: float = 0.16            # legacy alias for side_home_lateral_offset
-    side_home_partial_reverse_m: float = 0.55   # m; partial reverse clearance for side-approach fruits (vs 0.35m center)
+    center_partial_reverse_m: float = 0.20      # m; controlled retreat after a center grasp
+    side_home_partial_reverse_m: float = 0.30   # m; extra clearance for side-approach fruits
 
 
     mid_center_approach_depth_offset: float = 0.10
@@ -548,15 +561,17 @@ class Planner:
 
 
 
-    low_center_approach_depth_offset: float = 0.03
-    low_center_approach_y_offset: float = 0.03  # legacy alias for low_center_approach_depth_offset
-    low_center_approach_z_offset: float = -0.07
+    low_center_approach_depth_offset: float = 0.07
+    low_center_approach_y_offset: float = 0.07  # legacy alias for low_center_approach_depth_offset
+    low_center_approach_z_offset: float = 0.001  # legacy; center approach is derived from insertion angle
 
 
-    very_low_center_approach_depth_offset: float = 0.08
-    very_low_center_approach_y_offset: float = 0.08  # legacy alias for very_low_center_approach_depth_offset
-    very_low_center_approach_z_offset: float = -0.025
-    very_low_center_approach_pitch_deg: float = 5.0  # local tool X pitch to open forearm-flange clearance
+    very_low_center_approach_depth_offset: float = 0.07
+    very_low_center_approach_y_offset: float = 0.07  # legacy alias for very_low_center_approach_depth_offset
+    very_low_center_approach_z_offset: float = 0.001  # legacy; center approach is derived from insertion angle
+    low_center_insertion_pitch_deg: float = 12.0     # approach from below, then insert upward
+    very_low_center_approach_pitch_deg: float = 0.0  # legacy; orientation follows the insertion vector
+    low_center_forward_align_max_deg: float = 45.0    # align gripper local +Z with insertion direction
 
 
     low_left_standoff_lateral: float = 0.12
@@ -584,27 +599,39 @@ class Planner:
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
-    low_center_final_depth_offset: float = -0.01
-    low_center_final_y_offset: float = -0.01    # legacy alias for low_center_final_depth_offset
-    low_center_final_z_offset: float = 0.033    # m; gripper center offset above low-center fruit
+    # New robot: final X = detected X + this offset.  A less-negative value
+    # moves the gripper farther forward/deeper into the date cluster.
+    low_center_final_depth_offset: float = -0.009
+    low_center_final_y_offset: float = -0.009   # legacy alias for low_center_final_depth_offset
+    low_center_final_z_offset: float = 0.007    # m; 7mm above detected low-center point
 
-    mid_center_final_depth_offset: float = -0.02
-    mid_center_final_y_offset: float = -0.02    # legacy alias for mid_center_final_depth_offset
+    mid_center_final_depth_offset: float = -0.015
+    mid_center_final_y_offset: float = -0.015   # legacy alias for mid_center_final_depth_offset
     mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
 #---------------------------------------------------------------------------------------------------------
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
+    final_endpoint_tolerance: float = 0.004     # m; require FINAL TCP within 4mm before closing
     reverse_initial_wait: float = 0.15          # s; minimum wait after publishing partial reverse
     reverse_final_settle: float = 0.05          # s; settle after reverse stops before hold check
-    reverse_dt_multiplier: float = 1.7          # reverse dt=min_dt*multiplier (was fixed at 2.0)
+    reverse_dt_multiplier: float = 3.5          # slower reverse: dt=min_dt*multiplier
+    reverse_velocity_scale: float = 0.25        # dedicated joint velocity limit multiplier
+    reverse_acceleration_scale: float = 0.25    # dedicated joint acceleration limit multiplier
+    reverse_decel_tail_points: int = 14         # stationary endpoint samples for a softer stop
     grasp_post_close_settle_s: float = 0.10      # closure loop is synchronous; only sensor settle remains
 
 
     hold_check_settle_s: float = 0.05           # s; force settle before post-reverse hold samples
     hold_check_window_s: float = 0.30           # s; median force sample window after reverse
     hold_check_sample_dt: float = 0.04          # s; post-reverse force sample period
+    hold_force_finger_threshold_n: float = 3.0  # above empty-close maximum (1.8N)
+    hold_force_min_fingers: int = 2
+    hold_force_strong_single_n: float = 8.0     # verified proper centre finger was ≥6N; outer ≥36N
+    hold_force_sum_threshold_n: float = 12.0
+    force_retry_after_reverse: bool = False     # enable only after ground-truthed success/miss calibration
+    max_force_grasp_retries: int = 2
     dropoff_preplan_wait_s: float = 15.0        # wait for background plan before starting another planner
 
 
@@ -613,7 +640,11 @@ class Planner:
     pre_dropoff_y_offset: float = 0.25  # legacy alias for pre_dropoff_depth_offset
 
     # === REACQUIRE ===
-    reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
+    reacquire_after_approach: bool = False  # stable subscribed seed is used for normal grasps
+    reacquire_timeout_s: float = 1.0        # high-FPS vision: fail back to seed quickly
+    require_reacquire_before_grasp: bool = False  # allow stable-seed fallback when close-view reacquisition times out
+    reacquire_depth_settle_s: float = 0.10  # brief depth/RGB synchronization settle
+    reacquire_stable_frames: int = 2        # two consistent high-FPS measurements
     slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
     subscribe_goal_min_settle_s: float = 0.40  # ignore first depth samples after Subscribe
@@ -628,7 +659,8 @@ class Planner:
     log_cycle_start: bool = False      # verbose per-goal start/decision metadata
     log_phase_timings: bool = False    # per-phase timing lines; cycle summary always includes timings
     log_path_publish: bool = False     # RViz path marker publish messages
-    log_gripper_force_profile: bool = False  # full per-step closure force profile
+    concise_console_logs: bool = True  # operator view; warnings/errors and cycle results remain visible
+    log_gripper_force_profile: bool = False  # enable only while collecting force calibration data
 
 @dataclass
 class Perception:
@@ -643,6 +675,7 @@ class Perception:
 @dataclass
 class Gripper:
     use_suction: bool = False
+    adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
     closing_steps: int = 10
     step_delay_s: float = 0.05

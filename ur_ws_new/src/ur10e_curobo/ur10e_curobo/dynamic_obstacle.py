@@ -1,7 +1,5 @@
 from curobo.geom.types import Sphere, Cuboid
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Quaternion
-import math
 
 class DynamicObstacleManager:
     def __init__(self, node, motion_gen, world_model):

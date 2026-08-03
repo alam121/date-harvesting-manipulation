@@ -47,6 +47,7 @@ setup(
             "hand_eye = ur10e_curobo.vision.hand_eye_calibration:main",  # Hand-eye calibration
             "zed_extrinsic = ur10e_curobo.vision.zed_extrinsic_calibration:main",
             "dg3fm_finger_test = ur10e_curobo.dg3fm_finger_test:main",
+            "verify_grasp = ur10e_curobo.visual_grasp_verifier:main",
         ],
     },
 )

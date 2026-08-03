@@ -9,11 +9,6 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 
 
-def debug_print(msg: str) -> None:
-    """Lightweight debug printer with flush."""
-    print(f"[DEBUG] {msg}", flush=True)
-
-
 def wait_for_transform(tf_buffer, target_frame, source_frame, node, timeout=5.0):
     """Spin until the requested TF is available or timeout."""
     start = time()

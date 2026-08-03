@@ -2,6 +2,7 @@
 """Motion planning and execution for UR10e cuRobo node."""
 
 import copy
+import re
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from ..dynamic_obstacle import DynamicObstacleManager
 from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
 from .. import fk as fk_mod
+from ..vision.calibration_profiles import load_camera_profile
 
 if TYPE_CHECKING:
     from .config_manager import ConfigManager
@@ -162,36 +164,84 @@ class MotionExecutor:
         self._node.get_logger().info("MotionExecutor initialized")
 
     def _profile_curobo_config(self):
-        """Return a cuRobo config with geometry matching ROBOT_PROFILE."""
+        """Return a cuRobo config matching the robot and camera profile."""
         config_name = self._config.cfg.planner.urdf_config
-        if ROBOT_PROFILE == "new":
-            return config_name
-
         robot_config = load_yaml(
             join_path(get_robot_configs_path(), config_name))
         kinematics = robot_config["robot_cfg"]["kinematics"]
         source_urdf = Path(join_path(get_assets_path(), kinematics["urdf_path"]))
         text = source_urdf.read_text(encoding="utf-8")
 
-        replacements = {
-            'xyz="-0.008324 0.148998 0.040079"':
-                'xyz="0 0 -0.174"',
-            'rpy="-0.171298 -0.007406 -3.134152" '
-            'xyz="-0.001111 0.153451 0.081263"':
-                'rpy="-0.166668 0.013504 0.252667" '
-                'xyz="0.042550 -0.150154 0.074587"',
-        }
-        for current, previous in replacements.items():
-            if current not in text:
-                raise RuntimeError(
-                    f"Expected new-profile URDF transform not found: {current}")
-            text = text.replace(current, previous, 1)
+        if ROBOT_PROFILE == "old":
+            replacements = {
+                'xyz="-0.008324 0.148998 0.040079"':
+                    'xyz="0 0 -0.174"',
+                'rpy="-0.171298 -0.007406 -3.134152" '
+                'xyz="-0.001111 0.153451 0.081263"':
+                    'rpy="-0.166668 0.013504 0.252667" '
+                    'xyz="0.042550 -0.150154 0.074587"',
+            }
+            for current, previous in replacements.items():
+                if current not in text:
+                    raise RuntimeError(
+                        "Expected new-profile URDF transform not found: "
+                        f"{current}")
+                text = text.replace(current, previous, 1)
 
-        profile_urdf = Path("/tmp/ur10e_curobo_old_profile.urdf")
+        camera_profile = load_camera_profile()
+        hand_eye = camera_profile.get("hand_eye", {})
+        translation = hand_eye.get("translation", {})
+        rpy = hand_eye.get("rpy", {})
+        child_frame = str(hand_eye.get(
+            "child_frame",
+            camera_profile.get("rgb_frame", "zed_mini_left_camera_frame"),
+        ))
+        required_translation = all(axis in translation for axis in "xyz")
+        required_rpy = all(axis in rpy for axis in ("roll", "pitch", "yaw"))
+        if required_translation and required_rpy:
+            xyz_str = " ".join(
+                f"{float(translation[axis]):.6f}" for axis in "xyz")
+            rpy_str = " ".join(
+                f"{float(rpy[axis]):.6f}"
+                for axis in ("roll", "pitch", "yaw"))
+            joint_pattern = re.compile(
+                rf'(<joint\s+name="tool0_to_{re.escape(child_frame)}"'
+                rf'.*?</joint>)',
+                re.DOTALL,
+            )
+            joint_match = joint_pattern.search(text)
+            if not joint_match:
+                raise RuntimeError(
+                    "Camera joint for active calibration profile was not "
+                    f"found: tool0_to_{child_frame}")
+            joint_text = joint_match.group(1)
+            updated_joint, count = re.subn(
+                r'<origin\b[^>]*/>',
+                f'<origin rpy="{rpy_str}" xyz="{xyz_str}"/>',
+                joint_text,
+                count=1,
+            )
+            if count != 1:
+                raise RuntimeError(
+                    f"Camera origin was not found in tool0_to_{child_frame}")
+            text = (
+                text[:joint_match.start(1)] + updated_joint
+                + text[joint_match.end(1):]
+            )
+        else:
+            self._node.get_logger().warning(
+                "Active camera profile has no hand-eye transform; cuRobo "
+                "will use the transform embedded in its source URDF: "
+                f"{camera_profile.get('profile_path', '-')}")
+
+        profile_urdf = Path(
+            f"/tmp/ur10e_curobo_{ROBOT_PROFILE}_{ENVIRONMENT}.urdf")
         profile_urdf.write_text(text, encoding="utf-8")
         kinematics["urdf_path"] = str(profile_urdf)
         self._node.get_logger().info(
-            f"Generated old-profile cuRobo URDF: {profile_urdf}")
+            "Generated contextual cuRobo URDF: "
+            f"{profile_urdf} (calibration="
+            f"{camera_profile.get('camera_profile', '-')})")
         return robot_config
 
     def _wait_for_trunk_and_build_world(self, timeout: float = 15.0, collect_secs: float = 2.0) -> dict:

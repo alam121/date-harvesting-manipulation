@@ -95,13 +95,11 @@ from .config import (
 )
 from .utils import build_trajectory, wait_until_xyz
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
-from .motions import interpolated_positions, get_curobo_dt, execute_single_pose
-from .motions import execute_single_pose as exec_pose
-from .motions import rotate_wrist, move_to_predropoff_position, move_to_dropoff_position, move_to_home_position
+from .motions import interpolated_positions, get_curobo_dt
+from .motions import move_to_dropoff_position, move_to_home_position
 from .motions import blend_motion, preplan_js, execute_preplan, plan_execute_js, nearest_joint_config
-from .dynamic_obstacle import DynamicObstacleManager
 from .utils import compute_visibility_approach
-from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints, solve_ik_fast
+from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 from .grasp_learner import GraspRecord
 from . import gripper as gripper_mod
 from . import markers as markers_mod
@@ -403,6 +401,42 @@ def add_axis_offsets(x, y, *, depth=0.0, lateral=0.0):
         # New robot faces +X, so a positive standoff moves back toward the robot.
         return x - depth, y + lateral
     return x + lateral, y + depth
+
+
+def goal_is_in_robot_workspace(node, xyz):
+    """Validate a vision goal in semantic forward/lateral robot coordinates."""
+    if xyz is None or len(xyz) < 3 or not all(math.isfinite(float(v)) for v in xyz[:3]):
+        return False, "non-finite XYZ"
+    x, y, z = (float(v) for v in xyz[:3])
+    forward = x if X_FORWARD_Y_LATERAL else -y
+    lateral = y if X_FORWARD_Y_LATERAL else x
+    planner = node.cfg.planner
+    f_min = float(getattr(planner, "goal_workspace_forward_min_m", 0.35))
+    f_max = float(getattr(planner, "goal_workspace_forward_max_m", 1.60))
+    l_min = float(getattr(planner, "goal_workspace_lateral_min_m", -0.80))
+    l_max = float(getattr(planner, "goal_workspace_lateral_max_m", 0.90))
+    z_min = float(getattr(planner, "goal_workspace_z_min_m", 0.02))
+    z_max = float(getattr(planner, "goal_workspace_z_max_m", 1.40))
+    valid = (
+        f_min <= forward <= f_max
+        and l_min <= lateral <= l_max
+        and z_min <= z <= z_max
+    )
+    reason = (
+        f"forward={forward:.3f}m [{f_min:.2f},{f_max:.2f}], "
+        f"lateral={lateral:.3f}m [{l_min:.2f},{l_max:.2f}], "
+        f"z={z:.3f}m [{z_min:.2f},{z_max:.2f}]"
+    )
+    return valid, reason
+
+
+def _warn_rejected_goal_throttled(node, xyz, reason):
+    now = time.time()
+    if now - float(getattr(node, "_last_workspace_reject_log_s", 0.0)) >= 1.0:
+        node._last_workspace_reject_log_s = now
+        node.get_logger().warn(
+            "Rejected vision goal outside robot workspace: "
+            f"xyz=[{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}] | {reason}")
 
 
 def trunk_lateral(node, fallback=0.16):
@@ -947,7 +981,13 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
-    reached = wait_until_xyz(node, _wait_xyz, tol=0.008, timeout=8.0, target_quat=target_quat)
+    _endpoint_tol = (
+        float(getattr(planner, "final_endpoint_tolerance", 0.004))
+        if _is_final else 0.008
+    )
+    reached = wait_until_xyz(
+        node, _wait_xyz, tol=_endpoint_tol, timeout=8.0,
+        target_quat=target_quat)
     blend_motion(node)
 
     # Abort goal if robot has stalled twice — something is obstructing or IK is wrong
@@ -968,6 +1008,11 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         return True
     if cur_pose:
         final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
+        if _is_final and final_dist > _endpoint_tol:
+            node.get_logger().warn(
+                f"[DIRECT] {label}: endpoint error={final_dist*1000:.1f}mm "
+                f"exceeds {_endpoint_tol*1000:.1f}mm — treating as failure")
+            return False
         if final_dist > 0.015:
             node.get_logger().warn(
                 f"[DIRECT] {label}: stalled {final_dist*100:.1f}cm from target — treating as failure")
@@ -1126,7 +1171,7 @@ def _log_forearm_flange_clearance(node, states: list, label: str, log_result: bo
             elif min_dist_mm < threshold_mm:
                 node.get_logger().warn(
                     f"[CLAMP] {label}: WARNING {min_dist_mm:.1f}mm — below safety threshold {suffix}")
-            else:
+            elif not getattr(node.cfg.planner, "concise_console_logs", False):
                 node.get_logger().info(
                     f"[CLAMP] {label}: {min_dist_mm:.1f}mm OK {suffix}")
         return min_dist_mm, safe_cutoff_idx, destination_mm
@@ -1322,14 +1367,15 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
     best = min(safest_candidates, key=lambda item: item["score"])
     # Pitch is not sticky — each goal re-sweeps from the configured preferred pitch.
     node._very_low_preferred_wrist_deg = best["wrist_deg"]
-    node.get_logger().info(
-        f"[PREFLIGHT] selected pitch_offset={best['pitch_deg']:+.0f}deg "
-        f"wrist={best['wrist_deg']:+.0f}deg "
-        f"branch={best['branch']} clearance={best['clearance']:.1f}mm "
-        f"path={best['path_len']*100:.1f}cm ratio={best['ratio']:.2f}x "
-        f"from {len(candidates)} safe candidates "
-        f"after {orientations_tested} orientations "
-        f"(best clearance={max_clearance:.1f}mm)")
+    if not getattr(node.cfg.planner, "concise_console_logs", False):
+        node.get_logger().info(
+            f"[PREFLIGHT] selected pitch_offset={best['pitch_deg']:+.0f}deg "
+            f"wrist={best['wrist_deg']:+.0f}deg "
+            f"branch={best['branch']} clearance={best['clearance']:.1f}mm "
+            f"path={best['path_len']*100:.1f}cm ratio={best['ratio']:.2f}x "
+            f"from {len(candidates)} safe candidates "
+            f"after {orientations_tested} orientations "
+            f"(best clearance={max_clearance:.1f}mm)")
     return best
 
 
@@ -1858,33 +1904,65 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
     # Without this, build_trajectory sets velocity=0 only at the final point while
     # the second-to-last still carries full central-difference velocity — the
     # controller must stop in one dt (~18ms), causing a wrist jerk.
-    DECEL_TAIL = 8
+    DECEL_TAIL = max(
+        8, int(getattr(planner, "reverse_decel_tail_points", 14)))
     partial = partial + [partial[-1]] * DECEL_TAIL
 
+    reverse_velocity_scale = float(
+        getattr(planner, "reverse_velocity_scale", 0.35))
+    reverse_acceleration_scale = float(
+        getattr(planner, "reverse_acceleration_scale", 0.35))
     traj = build_trajectory(
         node.joint_order,
         partial,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
-        max_vel=getattr(planner, "max_joint_velocity", 2.0) * 0.7,
-        max_acc=getattr(planner, "max_joint_acceleration", 1.0) * 0.7,
+        max_vel=getattr(planner, "max_joint_velocity", 2.0) * reverse_velocity_scale,
+        max_acc=getattr(planner, "max_joint_acceleration", 1.0) * reverse_acceleration_scale,
         ramp_points=0,
     )
 
     node.trajectory_pub.publish(traj)
 
-    # Wait for partial reverse to complete naturally — do NOT send a new trajectory
-    # (blend_motion) while the controller is still decelerating; that preemption
-    # causes a jerk at the last waypoint.  Instead: wait until fully stopped, then
-    # hold a short configurable settle so the next trajectory does not preempt decel.
-    time.sleep(getattr(planner, "reverse_initial_wait", 0.15))
+    # Wait for the commanded reverse endpoint, not merely for a moment of zero
+    # velocity.  The controller may still be idle for a short time after publish;
+    # the old velocity-only check could therefore return before motion even began
+    # and let the "after reverse" camera capture duplicate the before image.
+    final_reverse_joints = list(partial[-1])
+    duration_msg = traj.points[-1].time_from_start
+    expected_duration = (
+        float(duration_msg.sec) + float(duration_msg.nanosec) * 1.0e-9)
+    reverse_wait_timeout = max(2.0, expected_duration + 2.0)
+    time.sleep(min(
+        getattr(planner, "reverse_initial_wait", 0.15),
+        max(0.02, expected_duration * 0.25),
+    ))
     timeout_start = time.time()
-    while time.time() - timeout_start < 10.0:
-        if not is_robot_moving(node, velocity_threshold=0.005):
-            break
-        time.sleep(0.1)
+    endpoint_reached = False
+    closest_joint_error = float("inf")
+    while time.time() - timeout_start < reverse_wait_timeout:
+        current = node.current_joint_positions
+        if current is not None and len(current) >= len(final_reverse_joints):
+            joint_error = max(
+                abs(float(c) - float(t))
+                for c, t in zip(current, final_reverse_joints)
+            )
+            closest_joint_error = min(closest_joint_error, joint_error)
+            if (
+                joint_error <= 0.02
+                and not is_robot_moving(node, velocity_threshold=0.005)
+            ):
+                endpoint_reached = True
+                break
+        time.sleep(0.05)
+    if not endpoint_reached:
+        node.get_logger().warn(
+            "Partial reverse endpoint wait timed out "
+            f"(closest joint error={closest_joint_error * 57.3:.2f}deg); "
+            "after-reverse snapshot will be marked unreliable"
+        )
     time.sleep(getattr(planner, "reverse_final_settle", 0.05))
-    return True
+    return endpoint_reached
 
 
 def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None, restore_mode="full"):
@@ -2182,6 +2260,7 @@ def subscribe_to_goal_pose(node):
     cur = node.get_end_effector_pose()
     current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
     node.goal_poses.clear()
+    getattr(node, "_reachability_goal_metadata", {}).clear()
     node.candidate_goals = []  # list of [x,y,z,qw,qx,qy,qz]
 
     # Track position stability before accepting
@@ -2189,6 +2268,7 @@ def subscribe_to_goal_pose(node):
         "poses": [], "stable_count": 0,
         "accepted": False, "accept_time": 0.0,
         "start_time": time.time(), "latest_quat": current_orientation,
+        "last_stamp_ns": None,
     }
 
     def _destroy_sub():
@@ -2202,9 +2282,22 @@ def subscribe_to_goal_pose(node):
     def _goal_cb(msg: PoseStamped):
         nonlocal goal_history
 
+        # /external_goal_pose is published faster than perception runs.  Count
+        # each stamped perception sample once; repeated timer publications of
+        # the same sample must not satisfy the stability requirement.
+        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+        if stamp_ns != 0:
+            if stamp_ns == goal_history["last_stamp_ns"]:
+                return
+            goal_history["last_stamp_ns"] = stamp_ns
+
         new_xyz = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
         new_quat = [msg.pose.orientation.w, msg.pose.orientation.x,
                      msg.pose.orientation.y, msg.pose.orientation.z]
+        _workspace_ok, _workspace_reason = goal_is_in_robot_workspace(node, new_xyz)
+        if not _workspace_ok:
+            _warn_rejected_goal_throttled(node, new_xyz, _workspace_reason)
+            return
 
         # ---- ALWAYS STORE LATEST GOAL POSE ----
         node.latest_goal_pose = [*new_xyz, *new_quat]
@@ -2277,6 +2370,28 @@ def subscribe_to_goal_pose(node):
             node.candidate_goals = [g]
             node.goal_poses.append(g)
             publish_goal_marker(node, new_xyz)
+            node.get_logger().info(
+                "Detected goal accepted: "
+                f"xyz=[{new_xyz[0]:.6f}, {new_xyz[1]:.6f}, {new_xyz[2]:.6f}] m, "
+                f"quat_wxyz=[{new_quat[0]:.6f}, {new_quat[1]:.6f}, "
+                f"{new_quat[2]:.6f}, {new_quat[3]:.6f}], "
+                f"accept={accept_mode}")
+            _depth_cached = getattr(node, "_latest_depth_diagnostics", None)
+            if (_depth_cached is not None and
+                    time.time() - _depth_cached[0] <= 1.0):
+                _dv = _depth_cached[1]
+                node.get_logger().info(
+                    "[GOAL_DEPTH] "
+                    f"cam=[{_dv[0]:.3f},{_dv[1]:.3f},{_dv[2]:.3f}]m "
+                    f"z_p5/p50/p95={_dv[3]:.3f}/{_dv[4]:.3f}/{_dv[5]:.3f}m "
+                    f"near/far={int(_dv[6])}/{int(_dv[7])} "
+                    f"outside_near={int(_dv[8])}/{int(_dv[9])} "
+                    + (
+                        f"outside_p5/p50={_dv[10]:.3f}/{_dv[11]:.3f}m "
+                        if len(_dv) >= 12 else ""
+                    ) +
+                    f"base=[{new_xyz[0]:.3f},{new_xyz[1]:.3f},{new_xyz[2]:.3f}]m"
+                )
             # Height + lateral classification from image-space bbox position when available,
             # falling back to 3D coordinate comparison with the trunk.
             # cy_norm > 0.60 = bottom 40% of image → LOW
@@ -2345,43 +2460,9 @@ def subscribe_to_goal_pose(node):
         fresh_qos,
     )
 
-    # Define idle micro-motions while waiting for goals
-    sequence = [
-        (0.0, 0.0, 0.2),
-        (0.0, 0.1, 0.0),
-        (0.0, -0.1, 0.0),
-        (0.0, 0.0, -0.1)
-    ]
-    idx = {"i": 0}
-
-    def _idle_cb():
-        """Perform gentle idle motions until a goal is received."""
-        # Guard against shutdown/stop - cancel timer and exit early
-        if not getattr(node, 'running', True) or getattr(node, 'stop_requested', False):
-            if hasattr(node, 'idle_timer'):
-                try:
-                    node.idle_timer.cancel()
-                    del node.idle_timer
-                except Exception:
-                    pass
-            return
-
-        if node.goal_received or idx["i"] >= len(sequence):
-            if hasattr(node, 'idle_timer'):
-                node.idle_timer.cancel()
-                del node.idle_timer
-            return
-
-        curp = node.get_end_effector_pose()
-        if curp and not is_robot_moving(node):
-            dx, dy, dz = sequence[idx['i']]
-            tgt = [curp[0] + dx, curp[1] + dy, curp[2] + dz, *current_orientation]
-            node.get_logger().info(f"Idle micro-motion to: [{tgt[0]:.3f},{tgt[1]:.3f},{tgt[2]:.3f}]")
-            _exec(node, tgt)
-            idx['i'] += 1
-
-    # Start idle motion timer
-    node.idle_timer = node.create_timer(5.0, _idle_cb)
+    # Keep the arm stationary while waiting for a valid vision goal. Previously
+    # a timer moved the TCP through four idle poses; that is undesirable in the
+    # field and can also change the camera view during depth stabilization.
 
 
 def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
@@ -2426,6 +2507,7 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
         del node.goal_pose_sub
 
     node.goal_poses.clear()
+    getattr(node, "_reachability_goal_metadata", {}).clear()
     node.candidate_goals = []
 
     # Clear vision exclusions at start
@@ -2449,6 +2531,10 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
             if len(xyz) < 3 or any(v is None for v in xyz[:3]):
                 continue
             xyz = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+            _workspace_ok, _workspace_reason = goal_is_in_robot_workspace(node, xyz)
+            if not _workspace_ok:
+                _warn_rejected_goal_throttled(node, xyz, _workspace_reason)
+                continue
             if any(math.dist(xyz, prev) < DISTINCT_DIST for prev in queued_xyz):
                 continue
             queued_xyz.append(xyz)
@@ -2526,6 +2612,10 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
         new_xyz = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
         new_quat = [msg.pose.orientation.w, msg.pose.orientation.x,
                      msg.pose.orientation.y, msg.pose.orientation.z]
+        _workspace_ok, _workspace_reason = goal_is_in_robot_workspace(node, new_xyz)
+        if not _workspace_ok:
+            _warn_rejected_goal_throttled(node, new_xyz, _workspace_reason)
+            return
 
         # Always store latest
         node.latest_goal_pose = [*new_xyz, *new_quat]
@@ -2997,11 +3087,14 @@ def plan_and_execute(node):
                         node,
                         seed_xyz=seed,
                         candidate_seeds=[],
-                        timeout=3.0,
+                        timeout=float(getattr(
+                            node.cfg.planner, "reacquire_timeout_s", 1.0)),
                         radius=0.03,
                         z_tolerance=0.002,
-                        depth_settle_s=0.6,
-                        stable_needed=2,
+                        depth_settle_s=float(getattr(
+                            node.cfg.planner, "reacquire_depth_settle_s", 0.10)),
+                        stable_needed=int(getattr(
+                            node.cfg.planner, "reacquire_stable_frames", 2)),
                         restore_mode="paused",
                     )
                     if reacq:
@@ -3107,18 +3200,35 @@ def plan_and_execute(node):
                             node.cfg.planner, "low_center_approach_depth_offset",
                             "low_center_approach_y_offset", 0.07)
                     )
-                    _x_off, _y_off = add_axis_offsets(0.0, 0.0, depth=_depth_off)
-                    _z_off = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
-                              if is_very_low_center
-                              else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
-                    _vlc_pitch = 0.0
-                    if is_very_low_center:
-                        _vlc_pitch = getattr(node.cfg.planner, "very_low_center_approach_pitch_deg", 15.0)
-                        if abs(_vlc_pitch) > 1e-6:
-                            orientation = quat_apply_local_x_pitch(orientation, _vlc_pitch)
-                        node.get_logger().info(
-                            f"VERY LOW slip-retry approach pitch={_vlc_pitch:+.1f}deg")
-                    approach = [ax + _x_off, ay + _y_off, az + _z_off, *orientation]
+                    _insert_pitch = math.radians(float(getattr(
+                        node.cfg.planner, "low_center_insertion_pitch_deg", 12.0)))
+                    _horizontal = math.cos(_insert_pitch)
+                    _insert_dir = (
+                        [_horizontal, 0.0, math.sin(_insert_pitch)]
+                        if X_FORWARD_Y_LATERAL
+                        else [0.0, _horizontal, math.sin(_insert_pitch)])
+                    _final_depth = _planner_value(
+                        node.cfg.planner, "low_center_final_depth_offset",
+                        "low_center_final_y_offset", 0.004)
+                    _final_z = min(
+                        getattr(node.cfg.planner, "low_center_final_z_offset", 0.025),
+                        0.02)
+                    _final_x, _final_y = add_axis_offsets(
+                        x, y, depth=-_final_depth)
+                    approach = [
+                        _final_x - _depth_off * _insert_dir[0],
+                        _final_y - _depth_off * _insert_dir[1],
+                        z + _final_z - _depth_off * _insert_dir[2],
+                        *orientation,
+                    ]
+                    orientation, _center_swing = align_local_axis_to_vector(
+                        orientation, _insert_dir, local_axis=(0.0, 0.0, 1.0),
+                        max_angle_deg=float(getattr(
+                            node.cfg.planner, "low_center_forward_align_max_deg", 45.0)))
+                    approach[3:] = orientation
+                    node.get_logger().info(
+                        f"LOW/CENTER slip-retry insertion: pitch={math.degrees(_insert_pitch):.1f}deg "
+                        f"standoff={_depth_off*1000:.0f}mm")
             else:
                 if not is_side_approach:
                     _pitch_deg = getattr(node.cfg.planner, "mid_center_approach_pitch_deg", 0.0)
@@ -3160,17 +3270,49 @@ def plan_and_execute(node):
                         node.cfg.planner, "low_center_approach_depth_offset",
                         "low_center_approach_y_offset", 0.07)
                 )
-                _x_offset, _y_offset = add_axis_offsets(
-                    0.0, 0.0, depth=_depth_offset)
-                _z_offset = (getattr(node.cfg.planner, "very_low_center_approach_z_offset", 0.020)
-                             if is_very_low_center
-                             else getattr(node.cfg.planner, "low_center_approach_z_offset", -0.07))
-                _vlc_pitch = 0.0
-                if is_very_low_center:
-                    _vlc_pitch = getattr(node.cfg.planner, "very_low_center_approach_pitch_deg", 15.0)
-                    if abs(_vlc_pitch) > 1e-6:
-                        orientation = quat_apply_local_x_pitch(orientation, _vlc_pitch)
-                approach = [ax + _x_offset, ay + _y_offset, az + _z_offset, *orientation]
+                _insert_pitch = math.radians(float(getattr(
+                    node.cfg.planner, "low_center_insertion_pitch_deg", 12.0)))
+                _horizontal = math.cos(_insert_pitch)
+                _center_insert_dir = (
+                    [_horizontal, 0.0, math.sin(_insert_pitch)]
+                    if X_FORWARD_Y_LATERAL
+                    else [0.0, _horizontal, math.sin(_insert_pitch)])
+                _center_final_depth = _planner_value(
+                    node.cfg.planner, "low_center_final_depth_offset",
+                    "low_center_final_y_offset", 0.004)
+                _center_final_z = getattr(
+                    node.cfg.planner, "low_center_final_z_offset", 0.025)
+                _center_final_x, _center_final_y = add_axis_offsets(
+                    x, y, depth=-_center_final_depth)
+                approach = [
+                    _center_final_x - _depth_offset * _center_insert_dir[0],
+                    _center_final_y - _depth_offset * _center_insert_dir[1],
+                    z + _center_final_z - _depth_offset * _center_insert_dir[2],
+                    *orientation,
+                ]
+                orientation, _center_swing = align_local_axis_to_vector(
+                    orientation,
+                    _center_insert_dir,
+                    local_axis=(0.0, 0.0, 1.0),
+                    max_angle_deg=float(getattr(
+                        node.cfg.planner, "low_center_forward_align_max_deg", 45.0)),
+                )
+                approach[3:] = orientation
+                _x_offset = approach[0] - ax
+                _y_offset = approach[1] - ay
+                _z_offset = approach[2] - az
+                _vlc_pitch = math.degrees(_insert_pitch)
+                if _log_cycle_start:
+                    _forward_axis = quat_rotate_vec(
+                        orientation, (0.0, 0.0, 1.0))
+                    node.get_logger().info(
+                        "CENTER forward-axis alignment: "
+                        f"swing={math.degrees(_center_swing):.1f}deg "
+                        f"local+Z_world=[{_forward_axis[0]:.3f},"
+                        f"{_forward_axis[1]:.3f},{_forward_axis[2]:.3f}] "
+                        f"insert_dir=[{_center_insert_dir[0]:.3f},"
+                        f"{_center_insert_dir[1]:.3f},{_center_insert_dir[2]:.3f}] "
+                        f"pitch={_vlc_pitch:.1f}deg standoff={_depth_offset*1000:.0f}mm")
             if _log_cycle_start:
                 node.get_logger().info(
                     f"{'VERY LOW' if is_very_low_center else 'LOW'} approach pose: {approach[:3]}, is_side={is_side_approach}, "
@@ -3464,7 +3606,8 @@ def plan_and_execute(node):
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
                 gripper_opened = True
             if not _skip_approach_wait:
-                _approach_reached = wait_until_xyz(node, approach[:3])
+                _approach_reached = wait_until_xyz(
+                    node, approach[:3], tol=0.008)
                 if _check_stop(): break
                 if not _approach_reached:
                     # Distinguish: arm never moved vs arm moved but stalled near target.
@@ -3482,7 +3625,12 @@ def plan_and_execute(node):
                         node.get_logger().info(
                             f"{'[CLAMP-TRUNCATED] ' if _truncated else ''}Approach stopped {_dist_to_approach*100:.1f}cm from standoff — proceeding to FINAL from here.")
                 log_path_deviation(node, "APPROACH")
-                blend_motion(node)
+                # wait_until_xyz can return as soon as the TCP enters tolerance,
+                # slightly before the controller consumes the trajectory's
+                # zero-velocity endpoint. Publishing a one-point blend/hold here
+                # preempts that deceleration and creates a visible end jerk.
+                time.sleep(float(getattr(
+                    node.cfg.planner, "approach_endpoint_settle_s", 0.25)))
 
             # Wait for joint state to be available after approach
             _post_approach_joints = _valid_joint_positions()
@@ -3512,11 +3660,10 @@ def plan_and_execute(node):
         # Side-home targets reacquire before approach from the side-home camera view,
         # so don't repeat it after moving to the side approach standoff.
         _t_reacq = time.time()
-        _skip_reacq_low_center = is_low and not is_side_approach
+        _skip_reacq_low_center = False
         _do_reacq_after_approach = (
             node.cfg.planner.reacquire_after_approach and
-            not side_home_reacquired and
-            not _skip_reacq_low_center
+            not side_home_reacquired
         )
         if _do_reacq_after_approach:
             _vision_resume()
@@ -3529,11 +3676,14 @@ def plan_and_execute(node):
                 node,
                 seed_xyz=seed,
                 candidate_seeds=[],   # tight to seed only — no roaming
-                timeout=3.0,
+                timeout=float(getattr(
+                    node.cfg.planner, "reacquire_timeout_s", 1.0)),
                 radius=0.03,          # 3cm — tighter than default 4cm
                 z_tolerance=0.002,    # 2mm
-                depth_settle_s=0.6,
-                stable_needed=2,
+                depth_settle_s=float(getattr(
+                    node.cfg.planner, "reacquire_depth_settle_s", 0.10)),
+                stable_needed=int(getattr(
+                    node.cfg.planner, "reacquire_stable_frames", 2)),
             )
             if reacq:
                 x, y, z = reacq
@@ -3553,14 +3703,10 @@ def plan_and_execute(node):
                         f"[{x:.3f}, {y:.3f}, {z:.3f}]")
             else:
                 node.reacquire_result = "SEED"
-                if _skip_reacq_low_center:
-                    if _log_cycle_start:
-                        node.get_logger().info(
-                            f"[REACQ] Skipped for LOW/CENTER — using original seed: "
-                            f"[{x:.3f}, {y:.3f}, {z:.3f}]")
-                else:
-                    if _log_cycle_start:
-                        node.get_logger().info(f"[REACQ] Skipped — using original seed: [{x:.3f}, {y:.3f}, {z:.3f}]")
+                if _log_cycle_start:
+                    node.get_logger().info(
+                        f"[REACQ] Skipped — using original seed: "
+                        f"[{x:.3f}, {y:.3f}, {z:.3f}]")
         # Pause YOLO again — final move and grasp need full GPU for IK.
         _vision_pause()
         node._publish_goal_info()
@@ -3569,7 +3715,20 @@ def plan_and_execute(node):
             node.get_logger().info(
                 f"[TIMING] reacquire={_timing['reacquire']:.2f}s "
                 f"result={node.reacquire_result or 'NA'} searched={_do_reacq_after_approach} "
-                f"skip_low_center={_skip_reacq_low_center} side_home_reacq={side_home_reacquired}")
+                f"fast_timeout={getattr(node.cfg.planner, 'reacquire_timeout_s', 1.0):.1f}s "
+                f"side_home_reacq={side_home_reacquired}")
+
+        if (
+            _do_reacq_after_approach
+            and node.reacquire_result != "OK"
+            and bool(getattr(
+                node.cfg.planner, "require_reacquire_before_grasp", True))
+        ):
+            node.get_logger().warn(
+                "[REACQ] Required close-view confirmation failed — "
+                "skipping grasp instead of closing at the seed target.")
+            unlock_target(node)
+            continue
             
         if _check_stop(): break
 
@@ -3628,11 +3787,19 @@ def plan_and_execute(node):
         gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
         gz = z + z_offset
         final_target = [gx, gy, gz, *orientation]
+        _goal_forward = x if X_FORWARD_Y_LATERAL else -y
+        _target_forward = gx if X_FORWARD_Y_LATERAL else -gy
+        _forward_delta_mm = (_target_forward - _goal_forward) * 1000.0
         if _log_cycle_start:
             node.get_logger().info(
                 f"FINAL target offsets: depth=-{depth_offset:.3f} "
                 f"z=+{z_offset:.3f} "
                 f"target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
+        else:
+            node.get_logger().info(
+                f"[FINAL_TARGET] goal=[{x:.3f},{y:.3f},{z:.3f}] "
+                f"tcp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
+                f"forward_delta={_forward_delta_mm:+.0f}mm")
         node.motion_phase = "FINAL"
         # Vision is already "paused" from _vision_pause() — keep it that way for final move.
         _t_final = time.time()
@@ -3660,7 +3827,10 @@ def plan_and_execute(node):
                 final_ok = plan_and_send(node, _final_start, Pose.from_list(final_target),
                     label="FINAL_PLAN", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True)
                 if final_ok:
-                    wait_until_xyz(node, final_target[:3], tol=0.008)
+                    final_ok = wait_until_xyz(
+                        node, final_target[:3],
+                        tol=float(getattr(
+                            node.cfg.planner, "final_endpoint_tolerance", 0.004)))
             if not final_ok:
                 node.get_logger().warn("All FINAL attempts failed — skipping goal.")
                 unlock_target(node)
@@ -3704,6 +3874,18 @@ def plan_and_execute(node):
                         f"pulling back {_backoff*1000:.1f}mm before close")
                     _direct_ik_move(node, _corrected_final, label="FINAL_BACKOFF",
                                     motion_type="final", store_trajectory=True)
+
+        _measured_final = node.get_end_effector_pose()
+        if _measured_final:
+            _final_error_mm = math.dist(
+                _measured_final[:3], final_target[:3]) * 1000.0
+            node.get_logger().info(
+                f"[FINAL_REACHED] target=[{final_target[0]:.3f},{final_target[1]:.3f},{final_target[2]:.3f}] "
+                f"actual=[{_measured_final[0]:.3f},{_measured_final[1]:.3f},{_measured_final[2]:.3f}] "
+                f"error={_final_error_mm:.1f}mm")
+        else:
+            node.get_logger().warn(
+                "[FINAL_REACHED] Actual TCP unavailable before gripper close")
 
         _t_grasp = time.time()
         node.control_gripper("CLOSE")
@@ -3857,6 +4039,19 @@ def plan_and_execute(node):
         node._slip_retry_approach = approach
         node._slip_retry_fruit_radius = fruit_radius
 
+        # Keep one in-memory frame while the closed gripper is beside the bunch.
+        # A second in-memory frame is captured after reverse for classification;
+        # neither frame is written to disk.
+        _grasp_pair_attempt_id = time.strftime("%Y%m%d_%H%M%S") + (
+            f"_{int((time.time() % 1.0) * 1000):03d}")
+        _grasp_pair_before_frame = None
+        try:
+            _grasp_pair_before_frame = node.capture_grasp_pair_frame(
+                _grasp_pair_attempt_id, "before_reverse", timeout=0.45)
+        except Exception as _e:
+            node.get_logger().warn(
+                f"[GRASP_PAIR] {_grasp_pair_attempt_id} before_reverse failed: {_e}")
+
         # 4. Drop-off and return
         if _check_stop():
             break
@@ -3875,12 +4070,50 @@ def plan_and_execute(node):
         # Reverse along the stored approach path.
         # Side-approach fruits need more clearance to clear the bunch before dropoff planning.
         _reverse_clearance = (
-            float(getattr(node.cfg.planner, "side_home_partial_reverse_m", 0.55))
-            if is_side_approach else 0.35
+            float(getattr(node.cfg.planner, "side_home_partial_reverse_m", 0.30))
+            if is_side_approach
+            else float(getattr(node.cfg.planner, "center_partial_reverse_m", 0.20))
         )
         _t_reverse_hold = time.time()
         node.motion_phase = "REVERSING"
-        execute_partial_reverse(node, clearance_m=_reverse_clearance)
+        _reverse_endpoint_reached = execute_partial_reverse(
+            node, clearance_m=_reverse_clearance)
+        _grasp_pair_after_frame = None
+        if _reverse_endpoint_reached:
+            try:
+                _grasp_pair_after_frame = node.capture_grasp_pair_frame(
+                    _grasp_pair_attempt_id, "after_reverse", timeout=0.45)
+            except Exception as _e:
+                node.get_logger().warn(
+                    f"[GRASP_PAIR] {_grasp_pair_attempt_id} "
+                    f"after_reverse failed: {_e}")
+        else:
+            node.get_logger().warn(
+                f"[GRASP_PAIR] {_grasp_pair_attempt_id} after_reverse NOT captured: "
+                "reverse endpoint was not confirmed")
+
+        # First temporal classifier: logging only.  No result from this block is
+        # connected to retry, dropoff, or any other robot command.
+        if (_grasp_pair_before_frame is not None and
+                _grasp_pair_after_frame is not None):
+            try:
+                from ur10e_curobo.visual_grasp_verifier import classify_grasp_pair
+                _temporal = classify_grasp_pair(
+                    _grasp_pair_before_frame,
+                    _grasp_pair_after_frame,
+                )
+                node.temporal_grasp_result = _temporal.label
+                node.get_logger().info(
+                    f"[TEMPORAL_GRASP] {_temporal.label} | "
+                    f"after_score={_temporal.after_score:.3f} "
+                    f"appearance_corr={_temporal.appearance_correlation:.3f} | "
+                    f"{_temporal.reason} (logging only; no automatic retry)"
+                )
+            except Exception as _e:
+                node.temporal_grasp_result = "UNCERTAIN"
+                node.get_logger().warn(
+                    f"[TEMPORAL_GRASP] UNCERTAIN | classifier failed: {_e} "
+                    "(logging only)")
 
         # Pre-plan dropoff in background:
         # - Center approach: plan from current (post-reverse) joints — runs during hold check (~0.35s)
@@ -3901,7 +4134,9 @@ def plan_and_execute(node):
                 result = preplan_js(node, _tgt, _dropoff_plan_start, "DROPOFF", "dropoff")
                 _dropoff_preplan_result[0] = result
                 if result is not None:
-                    node.get_logger().info("[PREPLAN] Dropoff pre-plan ready")
+                    if not getattr(
+                            node.cfg.planner, "concise_console_logs", False):
+                        node.get_logger().info("[PREPLAN] Dropoff pre-plan ready")
                 else:
                     node.get_logger().warn("[PREPLAN] Dropoff pre-plan returned no trajectory")
             except Exception as _e:
@@ -3913,6 +4148,7 @@ def plan_and_execute(node):
         # Check whether the fruit is still held after reversing away from the bunch.
         # If the fruit was only touched or slipped out during reverse, force deltas
         # usually drop back near the close baseline.
+        node.fruit_held_after_reverse = None
         try:
             _hold_base = list(gc.baseline_force[:3])
             time.sleep(getattr(node.cfg.planner, "hold_check_settle_s", 0.05))
@@ -3929,42 +4165,79 @@ def plan_and_execute(node):
                 _hold_deltas = np.median(np.array(_samples, dtype=float), axis=0).tolist()
             else:
                 _hold_deltas = [0.0, 0.0, 0.0]
-            _hold_fingers = sum(1 for d in _hold_deltas if d > 1.5)
+            _hold_finger_threshold = float(getattr(
+                node.cfg.planner, "hold_force_finger_threshold_n", 3.0))
+            _hold_min_fingers = int(getattr(
+                node.cfg.planner, "hold_force_min_fingers", 2))
+            _hold_strong_single = float(getattr(
+                node.cfg.planner, "hold_force_strong_single_n", 8.0))
+            _hold_sum_threshold = float(getattr(
+                node.cfg.planner, "hold_force_sum_threshold_n", 12.0))
+            _hold_fingers = sum(
+                1 for d in _hold_deltas if d >= _hold_finger_threshold)
             _hold_max = max(_hold_deltas) if _hold_deltas else 0.0
             _hold_sum = sum(_hold_deltas)
             # After reverse the fruit can settle against one finger/cup wall, so
             # 2-finger contact is ideal but not required. Accept one strong,
             # persistent contact or enough total force as "held".
             _hold_ok = (
-                _hold_fingers >= 2 or
-                _hold_max >= 2.3 or
-                _hold_sum >= 3.0
+                _hold_fingers >= _hold_min_fingers or
+                _hold_max >= _hold_strong_single or
+                _hold_sum >= _hold_sum_threshold
             )
             node.fruit_held_after_reverse = _hold_ok
-            node.get_logger().info(
-                f"[HOLD_CHECK] after reverse: "
-                f"{'HELD' if _hold_ok else 'NOT_HELD'} | "
-                f"deltas=[{_hold_deltas[0]:.2f},{_hold_deltas[1]:.2f},{_hold_deltas[2]:.2f}]N "
-                f"fingers={_hold_fingers}/3 max={_hold_max:.2f}N sum={_hold_sum:.2f}N "
-                f"samples={len(_samples)}"
-            )
+            if not getattr(node.cfg.planner, "concise_console_logs", False):
+                node.get_logger().info(
+                    f"[HOLD_CHECK] after reverse: "
+                    f"{'FORCE_PRESENT' if _hold_ok else 'FORCE_LOW'} "
+                    f"(not ground truth) | "
+                    f"deltas=[{_hold_deltas[0]:.2f},{_hold_deltas[1]:.2f},"
+                    f"{_hold_deltas[2]:.2f}]N fingers={_hold_fingers}/3 "
+                    f"max={_hold_max:.2f}N sum={_hold_sum:.2f}N "
+                    f"samples={len(_samples)}"
+                )
             if not _hold_ok:
                 node.get_logger().warn(
-                    "[HOLD_CHECK] Fruit likely not inside gripper after reverse "
-                    "(force dropped below hold threshold)."
+                    "[HOLD_CHECK] Low post-reverse force; grasp result remains UNKNOWN "
+                    "until operator-labelled calibration is complete."
                 )
         except Exception as _e:
             node.get_logger().warn(f"[HOLD_CHECK] after reverse failed: {_e}")
+
+        # Logging-only camera verification.  This is deliberately independent
+        # of force classification and cannot trigger retry or robot motion.
+        try:
+            _visual = node.verify_visual_grasp(frame_count=5, timeout=0.8)
+            node.visual_grasp_result = _visual.label
+            if not getattr(node.cfg.planner, "concise_console_logs", False):
+                node.get_logger().info(
+                    f"[VISUAL_GRASP] {_visual.label} | score={_visual.score:.3f} "
+                    f"red_pixels={_visual.red_pixels} | {_visual.reason} "
+                    "(logging only; no automatic retry)"
+                )
+        except Exception as _e:
+            node.visual_grasp_result = "UNCERTAIN"
+            node.get_logger().warn(
+                f"[VISUAL_GRASP] UNCERTAIN | verifier failed: {_e} "
+                "(logging only)")
         _timing["reverse_hold"] = time.time() - _t_reverse_hold
         if _log_phase_timings:
             node.get_logger().info(
                 f"[TIMING] reverse_hold={_timing['reverse_hold']:.2f}s "
-                f"held={getattr(node, 'fruit_held_after_reverse', None)}")
+                f"force_signal={getattr(node, 'fruit_held_after_reverse', None)} "
+                "(not ground truth)")
 
-        _MAX_SLIP_RETRIES = 2
+        _MAX_SLIP_RETRIES = int(getattr(
+            node.cfg.planner, "max_force_grasp_retries", 2))
         _slip_retry_count = getattr(node, "_slip_retry_count", 0)
-        _slip_detected = False
-        if node.cfg.planner.slip_check_reacquire:
+        _force_miss = (
+            bool(getattr(node.cfg.planner, "force_retry_after_reverse", True))
+            and getattr(node, "fruit_held_after_reverse", None) is False)
+        _slip_detected = _force_miss
+        if _force_miss:
+            node.get_logger().warn(
+                "[FORCE_RETRY] Post-reverse force indicates an empty/failed grasp")
+        elif node.cfg.planner.slip_check_reacquire:
             node.get_logger().info(f"Slip check: querying depth at grasp=[{x:.3f},{y:.3f},{z:.3f}]")
             _slip_reacq = reacquire_goal_pose(
                 node,
@@ -3996,9 +4269,11 @@ def plan_and_execute(node):
                 unlock_target(node)
                 break
             node._slip_retry_count = _slip_retry_count + 1
+            _retry_reason = "FORCE MISS" if _force_miss else "SLIP DETECTED"
             node.get_logger().warn(
-                f"SLIP DETECTED: fruit still at [{x:.3f},{y:.3f},{z:.3f}] after grasp "
-                f"(retry {node._slip_retry_count}/{_MAX_SLIP_RETRIES}) — retrying from reverse position")
+                f"{_retry_reason}: target=[{x:.3f},{y:.3f},{z:.3f}] "
+                f"(retry {node._slip_retry_count}/{_MAX_SLIP_RETRIES}) — "
+                "retrying from reverse position")
             unlock_target(node)
             if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles:
                 node.voxel_obstacles.clear()
@@ -4010,7 +4285,8 @@ def plan_and_execute(node):
         else:
             node._slip_retry_count = 0
             if _slip_detected:
-                node.get_logger().warn("Slip detected but max retries reached — proceeding to dropoff")
+                node.get_logger().warn(
+                    "Grasp failure detected but max retries reached — proceeding to dropoff")
 
         # Flush any async CUDA errors that accumulated during FINAL IK/planning.
         # They surface at the next CUDA op — force them here so DROP-OFF gets a clean state.
@@ -4191,7 +4467,7 @@ def plan_and_execute(node):
         )
         node.get_logger().info(
             f"[CYCLE {_cycle_idx}] DONE total={_cycle_total:.2f}s "
-            f"held={getattr(node, 'fruit_held_after_reverse', None)} "
+            f"force_signal={getattr(node, 'fruit_held_after_reverse', None)} "
             f"reacq={node.reacquire_result or 'NA'} {_timing_summary}")
 
         # Release target lock and reset tracking state for next goal

@@ -70,7 +70,7 @@ FRUIT_ID_TIMEOUT = 30.0       # seconds before forgetting a fruit ID
 MAX_FRUIT_ATTEMPTS = 3        # max grasp attempts before blacklisting
 
 # Temporal stabilization (reduce flickering)
-MIN_FRAMES_TO_SHOW = 1        # Fruit must appear in N consecutive frames before showing
+MIN_FRAMES_TO_SHOW = 2        # Fruit must appear in N consecutive frames before showing
 MAX_FRAMES_TO_KEEP = 2        # Keep fruit for N frames after last seen (persistence)
 
 # Target lock state
@@ -155,7 +155,7 @@ ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN
 ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED One (15 max at QHDPLUS)
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
 ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
-ZEDMINI_DEPTH_Z_MAX = 5.0    # maximum valid ZED Mini depth (m)
+ZEDMINI_DEPTH_Z_MAX = 2.0    # reject distant background behind nearby fruit
 ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.

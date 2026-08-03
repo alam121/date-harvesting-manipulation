@@ -1,7 +1,7 @@
 import sys
 import threading
 import json
-from typing import Optional, List
+from typing import Optional
 from collections import deque
 import math
 from enum import Enum
@@ -834,6 +834,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Keyboard window reference
         self.kbd_window = None
+        self._environment_synced = False
 
         # Data storage for graphs
         self.force_history = [deque(maxlen=200), deque(maxlen=200), deque(maxlen=200)]
@@ -913,6 +914,30 @@ class MainWindow(QtWidgets.QWidget):
         tabs.addTab(goal_tab, "Goal")
         tabs.addTab(settings_tab, "Settings")
         layout.addWidget(tabs, stretch=1)
+
+        # Runtime environment selects the complete HOME/DROPOFF preset family.
+        environment_group = QtWidgets.QGroupBox("Robot Environment")
+        environment_layout = QtWidgets.QGridLayout(environment_group)
+        self.environment_combo = QtWidgets.QComboBox()
+        self.environment_combo.addItem("Lab", "lab")
+        self.environment_combo.addItem("Outdoor / Field", "outdoor")
+        environment_layout.addWidget(QtWidgets.QLabel("Preset:"), 0, 0)
+        environment_layout.addWidget(self.environment_combo, 0, 1)
+
+        environment_apply = QtWidgets.QPushButton("Apply Environment")
+        environment_apply.setStyleSheet(
+            "background-color: #00695c; color: white; font-weight: bold;")
+        environment_apply.setToolTip(
+            "Switch HOME, DROPOFF, PREDROPOFF and side-home joint presets. "
+            "The robot does not move when this is pressed.")
+        environment_apply.clicked.connect(self._apply_environment)
+        environment_layout.addWidget(environment_apply, 1, 0, 1, 2)
+
+        self.environment_active_label = QtWidgets.QLabel("Active: waiting for robot…")
+        self.environment_active_label.setStyleSheet(
+            "font-size: 9pt; color: #455a64; padding: 3px;")
+        environment_layout.addWidget(self.environment_active_label, 2, 0, 1, 2)
+        settings_tab_layout.addWidget(environment_group)
 
         # Velocity Scale
         vel_group = QtWidgets.QGroupBox("Velocity Scale")
@@ -1324,6 +1349,17 @@ class MainWindow(QtWidgets.QWidget):
 
         # Motion phase badge
         goal_info = self.ros.goal_info_data
+        if goal_info:
+            active_environment = str(goal_info.get("environment", "")).lower()
+            active_profile = str(goal_info.get("robot_profile", "unknown"))
+            if active_environment in ("lab", "outdoor"):
+                if not self._environment_synced:
+                    index = self.environment_combo.findData(active_environment)
+                    if index >= 0:
+                        self.environment_combo.setCurrentIndex(index)
+                    self._environment_synced = True
+                self.environment_active_label.setText(
+                    f"Active: {active_profile} / {active_environment}")
         phase = goal_info.get("motion_phase", "IDLE") if goal_info else "IDLE"
         phase_colors = {
             "IDLE":      ("#455a64", "#eceff1"),
@@ -1460,6 +1496,15 @@ class MainWindow(QtWidgets.QWidget):
         scale = self.velocity_slider.value() / 10.0
         self.ros.publish_velocity_scale(scale)
         self.status_update.emit(f"Velocity: {scale:.1f}x", False)
+
+    def _apply_environment(self):
+        environment = self.environment_combo.currentData()
+        if environment not in ("lab", "outdoor"):
+            self.status_update.emit("Invalid environment selection", True)
+            return
+        self.ros.publish_cmd(f"set_environment {environment}")
+        self.status_update.emit(
+            f"Requested environment: {environment}", False)
 
     def _on_debug_preview_changed(self, state):
         enabled = "true" if state == Qt.Checked else "false"
