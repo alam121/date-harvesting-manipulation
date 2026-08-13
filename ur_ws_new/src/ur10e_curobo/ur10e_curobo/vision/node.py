@@ -33,6 +33,9 @@ from .config import (
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
+    SHOW_FINGER_CONTACTS, FINGERTIP_CONTACT_RADIUS_M,
+    FINGER_CONTACT_RADIAL_FRACTION, FINGER_CONTACT_ROTATION_SAMPLES,
+    FINGER_CONTACT_MIN_SCORE,
 )
 from ..perception_lidar import (
     parse_pointcloud2, project_lidar_to_image,
@@ -58,6 +61,7 @@ DEBUG_DEPTH_SAMPLING = True
 # field operation. Enable temporarily when benchmarking perception performance.
 DEBUG_PERFORMANCE = False
 from .scoring import compute_fruit_score, compute_collision_free_direction
+from .contact_points import estimate_three_finger_contacts
 from .yolo_thread import YoloThread
 from .visualization import VisionVisualizer
 
@@ -94,6 +98,11 @@ class VisionNode:
         self._heatmap_frame_count = 0
         self._heatmap_interval = 10  # recompute every 10th frame
         self._cached_heatmaps = {}  # key: target index → (heatmap, best_point, best_dir2d, best_point_3d)
+        # Selected-date contact geometry changes only when the camera/target
+        # moves. Cache it so the visual overlay adds no steady-state loop cost.
+        self._contact_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._grasp_candidate_history = deque(maxlen=8)
+        self._latest_grasp_candidate_record: Optional[Dict[str, Any]] = None
 
         # Per-frame TF cache — refreshed once at top of each loop iteration.
         # Avoids 8+ expensive tf_buffer.transform calls per frame (each ~20ms on Jetson).
@@ -248,6 +257,12 @@ class VisionNode:
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         self.image_pub = self.node.create_publisher(ROSImage, "/vision/display", 10)
         self.raw_image_pub = self.node.create_publisher(ROSImage, "/vision/raw", 10)
+        self.fingertip_verification_pub = self.node.create_publisher(
+            StdString, "/vision/fingertip_verification", 10)
+        self.grasp_candidates_pub = self.node.create_publisher(
+            StdString, "/vision/grasp_candidates", 10)
+        self.grasp_candidate_selection_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/grasp_candidate_selection", 10)
         self._camera_status_pub = self.node.create_publisher(StdString, "/camera_status", 10)
         self.node.create_timer(2.0, self._publish_camera_status)
         self.heatmap_data_pub = self.node.create_publisher(Float32MultiArray, "/vision/heatmap_3d_data", 10)
@@ -285,6 +300,7 @@ class VisionNode:
             else:
                 self.target_lock_position = [msg.point.x, msg.point.y, msg.point.z]
                 self.target_lock_active = True
+                self._publish_locked_grasp_candidates(self.target_lock_position)
                 print(f"Target locked at [{msg.point.x:.3f}, {msg.point.y:.3f}, {msg.point.z:.3f}]")
 
         self.node.create_subscription(PointStamped, "/target_lock", target_lock_cb, 10)
@@ -680,6 +696,13 @@ class VisionNode:
                         lidar_uv=uv_lidar,
                         lidar_pts_cam=pts_lidar,
                     )
+                    verification = self.visualizer.last_fingertip_verification
+                    self.fingertip_verification_pub.publish(
+                        StdString(data=verification))
+                    if verification != getattr(self, "_last_fingertip_verification", None):
+                        self._last_fingertip_verification = verification
+                        self.node.get_logger().info(
+                            f"[FINGERTIP_VERIFY] {verification}")
                     _vt1 = time()
                     if not getattr(self, "_printed_bottom_pixel_post_render", False):
                         _bottom = display_image[-12:, :, :3]
@@ -843,6 +866,7 @@ class VisionNode:
                         self.direction_history.clear()
                         self.best_history.clear()
                         self._cached_heatmaps.clear()
+                        self._contact_cache.clear()
                         self.prev_heat_point = None
                         self.prev_direction_base = None
                         current_dets = None  # discard stale bboxes; wait for fresh YOLO
@@ -978,7 +1002,8 @@ class VisionNode:
 
                 # Compute approach direction and publish — skip in reacquire mode
                 if best_idx is not None and not _reacquire:
-                    self._process_best_target(targets, best_idx, intrinsics, bunch_boxes)
+                    self._process_best_target(
+                        targets, best_idx, intrinsics, bunch_boxes, pc_np=pc_np)
                 _tp4 = time()
 
                 # Publish visible fruit positions sorted by score, highest first.
@@ -1514,7 +1539,7 @@ class VisionNode:
         mask_bool = mask_clean > 0
 
         # Ellipse fit for orientation
-        t_short_axis, long_axis_2d, t_angle = self._fit_ellipse(mask_clean)
+        t_short_axis, long_axis_2d, t_angle, ellipse_confidence = self._fit_ellipse(mask_clean)
 
         in_mask_uv: Optional[np.ndarray] = None  # ROI-local UV for depth viz
         if use_lidar and pts_cam is not None and pts_cam.shape[0] > 0:
@@ -1966,6 +1991,7 @@ class VisionNode:
                 "short_axis_cam": t_short_axis,
                 "long_axis_2d": long_axis_2d,
                 "ellipse_angle": t_angle,
+                "ellipse_confidence": ellipse_confidence,
                 "heatmap": heatmap,
                 "best_dir2d": t_best_dir2d,
                 "best_point2d": t_best_point,
@@ -2084,6 +2110,7 @@ class VisionNode:
         t_short_axis = None
         long_axis_2d = None
         t_angle = None
+        elongation_confidence = 0.0
 
         try:
             contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -2091,8 +2118,18 @@ class VisionNode:
                 cnt = max(contours, key=cv2.contourArea)
                 if len(cnt) >= 20:
                     ellipse = cv2.fitEllipse(cnt)
-                    (_, _), (_, _), angle_deg = ellipse
-
+                    (_, _), (axis_a, axis_b), angle_deg = ellipse
+                    # OpenCV's angle follows the first returned diameter. Make
+                    # it explicitly describe the fruit's major/long axis.
+                    if axis_b > axis_a:
+                        angle_deg += 90.0
+                    major = max(float(axis_a), float(axis_b))
+                    minor = min(float(axis_a), float(axis_b))
+                    # 0 for circular, approaching 1 for a strongly elongated
+                    # fruit. Unlike an axis-aligned bbox this is rotation invariant.
+                    elongation_confidence = float(np.clip(
+                        1.0 - minor / max(major, 1e-6), 0.0, 1.0))
+                    angle_deg = ((angle_deg + 90.0) % 180.0) - 90.0
                     theta = math.radians(angle_deg)
                     long_dir_img = np.array([math.cos(theta), math.sin(theta)], dtype=float)
                     short_dir_cam = np.array([-long_dir_img[1], long_dir_img[0], 0.0], dtype=float)
@@ -2106,7 +2143,7 @@ class VisionNode:
         except Exception as e:
             print(f"[WARN] Ellipse axis extraction failed: {e}")
 
-        return t_short_axis, long_axis_2d, t_angle
+        return t_short_axis, long_axis_2d, t_angle, elongation_confidence
 
     def _compute_heatmap(self, roi_xyz: np.ndarray, valid: np.ndarray, mask_clean: np.ndarray) -> tuple:
         """Compute depth heatmap and find best point."""
@@ -2313,15 +2350,304 @@ class VisionNode:
 
         return best_idx
 
+    def _record_grasp_candidates(
+        self, target: Dict[str, Any], contacts: Dict[str, Any],
+        intrinsics: Dict[str, float],
+    ) -> None:
+        """Retain a target-associated pre-motion Phase-3 evaluation."""
+        candidates = contacts.get("candidates", [])
+        point = target.get("pt_base")
+        if not candidates or point is None:
+            return
+        fruit_id = int(target.get("fruit_id", -1))
+        winner_deg = float(candidates[0]["psi_deg"])
+        winner_score = float(candidates[0]["total_score"])
+        self._grasp_candidate_history.append(
+            (fruit_id, winner_deg, winner_score, time()))
+        recent = [
+            (angle, score) for fid, angle, score, stamp in self._grasp_candidate_history
+            if fid == fruit_id and time() - stamp <= 1.5
+        ][-5:]
+        period_deg = 120.0
+        unwrapped = np.asarray([
+            winner_deg + ((angle - winner_deg + 60.0) % period_deg - 60.0)
+            for angle, _score in recent
+        ], dtype=float)
+        weights = np.asarray([
+            max(1e-3, score) for _angle, score in recent
+        ], dtype=float)
+        median_deg = float(np.median(unwrapped)) if len(unwrapped) else winner_deg
+        inlier_mask = np.abs(unwrapped - median_deg) <= 15.0
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        rejected_count = int(len(unwrapped) - inlier_count)
+        if inlier_count:
+            consensus_unwrapped = float(np.average(
+                unwrapped[inlier_mask], weights=weights[inlier_mask]))
+            consensus_psi_deg = consensus_unwrapped % period_deg
+            inlier_values = unwrapped[inlier_mask]
+            spread_deg = float(np.max(inlier_values) - np.min(inlier_values))
+        else:
+            consensus_psi_deg = winner_deg
+            spread_deg = float("inf")
+        consensus_ratio = inlier_count / max(1, len(unwrapped))
+        latest_consensus_delta_deg = abs(
+            (winner_deg - consensus_psi_deg + 60.0) % period_deg - 60.0)
+        stable = (
+            len(unwrapped) >= 4
+            and inlier_count >= 4
+            and consensus_ratio >= 0.80
+            and spread_deg <= 10.0
+            and latest_consensus_delta_deg <= 10.0
+        )
+        history_angles = [float(angle) for angle, _score in recent]
+
+        # Project gripper local +X (the zero-angle finger-pattern reference)
+        # into this target's image tangent plane. _cached_tf_grip maps camera
+        # vectors into gripper_tip, so its transpose maps gripper axes to camera.
+        current_psi_deg = None
+        proposed_delta_deg = None
+        if self._cached_tf_grip is not None:
+            rotation_gripper_from_camera = self._cached_tf_grip[0]
+            reference_camera = rotation_gripper_from_camera.T @ np.array(
+                [1.0, 0.0, 0.0], dtype=float)
+            target_camera = np.array([
+                float(target.get("Xc", 0.0)),
+                float(target.get("Yc", 0.0)),
+                float(target.get("Zc", 0.0)),
+            ], dtype=float)
+            z_cam = float(target_camera[2])
+            if z_cam > 0.05:
+                du = float(intrinsics["fx"]) * (
+                    reference_camera[0] * z_cam
+                    - target_camera[0] * reference_camera[2]) / (z_cam * z_cam)
+                dv = float(intrinsics["fy"]) * (
+                    reference_camera[1] * z_cam
+                    - target_camera[1] * reference_camera[2]) / (z_cam * z_cam)
+                if math.hypot(du, dv) > 1e-6:
+                    current_psi_deg = math.degrees(math.atan2(dv, du)) % period_deg
+                    proposed_delta_deg = (
+                        (consensus_psi_deg - current_psi_deg + 60.0)
+                        % period_deg - 60.0)
+
+        best_score = float(candidates[0]["total_score"])
+        near_best = [
+            candidate for candidate in candidates
+            if best_score - float(candidate["total_score"]) <= 0.01
+        ]
+        band_angles = [
+            winner_deg + ((float(candidate["psi_deg"]) - winner_deg + 60.0) % period_deg - 60.0)
+            for candidate in near_best
+        ]
+        best_safe_candidate = None
+        best_safe_delta_deg = None
+        if current_psi_deg is not None:
+            safe_candidates = []
+            for candidate in candidates:
+                candidate_delta_deg = (
+                    (float(candidate["psi_deg"]) - current_psi_deg + 60.0)
+                    % period_deg - 60.0)
+                if abs(candidate_delta_deg) <= 35.0:
+                    safe_candidates.append((candidate, candidate_delta_deg))
+            if safe_candidates:
+                best_safe_candidate, best_safe_delta_deg = max(
+                    safe_candidates,
+                    key=lambda item: float(item[0]["total_score"]),
+                )
+        self._latest_grasp_candidate_record = {
+            "fruit_id": fruit_id,
+            "stamp": time(),
+            "position": [point.point.x, point.point.y, point.point.z],
+            "candidates": candidates,
+            "stable": stable,
+            "stable_frames": len(unwrapped),
+            "spread_deg": spread_deg,
+            "winner_history_deg": history_angles,
+            "consensus_psi_deg": consensus_psi_deg,
+            "consensus_inliers": inlier_count,
+            "consensus_rejected": rejected_count,
+            "consensus_ratio": consensus_ratio,
+            "latest_consensus_delta_deg": latest_consensus_delta_deg,
+            "band_min_deg": min(band_angles),
+            "band_max_deg": max(band_angles),
+            "current_psi_deg": current_psi_deg,
+            "proposed_delta_deg": proposed_delta_deg,
+            "best_safe_candidate": best_safe_candidate,
+            "best_safe_delta_deg": best_safe_delta_deg,
+        }
+
+    def _publish_locked_grasp_candidates(self, lock_position: List[float]) -> None:
+        """Freeze and publish the candidate set associated with a new target lock."""
+        record = self._latest_grasp_candidate_record
+        if record is None:
+            self.node.get_logger().warn(
+                "[GRASP_CANDIDATES] no pre-lock candidate evaluation available")
+            return
+        age_s = time() - float(record["stamp"])
+        distance_m = math.dist(lock_position, record["position"])
+        if age_s > 2.0 or distance_m > TARGET_LOCK_RADIUS:
+            self.node.get_logger().warn(
+                f"[GRASP_CANDIDATES] rejected stale/mismatched pre-lock set "
+                f"target_id={record['fruit_id']} age={age_s:.2f}s "
+                f"distance={distance_m*1000:.1f}mm")
+            return
+
+        compact = []
+        for candidate in record["candidates"]:
+            finger_scores = candidate["point_scores"]
+            compact.append(
+                f"#{candidate['rank']} psi={candidate['psi_deg']:.1f}deg "
+                f"F=[{finger_scores[0]:.2f},{finger_scores[1]:.2f},"
+                f"{finger_scores[2]:.2f}] min={candidate['minimum_contact_score']:.2f} "
+                f"mean={candidate['mean_contact_score']:.2f} "
+                f"sym={candidate['symmetry_score']:.2f} "
+                f"center={candidate['centering_score']:.2f} "
+                f"sep={candidate['separation_score']:.2f} "
+                f"Q={candidate['total_score']:.3f} "
+                f"valid={candidate['geometry_valid']}")
+        spread_text = (
+            f"{record['spread_deg']:.1f}" if math.isfinite(record["spread_deg"])
+            else "inf"
+        )
+        current_text = (
+            f"{record['current_psi_deg']:.1f}deg"
+            if record["current_psi_deg"] is not None else "unavailable"
+        )
+        delta_text = (
+            f"{record['proposed_delta_deg']:+.1f}deg"
+            if record["proposed_delta_deg"] is not None else "unavailable"
+        )
+        band_width = float(record["band_max_deg"] - record["band_min_deg"])
+        selected_minimum = float(record["candidates"][0]["minimum_contact_score"])
+        unambiguous = bool(
+            record["stable"]
+            and band_width <= 20.0
+            and record["proposed_delta_deg"] is not None
+            and selected_minimum >= 0.75
+            and abs(record["proposed_delta_deg"]) <= 35.0
+            and record["latest_consensus_delta_deg"] <= 10.0
+        )
+        history_text = ",".join(
+            f"{angle:.1f}" for angle in record["winner_history_deg"])
+        safe_candidate = record.get("best_safe_candidate")
+        safe_delta = record.get("best_safe_delta_deg")
+        safe_candidate_available = False
+        safe_score_loss = 1.0
+        if safe_candidate is not None and safe_delta is not None:
+            safe_scores = safe_candidate["point_scores"]
+            safe_score_loss = max(
+                0.0,
+                float(record["candidates"][0]["total_score"])
+                - float(safe_candidate["total_score"]),
+            )
+            safe_candidate_available = bool(
+                record["stable"]
+                and band_width <= 20.0
+                and bool(safe_candidate["geometry_valid"])
+                and float(safe_candidate["minimum_contact_score"]) >= 0.75
+                and safe_score_loss <= 0.05
+            )
+            safe_text = (
+                f"safe_candidate_psi={safe_candidate['psi_deg']:.1f}deg "
+                f"safe_delta={safe_delta:+.1f}deg "
+                f"safe_F=[{safe_scores[0]:.2f},{safe_scores[1]:.2f},"
+                f"{safe_scores[2]:.2f}] "
+                f"safe_min={safe_candidate['minimum_contact_score']:.2f} "
+                f"safe_Q={safe_candidate['total_score']:.3f} "
+                f"score_loss={safe_score_loss:.3f} "
+                f"safe_decision={'SAFE_CANDIDATE_AVAILABLE' if safe_candidate_available else 'NO_SAFE_CANDIDATE'}"
+            )
+        else:
+            safe_text = (
+                "safe_candidate_psi=unavailable safe_delta=unavailable "
+                "safe_decision=NO_SAFE_CANDIDATE"
+            )
+        summary = (
+            f"[GRASP_CANDIDATES] evaluation_only frozen_pre_motion=True "
+            f"target_id={record['fruit_id']} age={age_s:.2f}s "
+            f"match={distance_m*1000:.1f}mm psi_frame=image_roi "
+            f"stable={record['stable']} frames={record['stable_frames']} "
+            f"winner_history=[{history_text}]deg "
+            f"consensus={record['consensus_psi_deg']:.1f}deg "
+            f"inliers={record['consensus_inliers']} "
+            f"rejected={record['consensus_rejected']} "
+            f"consensus_ratio={record['consensus_ratio']:.2f} "
+            f"latest_consensus_delta="
+            f"{record['latest_consensus_delta_deg']:.1f}deg "
+            f"inlier_spread={spread_text}deg preferred_band="
+            f"[{record['band_min_deg']:.1f},{record['band_max_deg']:.1f}]deg "
+            f"band_width={band_width:.1f}deg current_psi={current_text} "
+            f"winner_psi={record['candidates'][0]['psi_deg']:.1f}deg "
+            f"proposed_local_delta={delta_text} "
+            f"decision={'YAW_PROPOSED' if unambiguous else 'YAW_AMBIGUOUS'} "
+            f"{safe_text} "
+            f"count={len(record['candidates'])} | " + " | ".join(compact)
+        )
+        self.node.get_logger().info(summary)
+        message = StdString()
+        message.data = summary
+        self.grasp_candidates_pub.publish(message)
+        selection = Float32MultiArray()
+        selection.data = [
+            1.0 if safe_candidate_available else 0.0,
+            float(safe_delta) if safe_delta is not None else 0.0,
+            float(safe_candidate["psi_deg"]) if safe_candidate is not None else 0.0,
+            float(safe_candidate["total_score"]) if safe_candidate is not None else 0.0,
+            float(safe_candidate["minimum_contact_score"]) if safe_candidate is not None else 0.0,
+            float(safe_score_loss) if safe_candidate is not None else 1.0,
+            float(record["position"][0]),
+            float(record["position"][1]),
+            float(record["position"][2]),
+        ]
+        self.grasp_candidate_selection_pub.publish(selection)
+
     def _process_best_target(
         self,
         targets: List[Dict[str, Any]],
         best_idx: int,
         intrinsics: Dict[str, float],
         bunch_boxes: Optional[List[Dict[str, Any]]] = None,
+        pc_np: Optional[np.ndarray] = None,
     ) -> None:
         """Process the best target and publish goal."""
         t_best = targets[best_idx]
+
+        # Predict three fingertip contact regions for the selected date only.
+        # This is visual/diagnostic evidence; it does not change the goal pose or
+        # command the gripper until field validation establishes safe thresholds.
+        if SHOW_FINGER_CONTACTS:
+            x1, y1, x2, y2 = t_best["bb"]
+            contact_key = (
+                int(t_best.get("fruit_id", 0)),
+                x1 // 8, y1 // 8, x2 // 8, y2 // 8,
+            )
+            contacts = self._contact_cache.get(contact_key)
+            if contacts is None:
+                roi_xyz = None
+                if (
+                    pc_np is not None
+                    and pc_np.ndim == 3
+                    and y2 <= pc_np.shape[0]
+                    and x2 <= pc_np.shape[1]
+                    and y2 > y1
+                    and x2 > x1
+                ):
+                    roi_xyz = pc_np[y1:y2, x1:x2, :3]
+                contacts = estimate_three_finger_contacts(
+                    t_best.get("mask_resized"),
+                    roi_xyz=roi_xyz,
+                    target_depth=float(t_best.get("Zc", 0.0)),
+                    focal_length_px=0.5 * (
+                        float(intrinsics["fx"]) + float(intrinsics["fy"])),
+                    fingertip_radius_m=FINGERTIP_CONTACT_RADIUS_M,
+                    radial_fraction=FINGER_CONTACT_RADIAL_FRACTION,
+                    rotation_samples=FINGER_CONTACT_ROTATION_SAMPLES,
+                    minimum_score=FINGER_CONTACT_MIN_SCORE,
+                )
+                if len(self._contact_cache) >= 32:
+                    self._contact_cache.pop(next(iter(self._contact_cache)))
+                self._contact_cache[contact_key] = contacts
+            t_best["finger_contacts"] = contacts
+            self._record_grasp_candidates(t_best, contacts, intrinsics)
 
         # Publish the camera-frame depth evidence for the exact target selected
         # for /external_goal_pose. The motion node caches this and prints it only
@@ -2563,8 +2889,35 @@ class VisionNode:
                 gap_dir_base = _R_tf @ gap_dir_cam
                 gap_angle_base = float(math.atan2(gap_dir_base[2], gap_dir_base[0]))
 
+            contacts = t_best.get("finger_contacts") or {}
+            contact_valid = bool(contacts.get("valid", False))
+            contact_score = float(contacts.get("score", 0.0))
+            contact_angle_cam = math.radians(float(contacts.get("rotation_deg", 0.0)))
+            contact_angle_base = contact_angle_cam
+            if contact_valid and _R_tf is not None:
+                contact_dir_cam = np.array([
+                    math.cos(contact_angle_cam),
+                    math.sin(contact_angle_cam),
+                    0.0,
+                ], dtype=float)
+                contact_dir_base = _R_tf @ contact_dir_cam
+                # Old robot approaches along -Y, so tool roll lies in the X-Z plane.
+                contact_angle_base = float(math.atan2(
+                    contact_dir_base[2], contact_dir_base[0]))
+
             gap_msg = Float32MultiArray()
-            gap_msg.data = [1.0 if between_branches else 0.0, float(gap_angle_base)]
+            gap_msg.data = [
+                1.0 if between_branches else 0.0,
+                float(gap_angle_base),
+                1.0 if contact_valid else 0.0,
+                float(contact_angle_base),
+                contact_score,
+                # Signed major-axis deviation from image vertical. Vertical is
+                # zero; 180-degree axis ambiguity is removed by wrapping ±90.
+                float(math.radians((((float(t_best.get("ellipse_angle", 90.0))
+                                      - 90.0) + 90.0) % 180.0) - 90.0)),
+                float(t_best.get("ellipse_confidence", 0.0)),
+            ]
             self.gap_info_pub.publish(gap_msg)
 
             # Publish score components for GUI bar chart

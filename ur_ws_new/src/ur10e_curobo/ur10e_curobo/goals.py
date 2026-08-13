@@ -1,5 +1,5 @@
 # ruff: noqa
-import time, math, torch
+import time, math, re, torch
 import threading
 import copy
 import numpy as np
@@ -223,10 +223,30 @@ def quat_apply_local_x_pitch(q, pitch_deg):
     return quat_normalize(quat_multiply(list(q), q_pitch))
 
 
+def quat_apply_local_z_roll(q, roll_deg):
+    """Rotate the finger triangle around the tool's local insertion (+Z) axis."""
+    half = math.radians(float(roll_deg)) / 2.0
+    q_roll = [math.cos(half), 0.0, 0.0, math.sin(half)]
+    return quat_normalize(quat_multiply(list(q), q_roll))
+
+
 def quat_rotate_vec(q, v):
     qv = [0.0, v[0], v[1], v[2]]
     qi = [q[0], -q[1], -q[2], -q[3]]
     return quat_multiply(quat_multiply(q, qv), qi)[1:]
+
+
+def closure_center_corrected_tcp(desired_grasp_xyz, orientation_wxyz,
+                                 closure_offset_tcp):
+    """Return TCP XYZ that places the physical closure centre at the grasp point."""
+    if len(closure_offset_tcp) != 3:
+        raise ValueError("closure_center_offset_tcp_m must contain exactly 3 values")
+    offset_base = quat_rotate_vec(
+        quat_normalize(list(orientation_wxyz)), list(closure_offset_tcp))
+    tcp_xyz = [
+        float(desired_grasp_xyz[i]) - float(offset_base[i]) for i in range(3)
+    ]
+    return tcp_xyz, offset_base
 
 
 def yaw_delta_for_local_axis(current_quat, desired_dir, local_axis=(0.0, 0.0, 1.0)):
@@ -259,6 +279,26 @@ def yaw_only_align_local_axis(current_quat, desired_dir, local_axis=(0.0, 0.0, 1
         return list(current_quat) if current_quat is not None else current_quat
     q_yaw = [math.cos(delta / 2.0), 0.0, 0.0, math.sin(delta / 2.0)]
     return quat_normalize(quat_multiply(q_yaw, list(current_quat)))
+
+
+def bounded_yaw_align_local_axis(
+        current_quat, desired_dir, *, local_axis=(0.0, 0.0, 1.0),
+        max_delta_deg=35.0):
+    """Yaw toward desired_dir without changing tool pitch/roll."""
+    raw_delta = yaw_delta_for_local_axis(
+        current_quat, desired_dir, local_axis=local_axis)
+    if raw_delta is None:
+        return list(current_quat), 0.0, 0.0
+    limit = math.radians(abs(float(max_delta_deg)))
+    applied_delta = max(-limit, min(limit, raw_delta))
+    q_yaw = [
+        math.cos(applied_delta / 2.0), 0.0, 0.0,
+        math.sin(applied_delta / 2.0),
+    ]
+    aligned = quat_normalize(quat_multiply(q_yaw, list(current_quat)))
+    remaining = yaw_delta_for_local_axis(
+        aligned, desired_dir, local_axis=local_axis)
+    return aligned, raw_delta, (remaining if remaining is not None else 0.0)
 
 
 def align_local_axis_to_vector(current_quat, desired_dir, local_axis=(0.0, 0.0, 1.0),
@@ -398,7 +438,6 @@ def lateral_value(x, y):
 
 def add_axis_offsets(x, y, *, depth=0.0, lateral=0.0):
     if X_FORWARD_Y_LATERAL:
-        # New robot faces +X, so a positive standoff moves back toward the robot.
         return x - depth, y + lateral
     return x + lateral, y + depth
 
@@ -1899,14 +1938,31 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
     dt = getattr(planner, "min_dt", 0.012) * float(
         getattr(planner, "reverse_dt_multiplier", 1.7))
 
-    # Append deceleration tail: duplicate the last waypoint several times so the
-    # controller has multiple dt steps to decelerate the wrist to zero velocity.
-    # Without this, build_trajectory sets velocity=0 only at the final point while
-    # the second-to-last still carries full central-difference velocity — the
-    # controller must stop in one dt (~18ms), causing a wrist jerk.
+    # Shape the final section into a real ease-out. Duplicate endpoint samples do
+    # not decelerate: central differences merely become zero after the first
+    # duplicate, leaving an abrupt one-dt velocity drop. Remap progress along the
+    # existing final path with f(u)=u+u²-u³, whose slope starts at 1 and reaches 0
+    # at the endpoint. Interpolating on the existing polyline preserves its path.
     DECEL_TAIL = max(
         8, int(getattr(planner, "reverse_decel_tail_points", 14)))
-    partial = partial + [partial[-1]] * DECEL_TAIL
+    if len(partial) >= 4:
+        _tail_count = min(DECEL_TAIL, len(partial) - 1)
+        _tail_start = len(partial) - _tail_count - 1
+        _tail_path = np.asarray(partial[_tail_start:], dtype=float)
+        _segment_lengths = np.linalg.norm(np.diff(_tail_path, axis=0), axis=1)
+        _arc = np.concatenate(([0.0], np.cumsum(_segment_lengths)))
+        if _arc[-1] > 1e-9:
+            _u = np.linspace(0.0, 1.0, _tail_count + 1)
+            _eased_u = _u + _u * _u - _u * _u * _u
+            _sample_arc = _eased_u * _arc[-1]
+            _eased_tail = np.column_stack([
+                np.interp(_sample_arc, _arc, _tail_path[:, joint_idx])
+                for joint_idx in range(_tail_path.shape[1])
+            ])
+            partial[_tail_start:] = _eased_tail.tolist()
+    # A short stationary hold gives the controller an explicit settled endpoint;
+    # slowdown itself is provided by the eased samples above.
+    partial = partial + [list(partial[-1])] * 3
 
     reverse_velocity_scale = float(
         getattr(planner, "reverse_velocity_scale", 0.35))
@@ -2297,7 +2353,7 @@ def subscribe_to_goal_pose(node):
         _workspace_ok, _workspace_reason = goal_is_in_robot_workspace(node, new_xyz)
         if not _workspace_ok:
             _warn_rejected_goal_throttled(node, new_xyz, _workspace_reason)
-            return
+            #return
 
         # ---- ALWAYS STORE LATEST GOAL POSE ----
         node.latest_goal_pose = [*new_xyz, *new_quat]
@@ -2937,15 +2993,25 @@ def plan_and_execute(node):
                 lateral_value(x, y) < trunk_lateral(node)
                 if side_approach_enabled else False)
             _midhi_standoff = 0.12 if _is_right else standoff
-            _midhi_z_offset = getattr(node.cfg.planner, "mid_center_approach_z_offset", 0.0)
-            ax, ay = add_axis_offsets(x, y, depth=_midhi_standoff)
-            az = z + _midhi_z_offset
+            _midhi_final_depth = _planner_value(
+                node.cfg.planner, "mid_center_final_depth_offset",
+                "mid_center_final_y_offset", -0.015)
+            _midhi_final_z = float(getattr(
+                node.cfg.planner, "mid_center_final_z_offset", 0.030))
+            _midhi_final_x, _midhi_final_y = add_axis_offsets(
+                x, y, depth=-_midhi_final_depth)
+            # Level insertion: APPROACH is separated from the actual FINAL
+            # grasp point only along the configured robot depth axis.
+            ax, ay = add_axis_offsets(
+                _midhi_final_x, _midhi_final_y, depth=_midhi_standoff)
+            az = z + _midhi_final_z
             if _log_cycle_start:
                 node.get_logger().info(
                     f"MID/HIGH approach ({_height_source}, z={z:.2f}): "
                     f"fruit=[{x:.3f},{y:.3f},{z:.3f}] standoff=[{ax:.3f},{ay:.3f},{az:.3f}] "
-                    f"depth_offset={_midhi_standoff:+.3f} "
-                    f"z_offset={_midhi_z_offset:+.3f} right={_is_right}")
+                    f"depth_standoff={_midhi_standoff:+.3f} "
+                    f"final_z_offset={_midhi_final_z:+.3f} "
+                    "insertion=LEVEL right=" + str(_is_right))
 
         # 1. Plan approach - different strategy based on height and lateral position
         # Get current orientation and minimize rotation
@@ -3120,8 +3186,17 @@ def plan_and_execute(node):
                         fruit_lat = lateral_value(x, y)
                         _is_right = fruit_lat < trunk_lateral(node)
                         _midhi_standoff = 0.12 if _is_right else standoff
-                        ax, ay = add_axis_offsets(x, y, depth=_midhi_standoff)
-                        az = z
+                        _midhi_final_depth = _planner_value(
+                            node.cfg.planner, "mid_center_final_depth_offset",
+                            "mid_center_final_y_offset", -0.015)
+                        _midhi_final_z = float(getattr(
+                            node.cfg.planner, "mid_center_final_z_offset", 0.030))
+                        _midhi_final_x, _midhi_final_y = add_axis_offsets(
+                            x, y, depth=-_midhi_final_depth)
+                        ax, ay = add_axis_offsets(
+                            _midhi_final_x, _midhi_final_y,
+                            depth=_midhi_standoff)
+                        az = z + _midhi_final_z
             else:
                 if _log_cycle_start:
                     node.get_logger().info("Fruit near center; using default HOME without side move.")
@@ -3148,16 +3223,113 @@ def plan_and_execute(node):
         low_side_dir = None
         final_orientation_override = None
 
+        _roll_default = float(getattr(
+            node.cfg.planner, "low_center_tool_roll_default_deg", -60.0))
+        _center_tool_roll_deg = _roll_default
+        _center_tool_roll_source = "fallback"
+        _roll_score = float(getattr(node, "fruit_contact_roll_score", 0.0))
+        _roll_min_score = float(getattr(
+            node.cfg.planner, "low_center_tool_roll_min_score", 0.60))
+        _dynamic_roll = bool(getattr(
+            node.cfg.planner, "dynamic_low_center_tool_roll", True))
+        _vision_roll_deg = None
+        if _dynamic_roll and between_branches:
+            _vision_roll_deg = math.degrees(float(gap_angle))
+            _center_tool_roll_source = "vision_gap"
+        elif (
+            _dynamic_roll
+            and bool(getattr(node, "fruit_contact_roll_valid", False))
+            and _roll_score >= _roll_min_score
+        ):
+            _vision_roll_deg = math.degrees(float(getattr(
+                node, "fruit_contact_roll", 0.0)))
+            _center_tool_roll_source = "vision_contacts"
+        if _vision_roll_deg is not None:
+            # Three-finger geometry repeats every 120 degrees. Select the
+            # vision-equivalent angle closest to the calibrated fallback.
+            _center_tool_roll_deg = _roll_default + (
+                (_vision_roll_deg - _roll_default + 60.0) % 120.0 - 60.0)
+
+        if _dynamic_roll and is_low and not is_side_approach:
+            node.get_logger().info(
+                f"[TOOL_ROLL] selected={_center_tool_roll_deg:+.1f}deg "
+                f"source={_center_tool_roll_source} "
+                f"vision_valid={bool(getattr(node, 'fruit_contact_roll_valid', False))} "
+                f"score={_roll_score:.3f} threshold={_roll_min_score:.3f} "
+                f"stable={bool(getattr(node, 'fruit_contact_roll_stable', False))} "
+                f"samples={int(getattr(node, 'fruit_contact_roll_samples', 0))} "
+                f"spread={float(getattr(node, 'fruit_contact_roll_spread_deg', float('inf'))):.1f}deg "
+                f"fallback={_roll_default:+.1f}deg")
+
         if between_branches:
             node.get_logger().info(
                 f"Between-branches detected! gap_angle={math.degrees(gap_angle):.1f} deg — using 2-finger mode")
-            # Apply roll correction so left+right fingers align with gap
-            half = gap_angle / 2.0
-            q_roll = [math.cos(half), 0.0, 0.0, math.sin(half)]
-            target_quat = quat_multiply(list(target_quat), q_roll)
+            if not _dynamic_roll:
+                # Original two-finger behavior: align the active finger pair with
+                # the detected branch gap before insertion-axis alignment.
+                half = gap_angle / 2.0
+                q_roll = [math.cos(half), 0.0, 0.0, math.sin(half)]
+                target_quat = quat_multiply(list(target_quat), q_roll)
             node.gripper_controller.frozen_fingers = {1}  # freeze center finger
         else:
             node.gripper_controller.frozen_fingers = set()  # all 3 fingers active
+
+        def _apply_center_yaw(orientation_in, approach_xyz):
+            if not bool(getattr(
+                    node.cfg.planner, "low_center_yaw_align_enabled", True)):
+                return list(orientation_in)
+            desired_xy = [
+                x - float(approach_xyz[0]),
+                y - float(approach_xyz[1]),
+                0.0,
+            ]
+            aligned, raw_delta, remaining = bounded_yaw_align_local_axis(
+                orientation_in,
+                desired_xy,
+                local_axis=(0.0, 0.0, 1.0),
+                max_delta_deg=float(getattr(
+                    node.cfg.planner, "low_center_yaw_align_max_deg", 35.0)),
+            )
+            forward = quat_rotate_vec(aligned, (0.0, 0.0, 1.0))
+            node.get_logger().info(
+                f"[CENTER_YAW] requested={math.degrees(raw_delta):+.1f}deg "
+                f"applied={math.degrees(raw_delta - remaining):+.1f}deg "
+                f"remaining={math.degrees(remaining):+.1f}deg "
+                f"tool_forward=[{forward[0]:.3f},{forward[1]:.3f},{forward[2]:.3f}] "
+                f"date_dir_xy=[{desired_xy[0]:.3f},{desired_xy[1]:.3f}]"
+            )
+            return aligned
+
+        def _apply_date_axis_at_approach(orientation_in):
+            """Rotate finger layout at APPROACH, then hold it through FINAL."""
+            enabled = bool(getattr(
+                node.cfg.planner, "approach_date_axis_enabled", True))
+            angle = float(getattr(node, "fruit_major_axis_angle", 0.0))
+            confidence = float(getattr(
+                node, "fruit_major_axis_confidence", 0.0))
+            stable = bool(getattr(node, "fruit_major_axis_stable", False))
+            samples = int(getattr(node, "fruit_major_axis_samples", 0))
+            spread_deg = float(getattr(
+                node, "fruit_major_axis_spread_deg", float("inf")))
+            min_conf = float(getattr(
+                node.cfg.planner, "approach_date_axis_min_confidence", 0.20))
+            max_deg = float(getattr(
+                node.cfg.planner, "approach_date_axis_max_deg", 35.0))
+            requested_deg = math.degrees(angle)
+            applied_deg = float(np.clip(requested_deg, -max_deg, max_deg))
+            if not enabled or confidence < min_conf or not stable:
+                node.get_logger().info(
+                    f"[APPROACH_DATE_AXIS] applied=+0.0deg "
+                    f"requested={requested_deg:+.1f}deg confidence={confidence:.2f} "
+                    f"threshold={min_conf:.2f} stable={stable} samples={samples} "
+                    f"spread={spread_deg:.1f}deg decision=KEEP_DEFAULT")
+                return list(orientation_in)
+            node.get_logger().info(
+                f"[APPROACH_DATE_AXIS] requested={requested_deg:+.1f}deg "
+                f"applied={applied_deg:+.1f}deg confidence={confidence:.2f} "
+                f"stable={stable} samples={samples} spread={spread_deg:.1f}deg "
+                f"limit={max_deg:.1f}deg decision=APPLY_AT_APPROACH_HOLD_TO_FINAL")
+            return quat_apply_local_z_roll(orientation_in, applied_deg)
 
         if skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
@@ -3206,7 +3378,7 @@ def plan_and_execute(node):
                     _insert_dir = (
                         [_horizontal, 0.0, math.sin(_insert_pitch)]
                         if X_FORWARD_Y_LATERAL
-                        else [0.0, _horizontal, math.sin(_insert_pitch)])
+                        else [0.0, -_horizontal, math.sin(_insert_pitch)])
                     _final_depth = _planner_value(
                         node.cfg.planner, "low_center_final_depth_offset",
                         "low_center_final_y_offset", 0.004)
@@ -3225,10 +3397,19 @@ def plan_and_execute(node):
                         orientation, _insert_dir, local_axis=(0.0, 0.0, 1.0),
                         max_angle_deg=float(getattr(
                             node.cfg.planner, "low_center_forward_align_max_deg", 45.0)))
+                    orientation = _apply_center_yaw(
+                        orientation, approach[:3])
+                    orientation = _apply_date_axis_at_approach(orientation)
+                    if _dynamic_roll:
+                        orientation = quat_apply_local_z_roll(
+                            orientation, _center_tool_roll_deg)
                     approach[3:] = orientation
                     node.get_logger().info(
                         f"LOW/CENTER slip-retry insertion: pitch={math.degrees(_insert_pitch):.1f}deg "
-                        f"standoff={_depth_off*1000:.0f}mm")
+                        f"standoff={_depth_off*1000:.0f}mm"
+                        + (f" tool_roll={_center_tool_roll_deg:+.1f}deg "
+                           f"source={_center_tool_roll_source} score={_roll_score:.2f}"
+                           if _dynamic_roll else ""))
             else:
                 if not is_side_approach:
                     _pitch_deg = getattr(node.cfg.planner, "mid_center_approach_pitch_deg", 0.0)
@@ -3276,7 +3457,7 @@ def plan_and_execute(node):
                 _center_insert_dir = (
                     [_horizontal, 0.0, math.sin(_insert_pitch)]
                     if X_FORWARD_Y_LATERAL
-                    else [0.0, _horizontal, math.sin(_insert_pitch)])
+                    else [0.0, -_horizontal, math.sin(_insert_pitch)])
                 _center_final_depth = _planner_value(
                     node.cfg.planner, "low_center_final_depth_offset",
                     "low_center_final_y_offset", 0.004)
@@ -3297,6 +3478,12 @@ def plan_and_execute(node):
                     max_angle_deg=float(getattr(
                         node.cfg.planner, "low_center_forward_align_max_deg", 45.0)),
                 )
+                orientation = _apply_center_yaw(
+                    orientation, approach[:3])
+                orientation = _apply_date_axis_at_approach(orientation)
+                if _dynamic_roll:
+                    orientation = quat_apply_local_z_roll(
+                        orientation, _center_tool_roll_deg)
                 approach[3:] = orientation
                 _x_offset = approach[0] - ax
                 _y_offset = approach[1] - ay
@@ -3312,7 +3499,10 @@ def plan_and_execute(node):
                         f"{_forward_axis[1]:.3f},{_forward_axis[2]:.3f}] "
                         f"insert_dir=[{_center_insert_dir[0]:.3f},"
                         f"{_center_insert_dir[1]:.3f},{_center_insert_dir[2]:.3f}] "
-                        f"pitch={_vlc_pitch:.1f}deg standoff={_depth_offset*1000:.0f}mm")
+                        f"pitch={_vlc_pitch:.1f}deg standoff={_depth_offset*1000:.0f}mm"
+                        + (f" tool_roll={_center_tool_roll_deg:+.1f}deg "
+                           f"source={_center_tool_roll_source} score={_roll_score:.2f}"
+                           if _dynamic_roll else ""))
             if _log_cycle_start:
                 node.get_logger().info(
                     f"{'VERY LOW' if is_very_low_center else 'LOW'} approach pose: {approach[:3]}, is_side={is_side_approach}, "
@@ -3333,7 +3523,8 @@ def plan_and_execute(node):
             if _log_cycle_start:
                 node.get_logger().info(
                     f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
-                    f"pitch={_pitch_deg:+.1f}deg, d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+                    f"pitch={_pitch_deg:+.1f}deg insertion=LEVEL "
+                    f"d_blend_logging_only=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
 
         def _final_offsets(is_slip_retry=False):
             if is_low and is_side_approach:
@@ -3649,6 +3840,33 @@ def plan_and_execute(node):
                 f"[TIMING] approach={_timing['approach']:.2f}s "
                 f"skipped={skip_approach} gripper_opened={gripper_opened}")
 
+        # Lock the orientation that the robot physically reached at APPROACH.
+        # FINAL must be a translation-only insertion; asking it to correct even
+        # a small residual quaternion error makes one fingertip sweep into the
+        # fruit before the others. Preserve the +date-axis layout already reached.
+        _measured_approach_orientation = None
+        if (
+            not skip_approach
+            and bool(getattr(
+                node.cfg.planner,
+                "final_lock_measured_approach_orientation", True))
+        ):
+            _measured_approach_pose = node.get_end_effector_pose()
+            if _measured_approach_pose and len(_measured_approach_pose) >= 7:
+                _measured_approach_orientation = quat_normalize(
+                    list(_measured_approach_pose[3:7]))
+                _commanded_approach_orientation = quat_normalize(
+                    list(approach[3:7]))
+                _qdot = min(1.0, abs(float(np.dot(
+                    _measured_approach_orientation,
+                    _commanded_approach_orientation))))
+                _orient_error_deg = math.degrees(2.0 * math.acos(_qdot))
+                orientation = list(_measured_approach_orientation)
+                node.get_logger().info(
+                    f"[ORIENTATION_LOCK] source=MEASURED_APPROACH "
+                    f"command_error={_orient_error_deg:.2f}deg "
+                    "FINAL=TRANSLATION_ONLY")
+
         # Ensure gripper is open before final approach (fallback for skip_approach case)
         if not gripper_opened:
             gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
@@ -3784,32 +4002,233 @@ def plan_and_execute(node):
                     f"FINAL orientation: side-low local +Z/front aligned toward fruit "
                     f"(tilt={_front_tilt*57.3:.1f}deg cap={_front_tilt_cap:.1f}deg)")
 
+        # Deprecated FINAL-only approach yaw: disabled by default. Date-axis
+        # orientation is now established at APPROACH and held through FINAL.
+        # Face local +Z into the fruit using the
+        # opposite of vision's outward fruit/surface direction. This changes
+        # the insertion heading, not the three-finger roll about local +Z.
+        # The direct FINAL interpolation blends from the unchanged APPROACH
+        # orientation, and all existing IK/path fallback remains active.
+        _pre_final_approach_yaw_orientation = list(orientation)
+        _final_approach_yaw_applied = False
+        _fruit_dir_for_yaw = getattr(node, "fruit_direction", None)
+        if (
+            bool(getattr(node.cfg.planner, "final_approach_yaw_enabled", True))
+            and not is_side_approach
+            and _fruit_dir_for_yaw is not None
+        ):
+            _fd = np.asarray(_fruit_dir_for_yaw, dtype=float)
+            _fd_norm = float(np.linalg.norm(_fd))
+            _desired_final_xy = [-float(_fd[0]), -float(_fd[1]), 0.0]
+            _desired_xy_norm = math.hypot(
+                _desired_final_xy[0], _desired_final_xy[1])
+            if _fd_norm > 1e-6 and _desired_xy_norm > 0.20:
+                _yaw_orientation, _yaw_raw, _yaw_remaining = (
+                    bounded_yaw_align_local_axis(
+                        orientation,
+                        _desired_final_xy,
+                        local_axis=(0.0, 0.0, 1.0),
+                        max_delta_deg=float(getattr(
+                            node.cfg.planner,
+                            "final_approach_yaw_max_deg", 30.0)),
+                    ))
+                _yaw_applied = _yaw_raw - _yaw_remaining
+                orientation = list(_yaw_orientation)
+                _final_approach_yaw_applied = abs(_yaw_applied) > math.radians(0.1)
+                _final_forward = quat_rotate_vec(
+                    orientation, (0.0, 0.0, 1.0))
+                node.get_logger().info(
+                    f"[FINAL_APPROACH_YAW] source=fruit_direction "
+                    f"requested={math.degrees(_yaw_raw):+.1f}deg "
+                    f"applied={math.degrees(_yaw_applied):+.1f}deg "
+                    f"remaining={math.degrees(_yaw_remaining):+.1f}deg "
+                    f"desired_xy=[{_desired_final_xy[0]:+.3f},"
+                    f"{_desired_final_xy[1]:+.3f}] "
+                    f"tool_forward=[{_final_forward[0]:+.3f},"
+                    f"{_final_forward[1]:+.3f},{_final_forward[2]:+.3f}] "
+                    "tool_roll=UNCHANGED")
+            else:
+                node.get_logger().warn(
+                    "[FINAL_APPROACH_YAW] skipped: fruit direction has "
+                    "insufficient horizontal component")
+
         gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
         gz = z + z_offset
-        final_target = [gx, gy, gz, *orientation]
+        desired_grasp_xyz = [gx, gy, gz]
+        closure_offset_tcp = list(getattr(
+            node.cfg.planner, "closure_center_offset_tcp_m",
+            [-0.004553, -0.012559, -0.016223]))
+        _baseline_final_orientation = list(orientation)
+        _baseline_tcp_xyz, _baseline_offset_base = closure_center_corrected_tcp(
+            desired_grasp_xyz, _baseline_final_orientation, closure_offset_tcp)
+        _baseline_final_target = [
+            *_baseline_tcp_xyz, *_baseline_final_orientation]
+        _phase4_yaw_applied = False
+        _selection = getattr(node, "safe_grasp_candidate", None)
+        if (
+            bool(getattr(
+                node.cfg.planner, "phase4_safe_final_yaw_enabled", True))
+            and _selection
+            and bool(_selection.get("available", False))
+        ):
+            _candidate_match = math.dist(
+                [x, y, z], list(_selection.get("target_xyz", [0.0, 0.0, 0.0])))
+            _candidate_delta_deg = float(_selection.get("delta_deg", 0.0))
+            _max_candidate_delta = float(getattr(
+                node.cfg.planner, "phase4_safe_final_yaw_max_deg", 35.0))
+            _candidate_match_limit = float(getattr(
+                node.cfg.planner, "phase4_candidate_target_match_m", 0.05))
+            if (
+                _candidate_match <= _candidate_match_limit
+                and abs(_candidate_delta_deg) <= _max_candidate_delta
+            ):
+                _candidate_orientation = quat_apply_local_z_roll(
+                    _baseline_final_orientation, _candidate_delta_deg)
+                _candidate_tcp_xyz, _candidate_offset_base = (
+                    closure_center_corrected_tcp(
+                        desired_grasp_xyz, _candidate_orientation,
+                        closure_offset_tcp))
+                _candidate_target = [
+                    *_candidate_tcp_xyz, *_candidate_orientation]
+                _candidate_ik_valid = False
+                _candidate_ik_delta_deg = float("inf")
+                _candidate_start_js = _valid_joint_positions()
+                if (
+                    _candidate_start_js is not None
+                    and not getattr(node, "_cuda_faulted", False)
+                ):
+                    try:
+                        _dev = torch.device(
+                            "cuda" if torch.cuda.is_available() else "cpu")
+                        _candidate_pose = Pose(
+                            position=torch.tensor(
+                                [_candidate_target[:3]], dtype=torch.float32,
+                                device=_dev),
+                            quaternion=torch.tensor(
+                                [_candidate_target[3:]], dtype=torch.float32,
+                                device=_dev),
+                        )
+                        _seed_t = torch.tensor(
+                            [_candidate_start_js], dtype=torch.float32,
+                            device=_dev).unsqueeze(0)
+                        _retract_t = torch.tensor(
+                            [_candidate_start_js], dtype=torch.float32,
+                            device=_dev)
+                        _ik = node.motion_gen.ik_solver.solve_single(
+                            _candidate_pose, seed_config=_seed_t,
+                            retract_config=_retract_t)
+                        if _ik.success.item():
+                            _candidate_js = nearest_joint_config(
+                                _candidate_start_js,
+                                _ik.js_solution.position.squeeze().cpu().tolist())
+                            _candidate_ik_delta_deg = math.degrees(max(
+                                abs(a - b) for a, b in zip(
+                                    _candidate_js, _candidate_start_js)))
+                            _candidate_ik_valid = _candidate_ik_delta_deg <= 60.0
+                    except Exception as _candidate_ik_error:
+                        node.get_logger().warn(
+                            f"[PHASE4_YAW] IK preflight exception: "
+                            f"{_candidate_ik_error}")
+                node.get_logger().info(
+                    f"[PHASE4_YAW] safe_psi={_selection.get('psi_deg', 0.0):.1f}deg "
+                    f"local_delta={_candidate_delta_deg:+.1f}deg "
+                    f"target_match={_candidate_match*1000:.1f}mm "
+                    f"score={_selection.get('score', 0.0):.3f} "
+                    f"min={_selection.get('minimum_score', 0.0):.2f} "
+                    f"loss={_selection.get('score_loss', 0.0):.3f} "
+                    f"ik_valid={_candidate_ik_valid} "
+                    f"ik_max_delta={_candidate_ik_delta_deg:.1f}deg")
+                if _candidate_ik_valid:
+                    orientation = _candidate_orientation
+                    tcp_xyz = _candidate_tcp_xyz
+                    closure_offset_base = _candidate_offset_base
+                    final_target = _candidate_target
+                    _phase4_yaw_applied = True
+                else:
+                    node.get_logger().warn(
+                        "[PHASE4_YAW] candidate rejected by IK preflight; "
+                        "using unchanged FINAL orientation")
+            else:
+                node.get_logger().warn(
+                    f"[PHASE4_YAW] frozen candidate rejected: "
+                    f"target_match={_candidate_match*1000:.1f}mm/"
+                    f"{_candidate_match_limit*1000:.0f}mm "
+                    f"delta={_candidate_delta_deg:+.1f}deg/"
+                    f"{_max_candidate_delta:.1f}deg")
+        if not _phase4_yaw_applied:
+            orientation = _baseline_final_orientation
+            tcp_xyz = _baseline_tcp_xyz
+            closure_offset_base = _baseline_offset_base
+            final_target = _baseline_final_target
         _goal_forward = x if X_FORWARD_Y_LATERAL else -y
-        _target_forward = gx if X_FORWARD_Y_LATERAL else -gy
+        _target_forward = tcp_xyz[0] if X_FORWARD_Y_LATERAL else -tcp_xyz[1]
         _forward_delta_mm = (_target_forward - _goal_forward) * 1000.0
+        node.get_logger().info(
+            f"[CLOSURE_CENTER] desired=[{gx:.3f},{gy:.3f},{gz:.3f}] "
+            f"offset_tcp=[{closure_offset_tcp[0]:+.4f},{closure_offset_tcp[1]:+.4f},"
+            f"{closure_offset_tcp[2]:+.4f}] "
+            f"offset_base=[{closure_offset_base[0]:+.4f},{closure_offset_base[1]:+.4f},"
+            f"{closure_offset_base[2]:+.4f}] "
+            f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}]")
         if _log_cycle_start:
             node.get_logger().info(
                 f"FINAL target offsets: depth=-{depth_offset:.3f} "
                 f"z=+{z_offset:.3f} "
-                f"target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
+                f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
+                f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}]")
         else:
             node.get_logger().info(
                 f"[FINAL_TARGET] goal=[{x:.3f},{y:.3f},{z:.3f}] "
-                f"tcp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
+                f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
+                f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}] "
                 f"forward_delta={_forward_delta_mm:+.0f}mm")
         node.motion_phase = "FINAL"
         # Vision is already "paused" from _vision_pause() — keep it that way for final move.
         _t_final = time.time()
         final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                    motion_type="final", store_trajectory=True)
+        if not final_ok and _phase4_yaw_applied:
+            node.get_logger().warn(
+                "[PHASE4_YAW] candidate execution IK/path failed; retrying "
+                "unchanged FINAL orientation with recomputed TCP")
+            final_target = _baseline_final_target
+            orientation = _baseline_final_orientation
+            tcp_xyz = _baseline_tcp_xyz
+            closure_offset_base = _baseline_offset_base
+            _phase4_yaw_applied = False
+            final_ok = _direct_ik_move(
+                node, final_target, label="FINAL",
+                motion_type="final", store_trajectory=True)
+        if not final_ok and _final_approach_yaw_applied:
+            _yaw_fallback_tcp, _yaw_fallback_offset = (
+                closure_center_corrected_tcp(
+                    desired_grasp_xyz,
+                    _pre_final_approach_yaw_orientation,
+                    closure_offset_tcp))
+            _yaw_fallback_target = [
+                *_yaw_fallback_tcp, *_pre_final_approach_yaw_orientation]
+            node.get_logger().warn(
+                "[FINAL_APPROACH_YAW] adjusted FINAL failed IK/path; "
+                "retrying unchanged APPROACH orientation")
+            final_ok = _direct_ik_move(
+                node, _yaw_fallback_target, label="FINAL_YAW_FALLBACK",
+                motion_type="final", store_trajectory=True)
+            if final_ok:
+                orientation = list(_pre_final_approach_yaw_orientation)
+                tcp_xyz = list(_yaw_fallback_tcp)
+                closure_offset_base = list(_yaw_fallback_offset)
+                final_target = list(_yaw_fallback_target)
+                _final_approach_yaw_applied = False
         if not final_ok:
             if _used_side_low_tilt:
-                approach_orientation_target = [gx, gy, gz, *_approach_orientation_for_final]
+                _fallback_tcp_xyz, _fallback_offset_base = closure_center_corrected_tcp(
+                    desired_grasp_xyz, _approach_orientation_for_final,
+                    closure_offset_tcp)
+                approach_orientation_target = [
+                    *_fallback_tcp_xyz, *_approach_orientation_for_final]
                 node.get_logger().warn(
-                    "FINAL tilted IK failed — retrying with original approach orientation")
+                    "FINAL tilted IK failed — retrying with original approach "
+                    "orientation and its recomputed closure-centre TCP")
                 final_ok = _direct_ik_move(
                     node, approach_orientation_target, label="FINAL_APPROACH_ORIENT",
                     motion_type="final", store_trajectory=True)
@@ -3887,6 +4306,79 @@ def plan_and_execute(node):
             node.get_logger().warn(
                 "[FINAL_REACHED] Actual TCP unavailable before gripper close")
 
+        # Observation only: briefly resume live detection at the actual FINAL pose
+        # so the vision overlay can verify the physical red fingertips around the
+        # selected date. This stage never changes the target or commands motion.
+        _verify_s = max(0.0, float(getattr(
+            node.cfg.planner, "final_visual_verification_s", 0.7)))
+        if _verify_s > 0.0:
+            node.latest_fingertip_verification = None
+            node.latest_fingertip_verification_time = 0.0
+            node.get_logger().info(
+                f"[FINGERTIP_VERIFY] Observing FINAL pose for {_verify_s:.1f}s")
+            _vision_resume()
+            time.sleep(_verify_s)
+            _vision_pause()
+            _verification = getattr(node, "latest_fingertip_verification", None)
+            if _verification and _verification.startswith("FIT "):
+                node.get_logger().info(
+                    "[FINGERTIP_VERIFY] WITHIN: date is inside the detected "
+                    f"physical fingertip triangle; possible result=ALIGNED | {_verification}")
+            elif _verification and _verification.startswith("POSSIBLE_FIT "):
+                node.get_logger().info(
+                    "[FINGERTIP_VERIFY] POSSIBLY WITHIN: date is centered between "
+                    "the two visible physical fingertips; confidence is lower because "
+                    f"the third tip is occluded | possible result=ALIGNED_2_TIPS | {_verification}")
+            elif _verification and _verification.startswith("NOT_FIT "):
+                node.get_logger().warn(
+                    "[FINGERTIP_VERIFY] NOT WITHIN: date is not sufficiently "
+                    f"inside the fingertip triangle; possible result=MISALIGNED | {_verification}")
+            elif _verification and _verification.startswith("NEED_2_TIPS"):
+                node.get_logger().warn(
+                    "[FINGERTIP_VERIFY] INCONCLUSIVE: fewer than two physical "
+                    f"red fingertips were detected; possible result=OCCLUDED/LOW_LIGHT | {_verification}")
+            else:
+                node.get_logger().warn(
+                    "[FINGERTIP_VERIFY] INCONCLUSIVE: no fresh selected-date fit "
+                    f"was available; possible result=NO_TARGET/NO_FRAME | {_verification or 'NO_RESULT'}")
+
+            # Phase 5 is deliberately observation-only. Convert the measured
+            # image residual into a bounded image-plane suggestion for sign and
+            # scale calibration; do not map it to robot axes or command motion.
+            if bool(getattr(node.cfg.planner, "phase5_center_logging_enabled", True)):
+                _match = re.search(
+                    r"^(FIT|NOT_FIT) tips=3 containment=([0-9.]+) "
+                    r"dx=([+-]?[0-9.]+)px dy=([+-]?[0-9.]+)px$",
+                    _verification or "")
+                if _match:
+                    _state = _match.group(1)
+                    _containment = float(_match.group(2))
+                    _dx_px = float(_match.group(3))
+                    _dy_px = float(_match.group(4))
+                    _px_per_mm = max(0.1, float(getattr(
+                        node.cfg.planner, "phase5_center_px_per_mm", 4.0)))
+                    _limit_mm = max(0.0, float(getattr(
+                        node.cfg.planner, "phase5_center_max_correction_mm", 3.0)))
+                    _deadband_px = max(0.0, float(getattr(
+                        node.cfg.planner, "phase5_center_deadband_px", 4.0)))
+                    _du_mm = float(np.clip(_dx_px / _px_per_mm, -_limit_mm, _limit_mm))
+                    _dv_mm = float(np.clip(_dy_px / _px_per_mm, -_limit_mm, _limit_mm))
+                    _centered = (
+                        abs(_dx_px) <= _deadband_px
+                        and abs(_dy_px) <= _deadband_px
+                        and _state == "FIT")
+                    _result = "CENTERED" if _centered else "CORRECTION_SUGGESTED"
+                    node.get_logger().info(
+                        f"[PHASE5_CENTER] mode=OBSERVE_ONLY result={_result} tips=3 "
+                        f"containment={_containment:.2f} error_px=[{_dx_px:+.1f},{_dy_px:+.1f}] "
+                        f"suggest_image_mm=[u:{_du_mm:+.1f},v:{_dv_mm:+.1f}] "
+                        f"scale={_px_per_mm:.1f}px/mm clamp={_limit_mm:.1f}mm "
+                        "robot_correction=NOT_APPLIED camera_to_tool_mapping=UNVALIDATED")
+                else:
+                    node.get_logger().warn(
+                        "[PHASE5_CENTER] mode=OBSERVE_ONLY result=INCONCLUSIVE "
+                        f"robot_correction=NOT_APPLIED reason={_verification or 'NO_RESULT'}")
+
         _t_grasp = time.time()
         node.control_gripper("CLOSE")
         time.sleep(float(getattr(
@@ -3938,7 +4430,7 @@ def plan_and_execute(node):
 
                 # Lateral correction: imbalance between left (F0) and right (F2).
                 # Keep this in semantic axes; add_axis_offsets maps it to the
-                # active robot profile (old: X lateral/Y depth, new: Y lateral/X depth).
+                # old robot axes: X lateral, Y depth.
                 lateral_imbalance = f0 - f2
                 lateral_correction = -float(lateral_imbalance) * 0.008  # ~8mm per 1N imbalance
                 lateral_correction = max(-0.02, min(0.02, lateral_correction))  # clamp ±20mm

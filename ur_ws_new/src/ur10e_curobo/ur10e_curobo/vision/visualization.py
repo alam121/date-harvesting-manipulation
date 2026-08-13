@@ -10,7 +10,7 @@ from .config import (
     DRAW_ONLY_BEST, DRAW_TOP_N, SHOW_REJECTED, SKIP_DRAW,
     SHOW_CLASSIFICATION_ZONES, CLASS_ZONE_MID_LEFT_THRESH, CLASS_ZONE_MID_RIGHT_THRESH,
     CLASS_ZONE_LOW_LEFT_THRESH, CLASS_ZONE_LOW_RIGHT_THRESH, APPROACH_CHECK_DIST,
-    SHOW_GAP_DEBUG,
+    SHOW_GAP_DEBUG, SHOW_FINGER_CONTACTS,
 )
 from .math_utils import project_point_to_image
 from .scoring import estimate_fruit_radius
@@ -26,6 +26,7 @@ class VisionVisualizer:
         self.show_classification_zones = SHOW_CLASSIFICATION_ZONES
         self.show_gap_debug = SHOW_GAP_DEBUG
         self._s = 1.0  # active draw scale, set per-frame in render_frame
+        self.last_fingertip_verification = "NO_TARGET"
 
     # ------------------------------------------------------------------
     # Helpers that respect the active draw scale
@@ -334,8 +335,204 @@ class VisionVisualizer:
 
         if is_best:
             self._draw_approach_arrows(image, target, cx, cy, x1, y1, w_roi, h_roi)
+            self.draw_fingertip_contacts(image, target)
 
         self._draw_target_labels(image, target, cx, cy, is_best, idx)
+
+    def draw_fingertip_contacts(
+        self,
+        image: np.ndarray,
+        target: Dict[str, Any],
+    ) -> None:
+        """Draw the predicted three-finger contact patches for the best date."""
+        if not SHOW_FINGER_CONTACTS:
+            return
+        contacts = target.get("finger_contacts")
+        if not contacts:
+            return
+        points = np.asarray(contacts.get("points_px", []), dtype=np.float32)
+        center = contacts.get("center_px")
+        if points.shape != (3, 2) or center is None:
+            return
+
+        x1, y1, _, y2 = target["bb"]
+        absolute = [
+            (int(round(x1 + float(point[0]))), int(round(y1 + float(point[1]))))
+            for point in points
+        ]
+        center_abs = (
+            int(round(x1 + float(center[0]))),
+            int(round(y1 + float(center[1]))),
+        )
+        patch_radius = max(
+            self._radius(4),
+            int(round(float(contacts.get("patch_radius_px", 4.0)))),
+        )
+        colors = [
+            (0, 255, 255, 255),   # F1 yellow
+            (255, 0, 255, 255),   # F2 magenta
+            (255, 255, 0, 255),   # F3 cyan
+        ]
+        valid = bool(contacts.get("valid", False))
+        outline = (0, 255, 0, 255) if valid else (0, 80, 255, 255)
+
+        cv2.polylines(
+            image, [np.asarray(absolute, dtype=np.int32).reshape((-1, 1, 2))],
+            isClosed=True, color=outline, thickness=self._thick(2),
+            lineType=cv2.LINE_AA,
+        )
+        for idx, (point, color) in enumerate(zip(absolute, colors), start=1):
+            cv2.circle(image, point, patch_radius, color, self._thick(2), cv2.LINE_AA)
+            cv2.circle(image, point, self._radius(3), color, -1, cv2.LINE_AA)
+            cv2.putText(
+                image, f"F{idx}",
+                (point[0] + self._radius(5), point[1] - self._radius(5)),
+                cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45), color,
+                self._thick(1), cv2.LINE_AA,
+            )
+        cv2.drawMarker(
+            image, center_abs, outline, markerType=cv2.MARKER_CROSS,
+            markerSize=self._radius(14), thickness=self._thick(2),
+            line_type=cv2.LINE_AA,
+        )
+
+        score = float(contacts.get("score", 0.0))
+        state = "CONTACT OK" if valid else "CONTACT LOW"
+        label_y = min(image.shape[0] - self._radius(8), y2 + self._radius(20))
+        cv2.putText(
+            image, f"{state} {score:.0%}",
+            (max(2, x1), max(self._radius(18), label_y)),
+            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55), outline,
+            self._thick(2), cv2.LINE_AA,
+        )
+
+    def draw_actual_fingertip_verification(
+        self,
+        source: np.ndarray,
+        image: np.ndarray,
+        target: Optional[Dict[str, Any]],
+    ) -> None:
+        """Detect the three physical red fingertips and verify date containment."""
+        if target is None or target.get("mask_resized") is None:
+            self.last_fingertip_verification = "NO_TARGET"
+            return
+
+        bgr = source[:, :, :3]
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        red = cv2.inRange(hsv, (0, 105, 65), (12, 255, 255))
+        red |= cv2.inRange(hsv, (168, 105, 65), (179, 255, 255))
+        red = cv2.morphologyEx(
+            red, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        red = cv2.morphologyEx(
+            red, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+
+        x1, y1, x2, y2 = target["bb"]
+        bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+        pad_x, pad_y = int(1.2 * bw), int(1.2 * bh)
+        rx1, ry1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+        rx2 = min(image.shape[1], x2 + pad_x)
+        ry2 = min(image.shape[0], y2 + pad_y)
+        roi = red[ry1:ry2, rx1:rx2]
+        count, _, stats, centroids = cv2.connectedComponentsWithStats(roi, 8)
+        min_area = max(12, int(0.0015 * bw * bh))
+        max_area = max(min_area + 1, int(0.45 * bw * bh))
+        blobs = []
+        fruit_center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if not (min_area <= area <= max_area):
+                continue
+            cx = float(centroids[idx, 0] + rx1)
+            cy = float(centroids[idx, 1] + ry1)
+            distance = float(np.linalg.norm(np.array([cx, cy]) - fruit_center))
+            blobs.append((distance, -area, (cx, cy), area))
+        blobs.sort()
+        points = [entry[2] for entry in blobs[:3]]
+
+        if len(points) == 2:
+            p1 = np.asarray(points[0], dtype=np.float32)
+            p2 = np.asarray(points[1], dtype=np.float32)
+            segment = p2 - p1
+            span = float(np.linalg.norm(segment))
+            if span > 1.0:
+                along = float(np.dot(fruit_center - p1, segment) / (span * span))
+                closest = p1 + np.clip(along, 0.0, 1.0) * segment
+                cross_error = float(np.linalg.norm(fruit_center - closest))
+            else:
+                along = -1.0
+                cross_error = float("inf")
+            span_ok = 0.50 * min(bw, bh) <= span <= 3.5 * max(bw, bh)
+            between = 0.15 <= along <= 0.85
+            centered = cross_error <= 0.35 * max(span, 1.0)
+            possible_fit = span_ok and between and centered
+            state = "POSSIBLE_FIT" if possible_fit else "NOT_FIT"
+            self.last_fingertip_verification = (
+                f"{state} tips=2 between={between} "
+                f"along={along:.2f} cross={cross_error:.1f}px span={span:.1f}px")
+            color = (0, 255, 255, 255) if possible_fit else (0, 165, 255, 255)
+            p1i = tuple(np.round(p1).astype(int))
+            p2i = tuple(np.round(p2).astype(int))
+            cv2.line(image, p1i, p2i, color, self._thick(3), cv2.LINE_AA)
+            for index, point in enumerate((p1i, p2i), 1):
+                cv2.circle(image, point, self._radius(9), (255, 255, 0, 255),
+                           self._thick(3), cv2.LINE_AA)
+                cv2.putText(image, f"R{index}", (point[0] + 5, point[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                            (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
+            cv2.putText(image, self.last_fingertip_verification,
+                        (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                        self._font(0.58), color, self._thick(2), cv2.LINE_AA)
+            return
+
+        if len(points) != 3:
+            self.last_fingertip_verification = f"NEED_2_TIPS detected={len(points)}"
+            cv2.putText(
+                image, self.last_fingertip_verification,
+                (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                self._font(0.62), (0, 165, 255, 255), self._thick(2), cv2.LINE_AA)
+            return
+
+        triangle = np.asarray(points, dtype=np.float32)
+        hull = cv2.convexHull(triangle).reshape(-1, 2)
+        triangle_area = abs(float(cv2.contourArea(hull)))
+        center_inside = cv2.pointPolygonTest(
+            hull, (float(fruit_center[0]), float(fruit_center[1])), False) >= 0
+
+        mask = target["mask_resized"] > 0
+        ys, xs = np.nonzero(mask)
+        if xs.size:
+            sample_stride = max(1, xs.size // 1500)
+            samples = np.column_stack((xs[::sample_stride] + x1,
+                                       ys[::sample_stride] + y1))
+            inside = sum(
+                cv2.pointPolygonTest(hull, (float(px), float(py)), False) >= 0
+                for px, py in samples)
+            containment = inside / max(1, len(samples))
+        else:
+            containment = 0.0
+        area_ok = triangle_area >= 0.12 * bw * bh
+        fit = center_inside and area_ok and containment >= 0.50
+        tri_center = triangle.mean(axis=0)
+        dx = float(fruit_center[0] - tri_center[0])
+        dy = float(fruit_center[1] - tri_center[1])
+        state = "FIT" if fit else "NOT_FIT"
+        self.last_fingertip_verification = (
+            f"{state} tips=3 containment={containment:.2f} "
+            f"dx={dx:+.1f}px dy={dy:+.1f}px")
+
+        color = (0, 255, 0, 255) if fit else (0, 165, 255, 255)
+        cv2.polylines(image, [hull.astype(np.int32).reshape(-1, 1, 2)],
+                      True, color, self._thick(3), cv2.LINE_AA)
+        for index, point in enumerate(points, 1):
+            center = (int(round(point[0])), int(round(point[1])))
+            cv2.circle(image, center, self._radius(9), (255, 255, 0, 255),
+                       self._thick(3), cv2.LINE_AA)
+            cv2.putText(image, f"R{index}", (center[0] + 5, center[1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                        (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
+        cv2.putText(image, self.last_fingertip_verification,
+                    (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                    self._font(0.58), color, self._thick(2), cv2.LINE_AA)
 
     def _draw_approach_arrows(
         self,
@@ -655,11 +852,23 @@ class VisionVisualizer:
                     debug["cy"] *= s
                     debug["r"] *= s
                     t["_ring_debug"] = debug
+                if t.get("finger_contacts") is not None:
+                    contacts = dict(t["finger_contacts"])
+                    if contacts.get("center_px") is not None:
+                        contacts["center_px"] = np.asarray(
+                            contacts["center_px"], dtype=np.float32) * s
+                    contacts["points_px"] = np.asarray(
+                        contacts.get("points_px", []), dtype=np.float32) * s
+                    contacts["patch_radius_px"] = float(
+                        contacts.get("patch_radius_px", 0.0)) * s
+                    t["finger_contacts"] = contacts
                 return t
             targets = [_scale_target(t) for t in targets]
             rejected_targets = [_scale_target(t) for t in rejected_targets]
             if viz_only:
                 viz_only = [_scale_target(t) for t in viz_only]
+
+        verification_source = image.copy()
 
         if lidar_uv is not None and lidar_pts_cam is not None:
             self.draw_lidar_points(image, lidar_uv * self.display_scale, lidar_pts_cam)
@@ -688,6 +897,12 @@ class VisionVisualizer:
             self.draw_target(image, t, is_best=(i == best_idx), idx=i)
             if i == best_idx:
                 self.draw_gap_debug(image, t)
+
+        verification_target = (
+            targets[best_idx]
+            if best_idx is not None and 0 <= best_idx < len(targets) else None)
+        self.draw_actual_fingertip_verification(
+            verification_source, image, verification_target)
 
         self.draw_hud(image, net_fps, loop_fps)
 

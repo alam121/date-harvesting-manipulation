@@ -1,11 +1,12 @@
 # ur10e_curobo/managers/state_manager.py
 """Robot state management for UR10e cuRobo node."""
 
+import math
 import threading
 from typing import Optional, List, Tuple, TYPE_CHECKING
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Vector3Stamped, PointStamped
 from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import InteractiveMarkerFeedback
@@ -59,6 +60,20 @@ class StateManager:
         # Branch gap detection (for 2-finger mode)
         self.fruit_between_branches: bool = False
         self.fruit_gap_angle: float = 0.0
+        self.fruit_contact_roll_valid: bool = False
+        self.fruit_contact_roll: float = 0.0
+        self.fruit_contact_roll_score: float = 0.0
+        self.fruit_contact_roll_stable: bool = False
+        self.fruit_contact_roll_samples: int = 0
+        self.fruit_contact_roll_spread_deg: float = float("inf")
+        self._fruit_contact_roll_history: List[float] = []
+        self.safe_grasp_candidate = None
+        self.fruit_major_axis_angle: float = 0.0
+        self.fruit_major_axis_confidence: float = 0.0
+        self.fruit_major_axis_stable: bool = False
+        self.fruit_major_axis_samples: int = 0
+        self.fruit_major_axis_spread_deg: float = float("inf")
+        self._fruit_major_axis_history: List[float] = []
 
         # Normalised image-space bounding-box centre of best fruit [cx_norm, cy_norm]
         # cx_norm: 0=left, 1=right  |  cy_norm: 0=top, 1=bottom
@@ -128,6 +143,22 @@ class StateManager:
             Float32MultiArray,
             "/datefruit_gap_info",
             self._gap_info_cb,
+            10
+        )
+
+        # Evaluation-only ranked three-finger rotations from the vision node.
+        # Forward these through the main motion-node logger so field runs need
+        # only one captured log. This callback never changes motion state.
+        self._node.create_subscription(
+            String,
+            "/vision/grasp_candidates",
+            self._grasp_candidates_cb,
+            10
+        )
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/vision/grasp_candidate_selection",
+            self._grasp_candidate_selection_cb,
             10
         )
 
@@ -256,10 +287,120 @@ class StateManager:
         self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
 
     def _gap_info_cb(self, msg: Float32MultiArray) -> None:
-        """Store branch gap detection results for 2-finger mode."""
+        """Store branch-gap and vision-selected three-finger roll results."""
         if len(msg.data) >= 2:
             self.fruit_between_branches = msg.data[0] > 0.5
             self.fruit_gap_angle = float(msg.data[1])
+        if len(msg.data) >= 5:
+            self.fruit_contact_roll_valid = msg.data[2] > 0.5
+            self.fruit_contact_roll_score = float(msg.data[4])
+            if self.fruit_contact_roll_valid:
+                raw_roll = float(msg.data[3])
+                period = 2.0 * math.pi / 3.0  # three-finger symmetry
+                history = self._fruit_contact_roll_history
+                if history:
+                    reference = sum(history) / len(history)
+                    unwrapped = reference + (
+                        (raw_roll - reference + period / 2.0) % period
+                        - period / 2.0)
+                    reset_jump = math.radians(float(getattr(
+                        self._config.cfg.planner,
+                        "low_center_tool_roll_reset_jump_deg", 25.0)))
+                    if abs(unwrapped - reference) > reset_jump:
+                        history.clear()
+                        unwrapped = raw_roll
+                else:
+                    unwrapped = raw_roll
+                history.append(unwrapped)
+                stable_frames = max(2, int(getattr(
+                    self._config.cfg.planner,
+                    "low_center_tool_roll_stable_frames", 4)))
+                del history[:-max(stable_frames + 3, 7)]
+                recent = history[-stable_frames:]
+                spread = max(recent) - min(recent) if len(recent) > 1 else float("inf")
+                max_spread = math.radians(float(getattr(
+                    self._config.cfg.planner,
+                    "low_center_tool_roll_max_spread_deg", 8.0)))
+                self.fruit_contact_roll_stable = (
+                    len(recent) >= stable_frames and spread <= max_spread)
+                self.fruit_contact_roll_samples = len(recent)
+                self.fruit_contact_roll_spread_deg = math.degrees(spread)
+                self.fruit_contact_roll = sum(recent) / len(recent)
+            else:
+                self._fruit_contact_roll_history.clear()
+                self.fruit_contact_roll_stable = False
+                self.fruit_contact_roll_samples = 0
+                self.fruit_contact_roll_spread_deg = float("inf")
+        else:
+            self.fruit_contact_roll_valid = False
+            self.fruit_contact_roll_score = 0.0
+            self._fruit_contact_roll_history.clear()
+            self.fruit_contact_roll_stable = False
+            self.fruit_contact_roll_samples = 0
+            self.fruit_contact_roll_spread_deg = float("inf")
+        if len(msg.data) >= 7:
+            self.fruit_major_axis_confidence = float(msg.data[6])
+            raw_axis = float(msg.data[5])
+            # Axial data repeats every pi. Unwrap each observation about the
+            # recent estimate so +89/-89 degrees remain only 2 degrees apart.
+            history = self._fruit_major_axis_history
+            if history:
+                reference = sum(history) / len(history)
+                unwrapped = reference + (
+                    (raw_axis - reference + math.pi / 2.0) % math.pi
+                    - math.pi / 2.0)
+            else:
+                unwrapped = raw_axis
+            history.append(unwrapped)
+            stable_frames = max(2, int(getattr(
+                self._config.cfg.planner,
+                "approach_date_axis_stable_frames", 5)))
+            del history[:-max(stable_frames + 3, 8)]
+            recent = history[-stable_frames:]
+            spread = max(recent) - min(recent) if len(recent) > 1 else float("inf")
+            max_spread = math.radians(float(getattr(
+                self._config.cfg.planner,
+                "approach_date_axis_max_spread_deg", 8.0)))
+            self.fruit_major_axis_angle = sum(recent) / len(recent)
+            self.fruit_major_axis_samples = len(recent)
+            self.fruit_major_axis_spread_deg = math.degrees(spread)
+            self.fruit_major_axis_stable = (
+                len(recent) >= stable_frames and spread <= max_spread)
+        else:
+            self._fruit_major_axis_history.clear()
+            self.fruit_major_axis_angle = 0.0
+            self.fruit_major_axis_confidence = 0.0
+            self.fruit_major_axis_stable = False
+            self.fruit_major_axis_samples = 0
+            self.fruit_major_axis_spread_deg = float("inf")
+
+    def _grasp_candidates_cb(self, msg: String) -> None:
+        """Mirror Phase-3 evaluation results into the main application log."""
+        if msg.data:
+            self._node.get_logger().info(msg.data)
+            mapping = list(getattr(
+                self._config.cfg.planner, "grasp_visual_to_force_map", [0, 1, 2]))
+            if len(mapping) == 3:
+                self._node.get_logger().info(
+                    "[GRASP_CHANNEL_MAP] "
+                    f"visual_F1->force{int(mapping[0]) + 1} "
+                    f"visual_F2->force{int(mapping[1]) + 1} "
+                    f"visual_F3->force{int(mapping[2]) + 1} "
+                    "status=UNVALIDATED")
+
+    def _grasp_candidate_selection_cb(self, msg: Float32MultiArray) -> None:
+        """Store the frozen, validated Phase-4 candidate handoff."""
+        if len(msg.data) < 9:
+            return
+        self.safe_grasp_candidate = {
+            "available": bool(msg.data[0] > 0.5),
+            "delta_deg": float(msg.data[1]),
+            "psi_deg": float(msg.data[2]),
+            "score": float(msg.data[3]),
+            "minimum_score": float(msg.data[4]),
+            "score_loss": float(msg.data[5]),
+            "target_xyz": [float(v) for v in msg.data[6:9]],
+        }
 
     def _fruit_image_norm_cb(self, msg: Float32MultiArray) -> None:
         if len(msg.data) >= 2:

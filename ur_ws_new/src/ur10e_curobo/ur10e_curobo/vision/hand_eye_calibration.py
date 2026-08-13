@@ -184,7 +184,7 @@ def main():
     )
     parser.add_argument(
         "--robot-profile",
-        choices=("new", "old"),
+        choices=("old",),
         default=os.getenv("UR10E_ROBOT_PROFILE", "old").strip().lower(),
         help="physical robot being calibrated (default: UR10E_ROBOT_PROFILE or old)",
     )

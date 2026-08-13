@@ -118,6 +118,11 @@ class UR10eCuroboMoveIt(Node):
         self._vision_mode_state = None
         self._vision_paused_event = threading.Event()
         self.create_subscription(String, "/vision/mode_state", self._vision_mode_state_cb, 10)
+        self.latest_fingertip_verification = None
+        self.latest_fingertip_verification_time = 0.0
+        self.create_subscription(
+            String, "/vision/fingertip_verification",
+            self._fingertip_verification_cb, 10)
         self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
         # Active robot type + environment for the RViz panel. Republished periodically so
         # the panel shows it regardless of who started first.
@@ -267,6 +272,11 @@ class UR10eCuroboMoveIt(Node):
         self._vision_mode_state = msg.data
         if msg.data == "paused":
             self._vision_paused_event.set()
+
+    def _fingertip_verification_cb(self, msg: String):
+        """Cache the latest physical fingertip/date fit result for FINAL logging."""
+        self.latest_fingertip_verification = msg.data
+        self.latest_fingertip_verification_time = time.time()
 
     def wait_for_vision_paused(self, timeout: float = 0.30) -> bool:
         """Block until the vision node confirms it has paused and drained in-flight
@@ -1410,6 +1420,33 @@ class UR10eCuroboMoveIt(Node):
                     self.get_logger().info(
                         f"Environment switched to {requested_environment!r}; "
                         "HOME/DROPOFF and all related joint presets updated")
+        elif cmd.startswith("set_final_offsets "):
+            try:
+                values = [float(value) for value in cmd.split()[1:]]
+                self._config_mgr.set_final_offsets(values)
+            except ValueError as exc:
+                self.get_logger().error(f"Final-offset update rejected: {exc}")
+            else:
+                self.get_logger().info(
+                    "Final grasp offsets updated from RViz (metres): "
+                    + ", ".join(f"{value:+.3f}" for value in values))
+        elif cmd.startswith("set_closure_center_offsets "):
+            if self._motion_lock.locked() or self.motion_phase != "IDLE":
+                self.get_logger().warn(
+                    "Closure-center update rejected: robot motion is active")
+            else:
+                try:
+                    values = [float(value) for value in cmd.split()[1:]]
+                    self._config_mgr.set_closure_center_offsets(values)
+                except ValueError as exc:
+                    self.get_logger().error(
+                        f"Closure-center update rejected: {exc}")
+                else:
+                    self.get_logger().info(
+                        "[CLOSURE_CENTER_SETTINGS] updated from RViz "
+                        f"offset_tcp_mm=[{values[0]*1000:+.1f},"
+                        f"{values[1]*1000:+.1f},{values[2]*1000:+.1f}] "
+                        "effective=NEXT_GRASP")
         elif cmd == "safe_zone_enable":
             getattr(self, "enable_safe_zone", lambda: None)()
         elif cmd == "safe_zone_disable":
@@ -2748,6 +2785,26 @@ class UR10eCuroboMoveIt(Node):
         self._state_mgr.fruit_direction = value
 
     @property
+    def fruit_major_axis_angle(self):
+        return self._state_mgr.fruit_major_axis_angle
+
+    @property
+    def fruit_major_axis_confidence(self):
+        return self._state_mgr.fruit_major_axis_confidence
+
+    @property
+    def fruit_major_axis_stable(self):
+        return self._state_mgr.fruit_major_axis_stable
+
+    @property
+    def fruit_major_axis_samples(self):
+        return self._state_mgr.fruit_major_axis_samples
+
+    @property
+    def fruit_major_axis_spread_deg(self):
+        return self._state_mgr.fruit_major_axis_spread_deg
+
+    @property
     def fruit_image_norm(self):
         return self._state_mgr.fruit_image_norm
 
@@ -2758,6 +2815,42 @@ class UR10eCuroboMoveIt(Node):
     @property
     def fruit_bunch_rel_y(self):
         return self._state_mgr.fruit_bunch_rel_y
+
+    @property
+    def fruit_between_branches(self):
+        return self._state_mgr.fruit_between_branches
+
+    @property
+    def fruit_gap_angle(self):
+        return self._state_mgr.fruit_gap_angle
+
+    @property
+    def fruit_contact_roll_valid(self):
+        return self._state_mgr.fruit_contact_roll_valid
+
+    @property
+    def fruit_contact_roll(self):
+        return self._state_mgr.fruit_contact_roll
+
+    @property
+    def fruit_contact_roll_score(self):
+        return self._state_mgr.fruit_contact_roll_score
+
+    @property
+    def fruit_contact_roll_stable(self):
+        return self._state_mgr.fruit_contact_roll_stable
+
+    @property
+    def fruit_contact_roll_samples(self):
+        return self._state_mgr.fruit_contact_roll_samples
+
+    @property
+    def fruit_contact_roll_spread_deg(self):
+        return self._state_mgr.fruit_contact_roll_spread_deg
+
+    @property
+    def safe_grasp_candidate(self):
+        return self._state_mgr.safe_grasp_candidate
 
     # ============ BACKWARD COMPATIBILITY PROPERTIES (Phase 3: MotionExecutor) ============
 

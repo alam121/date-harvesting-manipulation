@@ -25,9 +25,8 @@ LOW_Z_THRESH = 0.94
 # Lateral threshold (m) from trunk center to classify LEFT/RIGHT vs CENTER.
 LATERAL_THRESH = 0.03
 
-# Change these when moving the software between robots / locations.
-# The launcher can override these with UR10E_ROBOT_PROFILE / UR10E_ENVIRONMENT.
-ROBOT_PROFILE = os.environ.get("UR10E_ROBOT_PROFILE", "old").strip().lower()
+# Only the old physical robot is supported. Environment remains selectable.
+ROBOT_PROFILE = "old"
 ENVIRONMENT   = os.environ.get("UR10E_ENVIRONMENT", "outdoor").strip().lower()
 
 # Joint configs depend on BOTH the robot (mounting/kinematics) and the environment (where
@@ -66,12 +65,12 @@ _NEW_LAB_JOINTS = {
 
 _OLD_LAB_JOINTS = {
     "home": [
-        5.108725070953369, -1.794300218621725, 2.4091363588916224,
-        1.6457602220722656, 4.382841110229492, -0.23138553300966436,
+        -1.4994238058673304, -0.7151940625957032, 1.7512252966510218,
+        -4.656813760797018, -1.7659905592547815, 1.1700091361999512,
     ],
     "dropoff": [
-        -2.362258497868673, -1.5946093998351039, 2.3843892256366175,
-        -2.6575151882567347, 4.8416242599487305, -0.17230397859682256,
+        -1.90818959871401, -1.079150215988495, 2.008786980305807,
+        -3.1874824963011683, -1.4845169226275843, 0.9511620998382568,
     ],
     "predropoff": [
         -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
@@ -163,13 +162,6 @@ _OLD_OUTDOOR_JOINTS = {
 }
 
 ROBOT_PROFILES = {
-    "new": {
-        "x_forward_y_lateral": True,
-        "environments": {
-            "lab": {"joints": _NEW_LAB_JOINTS},
-            "outdoor": {"joints": _NEW_OUTDOOR_JOINTS},
-        },
-    },
     "old": {
         "x_forward_y_lateral": False,
         "environments": {
@@ -186,7 +178,6 @@ if ROBOT_PROFILE not in ROBOT_PROFILES:
 
 ACTIVE_ROBOT_PROFILE = ROBOT_PROFILES[ROBOT_PROFILE]
 X_FORWARD_Y_LATERAL = ACTIVE_ROBOT_PROFILE["x_forward_y_lateral"]
-
 _ENVIRONMENTS = ACTIVE_ROBOT_PROFILE["environments"]
 if ENVIRONMENT not in _ENVIRONMENTS:
     raise ValueError(
@@ -313,22 +304,22 @@ _GOLFCART_BASE_SCREW_MARKERS = [
 
 _GOLFCART_PALLET_OBSTACLE = {
     # Outdoor pallet collision approximation for cuRobo. This follows the
-    # current RViz pallet orientation: the visible split STL footprint is about
-    # x=[-0.53, 0.59], y=[-0.20, 0.73] in base_link. Keep the top slightly below
-    # z=0 so the UR base can sit on the pallet without start-state collision.
+    # RViz pallet after the requested rotations about base_link Z. Keep the top
+    # slightly below z=0 so the UR base can sit on the pallet without
+    # start-state collision.
     "name": "golfcart_pallet",
     "type": "cuboid",
+    # Rotated -90° about base_link Z to match the pallet STL: dims x/y swapped,
+    # center (x,y)->(y,-x).
     "dims": [1.12, 0.93, 0.12],
     "pose": [0.03, 0.265, -0.08, 1, 0, 0, 0],
     "color": (0.20, 0.45, 0.75, 0.28),
 }
 
-# The lab has a physical table under the arm; outdoor (field/orchard) does not — drop the
-# table obstacle outdoors so it doesn't block low approaches. Applies to both cuRobo
-# planning (WORLD_CONFIG) and RViz visualization, which both derive from STATIC_OBSTACLES.
-STATIC_OBSTACLES = (
-    [_GOLFCART_PALLET_OBSTACLE] if ENVIRONMENT == "outdoor" else [_TABLE_OBSTACLE]
-) + [_TRUNK_OBSTACLE, _TRUNK_VISUAL]
+# Do not model the large table in either environment. The golf-cart pallet
+# support/collision approximation is included in BOTH lab and outdoor. This
+# applies to both cuRobo planning and RViz, which derive from STATIC_OBSTACLES.
+STATIC_OBSTACLES = [_GOLFCART_PALLET_OBSTACLE, _TRUNK_OBSTACLE, _TRUNK_VISUAL]
 
 # Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES.
 # cuRobo's OBB collision checker only reads "cuboid" — cylinders are not loaded.
@@ -540,9 +531,8 @@ class Planner:
     low_side_home_min_goal_z_m: float = 0.55    # below this, skip fixed side-low HOME; use target-local very-low approach
 
 
-    # Offset names below are semantic. They are mapped through ROBOT_PROFILE:
-    # - new robot: depth -> X, lateral -> Y
-    # - old robot: depth -> Y, lateral -> X
+    # Offset names below are semantic for the old robot:
+    # depth -> Y, lateral -> X
     side_home_lateral_offset: float = 0.16      # m; side-home lateral distance from trunk
     side_home_x_offset: float = 0.16            # legacy alias for side_home_lateral_offset
     center_partial_reverse_m: float = 0.20      # m; controlled retreat after a center grasp
@@ -551,7 +541,7 @@ class Planner:
 
     mid_center_approach_depth_offset: float = 0.10
     mid_center_approach_y_offset: float = 0.10  # legacy alias for mid_center_approach_depth_offset
-    mid_center_approach_z_offset: float = -0.05
+    mid_center_approach_z_offset: float = 0.0  # legacy; mid/high APPROACH now uses FINAL grasp Z
     mid_high_left_thresh: float = 0.20      # bunch/image rel-x below this is MID/HIGH LEFT
     mid_high_right_thresh: float = 0.80     # bunch/image rel-x above this is MID/HIGH RIGHT
     low_left_thresh: float = 0.32           # bunch/image rel-x below this is LOW LEFT
@@ -569,9 +559,19 @@ class Planner:
     very_low_center_approach_depth_offset: float = 0.07
     very_low_center_approach_y_offset: float = 0.07  # legacy alias for very_low_center_approach_depth_offset
     very_low_center_approach_z_offset: float = 0.001  # legacy; center approach is derived from insertion angle
+
+
     low_center_insertion_pitch_deg: float = 12.0     # approach from below, then insert upward
     very_low_center_approach_pitch_deg: float = 0.0  # legacy; orientation follows the insertion vector
     low_center_forward_align_max_deg: float = 45.0    # align gripper local +Z with insertion direction
+    low_center_yaw_align_enabled: bool = True         # face tool +Z horizontally toward the date
+    low_center_yaw_align_max_deg: float = 35.0        # bounded world-Z correction
+    dynamic_low_center_tool_roll: bool = False       # preserve current/aligned finger rotation
+    low_center_tool_roll_default_deg: float = 0.0    # no added local +Z roll
+    low_center_tool_roll_min_score: float = 0.60
+    low_center_tool_roll_stable_frames: int = 4
+    low_center_tool_roll_max_spread_deg: float = 8.0
+    low_center_tool_roll_reset_jump_deg: float = 25.0
 
 
     low_left_standoff_lateral: float = 0.12
@@ -599,27 +599,54 @@ class Planner:
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
-    # New robot: final X = detected X + this offset.  A less-negative value
-    # moves the gripper farther forward/deeper into the date cluster.
-    low_center_final_depth_offset: float = -0.009
-    low_center_final_y_offset: float = -0.009   # legacy alias for low_center_final_depth_offset
-    low_center_final_z_offset: float = 0.007    # m; 7mm above detected low-center point
+    # Negative final depth moves the old robot farther forward along -Y,
+    # deeper into the date cluster.
+    low_center_final_depth_offset: float = -0.035
+    low_center_final_y_offset: float = -0.035   # legacy alias for low_center_final_depth_offset
+    low_center_final_z_offset: float = 0.018    # m; 18mm above detected low-center point
 
     mid_center_final_depth_offset: float = -0.015
     mid_center_final_y_offset: float = -0.015   # legacy alias for mid_center_final_depth_offset
     mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
+    # Physical centre of the three fingertip bodies at the calibrated fully
+    # closed harvesting posture, expressed in gripper_tip coordinates (metres).
+    # FINAL commands compensate this rotated offset so the closure centre,
+    # rather than the nominal gripper_tip frame, reaches the grasp point.
+    closure_center_offset_tcp_m: List[float] = field(
+        default_factory=lambda: [-0.004553, -0.002559, -0.016223])
+    # visual F1/F2/F3 -> hardware force-channel indices. Keep identity until
+    # the controlled single-finger correspondence test establishes otherwise.
+    grasp_visual_to_force_map: List[int] = field(
+        default_factory=lambda: [0, 1, 2])
+    phase4_safe_final_yaw_enabled: bool = False # keep finger roll fixed while testing approach yaw
+    phase4_safe_final_yaw_max_deg: float = 35.0
+    phase4_candidate_target_match_m: float = 0.05
+    final_approach_yaw_enabled: bool = False     # deprecated unsafe FINAL-only experiment
+    final_approach_yaw_max_deg: float = 30.0
+    approach_date_axis_enabled: bool = True      # establish date-axis orientation at APPROACH
+    approach_date_axis_max_deg: float = 35.0
+    approach_date_axis_min_confidence: float = 0.20
+    approach_date_axis_stable_frames: int = 5
+    approach_date_axis_max_spread_deg: float = 8.0
+    final_lock_measured_approach_orientation: bool = True # prevent wrist correction during straight insertion
+
 #---------------------------------------------------------------------------------------------------------
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
     final_endpoint_tolerance: float = 0.004     # m; require FINAL TCP within 4mm before closing
+    final_visual_verification_s: float = 0.7    # observation-only camera window at FINAL before close
+    phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
+    phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves
+    phase5_center_max_correction_mm: float = 3.0 # clamp each logged image-axis suggestion
+    phase5_center_deadband_px: float = 4.0      # residual below this is reported as centered
     reverse_initial_wait: float = 0.15          # s; minimum wait after publishing partial reverse
     reverse_final_settle: float = 0.05          # s; settle after reverse stops before hold check
-    reverse_dt_multiplier: float = 3.5          # slower reverse: dt=min_dt*multiplier
-    reverse_velocity_scale: float = 0.25        # dedicated joint velocity limit multiplier
-    reverse_acceleration_scale: float = 0.25    # dedicated joint acceleration limit multiplier
-    reverse_decel_tail_points: int = 14         # stationary endpoint samples for a softer stop
+    reverse_dt_multiplier: float = 5.0          # slow straight-line reverse: 60ms at min_dt=12ms
+    reverse_velocity_scale: float = 0.18        # dedicated low joint-velocity cap for reverse only
+    reverse_acceleration_scale: float = 0.18    # dedicated joint acceleration limit multiplier
+    reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
     grasp_post_close_settle_s: float = 0.10      # closure loop is synchronous; only sensor settle remains
 
 

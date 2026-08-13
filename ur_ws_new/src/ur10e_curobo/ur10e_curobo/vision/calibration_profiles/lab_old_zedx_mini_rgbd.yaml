@@ -1,0 +1,46 @@
+camera_profile: lab_old_zedx_mini_rgbd
+mode: zedx_mini
+description: ZED X Mini used as both RGB camera and native stereo depth camera.
+parent_frame: tool0
+rgb_frame: zed_mini_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed_mini_left_camera_frame
+  translation:
+    x: -0.13986407377638446
+    y: -0.015226243717019822
+    z: 0.08144433446872489
+  quaternion:
+    x: -0.08347906487364183
+    y: 0.0498173666721053
+    z: -0.5894001744184566
+    w: 0.8019706416703621
+  rpy:
+    roll: -0.19386530634552013
+    pitch: -0.018502075368868498
+    yaw: -1.265786311644057
+  matrix:
+  - - 0.30025132874669985
+    - 0.9370458577894765
+    - 0.1783092818263403
+    - -0.13986407377638446
+  - - -0.9536806865264953
+    - 0.2912773602466305
+    - 0.0751707892342985
+    - -0.015226243717019822
+  - - 0.018501019760916296
+    - -0.19262024765672678
+    - 0.9810989514113586
+    - 0.08144433446872489
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: DANIILIDIS
+  mean_error_m: 0.0019957272277719125
+  num_samples: 20
+  calibrated_at: '2026-08-09 13:09:10'
+profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/lab_old_zedx_mini_rgbd.yaml
+robot_profile: old
+environment: lab

@@ -939,6 +939,44 @@ class MainWindow(QtWidgets.QWidget):
         environment_layout.addWidget(self.environment_active_label, 2, 0, 1, 2)
         settings_tab_layout.addWidget(environment_group)
 
+        # Physical closure-centre calibration in the gripper/tool frame. Values
+        # are displayed in millimetres but sent to the motion node in metres.
+        closure_group = QtWidgets.QGroupBox("Closure Center (tool frame, mm)")
+        closure_layout = QtWidgets.QGridLayout(closure_group)
+        self._closure_default_mm = (-4.553, -2.559, -16.223)
+        self.closure_offset_inputs = []
+        for column, (axis, value) in enumerate(zip(
+                ("X", "Y", "Z"), self._closure_default_mm)):
+            closure_layout.addWidget(QtWidgets.QLabel(axis), 0, column)
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-100.0, 100.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" mm")
+            spin.setValue(value)
+            spin.setToolTip(
+                f"Closure-centre offset along tool-local {axis}. "
+                "Takes effect on the next grasp; does not move the robot now.")
+            closure_layout.addWidget(spin, 1, column)
+            self.closure_offset_inputs.append(spin)
+
+        closure_apply = QtWidgets.QPushButton("Apply Runtime")
+        closure_apply.setStyleSheet(
+            "background-color: #1976d2; color: white; font-weight: bold;")
+        closure_apply.clicked.connect(self._apply_closure_center_offsets)
+        closure_layout.addWidget(closure_apply, 2, 0, 1, 2)
+
+        closure_reset = QtWidgets.QPushButton("Reset Default")
+        closure_reset.clicked.connect(self._reset_closure_center_offsets)
+        closure_layout.addWidget(closure_reset, 2, 2)
+
+        closure_note = QtWidgets.QLabel(
+            "Runtime only. Apply while IDLE; used by the next FINAL grasp.")
+        closure_note.setWordWrap(True)
+        closure_note.setStyleSheet("font-size: 8pt; color: #546e7a;")
+        closure_layout.addWidget(closure_note, 3, 0, 1, 3)
+        settings_tab_layout.addWidget(closure_group)
+
         # Velocity Scale
         vel_group = QtWidgets.QGroupBox("Velocity Scale")
         vel_layout = QtWidgets.QVBoxLayout(vel_group)
@@ -1505,6 +1543,22 @@ class MainWindow(QtWidgets.QWidget):
         self.ros.publish_cmd(f"set_environment {environment}")
         self.status_update.emit(
             f"Requested environment: {environment}", False)
+
+    def _apply_closure_center_offsets(self):
+        values_mm = [spin.value() for spin in self.closure_offset_inputs]
+        values_m = [value / 1000.0 for value in values_mm]
+        payload = " ".join(f"{value:.6f}" for value in values_m)
+        self.ros.publish_cmd(f"set_closure_center_offsets {payload}")
+        self.status_update.emit(
+            "Closure center requested: "
+            + ", ".join(f"{axis}={value:+.1f}mm" for axis, value in zip(
+                ("X", "Y", "Z"), values_mm)), False)
+
+    def _reset_closure_center_offsets(self):
+        for spin, value in zip(
+                self.closure_offset_inputs, self._closure_default_mm):
+            spin.setValue(value)
+        self._apply_closure_center_offsets()
 
     def _on_debug_preview_changed(self, state):
         enabled = "true" if state == Qt.Checked else "false"

@@ -172,23 +172,21 @@ class MotionExecutor:
         source_urdf = Path(join_path(get_assets_path(), kinematics["urdf_path"]))
         text = source_urdf.read_text(encoding="utf-8")
 
-        if ROBOT_PROFILE == "old":
-            replacements = {
-                'xyz="-0.008324 0.148998 0.040079"':
-                    'xyz="0 0 -0.174"',
-                'rpy="-0.171298 -0.007406 -3.134152" '
-                'xyz="-0.001111 0.153451 0.081263"':
-                    'rpy="-0.166668 0.013504 0.252667" '
-                    'xyz="0.042550 -0.150154 0.074587"',
-            }
-            for current, previous in replacements.items():
-                if current not in text:
-                    raise RuntimeError(
-                        "Expected new-profile URDF transform not found: "
-                        f"{current}")
-                text = text.replace(current, previous, 1)
-
         camera_profile = load_camera_profile()
+        profile_robot = str(camera_profile.get("robot_profile", "")).lower()
+        profile_environment = str(camera_profile.get("environment", "")).lower()
+        if profile_robot and profile_robot != ROBOT_PROFILE:
+            raise RuntimeError(
+                "Camera calibration robot-profile mismatch: selected "
+                f"{camera_profile.get('camera_profile', '-')!r} is for "
+                f"{profile_robot!r}, but the active robot is {ROBOT_PROFILE!r}")
+        if profile_environment and profile_environment != ENVIRONMENT:
+            raise RuntimeError(
+                "Camera calibration environment mismatch: selected "
+                f"{camera_profile.get('camera_profile', '-')!r} is for "
+                f"{profile_environment!r}, but the active environment is "
+                f"{ENVIRONMENT!r}")
+
         hand_eye = camera_profile.get("hand_eye", {})
         translation = hand_eye.get("translation", {})
         rpy = hand_eye.get("rpy", {})
@@ -651,8 +649,8 @@ class MotionExecutor:
             self.env_marker_pub.publish(marker)
 
     def _publish_golfcart_pallet_marker(self) -> None:
-        """Publish the outdoor pallet STL as a standalone RViz marker."""
-        if ENVIRONMENT != "outdoor" or self.golfcart_pallet_marker_pub is None:
+        """Publish the pallet STL as a standalone RViz marker (lab + outdoor)."""
+        if self.golfcart_pallet_marker_pub is None:
             return
 
         stamp = self._node.get_clock().now().to_msg()
@@ -683,14 +681,14 @@ class MotionExecutor:
                 "golfcart_pallet_front",
                 "package://ur10e_curobo/meshes/Golfcart_pallet_front.stl",
                 (0.34, 0.55, 0.72, 0.45),
-                (-0.500, 0.670, pallet_z),
+                (-0.500, 0.670, pallet_z),  # rotated -90° about base_link Z: (x,y)->(y,-x)
             ),
             (
                 1,
                 "golfcart_pallet_mount",
                 "package://ur10e_curobo/meshes/Golfcart_pallet_mount.stl",
                 (0.45, 0.72, 0.95, 0.78),
-                (-1.920, 0.670, pallet_z),
+                (-1.920, 0.670, pallet_z),  # rotated -90° about base_link Z: (x,y)->(y,-x)
             ),
         )
         for marker_id, ns, resource, color, xyz in meshes:
@@ -708,8 +706,10 @@ class MotionExecutor:
             marker.pose.position.z = xyz[2]
             marker.pose.orientation.x = 0.0
             marker.pose.orientation.y = 0.0
-            marker.pose.orientation.z = -0.7071068
-            marker.pose.orientation.w = 0.7071068
+            # Rotated -90 degrees about base_link Z (yaw). To flip direction to
+            # +90, set z = +0.70710678 and use (x,y)->(-y,x) for the positions.
+            marker.pose.orientation.z = -0.70710678
+            marker.pose.orientation.w = 0.70710678
             marker.scale.x = 0.001
             marker.scale.y = 0.001
             marker.scale.z = 0.001

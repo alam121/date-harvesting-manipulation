@@ -80,7 +80,7 @@ class YoloThread:
         # at inference. Force img_size to the engine's compiled size so a stale
         # DEFAULT_IMG_SIZE can never trigger the "input size N not equal to max
         # model size M" AssertionError. .pt/.onnx return None here and keep the
-        # configured size (they resize freely).
+        # configured size (they resize freely). 
         native = engine_imgsz(self.weights)
         if native is not None and native != self.img_size:
             print(f"[YoloThread] img_size {self.img_size} does not match engine "

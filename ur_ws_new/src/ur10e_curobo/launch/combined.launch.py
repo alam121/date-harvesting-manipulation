@@ -46,8 +46,8 @@ def generate_launch_description():
         description='Launch RViz'
     )
     robot_profile_arg = DeclareLaunchArgument(
-        'robot_profile', default_value=os.getenv('UR10E_ROBOT_PROFILE', 'new'),
-        choices=['new', 'old'], description='Physical robot profile'
+        'robot_profile', default_value='old',
+        choices=['old'], description='Physical robot profile (old robot only)'
     )
     environment_arg = DeclareLaunchArgument(
         'environment', default_value=os.getenv('UR10E_ENVIRONMENT', 'outdoor'),

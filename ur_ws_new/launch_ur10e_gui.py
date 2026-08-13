@@ -31,7 +31,6 @@ class LaunchDialog(QtWidgets.QDialog):
 
         self.robot_profile_combo = QtWidgets.QComboBox()
         self.robot_profile_combo.addItem("Old robot", "old")
-        self.robot_profile_combo.addItem("New robot", "new")
         self._set_combo_data(
             self.robot_profile_combo,
             self.settings.value("robot_profile", "old"),

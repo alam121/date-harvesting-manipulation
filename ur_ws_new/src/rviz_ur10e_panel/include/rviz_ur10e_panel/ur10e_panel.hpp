@@ -9,6 +9,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QKeyEvent>
@@ -105,6 +106,7 @@ private Q_SLOTS:
   void onPlanCancel();
   void onLidarScan();
   void onStabilityRecord();
+  void onApplyFinalOffsets();
   void updateDisplay();
 
 private:
@@ -267,6 +269,10 @@ private:
   QLineEdit * x_in_, * y_in_, * z_in_;
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
   QSpinBox * multi_goal_count_spin_;
+  QDoubleSpinBox * low_center_depth_in_, * low_center_z_in_;
+  QDoubleSpinBox * mid_center_depth_in_, * mid_center_z_in_;
+  QDoubleSpinBox * low_side_depth_in_, * low_left_z_in_, * low_right_z_in_;
+  QDoubleSpinBox * closure_x_in_, * closure_y_in_, * closure_z_in_;
   QCheckBox * debug_preview_cb_;
   QCheckBox * reachability_cloud_cb_;
   QCheckBox * lidar_scan_preview_cb_;

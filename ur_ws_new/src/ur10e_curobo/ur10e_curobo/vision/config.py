@@ -83,6 +83,14 @@ SHOW_REJECTED = False
 SKIP_DRAW = False
 SHOW_CLASSIFICATION_ZONES = False
 SHOW_GAP_DEBUG = False
+SHOW_FINGER_CONTACTS = True
+
+# Selected-date three-finger contact visualisation.  These values affect only
+# the predicted overlay/quality score; they do not alter gripper commands.
+FINGERTIP_CONTACT_RADIUS_M = 0.006
+FINGER_CONTACT_RADIAL_FRACTION = 0.68
+FINGER_CONTACT_ROTATION_SAMPLES = 24
+FINGER_CONTACT_MIN_SCORE = 0.60
 CLASS_ZONE_MID_LEFT_THRESH = 0.20
 CLASS_ZONE_MID_RIGHT_THRESH = 0.80
 
@@ -155,7 +163,7 @@ ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN
 ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED One (15 max at QHDPLUS)
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
 ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
-ZEDMINI_DEPTH_Z_MAX = 2.0    # reject distant background behind nearby fruit
+ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.

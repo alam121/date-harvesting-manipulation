@@ -1,6 +1,7 @@
 # ur10e_curobo/managers/config_manager.py
 """Configuration management for UR10e cuRobo node."""
 
+import math
 from typing import List, TYPE_CHECKING
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
@@ -109,6 +110,27 @@ class ConfigManager:
         self._node.declare_parameter("planner.low_side_final_y_offset", self.cfg.planner.low_side_final_y_offset)
         self._node.declare_parameter("planner.low_left_final_z_offset", self.cfg.planner.low_left_final_z_offset)
         self._node.declare_parameter("planner.low_right_final_z_offset", self.cfg.planner.low_right_final_z_offset)
+        self._node.declare_parameter("planner.low_center_final_depth_offset", self.cfg.planner.low_center_final_depth_offset)
+        self._node.declare_parameter("planner.low_center_final_z_offset", self.cfg.planner.low_center_final_z_offset)
+        self._node.declare_parameter("planner.mid_center_final_depth_offset", self.cfg.planner.mid_center_final_depth_offset)
+        self._node.declare_parameter("planner.mid_center_final_z_offset", self.cfg.planner.mid_center_final_z_offset)
+        self._node.declare_parameter("planner.closure_center_offset_tcp_m", self.cfg.planner.closure_center_offset_tcp_m)
+        self._node.declare_parameter("planner.grasp_visual_to_force_map", self.cfg.planner.grasp_visual_to_force_map)
+        self._node.declare_parameter("planner.phase4_safe_final_yaw_enabled", self.cfg.planner.phase4_safe_final_yaw_enabled)
+        self._node.declare_parameter("planner.phase4_safe_final_yaw_max_deg", self.cfg.planner.phase4_safe_final_yaw_max_deg)
+        self._node.declare_parameter("planner.phase4_candidate_target_match_m", self.cfg.planner.phase4_candidate_target_match_m)
+        self._node.declare_parameter("planner.final_approach_yaw_enabled", self.cfg.planner.final_approach_yaw_enabled)
+        self._node.declare_parameter("planner.final_approach_yaw_max_deg", self.cfg.planner.final_approach_yaw_max_deg)
+        self._node.declare_parameter("planner.approach_date_axis_enabled", self.cfg.planner.approach_date_axis_enabled)
+        self._node.declare_parameter("planner.approach_date_axis_max_deg", self.cfg.planner.approach_date_axis_max_deg)
+        self._node.declare_parameter("planner.approach_date_axis_min_confidence", self.cfg.planner.approach_date_axis_min_confidence)
+        self._node.declare_parameter("planner.approach_date_axis_stable_frames", self.cfg.planner.approach_date_axis_stable_frames)
+        self._node.declare_parameter("planner.approach_date_axis_max_spread_deg", self.cfg.planner.approach_date_axis_max_spread_deg)
+        self._node.declare_parameter("planner.final_lock_measured_approach_orientation", self.cfg.planner.final_lock_measured_approach_orientation)
+        self._node.declare_parameter("planner.phase5_center_logging_enabled", self.cfg.planner.phase5_center_logging_enabled)
+        self._node.declare_parameter("planner.phase5_center_px_per_mm", self.cfg.planner.phase5_center_px_per_mm)
+        self._node.declare_parameter("planner.phase5_center_max_correction_mm", self.cfg.planner.phase5_center_max_correction_mm)
+        self._node.declare_parameter("planner.phase5_center_deadband_px", self.cfg.planner.phase5_center_deadband_px)
         self._node.declare_parameter("planner.low_side_final_front_tilt_deg", self.cfg.planner.low_side_final_front_tilt_deg)
         self._node.declare_parameter("planner.bunch_lower_center_band", self.cfg.planner.bunch_lower_center_band)
         self._node.declare_parameter("planner.final_overshoot_threshold", self.cfg.planner.final_overshoot_threshold)
@@ -198,6 +220,44 @@ class ConfigManager:
         self.cfg.planner.low_side_final_y_offset = float(self._node.get_parameter("planner.low_side_final_y_offset").value)
         self.cfg.planner.low_left_final_z_offset = float(self._node.get_parameter("planner.low_left_final_z_offset").value)
         self.cfg.planner.low_right_final_z_offset = float(self._node.get_parameter("planner.low_right_final_z_offset").value)
+        self.cfg.planner.low_center_final_depth_offset = float(self._node.get_parameter("planner.low_center_final_depth_offset").value)
+        self.cfg.planner.low_center_final_z_offset = float(self._node.get_parameter("planner.low_center_final_z_offset").value)
+        self.cfg.planner.mid_center_final_depth_offset = float(self._node.get_parameter("planner.mid_center_final_depth_offset").value)
+        self.cfg.planner.mid_center_final_z_offset = float(self._node.get_parameter("planner.mid_center_final_z_offset").value)
+        self.cfg.planner.closure_center_offset_tcp_m = list(
+            self._node.get_parameter("planner.closure_center_offset_tcp_m").value)
+        self.cfg.planner.grasp_visual_to_force_map = list(
+            self._node.get_parameter("planner.grasp_visual_to_force_map").value)
+        self.cfg.planner.phase4_safe_final_yaw_enabled = bool(
+            self._node.get_parameter("planner.phase4_safe_final_yaw_enabled").value)
+        self.cfg.planner.phase4_safe_final_yaw_max_deg = float(
+            self._node.get_parameter("planner.phase4_safe_final_yaw_max_deg").value)
+        self.cfg.planner.phase4_candidate_target_match_m = float(
+            self._node.get_parameter("planner.phase4_candidate_target_match_m").value)
+        self.cfg.planner.final_approach_yaw_enabled = bool(
+            self._node.get_parameter("planner.final_approach_yaw_enabled").value)
+        self.cfg.planner.final_approach_yaw_max_deg = float(
+            self._node.get_parameter("planner.final_approach_yaw_max_deg").value)
+        self.cfg.planner.approach_date_axis_enabled = bool(
+            self._node.get_parameter("planner.approach_date_axis_enabled").value)
+        self.cfg.planner.approach_date_axis_max_deg = float(
+            self._node.get_parameter("planner.approach_date_axis_max_deg").value)
+        self.cfg.planner.approach_date_axis_min_confidence = float(
+            self._node.get_parameter("planner.approach_date_axis_min_confidence").value)
+        self.cfg.planner.approach_date_axis_stable_frames = int(
+            self._node.get_parameter("planner.approach_date_axis_stable_frames").value)
+        self.cfg.planner.approach_date_axis_max_spread_deg = float(
+            self._node.get_parameter("planner.approach_date_axis_max_spread_deg").value)
+        self.cfg.planner.final_lock_measured_approach_orientation = bool(
+            self._node.get_parameter("planner.final_lock_measured_approach_orientation").value)
+        self.cfg.planner.phase5_center_logging_enabled = bool(
+            self._node.get_parameter("planner.phase5_center_logging_enabled").value)
+        self.cfg.planner.phase5_center_px_per_mm = float(
+            self._node.get_parameter("planner.phase5_center_px_per_mm").value)
+        self.cfg.planner.phase5_center_max_correction_mm = float(
+            self._node.get_parameter("planner.phase5_center_max_correction_mm").value)
+        self.cfg.planner.phase5_center_deadband_px = float(
+            self._node.get_parameter("planner.phase5_center_deadband_px").value)
         self.cfg.planner.low_side_final_front_tilt_deg = float(self._node.get_parameter("planner.low_side_final_front_tilt_deg").value)
         self.cfg.planner.bunch_lower_center_band = float(self._node.get_parameter("planner.bunch_lower_center_band").value)
         self.cfg.planner.final_overshoot_threshold = float(self._node.get_parameter("planner.final_overshoot_threshold").value)
@@ -363,6 +423,27 @@ class ConfigManager:
             "planner.low_side_final_y_offset": (self.cfg.planner, "low_side_final_y_offset", float),
             "planner.low_left_final_z_offset": (self.cfg.planner, "low_left_final_z_offset", float),
             "planner.low_right_final_z_offset": (self.cfg.planner, "low_right_final_z_offset", float),
+            "planner.low_center_final_depth_offset": (self.cfg.planner, "low_center_final_depth_offset", float),
+            "planner.low_center_final_z_offset": (self.cfg.planner, "low_center_final_z_offset", float),
+            "planner.mid_center_final_depth_offset": (self.cfg.planner, "mid_center_final_depth_offset", float),
+            "planner.mid_center_final_z_offset": (self.cfg.planner, "mid_center_final_z_offset", float),
+            "planner.closure_center_offset_tcp_m": (self.cfg.planner, "closure_center_offset_tcp_m", list),
+            "planner.grasp_visual_to_force_map": (self.cfg.planner, "grasp_visual_to_force_map", list),
+            "planner.phase4_safe_final_yaw_enabled": (self.cfg.planner, "phase4_safe_final_yaw_enabled", bool),
+            "planner.phase4_safe_final_yaw_max_deg": (self.cfg.planner, "phase4_safe_final_yaw_max_deg", float),
+            "planner.phase4_candidate_target_match_m": (self.cfg.planner, "phase4_candidate_target_match_m", float),
+            "planner.final_approach_yaw_enabled": (self.cfg.planner, "final_approach_yaw_enabled", bool),
+            "planner.final_approach_yaw_max_deg": (self.cfg.planner, "final_approach_yaw_max_deg", float),
+            "planner.approach_date_axis_enabled": (self.cfg.planner, "approach_date_axis_enabled", bool),
+            "planner.approach_date_axis_max_deg": (self.cfg.planner, "approach_date_axis_max_deg", float),
+            "planner.approach_date_axis_min_confidence": (self.cfg.planner, "approach_date_axis_min_confidence", float),
+            "planner.approach_date_axis_stable_frames": (self.cfg.planner, "approach_date_axis_stable_frames", int),
+            "planner.approach_date_axis_max_spread_deg": (self.cfg.planner, "approach_date_axis_max_spread_deg", float),
+            "planner.final_lock_measured_approach_orientation": (self.cfg.planner, "final_lock_measured_approach_orientation", bool),
+            "planner.phase5_center_logging_enabled": (self.cfg.planner, "phase5_center_logging_enabled", bool),
+            "planner.phase5_center_px_per_mm": (self.cfg.planner, "phase5_center_px_per_mm", float),
+            "planner.phase5_center_max_correction_mm": (self.cfg.planner, "phase5_center_max_correction_mm", float),
+            "planner.phase5_center_deadband_px": (self.cfg.planner, "phase5_center_deadband_px", float),
             "planner.low_side_final_front_tilt_deg": (self.cfg.planner, "low_side_final_front_tilt_deg", float),
             "planner.bunch_lower_center_band": (self.cfg.planner, "bunch_lower_center_band", float),
             "planner.final_overshoot_threshold": (self.cfg.planner, "final_overshoot_threshold", float),
@@ -394,3 +475,44 @@ class ConfigManager:
                 setattr(obj, attr, cast(p.value))
                 self._node.get_logger().info(f"Parameter updated: {p.name} = {p.value}")
         return SetParametersResult(successful=True)
+
+    def set_final_offsets(self, values) -> None:
+        """Apply the operator's runtime FINAL target corrections in metres."""
+        names = (
+            "low_center_final_depth_offset",
+            "low_center_final_z_offset",
+            "mid_center_final_depth_offset",
+            "mid_center_final_z_offset",
+            "low_side_final_depth_offset",
+            "low_left_final_z_offset",
+            "low_right_final_z_offset",
+        )
+        if len(values) != len(names):
+            raise ValueError(f"expected {len(names)} final offsets, got {len(values)}")
+        if any(abs(float(value)) > 0.1 for value in values):
+            raise ValueError("final offsets must be within +/-0.1 m")
+        results = self._node.set_parameters([
+            Parameter(f"planner.{name}", value=float(value))
+            for name, value in zip(names, values)
+        ])
+        rejected = [result.reason for result in results if not result.successful]
+        if rejected:
+            raise ValueError("; ".join(rejected))
+
+    def set_closure_center_offsets(self, values) -> None:
+        """Apply the three tool-frame closure-centre offsets in metres."""
+        if len(values) != 3:
+            raise ValueError(
+                f"expected 3 closure-center offsets, got {len(values)}")
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError("closure-center offsets must be finite")
+        if any(abs(float(value)) > 0.1 for value in values):
+            raise ValueError("closure-center offsets must be within +/-0.1 m")
+        results = self._node.set_parameters([
+            Parameter(
+                "planner.closure_center_offset_tcp_m",
+                value=[float(value) for value in values])
+        ])
+        rejected = [result.reason for result in results if not result.successful]
+        if rejected:
+            raise ValueError("; ".join(rejected))

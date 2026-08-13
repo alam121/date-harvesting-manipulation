@@ -353,6 +353,106 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   environment_layout->addWidget(environment_apply);
   layout->addWidget(environment_group);
 
+  // Runtime grasp-target correction. Values are displayed in millimetres so
+  // operators can tune small physical errors without editing config.py.
+  auto * final_offsets_group = new QGroupBox("Final Grasp Offsets (mm)");
+  auto * final_offsets_layout = new QGridLayout(final_offsets_group);
+  auto make_offset_input = [](double value) {
+    auto * input = new QDoubleSpinBox();
+    input->setRange(-100.0, 100.0);
+    input->setDecimals(1);
+    input->setSingleStep(1.0);
+    input->setValue(value);
+    input->setSuffix(" mm");
+    return input;
+  };
+  low_center_depth_in_ = make_offset_input(-35.0);
+  low_center_z_in_ = make_offset_input(18.0);
+  mid_center_depth_in_ = make_offset_input(-15.0);
+  mid_center_z_in_ = make_offset_input(30.0);
+  low_side_depth_in_ = make_offset_input(0.0);
+  low_left_z_in_ = make_offset_input(20.0);
+  low_right_z_in_ = make_offset_input(10.0);
+  final_offsets_layout->addWidget(new QLabel("Target"), 0, 0);
+  final_offsets_layout->addWidget(new QLabel("Depth"), 0, 1);
+  final_offsets_layout->addWidget(new QLabel("Z"), 0, 2);
+  final_offsets_layout->addWidget(new QLabel("Low center"), 1, 0);
+  final_offsets_layout->addWidget(low_center_depth_in_, 1, 1);
+  final_offsets_layout->addWidget(low_center_z_in_, 1, 2);
+  final_offsets_layout->addWidget(new QLabel("Mid/high center"), 2, 0);
+  final_offsets_layout->addWidget(mid_center_depth_in_, 2, 1);
+  final_offsets_layout->addWidget(mid_center_z_in_, 2, 2);
+  auto * low_side_label = new QLabel("Low side\n(side approach enabled)");
+  low_side_label->setToolTip(
+    "These offsets are used only when the planner selects a low LEFT/RIGHT side approach");
+  final_offsets_layout->addWidget(low_side_label, 3, 0, 2, 1);
+  final_offsets_layout->addWidget(low_side_depth_in_, 3, 1);
+  final_offsets_layout->addWidget(new QLabel("Left Z"), 3, 2);
+  final_offsets_layout->addWidget(low_left_z_in_, 3, 3);
+  final_offsets_layout->addWidget(new QLabel("Right Z"), 4, 2);
+  final_offsets_layout->addWidget(low_right_z_in_, 4, 3);
+  auto * apply_final_offsets = new QPushButton("Apply Final Offsets");
+  apply_final_offsets->setToolTip(
+    "Apply immediately to subsequent FINAL moves; does not change hand-eye calibration");
+  connect(apply_final_offsets, &QPushButton::clicked,
+    this, &UR10ePanel::onApplyFinalOffsets);
+  final_offsets_layout->addWidget(apply_final_offsets, 5, 0, 1, 2);
+  auto * reset_final_offsets = new QPushButton("Reset to Defaults");
+  reset_final_offsets->setToolTip(
+    "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
+  connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
+    low_center_depth_in_->setValue(-35.0);
+    low_center_z_in_->setValue(18.0);
+    mid_center_depth_in_->setValue(-15.0);
+    mid_center_z_in_->setValue(30.0);
+    low_side_depth_in_->setValue(0.0);
+    low_left_z_in_->setValue(20.0);
+    low_right_z_in_->setValue(10.0);
+    onApplyFinalOffsets();
+    status_label_->setText("Final grasp offsets reset to defaults");
+  });
+  final_offsets_layout->addWidget(reset_final_offsets, 5, 2, 1, 2);
+
+  // Tool-frame closure centre: where the three physical fingers converge.
+  // This is separate from target depth/Z and is applied to the next grasp only.
+  auto * closure_group = new QGroupBox("Closure Center Offset (tool frame, mm)");
+  auto * closure_layout = new QGridLayout(closure_group);
+  closure_x_in_ = make_offset_input(-4.553);
+  closure_y_in_ = make_offset_input(-2.559);
+  closure_z_in_ = make_offset_input(-16.223);
+  for (auto * input : {closure_x_in_, closure_y_in_, closure_z_in_}) {
+    input->setDecimals(3);
+  }
+  closure_layout->addWidget(new QLabel("X"), 0, 0);
+  closure_layout->addWidget(new QLabel("Y"), 0, 1);
+  closure_layout->addWidget(new QLabel("Z"), 0, 2);
+  closure_layout->addWidget(closure_x_in_, 1, 0);
+  closure_layout->addWidget(closure_y_in_, 1, 1);
+  closure_layout->addWidget(closure_z_in_, 1, 2);
+  auto * apply_closure = new QPushButton("Apply Closure Center");
+  apply_closure->setToolTip(
+    "Apply to subsequent FINAL grasps while the robot is IDLE; no immediate motion");
+  connect(apply_closure, &QPushButton::clicked, this, [this]() {
+    std::ostringstream cmd;
+    cmd << std::fixed << std::setprecision(6)
+        << "set_closure_center_offsets "
+        << closure_x_in_->value() / 1000.0 << " "
+        << closure_y_in_->value() / 1000.0 << " "
+        << closure_z_in_->value() / 1000.0;
+    publishCmd(cmd.str());
+    status_label_->setText("Closure-center offset requested for next grasp");
+  });
+  closure_layout->addWidget(apply_closure, 2, 0, 1, 2);
+  auto * reset_closure = new QPushButton("Reset to Defaults");
+  connect(reset_closure, &QPushButton::clicked, this, [this, apply_closure]() {
+    closure_x_in_->setValue(-4.553);
+    closure_y_in_->setValue(-2.559);
+    closure_z_in_->setValue(-16.223);
+    apply_closure->click();
+    status_label_->setText("Closure-center offset reset to defaults");
+  });
+  closure_layout->addWidget(reset_closure, 2, 2);
+
   // Motion phase + reacquire result (side by side)
   auto * phase_row = new QHBoxLayout();
 
@@ -409,6 +509,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   tabs->addTab(heat_tab, "Heat");
   tabs->addTab(gripper_joints_tab, "Grip Joints");
   tabs->addTab(settings_tab, "Settings");
+  settings_tab_layout->addWidget(final_offsets_group);
+  settings_tab_layout->addWidget(closure_group);
 
   auto * gripper_joint_help = new QLabel(
     "M1–M12 calibration. Release a slider to preview the full posture. "
@@ -2532,6 +2634,21 @@ void UR10ePanel::onApplyVelocity()
   std::ostringstream ss;
   ss << "set_velocity_scale " << std::fixed << std::setprecision(2) << scale;
   publishCmd(ss.str());
+}
+
+void UR10ePanel::onApplyFinalOffsets()
+{
+  std::ostringstream cmd;
+  cmd << std::fixed << std::setprecision(6) << "set_final_offsets "
+      << low_center_depth_in_->value() / 1000.0 << " "
+      << low_center_z_in_->value() / 1000.0 << " "
+      << mid_center_depth_in_->value() / 1000.0 << " "
+      << mid_center_z_in_->value() / 1000.0 << " "
+      << low_side_depth_in_->value() / 1000.0 << " "
+      << low_left_z_in_->value() / 1000.0 << " "
+      << low_right_z_in_->value() / 1000.0;
+  publishCmd(cmd.str());
+  status_label_->setText("Final grasp offsets applied for subsequent goals");
 }
 
 void UR10ePanel::onVelocityPreset()

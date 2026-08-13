@@ -1,0 +1,47 @@
+camera_profile: outdoor_old_zedx_mini_rgbd
+robot_profile: old
+environment: outdoor
+mode: zedx_mini
+description: Initial old-robot outdoor seed copied from the preserved old/lab mount
+  calibration; replace by running hand-eye calibration on the outdoor robot.
+parent_frame: tool0
+rgb_frame: zed_mini_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed_mini_left_camera_frame
+  translation:
+    x: -0.07854553651885351
+    y: -0.0899023211174762
+    z: 0.07442050824956326
+  quaternion:
+    x: -0.09403213570922798
+    y: 0.02153566887274594
+    z: -0.2436260159701581
+    w: 0.9650598617509035
+  rpy:
+    roll: -0.19318774872254052
+    pitch: -0.004250942744693287
+    yaw: -0.49414800920310453
+  matrix:
+  - - 0.8803651586174235
+    - 0.46617728870610625
+    - 0.08738376844209975
+    - -0.07854553651885351
+  - - -0.47427746845823043
+    - 0.8636086435929393
+    - 0.17099998135794026
+    - -0.0899023211174762
+  - - 0.004250929941918018
+    - -0.19198657819281878
+    - 0.9813883448403296
+    - 0.07442050824956326
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: DANIILIDIS
+  mean_error_m: 0.0031703897179105526
+  num_samples: 22
+  calibrated_at: '1970-01-01 03:07:10'
+profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/outdoor_old_zedx_mini_rgbd.yaml

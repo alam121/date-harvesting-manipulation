@@ -37,7 +37,7 @@ def contextual_profile_name(
         "UR10E_ROBOT_PROFILE", "old")).strip().lower()
     env = (environment or os.getenv(
         "UR10E_ENVIRONMENT", "outdoor")).strip().lower()
-    if robot not in ("new", "old"):
+    if robot != "old":
         raise ValueError(f"unsupported robot profile: {robot!r}")
     if env not in ("lab", "outdoor"):
         raise ValueError(f"unsupported environment: {env!r}")

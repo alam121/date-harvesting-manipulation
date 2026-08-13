@@ -88,9 +88,9 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "robot_profile",
-            default_value=os.getenv("UR10E_ROBOT_PROFILE", "new"),
-            choices=["new", "old"],
-            description="Select robot-specific mount transforms.",
+            default_value="old",
+            choices=["old"],
+            description="Old robot mount transforms.",
         )
     )
     declared_arguments.append(

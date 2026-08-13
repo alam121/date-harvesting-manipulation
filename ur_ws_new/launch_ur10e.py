@@ -57,8 +57,8 @@ def load_robot_profile() -> str:
                 profile = ast.literal_eval(node.value)
             except (ValueError, SyntaxError):
                 profile = os.environ.get("UR10E_ROBOT_PROFILE", "old")
-            if profile not in ("new", "old"):
-                raise ValueError(f"ROBOT_PROFILE must be 'new' or 'old', got {profile!r}")
+            if profile != "old":
+                raise ValueError(f"ROBOT_PROFILE must be 'old', got {profile!r}")
             return profile
     raise RuntimeError(f"ROBOT_PROFILE not found in {ROBOT_CONFIG_SOURCE}")
 
@@ -74,7 +74,7 @@ def kinematics_file_for(robot_profile: str) -> Path:
     return (
         Path(WS) / "install" / "ur_description" / "share" / "ur_description"
         / "config" / "ur10e"
-        / ("default_kinematics.yaml" if robot_profile == "new" else "old_kinematics.yaml")
+        / "old_kinematics.yaml"
     )
 
 RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
@@ -507,11 +507,7 @@ def main():
 
     # Extract modifier flags
     fake_hardware = "fake" in args
-    robot_profile = DEFAULT_ROBOT_PROFILE
-    if any(a in args for a in ("robot_new", "new_robot")):
-        robot_profile = "new"
-    elif any(a in args for a in ("robot_old", "old_robot")):
-        robot_profile = "old"
+    robot_profile = "old"
     environment = DEFAULT_ENVIRONMENT
     if "lab" in args:
         environment = "lab"
@@ -540,7 +536,7 @@ def main():
         if a not in (
             "fake", "lidar", "zed_mini", "zedx_mini", "charuco", "aruco", "chessboard",
             "qhdplus", "qhd+", "4k", "hd1080", "1080", "1080p",
-            "robot_old", "robot_new", "old_robot", "new_robot",
+            "robot_old", "old_robot",
             "lab", "outdoor", "field_env",
             "gripper_old", "gripper_new", "old_gripper", "new_gripper",
             "gripper_on", "gripper_off", "use_gripper", "no_gripper",
@@ -552,7 +548,7 @@ def main():
     nodes = [arg for arg in args if arg in valid and arg not in ("bringup", "ur")]
 
     if not nodes and not bringup_only:
-        print("Usage: launch_ur10e [fake] [robot_old|robot_new] [lab|outdoor] [gripper_old|gripper_new] [gripper_on|gripper_off] [harvest|field] [lidar|zed_mini|zedx_mini] [charuco|chessboard] [qhdplus|4k|hd1080] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye] [extrinsic]")
+        print("Usage: launch_ur10e [fake] [lab|outdoor] [gripper_old|gripper_new] [gripper_on|gripper_off] [harvest|field] [lidar|zed_mini|zedx_mini] [charuco|chessboard] [qhdplus|4k|hd1080] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye] [extrinsic]")
         print()
         print("Presets:")
         print("  harvest  - Real robot + main + vision with ZED X Mini RGBD")
@@ -560,8 +556,7 @@ def main():
         print()
         print("Options:")
         print("  fake      - Use fake/simulated hardware (no real robot)")
-        print("  robot_old - Use old UR10e mounting/kinematics profile")
-        print("  robot_new - Use new UR10e mounting/kinematics profile")
+        print("  robot_old - Old UR10e profile (the only supported robot)")
         print("  lab       - Use the lab hand-eye calibration and joint presets")
         print("  outdoor   - Use the outdoor hand-eye calibration and joint presets")
         print("  gripper_old - Use old calibrated gripper open/close postures")
@@ -597,7 +592,7 @@ def main():
         print("  launch_harvest                       # Short wrapper for the harvest preset")
         print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
         print("  launch_ur10e fake main               # Fake hardware + main")
-        print("  launch_ur10e robot_new gripper_new fake main # New robot/gripper profiles in fake mode")
+        print("  launch_ur10e gripper_new fake main  # Old robot with new gripper in fake mode")
         print("  launch_ur10e gripper_off main       # Robot control without Delto gripper")
         print("  launch_ur10e main teleop             # Real robot + main + teleop")
         print("  launch_ur10e calibrate               # Grasp force calibration only")
