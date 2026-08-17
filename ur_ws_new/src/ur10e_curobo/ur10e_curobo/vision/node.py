@@ -235,6 +235,7 @@ class VisionNode:
         # ROS2 setup — init once for the lifetime of the process
         rclpy.init()
         self.node = rclpy.create_node("zed_date_detector_ros")
+        self.node.declare_parameter("vision.log_grasp_candidate_details", False)
         self.executor = MultiThreadedExecutor(num_threads=4)
 
         fast_qos = QoSProfile(
@@ -246,6 +247,8 @@ class VisionNode:
 
         goal_pub = self.node.create_publisher(PoseStamped, "/external_goal_pose", fast_qos)
         dir_pub = self.node.create_publisher(Vector3Stamped, "/datefruit_direction", 10)
+        self.date_tip_pub = self.node.create_publisher(
+            PointStamped, "/datefruit_tip_point", 10)
         depth_pub = self.node.create_publisher(PointCloud2, "/zed_depth_pointcloud", 10)
         trunk_pub     = self.node.create_publisher(PointStamped, "/trunk_position",     10)
         trunk_cam_pub = self.node.create_publisher(PointStamped, "/trunk_position_cam", 10)
@@ -2561,6 +2564,13 @@ class VisionNode:
                 "safe_candidate_psi=unavailable safe_delta=unavailable "
                 "safe_decision=NO_SAFE_CANDIDATE"
             )
+        log_candidate_details = bool(self.node.get_parameter(
+            "vision.log_grasp_candidate_details").value)
+        detail_text = (
+            f" count={len(record['candidates'])} | " + " | ".join(compact)
+            if log_candidate_details else
+            f" count={len(record['candidates'])} details=SUPPRESSED"
+        )
         summary = (
             f"[GRASP_CANDIDATES] evaluation_only frozen_pre_motion=True "
             f"target_id={record['fruit_id']} age={age_s:.2f}s "
@@ -2579,8 +2589,7 @@ class VisionNode:
             f"winner_psi={record['candidates'][0]['psi_deg']:.1f}deg "
             f"proposed_local_delta={delta_text} "
             f"decision={'YAW_PROPOSED' if unambiguous else 'YAW_AMBIGUOUS'} "
-            f"{safe_text} "
-            f"count={len(record['candidates'])} | " + " | ".join(compact)
+            f"{safe_text}" + detail_text
         )
         self.node.get_logger().info(summary)
         message = StdString()
@@ -2666,6 +2675,21 @@ class VisionNode:
         _t_tf: Optional[np.ndarray] = None
         if self._cached_tf_base is not None:
             _R_tf, _t_tf = self._cached_tf_base
+
+        # Publish the depth-supported heatmap peak as the selected fruit's 3D
+        # aim point. Motion applies its own temporal/proximity validation.
+        _tip_cam = t_best.get("best_point_3d")
+        if _tip_cam is not None and _R_tf is not None and _t_tf is not None:
+            _tip_cam = np.asarray(_tip_cam, dtype=float)
+            if _tip_cam.shape == (3,) and np.all(np.isfinite(_tip_cam)):
+                _tip_base = _R_tf @ _tip_cam + _t_tf
+                _tip_msg = PointStamped()
+                _tip_msg.header.frame_id = "base_link"
+                _tip_msg.header.stamp = self.node.get_clock().now().to_msg()
+                _tip_msg.point.x = float(_tip_base[0])
+                _tip_msg.point.y = float(_tip_base[1])
+                _tip_msg.point.z = float(_tip_base[2])
+                self.date_tip_pub.publish(_tip_msg)
 
         # Smooth best heatmap point
         best_pt = t_best.get("best_point2d")
@@ -2905,6 +2929,24 @@ class VisionNode:
                 contact_angle_base = float(math.atan2(
                     contact_dir_base[2], contact_dir_base[0]))
 
+            # Ellipse fitting is optional. A target may be valid even when the
+            # fit returned None, so never let missing orientation metadata kill
+            # the long-running perception thread.
+            ellipse_angle = t_best.get("ellipse_angle")
+            ellipse_confidence = t_best.get("ellipse_confidence")
+            try:
+                ellipse_angle = float(ellipse_angle)
+            except (TypeError, ValueError):
+                ellipse_angle = 90.0
+            if not math.isfinite(ellipse_angle):
+                ellipse_angle = 90.0
+            try:
+                ellipse_confidence = float(ellipse_confidence)
+            except (TypeError, ValueError):
+                ellipse_confidence = 0.0
+            if not math.isfinite(ellipse_confidence):
+                ellipse_confidence = 0.0
+
             gap_msg = Float32MultiArray()
             gap_msg.data = [
                 1.0 if between_branches else 0.0,
@@ -2914,9 +2956,9 @@ class VisionNode:
                 contact_score,
                 # Signed major-axis deviation from image vertical. Vertical is
                 # zero; 180-degree axis ambiguity is removed by wrapping ±90.
-                float(math.radians((((float(t_best.get("ellipse_angle", 90.0))
-                                      - 90.0) + 90.0) % 180.0) - 90.0)),
-                float(t_best.get("ellipse_confidence", 0.0)),
+                float(math.radians(((((ellipse_angle - 90.0) + 90.0)
+                                      % 180.0) - 90.0))),
+                ellipse_confidence,
             ]
             self.gap_info_pub.publish(gap_msg)
 

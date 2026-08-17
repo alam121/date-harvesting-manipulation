@@ -367,9 +367,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     return input;
   };
   low_center_depth_in_ = make_offset_input(-35.0);
-  low_center_z_in_ = make_offset_input(18.0);
-  mid_center_depth_in_ = make_offset_input(-15.0);
-  mid_center_z_in_ = make_offset_input(30.0);
+  low_center_z_in_ = make_offset_input(7.0);
+  mid_center_depth_in_ = make_offset_input(-35.0);
+  mid_center_z_in_ = make_offset_input(7.0);
   low_side_depth_in_ = make_offset_input(0.0);
   low_left_z_in_ = make_offset_input(20.0);
   low_right_z_in_ = make_offset_input(10.0);
@@ -402,9 +402,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
   connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
     low_center_depth_in_->setValue(-35.0);
-    low_center_z_in_->setValue(18.0);
-    mid_center_depth_in_->setValue(-15.0);
-    mid_center_z_in_->setValue(30.0);
+    low_center_z_in_->setValue(7.0);
+    mid_center_depth_in_->setValue(-35.0);
+    mid_center_z_in_->setValue(7.0);
     low_side_depth_in_->setValue(0.0);
     low_left_z_in_->setValue(20.0);
     low_right_z_in_->setValue(10.0);
@@ -418,7 +418,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * closure_group = new QGroupBox("Closure Center Offset (tool frame, mm)");
   auto * closure_layout = new QGridLayout(closure_group);
   closure_x_in_ = make_offset_input(-4.553);
-  closure_y_in_ = make_offset_input(-2.559);
+  closure_y_in_ = make_offset_input(0.100);
   closure_z_in_ = make_offset_input(-16.223);
   for (auto * input : {closure_x_in_, closure_y_in_, closure_z_in_}) {
     input->setDecimals(3);
@@ -446,12 +446,88 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * reset_closure = new QPushButton("Reset to Defaults");
   connect(reset_closure, &QPushButton::clicked, this, [this, apply_closure]() {
     closure_x_in_->setValue(-4.553);
-    closure_y_in_->setValue(-2.559);
+    closure_y_in_->setValue(0.100);
     closure_z_in_->setValue(-16.223);
     apply_closure->click();
     status_label_->setText("Closure-center offset reset to defaults");
   });
   closure_layout->addWidget(reset_closure, 2, 2);
+
+  // Runtime gripper grasp mode. This publishes through the same /ui_command
+  // path as the other grasp settings; the motion node accepts it only in IDLE.
+  auto * grasp_mode_group = new QGroupBox("Gripper Grasp Mode");
+  auto * grasp_mode_layout = new QGridLayout(grasp_mode_group);
+  auto * grasp_mode_combo = new QComboBox();
+  grasp_mode_combo->addItem("Auto (from date angle)", QString("AUTO"));
+  grasp_mode_combo->addItem("Normal", QString("NORMAL"));
+  grasp_mode_combo->addItem("Envelop (experimental)", QString("ENVELOP"));
+  grasp_mode_combo->setToolTip(
+    "ENVELOP uses the measured M1-M12 open/closed postures. Each mode's FINAL "
+    "depth and Z adjustment is configured below.");
+  grasp_mode_layout->addWidget(new QLabel("Mode"), 0, 0);
+  grasp_mode_layout->addWidget(grasp_mode_combo, 0, 1);
+  auto * apply_grasp_mode = new QPushButton("Apply Grasp Mode");
+  apply_grasp_mode->setStyleSheet(
+    "background-color: #6a1b9a; color: white; font-weight: bold;");
+  connect(apply_grasp_mode, &QPushButton::clicked, this,
+    [this, grasp_mode_combo]() {
+      const QString mode = grasp_mode_combo->currentData().toString();
+      publishCmd("set_grasp_mode " + mode.toStdString());
+      status_label_->setText("Grasp mode requested: " + mode + " (next grasp)");
+    });
+  grasp_mode_layout->addWidget(apply_grasp_mode, 1, 0, 1, 2);
+  auto * grasp_mode_note = new QLabel(
+    "AUTO: horizontal date -> ENVELOP; vertical/uncertain -> NORMAL. Apply while IDLE.");
+  grasp_mode_note->setWordWrap(true);
+  grasp_mode_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  grasp_mode_layout->addWidget(grasp_mode_note, 2, 0, 1, 2);
+
+  // Independent FINAL-pose trims for NORMAL and ENVELOP. Depth follows the
+  // tool insertion axis; Z is vertical in the robot base frame.
+  auto * mode_final_group = new QGroupBox("Mode Final Grasp Adjustments (mm)");
+  auto * mode_final_layout = new QGridLayout(mode_final_group);
+  auto * normal_depth = make_offset_input(0.0);
+  auto * normal_z = make_offset_input(0.0);
+  auto * envelop_depth = make_offset_input(24.0);
+  auto * envelop_z = make_offset_input(5.0);
+  mode_final_layout->addWidget(new QLabel("Mode"), 0, 0);
+  mode_final_layout->addWidget(new QLabel("Depth"), 0, 1);
+  mode_final_layout->addWidget(new QLabel("Z"), 0, 2);
+  mode_final_layout->addWidget(new QLabel("Normal"), 1, 0);
+  mode_final_layout->addWidget(normal_depth, 1, 1);
+  mode_final_layout->addWidget(normal_z, 1, 2);
+  mode_final_layout->addWidget(new QLabel("Envelop"), 2, 0);
+  mode_final_layout->addWidget(envelop_depth, 2, 1);
+  mode_final_layout->addWidget(envelop_z, 2, 2);
+  auto * apply_mode_final = new QPushButton("Apply Mode Final Adjustments");
+  connect(apply_mode_final, &QPushButton::clicked, this,
+    [this, normal_depth, normal_z, envelop_depth, envelop_z]() {
+      std::ostringstream cmd;
+      cmd << std::fixed << std::setprecision(6)
+          << "set_grasp_mode_offsets "
+          << normal_depth->value() / 1000.0 << " "
+          << normal_z->value() / 1000.0 << " "
+          << envelop_depth->value() / 1000.0 << " "
+          << envelop_z->value() / 1000.0;
+      publishCmd(cmd.str());
+      status_label_->setText("Mode-specific FINAL adjustments requested");
+    });
+  mode_final_layout->addWidget(apply_mode_final, 3, 0, 1, 2);
+  auto * reset_mode_final = new QPushButton("Reset Defaults");
+  connect(reset_mode_final, &QPushButton::clicked, this,
+    [normal_depth, normal_z, envelop_depth, envelop_z, apply_mode_final]() {
+      normal_depth->setValue(0.0);
+      normal_z->setValue(0.0);
+      envelop_depth->setValue(24.0);
+      envelop_z->setValue(5.0);
+      apply_mode_final->click();
+    });
+  mode_final_layout->addWidget(reset_mode_final, 3, 2);
+  auto * mode_final_note = new QLabel(
+    "Depth: along tool approach axis. Z: robot base vertical. AUTO applies the selected mode's row.");
+  mode_final_note->setWordWrap(true);
+  mode_final_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  mode_final_layout->addWidget(mode_final_note, 4, 0, 1, 3);
 
   // Motion phase + reacquire result (side by side)
   auto * phase_row = new QHBoxLayout();
@@ -511,6 +587,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   tabs->addTab(settings_tab, "Settings");
   settings_tab_layout->addWidget(final_offsets_group);
   settings_tab_layout->addWidget(closure_group);
+  settings_tab_layout->addWidget(grasp_mode_group);
+  settings_tab_layout->addWidget(mode_final_group);
 
   auto * gripper_joint_help = new QLabel(
     "M1–M12 calibration. Release a slider to preview the full posture. "

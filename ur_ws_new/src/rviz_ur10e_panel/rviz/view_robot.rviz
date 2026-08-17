@@ -7,7 +7,7 @@ Panels:
         - /Global Options1
         - /TF1
       Splitter Ratio: 0.4957627058029175
-    Tree Height: 575
+    Tree Height: 351
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -23,7 +23,7 @@ Panels:
   - Class: rviz_ur10e_panel/UR10ePanel
     Name: UR10e Control
     lidar_scan_preview: 1
-    reachability_cloud: 1
+    reachability_cloud: 0
     velocity_slider: 50
   - Class: rviz_ur10e_panel/LogPanel
     Name: Log Output
@@ -218,11 +218,11 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         zed_mini_left_camera_frame:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+          Value: true
       Mass Properties:
         Inertia: false
         Mass: false
@@ -286,6 +286,8 @@ Visualization Manager:
           Value: false
         tool0:
           Value: false
+        tool0_controller:
+          Value: true
         tool0_to_camera_mount_link:
           Value: false
         upper_arm_link:
@@ -311,7 +313,8 @@ Visualization Manager:
         world:
           base_link:
             base:
-              {}
+              tool0_controller:
+                {}
             base_link_inertia:
               shoulder_link:
                 upper_arm_link:
@@ -342,18 +345,17 @@ Visualization Manager:
                                           {}
                                 gripper_tip:
                                   {}
-                              tool0_to_camera_mount_link:
-                                {}
                               zed2_left_camera_frame:
                                 {}
                               zed_mini_left_camera_frame:
-                                {}
+                                tool0_to_camera_mount_link:
+                                  {}
                           ft_frame:
                             {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
-      Enabled: false
+      Enabled: true
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -365,12 +367,12 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /vision/display
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        voxel_obstacles: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -382,7 +384,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        environment: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -395,6 +397,7 @@ Visualization Manager:
       Enabled: true
       Name: Golfcart Pallet STL
       Namespaces:
+        golfcart_pallet_front: true
         golfcart_pallet_mount: true
         golfcart_robot_screws: true
       Topic:
@@ -409,7 +412,8 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        planned_path: true
+        robot_path: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -422,9 +426,10 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        lidar_scan_preview_labels: true
-        lidar_scan_preview_lines: true
-        lidar_scan_preview_points: true
+        goal_approach: true
+        goal_positions: true
+        plan_preview: true
+        plan_preview_lines: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -455,7 +460,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        safe_zone: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -468,8 +473,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        reachability_cloud: true
-        reachability_directions: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -507,25 +511,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.832263231277466
+      Distance: 0.7820718288421631
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.20429250597953796
-        Y: 0.24112512171268463
-        Z: 0.5924466252326965
+        X: 1.2004836797714233
+        Y: -0.10251505672931671
+        Z: 1.0334436893463135
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.2603985667228699
+      Pitch: 0.4053986668586731
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 5.231751441955566
+      Yaw: 0.6685682535171509
     Saved: ~
 Window Geometry:
   Displays:
@@ -535,7 +539,7 @@ Window Geometry:
   Hide Right Dock: false
   Log Output:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd00000002000000000000029a000003a2fc0200000006fb0000001a0056006900730069006f006e002000430061006d006500720061000000003b000001f30000002800fffffffb000000100044006900730070006c006100790073010000003b000002c1000000c700fffffffb0000001200530065006c0065006300740069006f006e00000001b60000006f0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007300000001ec000000810000005c00fffffffb0000000a00560069006500770073000000023500000106000000a000fffffffb00000014004c006f00670020004f007500740070007500740100000302000000db0000006000ffffff00000001000001da000003a2fc0200000001fb0000001a0055005200310030006500200043006f006e00740072006f006c010000003b000003a20000005c00ffffff000002ba000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000002000000000000029a000003c9fc0200000006fb0000001a0056006900730069006f006e002000430061006d0065007200610100000014000002960000002800fffffffb000000100044006900730070006c0061007900730000000161000001e1000000c700fffffffb0000001200530065006c0065006300740069006f006e00000001b60000006f0000005c00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007300000001ec000000810000005c00fffffffb0000000a00560069006500770073000000023500000106000000a000fffffffb00000014004c006f00670020004f0075007400700075007401000002b00000012d0000006000ffffff00000001000001da000003c9fc0200000001fb0000001a0055005200310030006500200043006f006e00740072006f006c0100000014000003c90000005c00ffffff000002ba000003c900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730000000000ffffffff0000000000000000
   Selection:
     collapsed: false
   Tool Properties:

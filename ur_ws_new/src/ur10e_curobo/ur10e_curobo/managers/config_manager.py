@@ -96,6 +96,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
         self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
         self._node.declare_parameter("planner.direct_final_joint_fallback_max_delta_deg", self.cfg.planner.direct_final_joint_fallback_max_delta_deg)
+        self._node.declare_parameter("planner.strict_final_cartesian_only", self.cfg.planner.strict_final_cartesian_only)
         self._node.declare_parameter("planner.low_left_standoff_lateral", self.cfg.planner.low_left_standoff_lateral)
         self._node.declare_parameter("planner.low_left_standoff_depth", self.cfg.planner.low_left_standoff_depth)
         self._node.declare_parameter("planner.low_left_standoff_x", self.cfg.planner.low_left_standoff_x)
@@ -127,6 +128,21 @@ class ConfigManager:
         self._node.declare_parameter("planner.approach_date_axis_stable_frames", self.cfg.planner.approach_date_axis_stable_frames)
         self._node.declare_parameter("planner.approach_date_axis_max_spread_deg", self.cfg.planner.approach_date_axis_max_spread_deg)
         self._node.declare_parameter("planner.final_lock_measured_approach_orientation", self.cfg.planner.final_lock_measured_approach_orientation)
+        self._node.declare_parameter("planner.target_specific_approach_enabled", self.cfg.planner.target_specific_approach_enabled)
+        self._node.declare_parameter("planner.target_specific_approach_max_deg", self.cfg.planner.target_specific_approach_max_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_approach_enabled", self.cfg.planner.mid_high_corridor_approach_enabled)
+        self._node.declare_parameter("planner.mid_high_corridor_inner_angle_deg", self.cfg.planner.mid_high_corridor_inner_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_side_angle_deg", self.cfg.planner.mid_high_corridor_side_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_wide_angle_deg", self.cfg.planner.mid_high_corridor_wide_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_outer_angle_deg", self.cfg.planner.mid_high_corridor_outer_angle_deg)
+        self._node.declare_parameter("planner.mid_high_direction_min_horizontal", self.cfg.planner.mid_high_direction_min_horizontal)
+        self._node.declare_parameter("planner.corridor_date_axis_enabled", self.cfg.planner.corridor_date_axis_enabled)
+        self._node.declare_parameter("planner.corridor_date_axis_min_confidence", self.cfg.planner.corridor_date_axis_min_confidence)
+        self._node.declare_parameter("planner.log_corridor_candidates", self.cfg.planner.log_corridor_candidates)
+        self._node.declare_parameter("planner.tool_axis_tip_aim_enabled", self.cfg.planner.tool_axis_tip_aim_enabled)
+        self._node.declare_parameter("planner.tool_axis_tip_max_age_s", self.cfg.planner.tool_axis_tip_max_age_s)
+        self._node.declare_parameter("planner.tool_axis_tip_max_goal_distance_m", self.cfg.planner.tool_axis_tip_max_goal_distance_m)
+        self._node.declare_parameter("planner.tool_axis_tip_max_swing_deg", self.cfg.planner.tool_axis_tip_max_swing_deg)
         self._node.declare_parameter("planner.phase5_center_logging_enabled", self.cfg.planner.phase5_center_logging_enabled)
         self._node.declare_parameter("planner.phase5_center_px_per_mm", self.cfg.planner.phase5_center_px_per_mm)
         self._node.declare_parameter("planner.phase5_center_max_correction_mm", self.cfg.planner.phase5_center_max_correction_mm)
@@ -206,6 +222,7 @@ class ConfigManager:
         self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
         self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
         self.cfg.planner.direct_final_joint_fallback_max_delta_deg = float(self._node.get_parameter("planner.direct_final_joint_fallback_max_delta_deg").value)
+        self.cfg.planner.strict_final_cartesian_only = bool(self._node.get_parameter("planner.strict_final_cartesian_only").value)
         self.cfg.planner.low_left_standoff_lateral = float(self._node.get_parameter("planner.low_left_standoff_lateral").value)
         self.cfg.planner.low_left_standoff_depth = float(self._node.get_parameter("planner.low_left_standoff_depth").value)
         self.cfg.planner.low_left_standoff_x = float(self._node.get_parameter("planner.low_left_standoff_x").value)
@@ -250,6 +267,36 @@ class ConfigManager:
             self._node.get_parameter("planner.approach_date_axis_max_spread_deg").value)
         self.cfg.planner.final_lock_measured_approach_orientation = bool(
             self._node.get_parameter("planner.final_lock_measured_approach_orientation").value)
+        self.cfg.planner.target_specific_approach_enabled = bool(
+            self._node.get_parameter("planner.target_specific_approach_enabled").value)
+        self.cfg.planner.target_specific_approach_max_deg = float(
+            self._node.get_parameter("planner.target_specific_approach_max_deg").value)
+        self.cfg.planner.mid_high_corridor_approach_enabled = bool(
+            self._node.get_parameter("planner.mid_high_corridor_approach_enabled").value)
+        self.cfg.planner.mid_high_corridor_inner_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_inner_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_side_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_side_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_wide_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_wide_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_outer_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_outer_angle_deg").value)
+        self.cfg.planner.mid_high_direction_min_horizontal = float(
+            self._node.get_parameter("planner.mid_high_direction_min_horizontal").value)
+        self.cfg.planner.corridor_date_axis_enabled = bool(
+            self._node.get_parameter("planner.corridor_date_axis_enabled").value)
+        self.cfg.planner.corridor_date_axis_min_confidence = float(
+            self._node.get_parameter("planner.corridor_date_axis_min_confidence").value)
+        self.cfg.planner.log_corridor_candidates = bool(
+            self._node.get_parameter("planner.log_corridor_candidates").value)
+        self.cfg.planner.tool_axis_tip_aim_enabled = bool(
+            self._node.get_parameter("planner.tool_axis_tip_aim_enabled").value)
+        self.cfg.planner.tool_axis_tip_max_age_s = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_age_s").value)
+        self.cfg.planner.tool_axis_tip_max_goal_distance_m = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_goal_distance_m").value)
+        self.cfg.planner.tool_axis_tip_max_swing_deg = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_swing_deg").value)
         self.cfg.planner.phase5_center_logging_enabled = bool(
             self._node.get_parameter("planner.phase5_center_logging_enabled").value)
         self.cfg.planner.phase5_center_px_per_mm = float(
@@ -409,6 +456,7 @@ class ConfigManager:
             "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
             "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
             "planner.direct_final_joint_fallback_max_delta_deg": (self.cfg.planner, "direct_final_joint_fallback_max_delta_deg", float),
+            "planner.strict_final_cartesian_only": (self.cfg.planner, "strict_final_cartesian_only", bool),
             "planner.low_left_standoff_lateral": (self.cfg.planner, "low_left_standoff_lateral", float),
             "planner.low_left_standoff_depth": (self.cfg.planner, "low_left_standoff_depth", float),
             "planner.low_left_standoff_x": (self.cfg.planner, "low_left_standoff_x", float),
@@ -440,6 +488,21 @@ class ConfigManager:
             "planner.approach_date_axis_stable_frames": (self.cfg.planner, "approach_date_axis_stable_frames", int),
             "planner.approach_date_axis_max_spread_deg": (self.cfg.planner, "approach_date_axis_max_spread_deg", float),
             "planner.final_lock_measured_approach_orientation": (self.cfg.planner, "final_lock_measured_approach_orientation", bool),
+            "planner.target_specific_approach_enabled": (self.cfg.planner, "target_specific_approach_enabled", bool),
+            "planner.target_specific_approach_max_deg": (self.cfg.planner, "target_specific_approach_max_deg", float),
+            "planner.mid_high_corridor_approach_enabled": (self.cfg.planner, "mid_high_corridor_approach_enabled", bool),
+            "planner.mid_high_corridor_inner_angle_deg": (self.cfg.planner, "mid_high_corridor_inner_angle_deg", float),
+            "planner.mid_high_corridor_side_angle_deg": (self.cfg.planner, "mid_high_corridor_side_angle_deg", float),
+            "planner.mid_high_corridor_wide_angle_deg": (self.cfg.planner, "mid_high_corridor_wide_angle_deg", float),
+            "planner.mid_high_corridor_outer_angle_deg": (self.cfg.planner, "mid_high_corridor_outer_angle_deg", float),
+            "planner.mid_high_direction_min_horizontal": (self.cfg.planner, "mid_high_direction_min_horizontal", float),
+            "planner.corridor_date_axis_enabled": (self.cfg.planner, "corridor_date_axis_enabled", bool),
+            "planner.corridor_date_axis_min_confidence": (self.cfg.planner, "corridor_date_axis_min_confidence", float),
+            "planner.log_corridor_candidates": (self.cfg.planner, "log_corridor_candidates", bool),
+            "planner.tool_axis_tip_aim_enabled": (self.cfg.planner, "tool_axis_tip_aim_enabled", bool),
+            "planner.tool_axis_tip_max_age_s": (self.cfg.planner, "tool_axis_tip_max_age_s", float),
+            "planner.tool_axis_tip_max_goal_distance_m": (self.cfg.planner, "tool_axis_tip_max_goal_distance_m", float),
+            "planner.tool_axis_tip_max_swing_deg": (self.cfg.planner, "tool_axis_tip_max_swing_deg", float),
             "planner.phase5_center_logging_enabled": (self.cfg.planner, "phase5_center_logging_enabled", bool),
             "planner.phase5_center_px_per_mm": (self.cfg.planner, "phase5_center_px_per_mm", float),
             "planner.phase5_center_max_correction_mm": (self.cfg.planner, "phase5_center_max_correction_mm", float),

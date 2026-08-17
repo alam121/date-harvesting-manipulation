@@ -39,6 +39,10 @@ class ThreadSafeGoalList:
         with self._lock:
             self._goals.append(goal)
 
+    def insert(self, index, goal):
+        with self._lock:
+            self._goals.insert(index, goal)
+
     def pop(self, index=0):
         with self._lock:
             if self._goals:
@@ -332,6 +336,167 @@ def align_local_axis_to_vector(current_quat, desired_dir, local_axis=(0.0, 0.0, 
     half = angle / 2.0
     q_swing = [math.cos(half), *(math.sin(half) * axis).tolist()]
     return quat_normalize(quat_multiply(q_swing, list(current_quat))), angle
+
+
+def bounded_target_approach_direction(nominal_dir, vision_outward_dir,
+                                      max_delta_deg=25.0):
+    """Return a bounded inward direction from collision-filtered vision data.
+
+    Vision publishes an outward fruit/surface direction. The insertion direction
+    is its opposite. The caller supplies the required vertical policy (level for
+    MID/HIGH or +12 degrees for LOW); only the horizontal heading comes from
+    vision so noisy surface tilt cannot create an unsafe vertical approach.
+    """
+    nominal = np.asarray(nominal_dir, dtype=float)
+    nominal /= max(float(np.linalg.norm(nominal)), 1e-9)
+    if vision_outward_dir is None:
+        return nominal, 0.0, 0.0, False
+    outward = np.asarray(vision_outward_dir, dtype=float)
+    proposed_xy = -outward[:2]
+    xy_norm = float(np.linalg.norm(proposed_xy))
+    if xy_norm < 0.15:
+        return nominal, 0.0, 0.0, False
+    nominal_xy_mag = math.hypot(float(nominal[0]), float(nominal[1]))
+    proposed = np.array([
+        proposed_xy[0] / xy_norm * nominal_xy_mag,
+        proposed_xy[1] / xy_norm * nominal_xy_mag,
+        nominal[2],
+    ], dtype=float)
+    proposed /= max(float(np.linalg.norm(proposed)), 1e-9)
+    dot = float(np.clip(np.dot(nominal, proposed), -1.0, 1.0))
+    requested = math.acos(dot)
+    limit = math.radians(abs(float(max_delta_deg)))
+    applied = min(requested, limit)
+    if requested < 1e-8:
+        return nominal, 0.0, 0.0, True
+    # Normalized interpolation is sufficient here because corrections are <=25°.
+    ratio = applied / requested
+    selected = (1.0 - ratio) * nominal + ratio * proposed
+    selected /= max(float(np.linalg.norm(selected)), 1e-9)
+    return selected, requested, applied, True
+
+
+def select_mid_high_corridor_direction(node, fruit_outward_dir,
+                                       class_label="MID_HIGH"):
+    """Choose a fixed horizontal corridor from selected-date direction only."""
+    planner = node.cfg.planner
+    nominal = np.array(
+        [1.0, 0.0, 0.0] if X_FORWARD_Y_LATERAL
+        else [0.0, -1.0, 0.0], dtype=float)
+    if not bool(getattr(planner, "mid_high_corridor_approach_enabled", True)):
+        return nominal, "STRAIGHT"
+    angle_deg = abs(float(getattr(
+        planner, "mid_high_corridor_side_angle_deg", 20.0)))
+    inner_angle_deg = abs(float(getattr(
+        planner, "mid_high_corridor_inner_angle_deg", 10.0)))
+    wide_angle_deg = abs(float(getattr(
+        planner, "mid_high_corridor_wide_angle_deg", 30.0)))
+    outer_angle_deg = abs(float(getattr(
+        planner, "mid_high_corridor_outer_angle_deg", 45.0)))
+    # World-Z rotation changes only the horizontal approach heading.
+    def rotated(delta):
+        c, s = math.cos(delta), math.sin(delta)
+        return np.array([
+            c * nominal[0] - s * nominal[1],
+            s * nominal[0] + c * nominal[1], 0.0])
+    candidates = [
+        (f"FROM_RIGHT_{outer_angle_deg:g}", rotated(-math.radians(outer_angle_deg))),
+        (f"FROM_RIGHT_{wide_angle_deg:g}", rotated(-math.radians(wide_angle_deg))),
+        (f"FROM_RIGHT_{angle_deg:g}", rotated(-math.radians(angle_deg))),
+        (f"FROM_RIGHT_{inner_angle_deg:g}", rotated(-math.radians(inner_angle_deg))),
+        ("STRAIGHT", nominal.copy()),
+        (f"FROM_LEFT_{inner_angle_deg:g}", rotated(math.radians(inner_angle_deg))),
+        (f"FROM_LEFT_{angle_deg:g}", rotated(math.radians(angle_deg))),
+        (f"FROM_LEFT_{wide_angle_deg:g}", rotated(math.radians(wide_angle_deg))),
+        (f"FROM_LEFT_{outer_angle_deg:g}", rotated(math.radians(outer_angle_deg))),
+    ]
+    axis_enabled = bool(getattr(
+        planner, "corridor_date_axis_enabled", True))
+    axis_stable = bool(getattr(node, "fruit_major_axis_stable", False))
+    axis_confidence = float(getattr(
+        node, "fruit_major_axis_confidence", 0.0))
+    axis_min_confidence = float(getattr(
+        planner, "corridor_date_axis_min_confidence", 0.20))
+    axis_angle_deg = math.degrees(float(getattr(
+        node, "fruit_major_axis_angle", 0.0)))
+    axis_valid = (
+        axis_enabled and axis_stable
+        and axis_confidence >= axis_min_confidence
+        and math.isfinite(axis_angle_deg))
+    if axis_valid:
+        # Image major-axis deviation is zero for a vertical date. Positive
+        # tilt selects an origin on the physical right; negative selects left.
+        # Clamp to the widest tested corridor and change translation heading
+        # only; this is not a tool-roll command.
+        bounded_axis_deg = float(np.clip(
+            axis_angle_deg, -outer_angle_deg, outer_angle_deg))
+        inward = rotated(-math.radians(bounded_axis_deg))
+        valid = True
+        direction_source = "selected_date_axis"
+        node.get_logger().info(
+            f"[APPROACH_AXIS_SOURCE] class={class_label} "
+            f"axis={axis_angle_deg:+.1f}deg applied={bounded_axis_deg:+.1f}deg "
+            f"confidence={axis_confidence:.2f} stable={axis_stable} "
+            "tool_roll=UNCHANGED")
+    elif fruit_outward_dir is None:
+        inward = nominal.copy()
+        valid = False
+        direction_source = "nominal_fallback"
+    else:
+        outward = np.asarray(fruit_outward_dir, dtype=float)
+        inward_xy = -outward[:2]
+        horizontal = float(np.linalg.norm(inward_xy))
+        minimum = float(getattr(
+            planner, "mid_high_direction_min_horizontal", 0.15))
+        valid = horizontal >= minimum
+        inward = (np.array([inward_xy[0] / horizontal,
+                            inward_xy[1] / horizontal, 0.0])
+                  if valid else nominal.copy())
+        direction_source = (
+            "selected_date_direction" if valid else "nominal_fallback")
+    evaluated = []
+    excluded = set(getattr(node, "_corridor_exclusions", set()))
+    for label, direction in candidates:
+        score = float(np.dot(direction, inward))
+        error_deg = math.degrees(math.acos(float(np.clip(score, -1.0, 1.0))))
+        evaluated.append({
+            "label": label, "direction": direction,
+            "score": score, "error_deg": error_deg})
+        if bool(getattr(planner, "log_corridor_candidates", False)):
+            node.get_logger().info(
+                f"[APPROACH_CANDIDATE] class={class_label} side={label} "
+                f"dir=[{direction[0]:+.3f},{direction[1]:+.3f},+0.000] "
+                f"direction_match={score:.3f} "
+                f"angular_error={error_deg:.1f}deg")
+    available = [item for item in evaluated if item["label"] not in excluded]
+    if bool(getattr(node, "_corridor_tip_fallback_active", False)):
+        # Centre fallback is a bounded reachability recovery, not another full
+        # nine-angle search. Try straight first, then the two nearest headings;
+        # prefer the +/-10-degree side that best matches the frozen date axis.
+        by_label = {item["label"]: item for item in available}
+        left_10 = f"FROM_LEFT_{inner_angle_deg:g}"
+        right_10 = f"FROM_RIGHT_{inner_angle_deg:g}"
+        near = [label for label in (left_10, right_10) if label in by_label]
+        near.sort(key=lambda label: by_label[label]["score"], reverse=True)
+        fallback_order = ["STRAIGHT", *near]
+        available = [by_label[label] for label in fallback_order
+                     if label in by_label]
+    if not available:
+        node.get_logger().error(
+            f"[APPROACH_SIDE_SELECTED] class={class_label} "
+            "no corridors remain after Cartesian failures")
+        return nominal, "NONE"
+    best = (available[0] if bool(getattr(
+        node, "_corridor_tip_fallback_active", False))
+        else max(available, key=lambda item: item["score"]))
+    node.get_logger().info(
+        f"[APPROACH_SIDE_SELECTED] class={class_label} side={best['label']} "
+        f"source={direction_source} "
+        f"inward=[{inward[0]:+.3f},{inward[1]:+.3f},+0.000] "
+        f"direction_match={best['score']:.3f} "
+        f"angular_error={best['error_deg']:.1f}deg "
+        "orientation=FIXED insertion=LEVEL neighbours=IGNORED")
+    return best["direction"], best["label"]
 
 
 def side_low_wrist3_orientation(node, base_quat, desired_dir, max_delta_deg=45.0):
@@ -863,6 +1028,39 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                 _r = node.motion_gen.ik_solver.solve_single(
                     Pose(position=_pos_t, quaternion=_quat_t),
                     seed_config=_seed_t, retract_config=_ret_t)
+                # A single seeded solve can miss a valid nearby branch. Retry
+                # deterministically around the previous waypoint before
+                # declaring the straight Cartesian corridor infeasible.
+                if not _r.success.item():
+                    _retry_offsets = (0.04, -0.04, 0.08, -0.08)
+                    _best_retry = None
+                    _best_retry_delta = float("inf")
+                    for _off in _retry_offsets:
+                        for _joint_idx in (0, 2, 4, 5):
+                            _retry_seed = list(_prev_js)
+                            _retry_seed[_joint_idx] += _off
+                            _retry_seed_t = torch.tensor(
+                                [_retry_seed], dtype=torch.float32,
+                                device=_dev).unsqueeze(0)
+                            _rr = node.motion_gen.ik_solver.solve_single(
+                                Pose(position=_pos_t, quaternion=_quat_t),
+                                seed_config=_retry_seed_t,
+                                retract_config=_ret_t)
+                            if _rr.success.item():
+                                _rr_js = nearest_joint_config(
+                                    _prev_js,
+                                    _rr.js_solution.position.squeeze().cpu().tolist())
+                                _rr_delta = max(abs(a - b) for a, b in zip(
+                                    _rr_js, _prev_js))
+                                if _rr_delta < _best_retry_delta:
+                                    _best_retry = _rr
+                                    _best_retry_delta = _rr_delta
+                    if _best_retry is not None:
+                        _r = _best_retry
+                        node.get_logger().info(
+                            f"[DIRECT] {label}: Cartesian waypoint {_k} "
+                            f"recovered with alternate seed "
+                            f"(max_delta={_best_retry_delta*57.3:.1f}deg)")
                 if _r.success.item():
                     _wj = nearest_joint_config(
                         _prev_js, _r.js_solution.position.squeeze().cpu().tolist())
@@ -934,6 +1132,11 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
 
     if not _states_built:
         if label == "FINAL":
+            if bool(getattr(planner, "strict_final_cartesian_only", True)):
+                node.get_logger().error(
+                    "[DIRECT] FINAL: straight Cartesian insertion unavailable; "
+                    "joint fallback DISABLED — rejecting grasp")
+                return False
             # Sometimes an intermediate Cartesian waypoint jumps IK branch even
             # though the final endpoint IK is close. In that case a guarded
             # joint interpolation is safer than falling back to slow trajopt.
@@ -1063,6 +1266,94 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         node.stored_trajectory_states.extend(states)
 
     return True
+
+
+def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
+                                    waypoint_count=2):
+    """Validate APPROACH and fixed-orientation straight FINAL before motion."""
+    node._corridor_preflight_approach_js = None
+    if start_js is None or getattr(node, "_cuda_faulted", False):
+        return False, "NO_IK_STATE"
+    try:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def solve(pose, seed, require_continuous=False):
+            pos = torch.tensor([pose[:3]], dtype=torch.float32, device=dev)
+            quat = torch.tensor([pose[3:]], dtype=torch.float32, device=dev)
+            retract_t = torch.tensor([seed], dtype=torch.float32, device=dev)
+            goal_pose = Pose(position=pos, quaternion=quat)
+
+            # Match the runtime FINAL solver's deterministic alternate-seed
+            # search.  A single cuRobo seed can either report no solution or
+            # return a distant kinematic branch even when a nearby continuous
+            # solution exists for this Cartesian waypoint.
+            # Try the normal seed first. Most reachable waypoints should cost
+            # exactly one IK call. Only retry a discontinuous/failed FINAL
+            # waypoint, and keep that retry set deliberately small so corridor
+            # preflight cannot add tens of seconds before confirmation.
+            seeds = [list(seed)]
+            for joint_index, offset in (
+                    (4, 0.08), (4, -0.08), (5, 0.08), (5, -0.08)):
+                alternate = list(seed)
+                alternate[joint_index] += offset
+                seeds.append(alternate)
+
+            best = None
+            best_delta = float("inf")
+            for candidate_seed in seeds:
+                seed_t = torch.tensor(
+                    [candidate_seed], dtype=torch.float32,
+                    device=dev).unsqueeze(0)
+                result = node.motion_gen.ik_solver.solve_single(
+                    goal_pose, seed_config=seed_t,
+                    retract_config=retract_t)
+                if not result.success.item():
+                    continue
+                candidate = nearest_joint_config(
+                    seed,
+                    result.js_solution.position.squeeze().cpu().tolist())
+                delta = max(abs(a - b) for a, b in zip(candidate, seed))
+                if delta < best_delta:
+                    best = candidate
+                    best_delta = delta
+                if not require_continuous or delta <= math.radians(30.0):
+                    return candidate
+            return best
+
+        approach_js = solve(approach_pose, start_js)
+        if approach_js is None:
+            return False, "APPROACH_IK"
+        approach_delta = max(
+            abs(a - b) for a, b in zip(approach_js, start_js))
+        max_approach_delta = math.radians(float(getattr(
+            node.cfg.planner,
+            "corridor_preflight_approach_max_joint_delta_deg", 75.0)))
+        if approach_delta > max_approach_delta:
+            return False, "APPROACH_BRANCH_SWITCH"
+
+        previous = approach_js
+        for index in range(1, waypoint_count + 2):
+            alpha = index / (waypoint_count + 1)
+            xyz = [
+                approach_pose[i] + alpha * (final_pose[i] - approach_pose[i])
+                for i in range(3)
+            ]
+            candidate = solve(
+                [*xyz, *final_pose[3:]], previous,
+                require_continuous=True)
+            if candidate is None:
+                return False, f"FINAL_WAYPOINT_{index}"
+            if max(abs(a - b) for a, b in zip(
+                    candidate, previous)) > math.radians(30.0):
+                return False, f"FINAL_BRANCH_SWITCH_{index}"
+            previous = candidate
+        # Execute the exact branch that passed this chain. Re-solving APPROACH
+        # later can select a different branch and produce a multi-metre detour.
+        node._corridor_preflight_approach_js = list(approach_js)
+        return True, "OK"
+    except Exception as exc:
+        node.get_logger().warn(f"[CORRIDOR_PREFLIGHT] IK exception: {exc}")
+        return False, "IK_EXCEPTION"
 
 
 def _log_forearm_flange_clearance(node, states: list, label: str, log_result: bool = True):
@@ -2776,10 +3067,6 @@ def is_robot_moving(node, velocity_threshold: float = 0.001) -> bool:
     return any(abs(x) > velocity_threshold for x in v)
 
 def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
-    d_vis_pt = compute_visibility_approach(node, x, y, z, dist=0.05)
-    d_vis = -np.array([x - d_vis_pt[0], y - d_vis_pt[1], z - d_vis_pt[2]])
-    d_vis /= np.linalg.norm(d_vis)
-
     prev_dir = getattr(node, "_prev_blend_dir", None)
     prev_dot = None
     d_prev = None
@@ -2790,7 +3077,10 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
         if n_dir > 1e-9:
             d_dir /= n_dir
         else:
-            d_dir = d_vis.copy()
+            d_dir = np.array([0.0, -1.0, 0.0], dtype=float)
+        # Visibility blending is currently disabled below. Do not enter the
+        # TF/spin fallback when vision already supplied a frozen direction.
+        d_vis = d_dir.copy()
 
         # Align with previous blended direction to avoid 180 flips.
         if prev_dir is not None:
@@ -2807,6 +3097,14 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
 
         dir_conf = 1.0
     else:
+        d_vis_pt = compute_visibility_approach(node, x, y, z, dist=0.05)
+        d_vis = -np.array(
+            [x - d_vis_pt[0], y - d_vis_pt[1], z - d_vis_pt[2]])
+        _d_vis_norm = float(np.linalg.norm(d_vis))
+        if _d_vis_norm > 1e-9:
+            d_vis /= _d_vis_norm
+        else:
+            d_vis = np.array([0.0, -1.0, 0.0], dtype=float)
         d_dir = d_vis
         dir_conf = 0.0
 
@@ -2867,6 +3165,12 @@ def plan_and_execute(node):
     if not node.robot_running:
         node.get_logger().error("Robot program OFF; may fail.")
 
+    # Corridor exclusions are valid only while retrying a target inside this
+    # execution batch. Never carry rejected angles into a later GUI run.
+    node._corridor_exclusions = set()
+    node._corridor_retry_goal = None
+    node._corridor_tip_fallback_active = False
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _yolo = getattr(node, 'yolo_thread', None)  # local inference_lock only (same process)
     # Vision mode helpers — these publish to /vision/mode to control the separate vision process.
@@ -2925,6 +3229,92 @@ def plan_and_execute(node):
             node._slip_retry_approach = None
             node._slip_retry_fruit_radius = None
         x,y,z = goal[:3]
+        _tip_anchored_final_grasp = None
+        _tip_anchor = None
+        _tip_candidate = getattr(node, "date_tip_point", None)
+        _tip_age = time.time() - float(getattr(node, "date_tip_time", 0.0))
+        _tip_goal_match = (
+            math.dist(list(_tip_candidate), [x, y, z])
+            if _tip_candidate is not None else float("inf"))
+        if (
+            bool(getattr(node.cfg.planner, "tool_axis_tip_aim_enabled", True))
+            and _tip_candidate is not None
+            and bool(getattr(node, "date_tip_stable", False))
+            and _tip_age <= float(getattr(
+                node.cfg.planner, "tool_axis_tip_max_age_s", 0.50))
+            and _tip_goal_match <= float(getattr(
+                node.cfg.planner,
+                "tool_axis_tip_max_goal_distance_m", 0.08))
+        ):
+            _tip_anchor = np.asarray(_tip_candidate, dtype=float)
+        _retry_goal = getattr(node, "_corridor_retry_goal", None)
+        _same_corridor_goal = bool(
+            _retry_goal is not None
+            and math.dist(list(goal[:3]), list(_retry_goal)) <= 0.005)
+        if not _same_corridor_goal:
+            node._corridor_exclusions = set()
+            node._corridor_roll_disabled = set()
+            node._corridor_retry_goal = list(goal[:3])
+            node._corridor_retry_tip_anchor = None
+            node._corridor_tip_fallback_active = False
+        if _tip_anchor is not None:
+            node._corridor_retry_tip_anchor = _tip_anchor.tolist()
+        elif _same_corridor_goal:
+            _saved_tip_anchor = getattr(
+                node, "_corridor_retry_tip_anchor", None)
+            if _saved_tip_anchor is not None:
+                _tip_anchor = np.asarray(_saved_tip_anchor, dtype=float)
+                _tip_goal_match = math.dist(
+                    _tip_anchor.tolist(), [x, y, z])
+        if bool(getattr(node, "_corridor_tip_fallback_active", False)):
+            _tip_anchor = None
+            node.get_logger().info(
+                "[TOOL_AXIS_AIM] mode=CENTRE_FALLBACK "
+                "tip_anchor=DISABLED_FOR_THIS_GOAL")
+
+        # Freeze the gripper geometry for this target. AUTO uses the selected
+        # date's stable image major axis: 0deg is vertical, +/-90deg horizontal.
+        _configured_grasp_mode = str(getattr(
+            node.cfg.gripper, "grasp_mode", "NORMAL")).strip().upper()
+        if (_same_corridor_goal
+                and getattr(node, "_corridor_retry_grasp_mode", None)):
+            _goal_grasp_mode = node._corridor_retry_grasp_mode
+        elif _configured_grasp_mode == "AUTO":
+            _axis_deg_raw = math.degrees(float(getattr(
+                node, "fruit_major_axis_angle", 0.0)))
+            _axis_from_vertical = abs(
+                ((_axis_deg_raw + 90.0) % 180.0) - 90.0)
+            _axis_confidence = float(getattr(
+                node, "fruit_major_axis_confidence", 0.0))
+            _axis_stable = bool(getattr(
+                node, "fruit_major_axis_stable", False))
+            _axis_threshold = float(getattr(
+                node.cfg.gripper,
+                "auto_envelop_axis_from_vertical_deg", 45.0))
+            _confidence_threshold = float(getattr(
+                node.cfg.gripper,
+                "auto_envelop_min_axis_confidence", 0.35))
+            _goal_grasp_mode = (
+                "ENVELOP"
+                if (_axis_stable
+                    and _axis_confidence >= _confidence_threshold
+                    and _axis_from_vertical >= _axis_threshold)
+                else "NORMAL")
+            node.get_logger().info(
+                f"[GRASP_MODE_AUTO] selected={_goal_grasp_mode} "
+                f"axis_from_vertical={_axis_from_vertical:.1f}deg "
+                f"threshold={_axis_threshold:.1f}deg "
+                f"confidence={_axis_confidence:.2f}/"
+                f"{_confidence_threshold:.2f} stable={_axis_stable} "
+                "frozen=THIS_GOAL")
+        else:
+            _goal_grasp_mode = (
+                _configured_grasp_mode
+                if _configured_grasp_mode in ("NORMAL", "ENVELOP")
+                else "NORMAL")
+        node.active_goal_grasp_mode = _goal_grasp_mode
+        node._corridor_retry_grasp_mode = _goal_grasp_mode
+        _active_corridor = None
         if _log_cycle_start:
             _img_norm_for_log = getattr(node, "fruit_image_norm", None)
             _bunch_rel_x_for_log = getattr(node, "fruit_bunch_rel_x", None)
@@ -3000,11 +3390,22 @@ def plan_and_execute(node):
                 node.cfg.planner, "mid_center_final_z_offset", 0.030))
             _midhi_final_x, _midhi_final_y = add_axis_offsets(
                 x, y, depth=-_midhi_final_depth)
-            # Level insertion: APPROACH is separated from the actual FINAL
-            # grasp point only along the configured robot depth axis.
-            ax, ay = add_axis_offsets(
-                _midhi_final_x, _midhi_final_y, depth=_midhi_standoff)
-            az = z + _midhi_final_z
+            _midhi_final_grasp = np.array(
+                [_midhi_final_x, _midhi_final_y, z + _midhi_final_z])
+            _midhi_insert_dir, _midhi_side = select_mid_high_corridor_direction(
+                node, d_blend)
+            _active_corridor = _midhi_side
+            # Level insertion: APPROACH follows the clearest explicit corridor.
+            _midhi_approach = (
+                _midhi_final_grasp - _midhi_standoff * _midhi_insert_dir)
+            ax, ay, az = _midhi_approach.tolist()
+            node.get_logger().info(
+                f"[APPROACH_ORIGIN] class=MID_HIGH from={_midhi_side} "
+                f"origin=[{ax:.3f},{ay:.3f},{az:.3f}] "
+                f"final_grasp=[{_midhi_final_grasp[0]:.3f},"
+                f"{_midhi_final_grasp[1]:.3f},{_midhi_final_grasp[2]:.3f}] "
+                f"travel_dir=[{_midhi_insert_dir[0]:+.3f},"
+                f"{_midhi_insert_dir[1]:+.3f},{_midhi_insert_dir[2]:+.3f}]")
             if _log_cycle_start:
                 node.get_logger().info(
                     f"MID/HIGH approach ({_height_source}, z={z:.2f}): "
@@ -3331,6 +3732,68 @@ def plan_and_execute(node):
                 f"limit={max_deg:.1f}deg decision=APPLY_AT_APPROACH_HOLD_TO_FINAL")
             return quat_apply_local_z_roll(orientation_in, applied_deg)
 
+        def _apply_candidate_roll_at_approach(orientation_in):
+            """Apply a small scored finger-layout correction before motion."""
+            node._approach_finger_roll_applied_deg = 0.0
+            if not bool(getattr(
+                    node.cfg.planner,
+                    "approach_candidate_roll_enabled", True)):
+                selection = getattr(node, "safe_grasp_candidate", None)
+                requested_deg = (
+                    float(selection.get("delta_deg", 0.0))
+                    if selection else 0.0)
+                node.get_logger().info(
+                    f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
+                    "applied=+0.0deg decision=LOG_ONLY_DISABLED "
+                    "orientation=CALIBRATED_FIXED")
+                return list(orientation_in)
+            if _active_corridor in getattr(
+                    node, "_corridor_roll_disabled", set()):
+                node.get_logger().info(
+                    f"[APPROACH_FINGER_ROLL] corridor={_active_corridor} "
+                    "applied=+0.0deg decision=IK_FALLBACK_NO_ROLL")
+                return list(orientation_in)
+            selection = getattr(node, "safe_grasp_candidate", None)
+            if not selection:
+                node.get_logger().info(
+                    "[APPROACH_FINGER_ROLL] applied=+0.0deg decision=NO_CANDIDATE")
+                return list(orientation_in)
+            target_match = math.dist(
+                [x, y, z],
+                list(selection.get("target_xyz", [0.0, 0.0, 0.0])))
+            requested_deg = float(selection.get("delta_deg", 0.0))
+            score = float(selection.get("score", 0.0))
+            minimum_score = float(selection.get("minimum_score", 0.0))
+            match_limit = float(getattr(
+                node.cfg.planner,
+                "approach_candidate_roll_target_match_m", 0.05))
+            min_score = float(getattr(
+                node.cfg.planner,
+                "approach_candidate_roll_min_score", 0.85))
+            min_finger_score = float(getattr(
+                node.cfg.planner,
+                "approach_candidate_roll_min_finger_score", 0.75))
+            max_deg = float(getattr(
+                node.cfg.planner,
+                "approach_candidate_roll_max_deg", 15.0))
+            if (target_match > match_limit or score < min_score
+                    or minimum_score < min_finger_score):
+                node.get_logger().info(
+                    f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
+                    "applied=+0.0deg decision=QUALITY_REJECT "
+                    f"match={target_match*1000:.1f}mm "
+                    f"Q={score:.3f} minF={minimum_score:.3f}")
+                return list(orientation_in)
+            applied_deg = float(np.clip(requested_deg, -max_deg, max_deg))
+            node._approach_finger_roll_applied_deg = applied_deg
+            node.get_logger().info(
+                f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
+                f"applied={applied_deg:+.1f}deg limit={max_deg:.1f}deg "
+                f"match={target_match*1000:.1f}mm Q={score:.3f} "
+                f"minF={minimum_score:.3f} "
+                "phase=APPROACH final=ORIENTATION_LOCKED")
+            return quat_apply_local_z_roll(orientation_in, applied_deg)
+
         if skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
             pass  # jump straight to reacquire + final below
@@ -3441,7 +3904,8 @@ def plan_and_execute(node):
                 approach = [ax + _x_offset, ay + _y_offset, az + _z_offset, *orientation]
             else:
                 side_blend = 0.10 if is_low_lateral else 0.25
-                orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
+                orientation = (list(cur_quat) if cur_quat is not None
+                               else list(target_quat))
                 _depth_offset = (
                     _planner_value(
                         node.cfg.planner, "very_low_center_approach_depth_offset",
@@ -3454,10 +3918,29 @@ def plan_and_execute(node):
                 _insert_pitch = math.radians(float(getattr(
                     node.cfg.planner, "low_center_insertion_pitch_deg", 12.0)))
                 _horizontal = math.cos(_insert_pitch)
-                _center_insert_dir = (
+                _center_nominal_dir = np.array(
                     [_horizontal, 0.0, math.sin(_insert_pitch)]
-                    if X_FORWARD_Y_LATERAL
-                    else [0.0, -_horizontal, math.sin(_insert_pitch)])
+                    if X_FORWARD_Y_LATERAL else
+                    [0.0, -_horizontal, math.sin(_insert_pitch)], dtype=float)
+                _low_class = "VERY_LOW" if is_very_low_center else "LOW"
+                _low_horizontal_dir, _low_corridor = (
+                    select_mid_high_corridor_direction(
+                        node, d_blend, class_label=_low_class))
+                _active_corridor = _low_corridor
+                # Preserve LOW's calibrated upward pitch while using the
+                # selected date to choose only the horizontal corridor.
+                _center_insert_dir = np.array([
+                    _horizontal * _low_horizontal_dir[0],
+                    _horizontal * _low_horizontal_dir[1],
+                    math.sin(_insert_pitch),
+                ], dtype=float)
+                node.get_logger().info(
+                    f"[APPROACH_ANGLE] class={_low_class} mode=CORRIDOR "
+                    f"side={_low_corridor} pitch={math.degrees(_insert_pitch):.1f}deg "
+                    f"nominal=[{_center_nominal_dir[0]:+.3f},"
+                    f"{_center_nominal_dir[1]:+.3f},{_center_nominal_dir[2]:+.3f}] "
+                    f"selected=[{_center_insert_dir[0]:+.3f},"
+                    f"{_center_insert_dir[1]:+.3f},{_center_insert_dir[2]:+.3f}]")
                 _center_final_depth = _planner_value(
                     node.cfg.planner, "low_center_final_depth_offset",
                     "low_center_final_y_offset", 0.004)
@@ -3471,19 +3954,50 @@ def plan_and_execute(node):
                     z + _center_final_z - _depth_offset * _center_insert_dir[2],
                     *orientation,
                 ]
+                node.get_logger().info(
+                    f"[APPROACH_ORIGIN] class={_low_class} from={_low_corridor} "
+                    f"origin=[{approach[0]:.3f},{approach[1]:.3f},"
+                    f"{approach[2]:.3f}] "
+                    f"final_grasp=[{_center_final_x:.3f},"
+                    f"{_center_final_y:.3f},{z + _center_final_z:.3f}] "
+                    f"travel_dir=[{_center_insert_dir[0]:+.3f},"
+                    f"{_center_insert_dir[1]:+.3f},"
+                    f"{_center_insert_dir[2]:+.3f}]")
+                # Face the selected corridor before insertion. FINAL later
+                # locks the orientation physically reached at APPROACH.
                 orientation, _center_swing = align_local_axis_to_vector(
                     orientation,
                     _center_insert_dir,
                     local_axis=(0.0, 0.0, 1.0),
                     max_angle_deg=float(getattr(
-                        node.cfg.planner, "low_center_forward_align_max_deg", 45.0)),
+                        node.cfg.planner,
+                        "low_center_forward_align_max_deg", 45.0)),
                 )
-                orientation = _apply_center_yaw(
-                    orientation, approach[:3])
-                orientation = _apply_date_axis_at_approach(orientation)
-                if _dynamic_roll:
-                    orientation = quat_apply_local_z_roll(
-                        orientation, _center_tool_roll_deg)
+                orientation = _apply_candidate_roll_at_approach(orientation)
+                if _tip_anchor is not None:
+                    _tip_depth = abs(float(_center_final_depth))
+                    _tip_standoff = float(_depth_offset)
+                    _tip_anchored_final_grasp = (
+                        _tip_anchor - _tip_depth * _center_insert_dir)
+                    _tip_approach_closure = (
+                        _tip_anchor
+                        - (_tip_depth + _tip_standoff) * _center_insert_dir)
+                    _tip_offset_tcp = list(getattr(
+                        node.cfg.planner, "closure_center_offset_tcp_m",
+                        [-0.004553, 0.000100, -0.016223]))
+                    _tip_approach_tcp, _ = closure_center_corrected_tcp(
+                        _tip_approach_closure, orientation, _tip_offset_tcp)
+                    approach[:3] = list(_tip_approach_tcp)
+                    node.get_logger().info(
+                        f"[TOOL_AXIS_AIM] class={_low_class} "
+                        "source=DATE_TIP_3D geometry=COLLINEAR "
+                        f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
+                        f"{_tip_anchor[2]:.3f}] goal_match={_tip_goal_match*1000:.1f}mm "
+                        f"approach_closure=[{_tip_approach_closure[0]:.3f},"
+                        f"{_tip_approach_closure[1]:.3f},{_tip_approach_closure[2]:.3f}] "
+                        f"final_closure=[{_tip_anchored_final_grasp[0]:.3f},"
+                        f"{_tip_anchored_final_grasp[1]:.3f},"
+                        f"{_tip_anchored_final_grasp[2]:.3f}]")
                 approach[3:] = orientation
                 _x_offset = approach[0] - ax
                 _y_offset = approach[1] - ay
@@ -3493,16 +4007,15 @@ def plan_and_execute(node):
                     _forward_axis = quat_rotate_vec(
                         orientation, (0.0, 0.0, 1.0))
                     node.get_logger().info(
-                        "CENTER forward-axis alignment: "
+                        "CENTER approach orientation: "
                         f"swing={math.degrees(_center_swing):.1f}deg "
                         f"local+Z_world=[{_forward_axis[0]:.3f},"
                         f"{_forward_axis[1]:.3f},{_forward_axis[2]:.3f}] "
                         f"insert_dir=[{_center_insert_dir[0]:.3f},"
                         f"{_center_insert_dir[1]:.3f},{_center_insert_dir[2]:.3f}] "
-                        f"pitch={_vlc_pitch:.1f}deg standoff={_depth_offset*1000:.0f}mm"
-                        + (f" tool_roll={_center_tool_roll_deg:+.1f}deg "
-                           f"source={_center_tool_roll_source} score={_roll_score:.2f}"
-                           if _dynamic_roll else ""))
+                        f"path_pitch={_vlc_pitch:.1f}deg "
+                        f"standoff={_depth_offset*1000:.0f}mm "
+                        "rotation_phase=APPROACH final=TRANSLATION_ONLY")
             if _log_cycle_start:
                 node.get_logger().info(
                     f"{'VERY LOW' if is_very_low_center else 'LOW'} approach pose: {approach[:3]}, is_side={is_side_approach}, "
@@ -3519,12 +4032,50 @@ def plan_and_execute(node):
                 if abs(_pitch_deg) > 1e-6:
                     final_orientation_override = list(orientation)
                     orientation = quat_apply_local_x_pitch(orientation, _pitch_deg)
+            orientation, _midhi_swing = align_local_axis_to_vector(
+                orientation,
+                _midhi_insert_dir,
+                local_axis=(0.0, 0.0, 1.0),
+                max_angle_deg=float(getattr(
+                    node.cfg.planner,
+                    "low_center_forward_align_max_deg", 45.0)),
+            )
+            if not is_side_approach:
+                orientation = _apply_candidate_roll_at_approach(orientation)
+            if _tip_anchor is not None:
+                _tip_depth = abs(float(_midhi_final_depth))
+                _tip_standoff = float(_midhi_standoff)
+                _tip_anchored_final_grasp = (
+                    _tip_anchor - _tip_depth * _midhi_insert_dir)
+                _tip_approach_closure = (
+                    _tip_anchor
+                    - (_tip_depth + _tip_standoff) * _midhi_insert_dir)
+                _tip_offset_tcp = list(getattr(
+                    node.cfg.planner, "closure_center_offset_tcp_m",
+                    [-0.004553, 0.000100, -0.016223]))
+                _tip_approach_tcp, _ = closure_center_corrected_tcp(
+                    _tip_approach_closure, orientation, _tip_offset_tcp)
+                ax, ay, az = _tip_approach_tcp
+                node.get_logger().info(
+                    "[TOOL_AXIS_AIM] class=MID_HIGH source=DATE_TIP_3D "
+                    "geometry=COLLINEAR "
+                    f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
+                    f"{_tip_anchor[2]:.3f}] goal_match={_tip_goal_match*1000:.1f}mm "
+                    f"approach_closure=[{_tip_approach_closure[0]:.3f},"
+                    f"{_tip_approach_closure[1]:.3f},{_tip_approach_closure[2]:.3f}] "
+                    f"final_closure=[{_tip_anchored_final_grasp[0]:.3f},"
+                    f"{_tip_anchored_final_grasp[1]:.3f},"
+                    f"{_tip_anchored_final_grasp[2]:.3f}]")
             approach = [ax, ay, az, *orientation]
             if _log_cycle_start:
+                _forward_axis = quat_rotate_vec(
+                    orientation, (0.0, 0.0, 1.0))
                 node.get_logger().info(
                     f"MID/HIGH approach pose: {approach[:3]}, is_side={is_side_approach}, blend={side_blend:.2f}, "
                     f"pitch={_pitch_deg:+.1f}deg insertion=LEVEL "
-                    f"d_blend_logging_only=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
+                    f"orientation_swing={math.degrees(_midhi_swing):.1f}deg "
+                    f"tool_forward=[{_forward_axis[0]:+.3f},{_forward_axis[1]:+.3f},{_forward_axis[2]:+.3f}] "
+                    "rotation_phase=APPROACH final=TRANSLATION_ONLY")
 
         def _final_offsets(is_slip_retry=False):
             if is_low and is_side_approach:
@@ -3552,8 +4103,114 @@ def plan_and_execute(node):
                     "mid_center_final_y_offset", 0.008),
                 (getattr(node.cfg.planner, "mid_center_slip_final_z_offset", 0.020)
                  if is_slip_retry
-                 else getattr(node.cfg.planner, "mid_center_final_z_offset", 0.030)),
+                else getattr(node.cfg.planner, "mid_center_final_z_offset", 0.030)),
             )
+
+        def _apply_mode_final_adjustment(position, pose_orientation):
+            """Apply the selected grasp mode's FINAL-only depth and world-Z trim."""
+            mode = str(getattr(
+                node, "active_goal_grasp_mode", "NORMAL")).strip().upper()
+            prefix = "envelop" if mode == "ENVELOP" else "normal"
+            depth_extra = float(getattr(
+                node.cfg.gripper, f"{prefix}_depth_extra_m", 0.0))
+            z_extra = float(getattr(
+                node.cfg.gripper, f"{prefix}_z_extra_m", 0.0))
+            tool_axis = quat_rotate_vec(
+                pose_orientation, (0.0, 0.0, 1.0))
+            adjusted = [
+                float(position[i]) + depth_extra * float(tool_axis[i])
+                for i in range(3)
+            ]
+            adjusted[2] += z_extra
+            return adjusted, mode, depth_extra, z_extra, tool_axis
+
+        # Reject an unusable corridor before preview/confirmation and before
+        # any robot motion. Validate the exact approach quaternion followed by
+        # the closure-centre-corrected, fixed-orientation straight FINAL chain.
+        if (not skip_approach and not is_side_approach
+                and _active_corridor not in (None, "NONE")):
+            _pf_depth, _pf_z = _final_offsets(is_slip_retry=False)
+            _pf_gx, _pf_gy = add_axis_offsets(x, y, depth=-_pf_depth)
+            _pf_grasp = (
+                list(_tip_anchored_final_grasp)
+                if _tip_anchored_final_grasp is not None
+                else [_pf_gx, _pf_gy, z + _pf_z])
+            _pf_grasp, _, _, _, _ = _apply_mode_final_adjustment(
+                _pf_grasp, orientation)
+            _pf_closure_offset = list(getattr(
+                node.cfg.planner, "closure_center_offset_tcp_m",
+                [-0.004553, 0.000100, -0.016223]))
+            _pf_tcp, _ = closure_center_corrected_tcp(
+                _pf_grasp, orientation, _pf_closure_offset)
+            _pf_final = [*_pf_tcp, *orientation]
+            _pf_start = _valid_joint_positions()
+            _pf_ok, _pf_reason = _preflight_approach_final_chain(
+                node, _pf_start, approach, _pf_final,
+                waypoint_count=max(1, int(getattr(
+                    node.cfg.planner, "direct_final_cart_waypoints", 2))))
+            node.get_logger().info(
+                f"[CORRIDOR_PREFLIGHT] candidate={_active_corridor} "
+                f"result={'PASS' if _pf_ok else 'REJECT'} reason={_pf_reason} "
+                "stage=BEFORE_CONFIRM motion=NONE")
+            if not _pf_ok:
+                _roll_applied = abs(float(getattr(
+                    node, "_approach_finger_roll_applied_deg", 0.0))) > 0.1
+                _roll_disabled = getattr(
+                    node, "_corridor_roll_disabled", set())
+                if _roll_applied and _active_corridor not in _roll_disabled:
+                    _roll_disabled.add(_active_corridor)
+                    node._corridor_roll_disabled = _roll_disabled
+                    node.get_logger().warn(
+                        f"[APPROACH_FINGER_ROLL] corridor={_active_corridor} "
+                        f"rolled_preflight={_pf_reason}; retrying same corridor "
+                        "with zero finger roll before excluding it")
+                    node.goal_poses.insert(0, goal)
+                    _vision_resume()
+                    unlock_target(node)
+                    continue
+                node._corridor_exclusions.add(_active_corridor)
+                _tip_failure_limit = max(1, int(getattr(
+                    node.cfg.planner,
+                    "tool_axis_tip_fallback_after_corridors", 2)))
+                if (_tip_anchor is not None
+                        and len(node._corridor_exclusions)
+                        >= _tip_failure_limit):
+                    node._corridor_tip_fallback_active = True
+                    node._corridor_exclusions = set()
+                    node._corridor_roll_disabled = set()
+                    node.get_logger().warn(
+                        "[TOOL_AXIS_AIM_FALLBACK] "
+                        f"tip-aligned preflight failed for {_tip_failure_limit} "
+                        "corridors; retrying once from detected date centre "
+                        "with calibrated closure offsets")
+                    node.goal_poses.insert(0, goal)
+                    _vision_resume()
+                    unlock_target(node)
+                    continue
+                _centre_fallback = bool(getattr(
+                    node, "_corridor_tip_fallback_active", False))
+                _pf_limit = 3 if _centre_fallback else 9
+                _pf_remaining = _pf_limit - len(node._corridor_exclusions)
+                if _pf_remaining > 0:
+                    node.get_logger().warn(
+                        f"[CORRIDOR_RETRY] rejected={_active_corridor} "
+                        f"reason=PREFLIGHT_{_pf_reason} "
+                        f"remaining={_pf_remaining}; trying next-best "
+                        f"{'bounded centre-fallback' if _centre_fallback else ''} corridor "
+                        "without robot motion")
+                    node.goal_poses.insert(0, goal)
+                else:
+                    node.get_logger().warn(
+                        ("Bounded centre fallback exhausted after 3 corridors; "
+                         "rejecting unreachable goal without further search."
+                         if _centre_fallback else
+                         "All candidate corridors failed pre-motion IK validation."))
+                    node._corridor_exclusions = set()
+                    node._corridor_retry_goal = None
+                    node._corridor_tip_fallback_active = False
+                _vision_resume()
+                unlock_target(node)
+                continue
 
         # === DEBUG PLAN PREVIEW (RViz visualization) ===
         if node.cfg.planner.debug_plan_preview:
@@ -3577,9 +4234,16 @@ def plan_and_execute(node):
                 is_slip_retry=False)
             _preview_x, _preview_y = add_axis_offsets(
                 x, y, depth=-_preview_depth_offset)
+            _preview_final_position = (
+                list(_tip_anchored_final_grasp)
+                if _tip_anchored_final_grasp is not None
+                else [_preview_x, _preview_y, z + _preview_z_offset])
+            _preview_final_position, _, _, _, _ = \
+                _apply_mode_final_adjustment(
+                    _preview_final_position, orientation)
             preview_steps.append({
                 "label": "FINAL",
-                "position": [_preview_x, _preview_y, z + _preview_z_offset],
+                "position": _preview_final_position,
             })
             # 4. Dropoff
             preview_steps.append({"label": "DROPOFF", "joints": node.dropoff_joints})
@@ -3690,7 +4354,15 @@ def plan_and_execute(node):
                 node._approach_clamp_rejected = False
                 node._approach_safety_rejected = False
                 node._approach_truncated = False
-                _approach_ok = _direct_ik_move(node, approach, label="APPROACH", motion_type="approach", store_trajectory=True)
+                _corridor_approach_js = (
+                    getattr(node, "_corridor_preflight_approach_js", None)
+                    if (not is_side_approach
+                        and _active_corridor not in (None, "NONE"))
+                    else None)
+                _approach_ok = _direct_ik_move(
+                    node, approach, label="APPROACH",
+                    motion_type="approach", store_trajectory=True,
+                    goal_js_override=_corridor_approach_js)
                 if not _approach_ok and not getattr(node, '_approach_clamp_rejected', False):
                     # IK failed (branch mismatch) — cuRobo handles branch switching via TRAJOPT.
                     # Path will be a detour but gets the arm to the correct approach position.
@@ -3806,11 +4478,29 @@ def plan_and_execute(node):
                     _dist_to_approach = math.dist(_cur_after[:3], approach[:3]) if _cur_after else float('inf')
                     _truncated = getattr(node, '_approach_truncated', False)
                     if _dist_to_approach > 0.10 and not _truncated:
-                        node.get_logger().warn(
-                            f"Approach did not execute (arm {_dist_to_approach*100:.0f}cm from target) — aborting goal, returning HOME.")
+                        if _active_corridor not in (None, "NONE"):
+                            node._corridor_exclusions.add(_active_corridor)
+                            remaining = 9 - len(node._corridor_exclusions)
+                        else:
+                            remaining = 0
+                        if remaining > 0:
+                            node.get_logger().warn(
+                                f"[CORRIDOR_RETRY] rejected={_active_corridor} "
+                                f"reason=APPROACH_EXECUTION_FAILED "
+                                f"distance={_dist_to_approach*100:.1f}cm "
+                                f"remaining={remaining}; returning HOME and "
+                                "trying next-best corridor")
+                            node.goal_poses.insert(0, goal)
+                        else:
+                            node.get_logger().warn(
+                                f"Approach did not execute (arm "
+                                f"{_dist_to_approach*100:.0f}cm from target) "
+                                "and no candidate corridors remain.")
                         _vision_resume()
                         unlock_target(node)
                         move_to_home_position(node)
+                        if remaining > 0:
+                            continue
                         break
                     if _log_phase_timings or _truncated:
                         node.get_logger().info(
@@ -3986,7 +4676,8 @@ def plan_and_execute(node):
             _sm_dir = getattr(getattr(node, 'state_manager', None), 'fruit_direction', None)
             approach_dir = list(_sm_dir) if _sm_dir is not None else None
         _approach_orientation_for_final = list(orientation)
-        if final_orientation_override is not None:
+        if (final_orientation_override is not None
+                and _measured_approach_orientation is None):
             orientation = list(final_orientation_override)
             if _log_cycle_start:
                 node.get_logger().info(
@@ -4052,9 +4743,23 @@ def plan_and_execute(node):
                     "[FINAL_APPROACH_YAW] skipped: fruit direction has "
                     "insufficient horizontal component")
 
-        gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
-        gz = z + z_offset
+        if _tip_anchored_final_grasp is not None:
+            gx, gy, gz = [float(v) for v in _tip_anchored_final_grasp]
+        else:
+            gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
+            gz = z + z_offset
         desired_grasp_xyz = [gx, gy, gz]
+        (desired_grasp_xyz, _grasp_mode, _mode_depth_extra,
+         _mode_z_extra, _mode_axis) = _apply_mode_final_adjustment(
+            desired_grasp_xyz, orientation)
+        gx, gy, gz = desired_grasp_xyz
+        node.get_logger().info(
+            f"[GRIPPER_MODE] mode={_grasp_mode} "
+            f"depth_extra={_mode_depth_extra*1000:+.1f}mm "
+            f"z_extra={_mode_z_extra*1000:+.1f}mm "
+            f"tool_axis=[{_mode_axis[0]:+.3f},"
+            f"{_mode_axis[1]:+.3f},{_mode_axis[2]:+.3f}] "
+            f"closure_target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
         closure_offset_tcp = list(getattr(
             node.cfg.planner, "closure_center_offset_tcp_m",
             [-0.004553, -0.012559, -0.016223]))
@@ -4234,7 +4939,8 @@ def plan_and_execute(node):
                     motion_type="final", store_trajectory=True)
                 if final_ok:
                     final_target = approach_orientation_target
-        if not final_ok:
+        if (not final_ok and not bool(getattr(
+                node.cfg.planner, "strict_final_cartesian_only", True))):
             # Fallback: full cuRobo plan_and_send (handles branch changes, no IK restriction)
             node.get_logger().warn("FINAL IK failed — trying plan_and_send as fallback...")
             _final_joints = _valid_joint_positions()
@@ -4250,10 +4956,28 @@ def plan_and_execute(node):
                         node, final_target[:3],
                         tol=float(getattr(
                             node.cfg.planner, "final_endpoint_tolerance", 0.004)))
-            if not final_ok:
-                node.get_logger().warn("All FINAL attempts failed — skipping goal.")
-                unlock_target(node)
-                continue
+        if not final_ok:
+            if _active_corridor not in (None, "NONE"):
+                node._corridor_exclusions.add(_active_corridor)
+                remaining = 9 - len(node._corridor_exclusions)
+                if remaining > 0:
+                    node.get_logger().warn(
+                        f"[CORRIDOR_RETRY] rejected={_active_corridor} "
+                        f"reason=STRAIGHT_FINAL_IK remaining={remaining}; "
+                        "returning HOME and trying next-best corridor")
+                    node.motion_phase = "HOME"
+                    move_to_home_position(node)
+                    node.goal_poses.insert(0, goal)
+                    unlock_target(node)
+                    _vision_resume()
+                    continue
+            node.get_logger().warn(
+                "All candidate corridors failed straight Cartesian FINAL — "
+                "skipping grasp without closing.")
+            node._corridor_exclusions = set()
+            node._corridor_retry_goal = None
+            unlock_target(node)
+            continue
         log_path_deviation(node, "FINAL")
         _timing["final"] = time.time() - _t_final
         if _log_phase_timings:
@@ -4537,9 +5261,12 @@ def plan_and_execute(node):
         _grasp_pair_attempt_id = time.strftime("%Y%m%d_%H%M%S") + (
             f"_{int((time.time() % 1.0) * 1000):03d}")
         _grasp_pair_before_frame = None
+        _grasp_pair_timeout = float(getattr(
+            node.cfg.planner, "grasp_pair_capture_timeout_s", 0.25))
         try:
             _grasp_pair_before_frame = node.capture_grasp_pair_frame(
-                _grasp_pair_attempt_id, "before_reverse", timeout=0.45)
+                _grasp_pair_attempt_id, "before_reverse",
+                timeout=_grasp_pair_timeout)
         except Exception as _e:
             node.get_logger().warn(
                 f"[GRASP_PAIR] {_grasp_pair_attempt_id} before_reverse failed: {_e}")
@@ -4574,7 +5301,8 @@ def plan_and_execute(node):
         if _reverse_endpoint_reached:
             try:
                 _grasp_pair_after_frame = node.capture_grasp_pair_frame(
-                    _grasp_pair_attempt_id, "after_reverse", timeout=0.45)
+                    _grasp_pair_attempt_id, "after_reverse",
+                    timeout=_grasp_pair_timeout)
             except Exception as _e:
                 node.get_logger().warn(
                     f"[GRASP_PAIR] {_grasp_pair_attempt_id} "
@@ -4980,6 +5708,10 @@ def plan_and_execute(node):
 
     # Always resume YOLO when the grasp loop exits — break, stop, or normal completion.
     _vision_resume()
+    # HOME describes the last commanded motion, not the post-cycle state. Return
+    # to IDLE so safe runtime settings are not permanently rejected after Done.
+    if getattr(node, "motion_phase", "") != "ERROR":
+        node.motion_phase = "IDLE"
     node.get_logger().info(f"Done. run_time={time.time() - _run_t0:.2f}s cycles={_cycle_idx}")
 
 

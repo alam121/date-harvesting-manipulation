@@ -8,6 +8,8 @@ import os
 from .gripper_profiles import (
     finger_joint_indices_for_profile,
     make_closed_position,
+    make_envelop_closed_position,
+    make_envelop_open_position,
     make_open_position,
     new_gripper_open_extra_deg,
 )
@@ -62,6 +64,8 @@ class FakeGripperController:
         self.finger_joint_indices = finger_joint_indices_for_profile(self.gripper_profile)
         self.open_position = make_open_position(self.gripper_profile)
         self.closed_position = make_closed_position(self.gripper_profile)
+        self.normal_open_position = self.open_position.copy()
+        self.normal_closed_position = self.closed_position.copy()
         self.current_position = self.open_position.copy()
         self.current_open_alpha = 0.0
         self.node.get_logger().info(
@@ -71,6 +75,17 @@ class FakeGripperController:
         self.joint_state_pub = node.create_publisher(JointState, "/joint_states", 10)
         self.joint_state_timer = node.create_timer(0.2, self.publish_joint_state)
         self.publish_joint_state()
+
+    def configure_grasp_mode(self, mode: str):
+        normalized = str(mode or "NORMAL").strip().upper()
+        if normalized == "ENVELOP":
+            self.open_position = make_envelop_open_position()
+            self.closed_position = make_envelop_closed_position()
+        else:
+            normalized = "NORMAL"
+            self.open_position = self.normal_open_position.copy()
+            self.closed_position = self.normal_closed_position.copy()
+        self.active_grasp_mode = normalized
 
     def publish_joint_state(self):
         msg = JointState()
@@ -249,18 +264,33 @@ def control_gripper(node, action: str, fruit_radius: float = None):
         if node.gripper_controller.suction and not getattr(node.gripper_controller, "fake", False):
             activate_suction(node, False)
 
-        adaptive_aperture = bool(getattr(
-            node.cfg.gripper, "adaptive_aperture_enabled", False))
-        if adaptive_aperture and fruit_radius is not None and fruit_radius > 0:
-            # Adaptive aperture: open only enough for this fruit
-            desired_aperture = (fruit_radius * 2) + APERTURE_MARGIN
-            open_alpha = max(0.0, 1.0 - desired_aperture / GRIPPER_MAX_APERTURE)
+        grasp_mode = str(getattr(
+            node, "active_goal_grasp_mode", getattr(
+                node.cfg.gripper, "grasp_mode", "NORMAL"))).strip().upper()
+        if grasp_mode == "ENVELOP":
+            # Exact measured three-finger ENVELOP preshape.
+            node.gripper_controller.frozen_fingers = set()
+            if hasattr(node.gripper_controller, "configure_grasp_mode"):
+                node.gripper_controller.configure_grasp_mode("ENVELOP")
             node.get_logger().info(
-                f"Adaptive gripper: radius={fruit_radius*1000:.0f}mm, "
-                f"aperture={desired_aperture*1000:.0f}mm, alpha={open_alpha:.2f}")
-            node.gripper_controller.open_gripper_to(open_alpha)
-        else:
+                "[GRIPPER_MODE] mode=ENVELOP preshape=MEASURED "
+                "active_fingers=3 closure=MEASURED_SIMULTANEOUS")
             node.gripper_controller.open_gripper()
+        else:
+            if hasattr(node.gripper_controller, "configure_grasp_mode"):
+                node.gripper_controller.configure_grasp_mode("NORMAL")
+            adaptive_aperture = bool(getattr(
+                node.cfg.gripper, "adaptive_aperture_enabled", False))
+            if adaptive_aperture and fruit_radius is not None and fruit_radius > 0:
+                # Adaptive aperture: open only enough for this fruit
+                desired_aperture = (fruit_radius * 2) + APERTURE_MARGIN
+                open_alpha = max(0.0, 1.0 - desired_aperture / GRIPPER_MAX_APERTURE)
+                node.get_logger().info(
+                    f"Adaptive gripper: radius={fruit_radius*1000:.0f}mm, "
+                    f"aperture={desired_aperture*1000:.0f}mm, alpha={open_alpha:.2f}")
+                node.gripper_controller.open_gripper_to(open_alpha)
+            else:
+                node.gripper_controller.open_gripper()
 
         node.gripper_closed = False
         node.slip_detection = False
@@ -272,6 +302,19 @@ def control_gripper(node, action: str, fruit_radius: float = None):
     # CLOSE
     # --------------------------------------------------------
     elif act == "CLOSE":
+
+        grasp_mode = str(getattr(
+            node, "active_goal_grasp_mode", getattr(
+                node.cfg.gripper, "grasp_mode", "NORMAL"))).strip().upper()
+        if grasp_mode == "ENVELOP":
+            # Prevent an earlier two-finger experiment from carrying into an
+            # enveloping grasp. Non-suction closure moves all three together.
+            node.gripper_controller.frozen_fingers = set()
+            node.gripper_controller.suction = False
+            if hasattr(node.gripper_controller, "configure_grasp_mode"):
+                node.gripper_controller.configure_grasp_mode("ENVELOP")
+        elif hasattr(node.gripper_controller, "configure_grasp_mode"):
+            node.gripper_controller.configure_grasp_mode("NORMAL")
 
         # Only enable suction if suction-mode is active
         if node.gripper_controller.suction and not getattr(node.gripper_controller, "fake", False):

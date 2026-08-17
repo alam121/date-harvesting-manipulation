@@ -513,6 +513,7 @@ class Planner:
     direct_branch_retry_seeds: int = 8          # extra perturbed IK seeds when branch retry is needed
     direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
     direct_final_joint_fallback_max_delta_deg: float = 25.0  # allow FINAL joint fallback only for small endpoint moves
+    strict_final_cartesian_only: bool = True  # never replace straight FINAL insertion with a joint/planner curve
     very_low_ik_return_seeds: int = 8           # IK branches scored before moving to a very-low goal
     very_low_ik_max_joint_delta_deg: float = 75.0
     # Sphere-surface clearance, not physical caliper distance. A modeled 41.8mm
@@ -603,11 +604,11 @@ class Planner:
     # deeper into the date cluster.
     low_center_final_depth_offset: float = -0.035
     low_center_final_y_offset: float = -0.035   # legacy alias for low_center_final_depth_offset
-    low_center_final_z_offset: float = 0.018    # m; 18mm above detected low-center point
+    low_center_final_z_offset: float = 0.007    # m; calibrated 7mm above detected low-center point
 
-    mid_center_final_depth_offset: float = -0.015
-    mid_center_final_y_offset: float = -0.015   # legacy alias for mid_center_final_depth_offset
-    mid_center_final_z_offset: float = 0.030    # m; gripper center offset above MID/HIGH center fruit
+    mid_center_final_depth_offset: float = -0.035
+    mid_center_final_y_offset: float = -0.035   # legacy alias for mid_center_final_depth_offset
+    mid_center_final_z_offset: float = 0.007    # same calibrated FINAL Z as LOW center
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
     # Physical centre of the three fingertip bodies at the calibrated fully
@@ -615,7 +616,7 @@ class Planner:
     # FINAL commands compensate this rotated offset so the closure centre,
     # rather than the nominal gripper_tip frame, reaches the grasp point.
     closure_center_offset_tcp_m: List[float] = field(
-        default_factory=lambda: [-0.004553, -0.002559, -0.016223])
+        default_factory=lambda: [-0.004553, 0.000100, -0.016223])
     # visual F1/F2/F3 -> hardware force-channel indices. Keep identity until
     # the controlled single-finger correspondence test establishes otherwise.
     grasp_visual_to_force_map: List[int] = field(
@@ -625,18 +626,39 @@ class Planner:
     phase4_candidate_target_match_m: float = 0.05
     final_approach_yaw_enabled: bool = False     # deprecated unsafe FINAL-only experiment
     final_approach_yaw_max_deg: float = 30.0
-    approach_date_axis_enabled: bool = True      # establish date-axis orientation at APPROACH
+    approach_date_axis_enabled: bool = False     # ellipse finger rotation disabled; logging remains available
     approach_date_axis_max_deg: float = 35.0
     approach_date_axis_min_confidence: float = 0.20
     approach_date_axis_stable_frames: int = 5
     approach_date_axis_max_spread_deg: float = 8.0
+    approach_candidate_roll_enabled: bool = False # score/log only; keep calibrated finger orientation
+    approach_candidate_roll_max_deg: float = 15.0
+    approach_candidate_roll_target_match_m: float = 0.05
+    approach_candidate_roll_min_score: float = 0.85
+    approach_candidate_roll_min_finger_score: float = 0.75
     final_lock_measured_approach_orientation: bool = True # prevent wrist correction during straight insertion
+    target_specific_approach_enabled: bool = False # superseded by explicit mid/high corridor candidates
+    target_specific_approach_max_deg: float = 25.0
+    mid_high_corridor_approach_enabled: bool = True
+    mid_high_corridor_inner_angle_deg: float = 10.0
+    mid_high_corridor_side_angle_deg: float = 20.0
+    mid_high_corridor_wide_angle_deg: float = 30.0
+    mid_high_corridor_outer_angle_deg: float = 45.0
+    mid_high_direction_min_horizontal: float = 0.15
+    corridor_date_axis_enabled: bool = True
+    corridor_date_axis_min_confidence: float = 0.20
+    log_corridor_candidates: bool = False
+    tool_axis_tip_aim_enabled: bool = True
+    tool_axis_tip_max_age_s: float = 0.50
+    tool_axis_tip_max_goal_distance_m: float = 0.08
+    tool_axis_tip_max_swing_deg: float = 45.0
+    tool_axis_tip_fallback_after_corridors: int = 2  # then retry from detected centre
 
 #---------------------------------------------------------------------------------------------------------
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
     final_endpoint_tolerance: float = 0.004     # m; require FINAL TCP within 4mm before closing
-    final_visual_verification_s: float = 0.7    # observation-only camera window at FINAL before close
+    final_visual_verification_s: float = 0.4    # observation-only camera window at FINAL before close
     phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves
     phase5_center_max_correction_mm: float = 3.0 # clamp each logged image-axis suggestion
@@ -647,11 +669,12 @@ class Planner:
     reverse_velocity_scale: float = 0.18        # dedicated low joint-velocity cap for reverse only
     reverse_acceleration_scale: float = 0.18    # dedicated joint acceleration limit multiplier
     reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
-    grasp_post_close_settle_s: float = 0.10      # closure loop is synchronous; only sensor settle remains
+    grasp_post_close_settle_s: float = 0.05      # closure loop is synchronous; only sensor settle remains
+    grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
 
 
-    hold_check_settle_s: float = 0.05           # s; force settle before post-reverse hold samples
-    hold_check_window_s: float = 0.30           # s; median force sample window after reverse
+    hold_check_settle_s: float = 0.03           # s; force settle before post-reverse hold samples
+    hold_check_window_s: float = 0.20           # s; median force sample window after reverse
     hold_check_sample_dt: float = 0.04          # s; post-reverse force sample period
     hold_force_finger_threshold_n: float = 3.0  # above empty-close maximum (1.8N)
     hold_force_min_fingers: int = 2
@@ -674,7 +697,7 @@ class Planner:
     reacquire_stable_frames: int = 2        # two consistent high-FPS measurements
     slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
-    subscribe_goal_min_settle_s: float = 0.40  # ignore first depth samples after Subscribe
+    subscribe_goal_min_settle_s: float = 0.25  # ignore first depth samples after Subscribe
     subscribe_goal_max_wait_s: float = 1.20    # fast median fallback if XYZ does not stabilize
     subscribe_goal_stable_tol: float = 0.020   # m; last 2 XYZ readings must be this close
     subscribe_goal_median_window: int = 5      # recent XYZ samples for fast fallback median
@@ -702,15 +725,22 @@ class Perception:
 @dataclass
 class Gripper:
     use_suction: bool = False
+    grasp_mode: str = "AUTO"             # AUTO chooses NORMAL/ENVELOP per accepted goal
+    auto_envelop_axis_from_vertical_deg: float = 45.0
+    auto_envelop_min_axis_confidence: float = 0.35
+    normal_depth_extra_m: float = 0.0
+    normal_z_extra_m: float = 0.0
+    envelop_depth_extra_m: float = 0.024 # place fruit 24mm deeper than NORMAL
+    envelop_z_extra_m: float = 0.005
     adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
     closing_steps: int = 10
     step_delay_s: float = 0.05
-    opening_steps: int = 8
-    opening_step_delay_s: float = 0.08
-    open_settle_s: float = 0.15
-    open_hold_repeats: int = 8
-    open_hold_interval_s: float = 0.10
+    opening_steps: int = 6
+    opening_step_delay_s: float = 0.06
+    open_settle_s: float = 0.10
+    open_hold_repeats: int = 3
+    open_hold_interval_s: float = 0.04
 
 @dataclass
 class Grasp:

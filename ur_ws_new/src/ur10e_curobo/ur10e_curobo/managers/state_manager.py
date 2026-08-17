@@ -2,6 +2,7 @@
 """Robot state management for UR10e cuRobo node."""
 
 import math
+import time
 import threading
 from typing import Optional, List, Tuple, TYPE_CHECKING
 from rclpy.node import Node
@@ -56,6 +57,10 @@ class StateManager:
 
         # Direction tracking (for pre-grasp bias)
         self.fruit_direction: Optional[Tuple[float, float, float]] = None
+        self.date_tip_point: Optional[Tuple[float, float, float]] = None
+        self.date_tip_time: float = 0.0
+        self.date_tip_stable: bool = False
+        self._date_tip_history: List[Tuple[float, float, float]] = []
 
         # Branch gap detection (for 2-finger mode)
         self.fruit_between_branches: bool = False
@@ -135,6 +140,12 @@ class StateManager:
             Vector3Stamped,
             "/datefruit_direction",
             self._direction_cb,
+            10
+        )
+        self._node.create_subscription(
+            PointStamped,
+            "/datefruit_tip_point",
+            self._date_tip_cb,
             10
         )
 
@@ -285,6 +296,18 @@ class StateManager:
     def _direction_cb(self, msg: Vector3Stamped) -> None:
         """Store fruit direction for pre-grasp bias."""
         self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
+
+    def _date_tip_cb(self, msg: PointStamped) -> None:
+        point = (float(msg.point.x), float(msg.point.y), float(msg.point.z))
+        history = self._date_tip_history
+        history.append(point)
+        del history[:-5]
+        mean = tuple(sum(p[i] for p in history) / len(history) for i in range(3))
+        spread = max(
+            math.dist(point_i, mean) for point_i in history) if history else float("inf")
+        self.date_tip_point = mean
+        self.date_tip_time = time.time()
+        self.date_tip_stable = len(history) >= 3 and spread <= 0.012
 
     def _gap_info_cb(self, msg: Float32MultiArray) -> None:
         """Store branch-gap and vision-selected three-finger roll results."""

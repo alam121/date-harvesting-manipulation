@@ -1420,6 +1420,54 @@ class UR10eCuroboMoveIt(Node):
                     self.get_logger().info(
                         f"Environment switched to {requested_environment!r}; "
                         "HOME/DROPOFF and all related joint presets updated")
+        elif cmd.startswith("set_grasp_mode "):
+            requested_mode = cmd.split(maxsplit=1)[1].strip().upper()
+            if requested_mode not in ("AUTO", "NORMAL", "ENVELOP"):
+                self.get_logger().warn(
+                    f"Grasp-mode update rejected: invalid mode "
+                    f"{requested_mode!r}")
+            elif self.motion_phase != "IDLE":
+                self.get_logger().warn(
+                    "Grasp-mode update rejected: robot motion is active "
+                    f"(phase={self.motion_phase})")
+            else:
+                self.cfg.gripper.grasp_mode = requested_mode
+                self.active_goal_grasp_mode = (
+                    requested_mode
+                    if requested_mode in ("NORMAL", "ENVELOP")
+                    else "NORMAL")
+                self.get_logger().info(
+                    f"[GRIPPER_MODE_SETTINGS] active={requested_mode} "
+                    "source=RVIZ effective=NEXT_GRASP")
+                self._publish_goal_info()
+        elif cmd.startswith("set_grasp_mode_offsets "):
+            try:
+                values = [float(value) for value in cmd.split()[1:]]
+                if len(values) != 4:
+                    raise ValueError(
+                        "expected NORMAL depth/Z and ENVELOP depth/Z")
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError("all offsets must be finite")
+                if any(abs(value) > 0.050 for value in values):
+                    raise ValueError("each offset must be within +/-50 mm")
+                if self.motion_phase != "IDLE":
+                    raise ValueError(
+                        f"robot motion is active (phase={self.motion_phase})")
+            except ValueError as exc:
+                self.get_logger().warn(
+                    f"Grasp-mode final-offset update rejected: {exc}")
+            else:
+                (self.cfg.gripper.normal_depth_extra_m,
+                 self.cfg.gripper.normal_z_extra_m,
+                 self.cfg.gripper.envelop_depth_extra_m,
+                 self.cfg.gripper.envelop_z_extra_m) = values
+                self.get_logger().info(
+                    "[GRASP_MODE_FINAL_SETTINGS] "
+                    f"normal_mm=[depth:{values[0]*1000:+.1f},"
+                    f"z:{values[1]*1000:+.1f}] "
+                    f"envelop_mm=[depth:{values[2]*1000:+.1f},"
+                    f"z:{values[3]*1000:+.1f}] effective=NEXT_GRASP")
+                self._publish_goal_info()
         elif cmd.startswith("set_final_offsets "):
             try:
                 values = [float(value) for value in cmd.split()[1:]]
@@ -1431,9 +1479,16 @@ class UR10eCuroboMoveIt(Node):
                     "Final grasp offsets updated from RViz (metres): "
                     + ", ".join(f"{value:+.3f}" for value in values))
         elif cmd.startswith("set_closure_center_offsets "):
-            if self._motion_lock.locked() or self.motion_phase != "IDLE":
+            _joint_velocities = getattr(self, "current_joint_velocities", None)
+            _physically_moving = (
+                _joint_velocities is None
+                or any(abs(float(value)) > 0.02 for value in _joint_velocities)
+            )
+            if self._motion_lock.locked() or _physically_moving:
                 self.get_logger().warn(
-                    "Closure-center update rejected: robot motion is active")
+                    "Closure-center update rejected: robot motion is active "
+                    f"(lock={self._motion_lock.locked()} "
+                    f"moving={_physically_moving} phase={self.motion_phase})")
             else:
                 try:
                     values = [float(value) for value in cmd.split()[1:]]
@@ -1773,6 +1828,10 @@ class UR10eCuroboMoveIt(Node):
             "gripper_fake": bool(getattr(gripper, 'fake', False)),
             "gripper_disabled": bool(getattr(gripper, 'disabled', False)),
             "gripper_suction": bool(getattr(gripper, 'suction', False)),
+            "grasp_mode": str(getattr(
+                self.cfg.gripper, "grasp_mode", "NORMAL")).upper(),
+            "active_goal_grasp_mode": str(getattr(
+                self, "active_goal_grasp_mode", "NORMAL")).upper(),
             "session_recording": bool(getattr(self, "session_recording", False)),
             "session_item_count": len(getattr(self, "session_items", []) or []),
             "session_saved_path": getattr(self, "session_saved_path", ""),
@@ -2783,6 +2842,18 @@ class UR10eCuroboMoveIt(Node):
     @fruit_direction.setter
     def fruit_direction(self, value):
         self._state_mgr.fruit_direction = value
+
+    @property
+    def date_tip_point(self):
+        return self._state_mgr.date_tip_point
+
+    @property
+    def date_tip_time(self):
+        return self._state_mgr.date_tip_time
+
+    @property
+    def date_tip_stable(self):
+        return self._state_mgr.date_tip_stable
 
     @property
     def fruit_major_axis_angle(self):

@@ -943,7 +943,7 @@ class MainWindow(QtWidgets.QWidget):
         # are displayed in millimetres but sent to the motion node in metres.
         closure_group = QtWidgets.QGroupBox("Closure Center (tool frame, mm)")
         closure_layout = QtWidgets.QGridLayout(closure_group)
-        self._closure_default_mm = (-4.553, -2.559, -16.223)
+        self._closure_default_mm = (-4.553, 0.100, -16.223)
         self.closure_offset_inputs = []
         for column, (axis, value) in enumerate(zip(
                 ("X", "Y", "Z"), self._closure_default_mm)):
@@ -1115,15 +1115,34 @@ class MainWindow(QtWidgets.QWidget):
 
         # Gripper
         gripper_group = QtWidgets.QGroupBox("Gripper")
-        gripper_layout = QtWidgets.QHBoxLayout(gripper_group)
+        gripper_layout = QtWidgets.QGridLayout(gripper_group)
 
         open_btn = QtWidgets.QPushButton("Open")
         open_btn.clicked.connect(lambda: self._send_cmd("open"))
-        gripper_layout.addWidget(open_btn)
+        gripper_layout.addWidget(open_btn, 0, 0)
 
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(lambda: self._send_cmd("close"))
-        gripper_layout.addWidget(close_btn)
+        gripper_layout.addWidget(close_btn, 0, 1)
+
+        gripper_layout.addWidget(QtWidgets.QLabel("Grasp mode:"), 1, 0)
+        self.grasp_mode_combo = QtWidgets.QComboBox()
+        self.grasp_mode_combo.addItem("Auto (from date angle)", "AUTO")
+        self.grasp_mode_combo.addItem("Normal", "NORMAL")
+        self.grasp_mode_combo.addItem("Envelop (experimental)", "ENVELOP")
+        self.grasp_mode_combo.setToolTip(
+            "ENVELOP uses the measured 12-joint open/closed postures and "
+            "places the closure center slightly deeper. Applied while IDLE.")
+        gripper_layout.addWidget(self.grasp_mode_combo, 1, 1)
+
+        grasp_mode_apply = QtWidgets.QPushButton("Apply Mode")
+        grasp_mode_apply.clicked.connect(self._apply_grasp_mode)
+        gripper_layout.addWidget(grasp_mode_apply, 2, 0)
+        self.grasp_mode_active_label = QtWidgets.QLabel("Active: waiting…")
+        self.grasp_mode_active_label.setStyleSheet(
+            "font-size: 9pt; color: #455a64;")
+        gripper_layout.addWidget(self.grasp_mode_active_label, 2, 1)
+        self._grasp_mode_synced = False
         motion_tab_layout.addWidget(gripper_group)
 
         # Keyboard Mode Button (opens separate window)
@@ -1398,6 +1417,16 @@ class MainWindow(QtWidgets.QWidget):
                     self._environment_synced = True
                 self.environment_active_label.setText(
                     f"Active: {active_profile} / {active_environment}")
+            active_grasp_mode = str(
+                goal_info.get("grasp_mode", "NORMAL")).upper()
+            if active_grasp_mode in ("AUTO", "NORMAL", "ENVELOP"):
+                if not self._grasp_mode_synced:
+                    index = self.grasp_mode_combo.findData(active_grasp_mode)
+                    if index >= 0:
+                        self.grasp_mode_combo.setCurrentIndex(index)
+                    self._grasp_mode_synced = True
+                self.grasp_mode_active_label.setText(
+                    f"Active: {active_grasp_mode}")
         phase = goal_info.get("motion_phase", "IDLE") if goal_info else "IDLE"
         phase_colors = {
             "IDLE":      ("#455a64", "#eceff1"),
@@ -1543,6 +1572,15 @@ class MainWindow(QtWidgets.QWidget):
         self.ros.publish_cmd(f"set_environment {environment}")
         self.status_update.emit(
             f"Requested environment: {environment}", False)
+
+    def _apply_grasp_mode(self):
+        mode = str(self.grasp_mode_combo.currentData()).upper()
+        if mode not in ("AUTO", "NORMAL", "ENVELOP"):
+            self.status_update.emit("Invalid grasp mode", True)
+            return
+        self.ros.publish_cmd(f"set_grasp_mode {mode}")
+        self.status_update.emit(
+            f"Requested grasp mode: {mode} (next grasp)", False)
 
     def _apply_closure_center_offsets(self):
         values_mm = [spin.value() for spin in self.closure_offset_inputs]

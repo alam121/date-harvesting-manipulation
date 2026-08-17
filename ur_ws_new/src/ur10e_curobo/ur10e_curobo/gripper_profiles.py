@@ -20,6 +20,21 @@ NEW_GRIPPER_OPEN_POSITION = [
 NEW_GRIPPER_CLOSE_DELTA = 2.5673 - 2.1260
 NEW_GRIPPER_OPEN_EXTRA_DEG = 7.0
 
+# Measured physical postures for the enveloping three-finger grasp. These are
+# full M1..M12 targets captured from /gripper/joint_states, rather than an
+# alpha extrapolation of the normal curl posture.
+ENVELOP_GRIPPER_OPEN_POSITION = [
+    -1.2950343050, 0.1692969374, 2.2636920398, -0.8639379797,
+    -1.2007865254, -0.0872664626, 1.8849555922, -0.3630284844,
+    1.5742869853, 0.1308996939, 2.3561944902, -0.8918632478,
+]
+
+ENVELOP_GRIPPER_CLOSED_POSITION = [
+    -1.3037609512, 0.0226892803, 2.4068090385, -0.5009094953,
+    -1.2758356832, 0.1745329252, 1.5044738152, 0.6195918845,
+    1.5830136316, -0.0785398163, 2.6145032195, -0.5829399702,
+]
+
 OLD_FINGER_JOINT_INDICES = {
     0: (2,),
     1: (6,),
@@ -83,3 +98,11 @@ def make_closed_position(gripper_profile: str = "new"):
         for j_idx in joints:
             position[j_idx] = NEW_GRIPPER_OPEN_POSITION[j_idx] + NEW_GRIPPER_CLOSE_DELTA
     return position
+
+
+def make_envelop_open_position():
+    return ENVELOP_GRIPPER_OPEN_POSITION.copy()
+
+
+def make_envelop_closed_position():
+    return ENVELOP_GRIPPER_CLOSED_POSITION.copy()

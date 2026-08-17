@@ -199,13 +199,26 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
             else:
                 _at_tol_since = None
 
-            # Stall detection: only timeout if robot has stopped moving
-            if last_dist is not None and abs(dist - last_dist) < 0.001:
+            # Stall detection must use actual robot motion as well as radial
+            # progress. On a curved cuRobo path the TCP can move tangentially
+            # for several seconds while its straight-line distance to the goal
+            # changes by less than 1 mm; distance-only detection falsely stopped
+            # valid approaches in that case.
+            joint_velocities = getattr(node, 'current_joint_velocities', None)
+            velocity_known = (
+                joint_velocities is not None and len(joint_velocities) > 0)
+            robot_stationary = (
+                velocity_known
+                and max(abs(float(v)) for v in joint_velocities) < 0.005)
+            no_radial_progress = (
+                last_dist is not None and abs(dist - last_dist) < 0.001)
+            if no_radial_progress and (robot_stationary or not velocity_known):
                 if stall_start is None:
                     stall_start = time.time()
                 elif time.time() - stall_start > STALL_TIMEOUT:
                     node.get_logger().warn(
-                        f"Robot not moving (dist={dist*100:.1f}cm from target, stalled {STALL_TIMEOUT}s) — accepting.")
+                        f"Robot not moving (dist={dist*100:.1f}cm from target, "
+                        f"stalled {STALL_TIMEOUT}s) — declaring motion failed.")
                     stalled = True
                     break
             else:

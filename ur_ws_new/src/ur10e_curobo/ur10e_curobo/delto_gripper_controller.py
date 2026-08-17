@@ -7,6 +7,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from .gripper_profiles import (
     finger_joint_indices_for_profile,
     make_closed_position,
+    make_envelop_closed_position,
+    make_envelop_open_position,
     make_open_position,
     new_gripper_open_extra_deg,
 )
@@ -52,6 +54,8 @@ class DeltoGripperController:
 
         self.open_position = make_open_position(self.gripper_profile)
         self.closed_position = make_closed_position(self.gripper_profile)
+        self.normal_open_position = self.open_position.copy()
+        self.normal_closed_position = self.closed_position.copy()
 
         self.current_position = self.open_position.copy()
         self.current_open_alpha = 0.0
@@ -92,6 +96,18 @@ class DeltoGripperController:
             else:
                 self.node.get_logger().warn("⚠️ No force data received - baseline will be set on first close")
         threading.Thread(target=capture_initial_baseline, daemon=True).start()
+
+    def configure_grasp_mode(self, mode: str):
+        """Select exact NORMAL or measured ENVELOP open/closed postures."""
+        normalized = str(mode or "NORMAL").strip().upper()
+        if normalized == "ENVELOP":
+            self.open_position = make_envelop_open_position()
+            self.closed_position = make_envelop_closed_position()
+        else:
+            normalized = "NORMAL"
+            self.open_position = self.normal_open_position.copy()
+            self.closed_position = self.normal_closed_position.copy()
+        self.active_grasp_mode = normalized
 
     # --------------------------------------------------------
     # Utility functions
@@ -228,15 +244,25 @@ class DeltoGripperController:
         else:
             fingers_to_move = [0, 1, 2]  # all fingers move every step
 
-        for ch in fingers_to_move:
-            if ch in self.frozen_fingers:
-                continue
-            start = getattr(self, 'close_start_position', self.open_position)
-            for j_idx in self.finger_joint_indices.get(ch, (self.finger_joint_idx[ch],)):
+        start = getattr(self, 'close_start_position', self.open_position)
+        if getattr(self, "active_grasp_mode", "NORMAL") == "ENVELOP":
+            # The measured envelop grasp changes the complete M1..M12 hand
+            # geometry, not only each finger's curl joint.
+            for j_idx in range(len(self.closed_position)):
                 self.current_position[j_idx] = (
                     (1 - alpha) * start[j_idx] +
                     alpha * self.closed_position[j_idx]
                 )
+        else:
+            for ch in fingers_to_move:
+                if ch in self.frozen_fingers:
+                    continue
+                for j_idx in self.finger_joint_indices.get(
+                        ch, (self.finger_joint_idx[ch],)):
+                    self.current_position[j_idx] = (
+                        (1 - alpha) * start[j_idx] +
+                        alpha * self.closed_position[j_idx]
+                    )
 
         msg = Float32MultiArray()
         msg.data = self.current_position
