@@ -1,5 +1,7 @@
 import math
 import os
+import json
+from pathlib import Path
 
 OLD_GRIPPER_OPEN_POSITION = [
     -0.0942, -0.1500, 2.0660, -0.5062,
@@ -19,6 +21,21 @@ NEW_GRIPPER_OPEN_POSITION = [
 ]
 NEW_GRIPPER_CLOSE_DELTA = 2.5673 - 2.1260
 NEW_GRIPPER_OPEN_EXTRA_DEG = 7.0
+
+# Outdoor gripper postures measured from /gripper/joint_states.  This second
+# physical DG-3F-M has slightly different zero/alignment values from the Lab
+# unit, so keep its complete 12-joint targets rather than applying a delta.
+OUTDOOR_NORMAL_OPEN_POSITION = [
+    0.4350, -0.1130, 2.0250, -0.3700,
+    -1.1330, 0.0000, 1.6580, -0.0930,
+    0.3770, 0.1710, 2.0320, -0.4400,
+]
+
+OUTDOOR_NORMAL_CLOSED_POSITION = [
+    0.3140, -0.1120, 1.9600, 0.1260,
+    -1.1340, 0.0000, 1.9390, -0.1100,
+    0.3870, 0.1760, 1.8030, 0.3580,
+]
 
 # Measured physical postures for the enveloping three-finger grasp. These are
 # full M1..M12 targets captured from /gripper/joint_states, rather than an
@@ -52,6 +69,70 @@ CALIBRATED_OPEN_POSITION = NEW_GRIPPER_OPEN_POSITION
 CALIBRATED_CLOSE_DELTA = NEW_GRIPPER_CLOSE_DELTA
 FINGER_JOINT_INDICES = NEW_FINGER_JOINT_INDICES
 
+GRIPPER_CALIBRATION_PATH = Path(os.environ.get(
+    "UR10E_GRIPPER_CALIBRATION_FILE",
+    "~/.config/datepalm/gripper_calibration.json",
+)).expanduser()
+
+
+def _current_normal_open_default():
+    position = NEW_GRIPPER_OPEN_POSITION.copy()
+    open_extra = math.radians(NEW_GRIPPER_OPEN_EXTRA_DEG)
+    for joints in NEW_FINGER_JOINT_INDICES.values():
+        for j_idx in joints:
+            position[j_idx] -= open_extra
+    return position
+
+
+def _current_normal_closed_default():
+    position = NEW_GRIPPER_OPEN_POSITION.copy()
+    for joints in NEW_FINGER_JOINT_INDICES.values():
+        for j_idx in joints:
+            position[j_idx] = NEW_GRIPPER_OPEN_POSITION[j_idx] + NEW_GRIPPER_CLOSE_DELTA
+    return position
+
+
+def default_environment_calibrations():
+    """Return independent Lab/Outdoor copies of today's four calibrated poses."""
+    poses = {
+        "normal_open": _current_normal_open_default(),
+        "normal_closed": _current_normal_closed_default(),
+        "envelop_open": ENVELOP_GRIPPER_OPEN_POSITION.copy(),
+        "envelop_closed": ENVELOP_GRIPPER_CLOSED_POSITION.copy(),
+    }
+    calibrations = {
+        environment: {name: values.copy() for name, values in poses.items()}
+        for environment in ("lab", "outdoor")
+    }
+    calibrations["outdoor"]["normal_open"] = (
+        OUTDOOR_NORMAL_OPEN_POSITION.copy())
+    calibrations["outdoor"]["normal_closed"] = (
+        OUTDOOR_NORMAL_CLOSED_POSITION.copy())
+    return calibrations
+
+
+def load_environment_calibration(environment=None):
+    environment = str(environment or os.environ.get(
+        "UR10E_ENVIRONMENT", "outdoor")).strip().lower()
+    if environment not in ("lab", "outdoor"):
+        environment = "outdoor"
+    defaults = default_environment_calibrations()[environment]
+    try:
+        data = json.loads(GRIPPER_CALIBRATION_PATH.read_text())
+        selected = data.get(environment, {})
+    except (OSError, ValueError, TypeError):
+        return defaults
+    result = {}
+    for name, fallback in defaults.items():
+        values = selected.get(name)
+        if (isinstance(values, list) and len(values) == 12
+                and all(isinstance(value, (int, float))
+                        and math.isfinite(float(value)) for value in values)):
+            result[name] = [float(value) for value in values]
+        else:
+            result[name] = fallback
+    return result
+
 
 def new_gripper_open_extra_deg() -> float:
     value = os.environ.get("UR10E_NEW_GRIPPER_OPEN_EXTRA_DEG")
@@ -79,13 +160,16 @@ def make_open_position(gripper_profile: str = "new"):
     if profile == "old":
         return OLD_GRIPPER_OPEN_POSITION.copy()
 
-    position = NEW_GRIPPER_OPEN_POSITION.copy()
-    if profile == "new":
+    # Preserve the legacy environment-variable trim when explicitly supplied;
+    # otherwise use the environment-specific calibrated 12-joint posture.
+    if "UR10E_NEW_GRIPPER_OPEN_EXTRA_DEG" in os.environ:
+        position = NEW_GRIPPER_OPEN_POSITION.copy()
         open_extra = math.radians(new_gripper_open_extra_deg())
         for joints in NEW_FINGER_JOINT_INDICES.values():
             for j_idx in joints:
                 position[j_idx] -= open_extra
-    return position
+        return position
+    return load_environment_calibration()["normal_open"]
 
 
 def make_closed_position(gripper_profile: str = "new"):
@@ -93,16 +177,12 @@ def make_closed_position(gripper_profile: str = "new"):
     if profile == "old":
         return OLD_GRIPPER_CLOSED_POSITION.copy()
 
-    position = NEW_GRIPPER_OPEN_POSITION.copy()
-    for joints in NEW_FINGER_JOINT_INDICES.values():
-        for j_idx in joints:
-            position[j_idx] = NEW_GRIPPER_OPEN_POSITION[j_idx] + NEW_GRIPPER_CLOSE_DELTA
-    return position
+    return load_environment_calibration()["normal_closed"]
 
 
 def make_envelop_open_position():
-    return ENVELOP_GRIPPER_OPEN_POSITION.copy()
+    return load_environment_calibration()["envelop_open"]
 
 
 def make_envelop_closed_position():
-    return ENVELOP_GRIPPER_CLOSED_POSITION.copy()
+    return load_environment_calibration()["envelop_closed"]

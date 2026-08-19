@@ -671,6 +671,7 @@ class Planner:
     reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
     grasp_post_close_settle_s: float = 0.05      # closure loop is synchronous; only sensor settle remains
     grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
+    skip_redundant_visual_grasp_after_temporal: bool = True  # reuse fresh after-reverse frame path
 
 
     hold_check_settle_s: float = 0.03           # s; force settle before post-reverse hold samples

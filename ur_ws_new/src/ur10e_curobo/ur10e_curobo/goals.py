@@ -3330,12 +3330,18 @@ def plan_and_execute(node):
         # Clear previous trajectory markers from RViz
         clear_path_markers(node)
 
-        # Lock vision onto this target (prevents switching to different "best" during approach)
-        lock_target(node, goal[:3])
-
-        # Pause YOLO — goal is committed; no new detections needed until reacquire at standoff.
-        # Frees GPU fully for cuRobo planning and arm motion.
-        _vision_pause()
+        # A preflight-only corridor retry has not moved the robot and deliberately
+        # keeps this exact target locked with vision paused. Do not republish the
+        # lock or repeat the GPU pause handshake/candidate evaluation.
+        _reuse_preflight_lock = bool(
+            _same_corridor_goal
+            and getattr(node, "_corridor_retry_keep_lock", False))
+        node._corridor_retry_keep_lock = False
+        if not _reuse_preflight_lock:
+            # Lock vision onto this target (prevents switching to a different
+            # "best" during approach), then free the GPU for cuRobo.
+            lock_target(node, goal[:3])
+            _vision_pause()
 
         # Clear stored trajectory for partial reverse after grasp
         node.stored_trajectory_states = []
@@ -4165,8 +4171,10 @@ def plan_and_execute(node):
                         f"rolled_preflight={_pf_reason}; retrying same corridor "
                         "with zero finger roll before excluding it")
                     node.goal_poses.insert(0, goal)
-                    _vision_resume()
-                    unlock_target(node)
+                    # Same target, no motion: retain the target lock and paused
+                    # perception snapshot instead of paying another vision
+                    # handshake/candidate evaluation on the retry.
+                    node._corridor_retry_keep_lock = True
                     continue
                 node._corridor_exclusions.add(_active_corridor)
                 _tip_failure_limit = max(1, int(getattr(
@@ -4184,8 +4192,8 @@ def plan_and_execute(node):
                         "corridors; retrying once from detected date centre "
                         "with calibrated closure offsets")
                     node.goal_poses.insert(0, goal)
-                    _vision_resume()
-                    unlock_target(node)
+                    # Retry the same frozen target without restarting vision.
+                    node._corridor_retry_keep_lock = True
                     continue
                 _centre_fallback = bool(getattr(
                     node, "_corridor_tip_fallback_active", False))
@@ -4199,6 +4207,7 @@ def plan_and_execute(node):
                         f"{'bounded centre-fallback' if _centre_fallback else ''} corridor "
                         "without robot motion")
                     node.goal_poses.insert(0, goal)
+                    node._corridor_retry_keep_lock = True
                 else:
                     node.get_logger().warn(
                         ("Bounded centre fallback exhausted after 3 corridors; "
@@ -4208,8 +4217,9 @@ def plan_and_execute(node):
                     node._corridor_exclusions = set()
                     node._corridor_retry_goal = None
                     node._corridor_tip_fallback_active = False
-                _vision_resume()
-                unlock_target(node)
+                if _pf_remaining <= 0:
+                    _vision_resume()
+                    unlock_target(node)
                 continue
 
         # === DEBUG PLAN PREVIEW (RViz visualization) ===
@@ -5274,7 +5284,8 @@ def plan_and_execute(node):
         # 4. Drop-off and return
         if _check_stop():
             break
-        time.sleep(0.2)
+        time.sleep(float(getattr(
+            node.cfg.planner, "grasp_post_close_settle_s", 0.05)))
 
         # Wrist rotation to detach fruit from stem
         if _log_cycle_start:
@@ -5426,20 +5437,25 @@ def plan_and_execute(node):
 
         # Logging-only camera verification.  This is deliberately independent
         # of force classification and cannot trigger retry or robot motion.
-        try:
-            _visual = node.verify_visual_grasp(frame_count=5, timeout=0.8)
-            node.visual_grasp_result = _visual.label
-            if not getattr(node.cfg.planner, "concise_console_logs", False):
-                node.get_logger().info(
-                    f"[VISUAL_GRASP] {_visual.label} | score={_visual.score:.3f} "
-                    f"red_pixels={_visual.red_pixels} | {_visual.reason} "
-                    "(logging only; no automatic retry)"
-                )
-        except Exception as _e:
-            node.visual_grasp_result = "UNCERTAIN"
-            node.get_logger().warn(
-                f"[VISUAL_GRASP] UNCERTAIN | verifier failed: {_e} "
-                "(logging only)")
+        _skip_redundant_visual = bool(getattr(
+            node.cfg.planner,
+            "skip_redundant_visual_grasp_after_temporal", True))
+        if not (_skip_redundant_visual
+                and _grasp_pair_after_frame is not None):
+            try:
+                _visual = node.verify_visual_grasp(frame_count=5, timeout=0.8)
+                node.visual_grasp_result = _visual.label
+                if not getattr(node.cfg.planner, "concise_console_logs", False):
+                    node.get_logger().info(
+                        f"[VISUAL_GRASP] {_visual.label} | score={_visual.score:.3f} "
+                        f"red_pixels={_visual.red_pixels} | {_visual.reason} "
+                        "(logging only; no automatic retry)"
+                    )
+            except Exception as _e:
+                node.visual_grasp_result = "UNCERTAIN"
+                node.get_logger().warn(
+                    f"[VISUAL_GRASP] UNCERTAIN | verifier failed: {_e} "
+                    "(logging only)")
         _timing["reverse_hold"] = time.time() - _t_reverse_hold
         if _log_phase_timings:
             node.get_logger().info(

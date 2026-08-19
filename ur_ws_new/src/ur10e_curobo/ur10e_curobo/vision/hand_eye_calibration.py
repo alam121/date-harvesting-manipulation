@@ -66,9 +66,23 @@ ARUCO_DICTIONARY_NAME = "DICT_5X5_1000"
 MIN_CHARUCO_CORNERS = 12
 BOARD_DPI = 300
 
+# A sample is redundant only when both the robot position and orientation are
+# close to an accepted sample.  This still permits useful rotation-in-place or
+# translation-only captures while preventing repeated presses at one pose.
+DUPLICATE_TRANSLATION_M = 0.010
+DUPLICATE_ROTATION_DEG = 5.0
+
 # Legacy plain chessboard option: 7 × 10 inner corners (8 × 11 squares).
 CHESSBOARD_INNER_X = 7
 CHESSBOARD_INNER_Y = 10
+CHESSBOARD_SQUARE_SIZE = 0.02975  # measured mean: 29.7–29.8 mm
+MAX_REPROJECTION_RMSE_PX = 0.60
+STATIONARY_TRANSLATION_FLOOR_M = 0.005
+STATIONARY_ROTATION_FLOOR_DEG = 1.5
+ROBOT_SETTLE_WINDOW_S = 0.60
+ROBOT_SETTLE_CHECK_INTERVAL_S = 0.20
+ROBOT_SETTLE_MAX_TRANSLATION_M = 0.0005
+ROBOT_SETTLE_MAX_ROTATION_DEG = 0.20
 
 # ── Output path ───────────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).resolve().parent
@@ -77,6 +91,23 @@ OUTPUT_FILE = OUTPUT_DIR / "hand_eye_calibration.yaml"
 # ── TF frames ─────────────────────────────────────────────────────────
 BASE_FRAME = "base_link"
 EE_FRAME = "tool0"  # UR driver end-effector frame
+
+
+def find_duplicate_robot_pose(candidate_pose, accepted_rotations,
+                              accepted_translations):
+    """Return the matching sample and pose deltas, or None if it is distinct."""
+    candidate_rotation = candidate_pose[:3, :3]
+    candidate_translation = candidate_pose[:3, 3]
+    for index, (rotation, translation) in enumerate(zip(
+            accepted_rotations, accepted_translations)):
+        translation_delta = float(np.linalg.norm(
+            candidate_translation - np.asarray(translation).reshape(3)))
+        rotation_delta_deg = float(np.degrees(Rotation.from_matrix(
+            rotation.T @ candidate_rotation).magnitude()))
+        if (translation_delta < DUPLICATE_TRANSLATION_M
+                and rotation_delta_deg < DUPLICATE_ROTATION_DEG):
+            return index, translation_delta, rotation_delta_deg
+    return None
 
 
 def create_charuco_board(
@@ -108,8 +139,10 @@ def generate_board_image(output_path: Path, target_type: str) -> None:
         squares_x = CHESSBOARD_INNER_X + 1
         squares_y = CHESSBOARD_INNER_Y + 1
 
-    width_mm = squares_x * SQUARE_SIZE * 1000.0
-    height_mm = squares_y * SQUARE_SIZE * 1000.0
+    physical_square_size = (
+        SQUARE_SIZE if target_type == "charuco" else CHESSBOARD_SQUARE_SIZE)
+    width_mm = squares_x * physical_square_size * 1000.0
+    height_mm = squares_y * physical_square_size * 1000.0
     width_px = round(width_mm / 25.4 * BOARD_DPI)
     height_px = round(height_mm / 25.4 * BOARD_DPI)
     if target_type == "charuco":
@@ -130,7 +163,7 @@ def generate_board_image(output_path: Path, target_type: str) -> None:
     print(f"Generated {target_type} board: {output_path}")
     print(f"  Squares: {squares_x} x {squares_y}")
     print(f"  Physical size: {width_mm:.0f} x {height_mm:.0f} mm")
-    print(f"  Square: {SQUARE_SIZE * 1000:.0f} mm")
+    print(f"  Square: {physical_square_size * 1000:.2f} mm")
     if target_type == "charuco":
         print(f"  Marker: {MARKER_SIZE * 1000:.0f} mm")
         print(f"  Dictionary: {ARUCO_DICTIONARY_NAME}")
@@ -151,6 +184,36 @@ def get_ee_pose(tf_buffer: Buffer, node: Node, timeout_sec: float = 2.0):
     T[:3, 3] = [trans.x, trans.y, trans.z]
     T[:3, :3] = Rotation.from_quat([rot.x, rot.y, rot.z, rot.w]).as_matrix()
     return T
+
+
+def verify_robot_settled(tf_buffer: Buffer, node: Node):
+    """Measure tool0 throughout a settling window; return stability diagnostics."""
+    poses = []
+    checks = max(
+        2, int(round(
+            ROBOT_SETTLE_WINDOW_S / ROBOT_SETTLE_CHECK_INTERVAL_S)) + 1)
+    for check_index in range(checks):
+        pose = get_ee_pose(tf_buffer, node, timeout_sec=0.5)
+        if pose is None:
+            return False, None, float("inf"), float("inf")
+        poses.append(pose)
+        if check_index + 1 < checks:
+            time.sleep(ROBOT_SETTLE_CHECK_INTERVAL_S)
+
+    reference = poses[0]
+    translation_delta_max = max(
+        float(np.linalg.norm(pose[:3, 3] - reference[:3, 3]))
+        for pose in poses[1:])
+    rotation_delta_max_deg = max(
+        float(np.degrees(Rotation.from_matrix(
+            reference[:3, :3].T @ pose[:3, :3]).magnitude()))
+        for pose in poses[1:])
+    settled = (
+        translation_delta_max <= ROBOT_SETTLE_MAX_TRANSLATION_M
+        and rotation_delta_max_deg <= ROBOT_SETTLE_MAX_ROTATION_DEG)
+    # The displayed camera frame was acquired immediately before the first TF
+    # sample, so retain that pose after proving it stayed stable afterward.
+    return settled, poses[0], translation_delta_max, rotation_delta_max_deg
 
 
 def rotation_matrix_to_rvec(R):
@@ -210,7 +273,7 @@ def main():
             filename = (
                 "charuco_7x24_30mm_22mm_dict5x5_100.png"
                 if args.target == "charuco"
-                else "chessboard_8x11_30mm.png"
+                else "chessboard_8x11_29p75mm.png"
             )
             output_path = OUTPUT_DIR / filename
         else:
@@ -227,6 +290,16 @@ def main():
     from threading import Thread
     spin_thread = Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
+
+    def shutdown_ros():
+        """Stop the executor thread before Python unloads ROS/ZED extensions."""
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin_thread.join(timeout=2.0)
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
 
     # Poll until base_link→tool0 is available (UR bringup can take 10–30 s)
     node.get_logger().info("Waiting for TF tree (base_link → tool0)...")
@@ -245,7 +318,7 @@ def main():
     else:
         print()
         node.get_logger().error("TF not available after 60 s — is the robot driver running?")
-        rclpy.shutdown()
+        shutdown_ros()
         return
     print()
 
@@ -348,7 +421,7 @@ def main():
             (CHESSBOARD_INNER_X * CHESSBOARD_INNER_Y, 3), np.float32)
         objp[:, :2] = np.mgrid[
             0:CHESSBOARD_INNER_X, 0:CHESSBOARD_INNER_Y
-        ].T.reshape(-1, 2) * SQUARE_SIZE
+        ].T.reshape(-1, 2) * CHESSBOARD_SQUARE_SIZE
         criteria = (
             cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
             30,
@@ -360,8 +433,108 @@ def main():
     t_gripper2base_list = []   # translation: gripper -> base
     R_target2cam_list = []     # rotation:    chessboard -> camera
     t_target2cam_list = []     # translation: chessboard -> camera
+    reprojection_rmse_list = []
+    sample_id_list = []
 
     sample_count = 0
+
+    def run_fixed_pose_diagnostic(frame_count=50):
+        if args.target != "chessboard":
+            node.get_logger().warn(
+                "Fixed-pose PnP diagnostic currently requires --target chessboard.")
+            return
+        settled, _, settle_translation, settle_rotation_deg = (
+            verify_robot_settled(tf_buffer, node))
+        if not settled:
+            node.get_logger().warn(
+                f"FIXED_POSE_DIAG aborted: ROBOT_SETTLING "
+                f"{settle_translation*1000.0:.2f}mm/"
+                f"{settle_rotation_deg:.2f}deg.")
+            return
+
+        results = {
+            "ITERATIVE": {"translations": [], "rotations": [], "reprojection": []},
+            "IPPE": {"translations": [], "rotations": [], "reprojection": []},
+        }
+        solver_flags = {
+            "ITERATIVE": cv2.SOLVEPNP_ITERATIVE,
+            "IPPE": cv2.SOLVEPNP_IPPE,
+        }
+        attempts = 0
+        while (len(results["ITERATIVE"]["translations"]) < frame_count
+               and attempts < frame_count * 3):
+            attempts += 1
+            if zed.grab() != sl.ERROR_CODE.SUCCESS:
+                continue
+            if use_zedx_mini:
+                zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+            else:
+                zed.retrieve_image(image_mat)
+            diagnostic_frame = image_mat.get_data()[:, :, :3].copy()
+            diagnostic_gray = cv2.cvtColor(
+                diagnostic_frame, cv2.COLOR_BGR2GRAY)
+            detected, diagnostic_corners = cv2.findChessboardCorners(
+                diagnostic_gray,
+                (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
+                cv2.CALIB_CB_ADAPTIVE_THRESH
+                + cv2.CALIB_CB_NORMALIZE_IMAGE
+                + cv2.CALIB_CB_FAST_CHECK,
+            )
+            if not detected:
+                continue
+            diagnostic_corners = cv2.cornerSubPix(
+                diagnostic_gray, diagnostic_corners, (11, 11), (-1, -1),
+                criteria)
+            for solver_name, solver_flag in solver_flags.items():
+                solved, diagnostic_rvec, diagnostic_tvec = cv2.solvePnP(
+                    objp, diagnostic_corners, camera_matrix, dist_coeffs,
+                    flags=solver_flag)
+                if not solved:
+                    continue
+                projected, _ = cv2.projectPoints(
+                    objp, diagnostic_rvec, diagnostic_tvec,
+                    camera_matrix, dist_coeffs)
+                observed = diagnostic_corners.reshape(-1, 2)
+                rmse = float(np.sqrt(np.mean(np.sum(
+                    (observed - projected.reshape(-1, 2)) ** 2, axis=1))))
+                diagnostic_rotation, _ = cv2.Rodrigues(diagnostic_rvec)
+                results[solver_name]["translations"].append(
+                    diagnostic_tvec.reshape(3))
+                results[solver_name]["rotations"].append(diagnostic_rotation)
+                results[solver_name]["reprojection"].append(rmse)
+
+        print("\n" + "=" * 60)
+        print("FIXED-POSE CHECKERBOARD PNP DIAGNOSTIC")
+        print("=" * 60)
+        for solver_name, values in results.items():
+            translations = np.asarray(values["translations"])
+            if len(translations) < 10:
+                print(f"  {solver_name}: FAILED — only {len(translations)} frames")
+                continue
+            translation_center = np.median(translations, axis=0)
+            translation_deviation_mm = np.linalg.norm(
+                translations - translation_center, axis=1) * 1000.0
+            rotations = Rotation.from_matrix(np.asarray(values["rotations"]))
+            rotation_deviation_deg = np.degrees(
+                (rotations.mean().inv() * rotations).magnitude())
+            reprojection = np.asarray(values["reprojection"])
+            print(
+                f"  {solver_name}: frames={len(translations)} "
+                f"xyz_median=[{translation_center[0]:+.5f},"
+                f"{translation_center[1]:+.5f},{translation_center[2]:+.5f}]m")
+            print(
+                f"    translation deviation median="
+                f"{np.median(translation_deviation_mm):.3f}mm "
+                f"p95={np.percentile(translation_deviation_mm,95):.3f}mm "
+                f"max={np.max(translation_deviation_mm):.3f}mm")
+            print(
+                f"    rotation deviation median="
+                f"{np.median(rotation_deviation_deg):.3f}deg "
+                f"p95={np.percentile(rotation_deviation_deg,95):.3f}deg "
+                f"max={np.max(rotation_deviation_deg):.3f}deg | "
+                f"reprojection mean={np.mean(reprojection):.3f}px")
+        print("  Diagnostic frames were NOT added to calibration samples.")
+        print("=" * 60 + "\n")
 
     node.get_logger().info(
         f"Hand-eye calibration ready.\n"
@@ -372,7 +545,7 @@ def main():
             f"  Dictionary: {ARUCO_DICTIONARY_NAME}\n"
             if args.target == "charuco"
             else f"  Chessboard: {CHESSBOARD_INNER_X}x{CHESSBOARD_INNER_Y} "
-                 f"inner corners, square={SQUARE_SIZE*1000:.0f}mm\n"
+                 f"inner corners, square={CHESSBOARD_SQUARE_SIZE*1000:.2f}mm\n"
         )
         +
         f"  Move the robot, press 'c' to capture, 'q' to finish.\n"
@@ -462,7 +635,7 @@ def main():
             2,
         )
 
-        cv2.putText(display, f"Samples: {sample_count}  |  'c'=capture  'q'=calibrate & quit",
+        cv2.putText(display, f"Samples: {sample_count} | 'c'=capture 'v'=fixed test 'q'=calibrate",
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # Resize for display
@@ -473,14 +646,43 @@ def main():
 
         key = cv2.waitKey(30) & 0xFF
 
-        if key == ord('c') and found:
-            # Get end-effector pose
-            ee_pose = get_ee_pose(tf_buffer, node)
+        if key == ord('v'):
+            run_fixed_pose_diagnostic()
+
+        elif key == ord('c') and found:
+            # The camera frame and robot pose are only paired after tool0 has
+            # remained still throughout the complete settling window.
+            settled, ee_pose, settle_translation, settle_rotation_deg = (
+                verify_robot_settled(tf_buffer, node))
             if ee_pose is None:
                 cv2.putText(display, "NO TF — is the robot driver running?",
                             (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 cv2.imshow("Hand-Eye Calibration", display)
                 cv2.waitKey(1500)
+                continue
+            if not settled:
+                node.get_logger().warn(
+                    f"Sample rejected: ROBOT_SETTLING tool0 moved "
+                    f"{settle_translation * 1000.0:.2f}mm / "
+                    f"{settle_rotation_deg:.2f}deg during "
+                    f"{ROBOT_SETTLE_WINDOW_S:.1f}s (limits "
+                    f"{ROBOT_SETTLE_MAX_TRANSLATION_M * 1000.0:.1f}mm / "
+                    f"{ROBOT_SETTLE_MAX_ROTATION_DEG:.2f}deg). Wait for the "
+                    f"robot to stop completely and capture again.")
+                continue
+
+            duplicate = find_duplicate_robot_pose(
+                ee_pose, R_gripper2base_list, t_gripper2base_list)
+            if duplicate is not None:
+                matched_index, translation_delta, rotation_delta_deg = duplicate
+                node.get_logger().warn(
+                    f"Duplicate sample rejected: matches sample "
+                    f"{matched_index + 1} (translation="
+                    f"{translation_delta * 1000.0:.1f}mm < "
+                    f"{DUPLICATE_TRANSLATION_M * 1000.0:.0f}mm, rotation="
+                    f"{rotation_delta_deg:.1f}deg < "
+                    f"{DUPLICATE_ROTATION_DEG:.1f}deg). Move the robot before "
+                    f"capturing again.")
                 continue
 
             if args.target == "charuco":
@@ -494,6 +696,21 @@ def main():
                 node.get_logger().warn("solvePnP failed — skipping.")
                 continue
 
+            projected_points, _ = cv2.projectPoints(
+                obj_points, rvec, tvec, camera_matrix, dist_coeffs)
+            observed = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+            projected = projected_points.reshape(-1, 2)
+            reprojection_rmse = float(np.sqrt(np.mean(np.sum(
+                (observed - projected) ** 2, axis=1))))
+            if (not np.isfinite(reprojection_rmse)
+                    or reprojection_rmse > MAX_REPROJECTION_RMSE_PX):
+                node.get_logger().warn(
+                    f"Sample rejected: reprojection RMSE="
+                    f"{reprojection_rmse:.3f}px exceeds "
+                    f"{MAX_REPROJECTION_RMSE_PX:.2f}px. Improve focus, "
+                    f"lighting, or board visibility.")
+                continue
+
             R_target2cam, _ = cv2.Rodrigues(rvec)
 
             # Store poses
@@ -501,9 +718,16 @@ def main():
             t_gripper2base_list.append(ee_pose[:3, 3].reshape(3, 1))
             R_target2cam_list.append(R_target2cam)
             t_target2cam_list.append(tvec.reshape(3, 1))
+            reprojection_rmse_list.append(reprojection_rmse)
+            sample_id_list.append(sample_count + 1)
 
             sample_count += 1
-            node.get_logger().info(f"Sample {sample_count} captured.")
+            node.get_logger().info(
+                f"Sample {sample_count} captured "
+                f"(reprojection={reprojection_rmse:.3f}px, settled="
+                f"{settle_translation * 1000.0:.2f}mm/"
+                f"{settle_rotation_deg:.2f}deg over "
+                f"{ROBOT_SETTLE_WINDOW_S:.1f}s).")
 
         elif key == ord('q'):
             break
@@ -514,7 +738,7 @@ def main():
     # ── Run hand-eye calibration ──────────────────────────────────────
     if sample_count < 10:
         node.get_logger().error(f"Need at least 10 samples, got {sample_count}. Aborting.")
-        rclpy.shutdown()
+        shutdown_ros()
         return
 
     # ── Rotation diversity check ──────────────────────────────────────
@@ -536,7 +760,7 @@ def main():
         print("  Add poses with larger wrist_3 / wrist_1 rotations (±30°).")
         confirm = input("  Continue anyway? [y/N]: ").strip().lower()
         if confirm != "y":
-            rclpy.shutdown()
+            shutdown_ros()
             return
     else:
         print(f"  OK — sufficient rotation diversity.")
@@ -568,39 +792,156 @@ def main():
     print("COMPARING ALL METHODS")
     print("=" * 60)
 
-    best_method_name = None
-    best_error = float("inf")
-    best_T = None
+    def solve_all_methods():
+        selected_name = None
+        selected_error = float("inf")
+        selected_transform = None
+        for name, method in methods.items():
+            try:
+                R_x, t_x = cv2.calibrateHandEye(
+                    R_gripper2base_list, t_gripper2base_list,
+                    R_target2cam_list, t_target2cam_list,
+                    method=method,
+                )
+                T_x = np.eye(4)
+                T_x[:3, :3] = R_x
+                T_x[:3, 3] = t_x.flatten()
+                err = compute_consistency_error(T_x)
+                if not np.isfinite(err):
+                    raise ValueError("non-finite error")
+                print(
+                    f"  {name:12s}  mean error: {err*1000:.2f} mm  |  "
+                    f"t=[{t_x[0,0]:.4f}, {t_x[1,0]:.4f}, {t_x[2,0]:.4f}]")
+                if err < selected_error:
+                    selected_error = err
+                    selected_name = name
+                    selected_transform = T_x
+            except Exception as e:
+                print(f"  {name:12s}  FAILED: {e}")
+        return selected_name, selected_error, selected_transform
 
-    for name, method in methods.items():
-        try:
-            R_x, t_x = cv2.calibrateHandEye(
-                R_gripper2base_list, t_gripper2base_list,
-                R_target2cam_list, t_target2cam_list,
-                method=method,
-            )
-            T_x = np.eye(4)
-            T_x[:3, :3] = R_x
-            T_x[:3, 3] = t_x.flatten()
-            err = compute_consistency_error(T_x)
-            if not np.isfinite(err):
-                raise ValueError("non-finite error")
-            print(f"  {name:12s}  mean error: {err*1000:.2f} mm  |  t=[{t_x[0,0]:.4f}, {t_x[1,0]:.4f}, {t_x[2,0]:.4f}]")
-            if err < best_error:
-                best_error = err
-                best_method_name = name
-                best_T = T_x
-        except Exception as e:
-            print(f"  {name:12s}  FAILED: {e}")
+    best_method_name, best_error, best_T = solve_all_methods()
 
     if best_T is None:
         print("\n  >>> ALL METHODS FAILED.")
         print("  The poses lack rotational diversity. Redo with larger wrist rotations (20-30 deg).")
         zed.close()
-        rclpy.shutdown()
+        shutdown_ros()
         return
 
-    print(f"\n  >>> Best method: {best_method_name} ({best_error*1000:.2f} mm)")
+    print(f"\n  >>> Initial best method: {best_method_name} ({best_error*1000:.2f} mm)")
+
+    def robust_limit(values, floor):
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        return max(floor, median + 3.0 * 1.4826 * mad)
+
+    def stationary_board_errors(transform_camera_to_gripper):
+        base_target_transforms = []
+        for R_g2b, t_g2b, R_t2c, t_t2c in zip(
+                R_gripper2base_list, t_gripper2base_list,
+                R_target2cam_list, t_target2cam_list):
+            T_base_gripper = np.eye(4)
+            T_base_gripper[:3, :3] = R_g2b
+            T_base_gripper[:3, 3] = np.asarray(t_g2b).reshape(3)
+            T_camera_target = np.eye(4)
+            T_camera_target[:3, :3] = R_t2c
+            T_camera_target[:3, 3] = np.asarray(t_t2c).reshape(3)
+            base_target_transforms.append(
+                T_base_gripper @ transform_camera_to_gripper @ T_camera_target)
+
+        positions = np.asarray(
+            [transform[:3, 3] for transform in base_target_transforms])
+        median_position = np.median(positions, axis=0)
+        translation_values = np.linalg.norm(
+            positions - median_position, axis=1)
+        rotations = Rotation.from_matrix(np.asarray(
+            [transform[:3, :3] for transform in base_target_transforms]))
+        mean_rotation = rotations.mean()
+        rotation_values_deg = np.degrees(
+            (mean_rotation.inv() * rotations).magnitude())
+        return translation_values, rotation_values_deg
+
+    print("\n" + "=" * 60)
+    print("ITERATIVE STATIONARY-BOARD CONSISTENCY CHECK")
+    print("=" * 60)
+    max_filter_passes = 5
+    total_rejected = 0
+    filtering_converged = False
+    for filter_pass in range(1, max_filter_passes + 1):
+        translation_errors, rotation_errors_deg = stationary_board_errors(best_T)
+        translation_limit = robust_limit(
+            translation_errors, STATIONARY_TRANSLATION_FLOOR_M)
+        rotation_limit_deg = robust_limit(
+            rotation_errors_deg, STATIONARY_ROTATION_FLOOR_DEG)
+        outlier_indices = [
+            index for index, (translation_error, rotation_error) in enumerate(zip(
+                translation_errors, rotation_errors_deg))
+            if (translation_error > translation_limit
+                or rotation_error > rotation_limit_deg)
+        ]
+
+        print(
+            f"  Pass {filter_pass}: n={sample_count}, translation "
+            f"median={np.median(translation_errors)*1000:.2f}mm, "
+            f"p95={np.percentile(translation_errors, 95)*1000:.2f}mm, "
+            f"limit={translation_limit*1000:.2f}mm | rotation "
+            f"median={np.median(rotation_errors_deg):.2f}deg, "
+            f"p95={np.percentile(rotation_errors_deg, 95):.2f}deg, "
+            f"limit={rotation_limit_deg:.2f}deg")
+
+        if not outlier_indices:
+            filtering_converged = True
+            print("  PASS — no stationary-board outliers detected.")
+            break
+        if sample_count - len(outlier_indices) < 10:
+            print("  STOP — outliers retained because removal would leave "
+                  "fewer than 10 samples.")
+            break
+
+        for index in outlier_indices:
+            print(
+                f"    REJECT original sample {sample_id_list[index]}: "
+                f"translation={translation_errors[index]*1000:.2f}mm, "
+                f"rotation={rotation_errors_deg[index]:.2f}deg, "
+                f"reprojection={reprojection_rmse_list[index]:.3f}px")
+
+        rejected = set(outlier_indices)
+        for values in (
+                R_gripper2base_list, t_gripper2base_list,
+                R_target2cam_list, t_target2cam_list,
+                reprojection_rmse_list, sample_id_list):
+            values[:] = [
+                value for index, value in enumerate(values)
+                if index not in rejected]
+        sample_count = len(R_gripper2base_list)
+        total_rejected += len(outlier_indices)
+        print(
+            f"  Re-solving after pass {filter_pass}: rejected "
+            f"{len(outlier_indices)}, {sample_count} samples remain.")
+        best_method_name, best_error, best_T = solve_all_methods()
+        if best_T is None:
+            print("  Re-solve failed after filtering; calibration aborted.")
+            shutdown_ros()
+            return
+
+    final_translation_errors, final_rotation_errors_deg = (
+        stationary_board_errors(best_T))
+    print("\n  FINAL CLEANED CONSISTENCY")
+    print(
+        f"    translation median="
+        f"{np.median(final_translation_errors)*1000:.2f}mm, "
+        f"p95={np.percentile(final_translation_errors, 95)*1000:.2f}mm, "
+        f"max={np.max(final_translation_errors)*1000:.2f}mm")
+    print(
+        f"    rotation median={np.median(final_rotation_errors_deg):.2f}deg, "
+        f"p95={np.percentile(final_rotation_errors_deg, 95):.2f}deg, "
+        f"max={np.max(final_rotation_errors_deg):.2f}deg")
+    print(
+        f"    rejected_total={total_rejected}, converged={filtering_converged}")
+
+    print(f"\n  >>> Final best method: {best_method_name} "
+          f"({best_error*1000:.2f} mm, {sample_count} samples)")
 
     T_cam2gripper = best_T
     R_cam2gripper = T_cam2gripper[:3, :3]
@@ -647,6 +988,16 @@ def main():
             "matrix": T_cam2gripper.tolist(),
             "method": best_method_name,
             "num_samples": sample_count,
+            "stationary_board_validation": {
+                "translation_median_m": float(np.median(final_translation_errors)),
+                "translation_p95_m": float(np.percentile(final_translation_errors, 95)),
+                "translation_max_m": float(np.max(final_translation_errors)),
+                "rotation_median_deg": float(np.median(final_rotation_errors_deg)),
+                "rotation_p95_deg": float(np.percentile(final_rotation_errors_deg, 95)),
+                "rotation_max_deg": float(np.max(final_rotation_errors_deg)),
+                "rejected_samples": int(total_rejected),
+                "converged": bool(filtering_converged),
+            },
             "calibrated_at": timestamp,
             "camera_mode": camera_mode,
             "camera_profile": camera_profile.get("camera_profile"),
@@ -689,6 +1040,16 @@ def main():
         "method": best_method_name,
         "mean_error_m": float(best_error),
         "num_samples": sample_count,
+        "stationary_board_validation": {
+            "translation_median_m": float(np.median(final_translation_errors)),
+            "translation_p95_m": float(np.percentile(final_translation_errors, 95)),
+            "translation_max_m": float(np.max(final_translation_errors)),
+            "rotation_median_deg": float(np.median(final_rotation_errors_deg)),
+            "rotation_p95_deg": float(np.percentile(final_rotation_errors_deg, 95)),
+            "rotation_max_deg": float(np.max(final_rotation_errors_deg)),
+            "rejected_samples": int(total_rejected),
+            "converged": bool(filtering_converged),
+        },
         "calibrated_at": timestamp,
     }
     print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
@@ -764,7 +1125,7 @@ def main():
             "Profile and URDFs not changed. The raw result remains in "
             f"{OUTPUT_FILE}.")
 
-    rclpy.shutdown()
+    shutdown_ros()
 
 
 def _replace_environment_value(text, attribute, environment, value):

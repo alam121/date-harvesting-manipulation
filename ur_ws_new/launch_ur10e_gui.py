@@ -3,6 +3,10 @@
 import shlex
 import subprocess
 import sys
+import json
+import math
+import re
+import importlib.util
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -13,6 +17,326 @@ REPO_ROOT = WS.parent
 LAUNCHER = REPO_ROOT / "bin" / "launch_ur10e"
 VISION_DIR = WS / "src" / "ur10e_curobo" / "ur10e_curobo" / "vision"
 PROFILE_DIR = VISION_DIR / "calibration_profiles"
+GRIPPER_PROFILE_SOURCE = (
+    WS / "src" / "ur10e_curobo" / "ur10e_curobo" / "gripper_profiles.py")
+GRIPPER_CALIBRATION_FILE = (
+    Path.home() / ".config" / "datepalm" / "gripper_calibration.json")
+
+
+def _gripper_defaults():
+    spec = importlib.util.spec_from_file_location(
+        "launcher_gripper_profiles", GRIPPER_PROFILE_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.default_environment_calibrations()
+
+
+class GripperCalibrationDialog(QtWidgets.QDialog):
+    POSES = (
+        ("normal_open", "NORMAL Open"),
+        ("normal_closed", "NORMAL Closed"),
+        ("envelop_open", "ENVELOP Open"),
+        ("envelop_closed", "ENVELOP Closed"),
+    )
+
+    def __init__(self, parent=None, initial_environment="outdoor"):
+        super().__init__(parent)
+        self.setWindowTitle("Environment Gripper Calibration")
+        self.resize(900, 850)
+        self._driver_process = None
+        self.defaults = _gripper_defaults()
+        self.data = json.loads(json.dumps(self.defaults))
+        try:
+            loaded = json.loads(GRIPPER_CALIBRATION_FILE.read_text())
+            for environment in ("lab", "outdoor"):
+                for key, _ in self.POSES:
+                    values = loaded.get(environment, {}).get(key)
+                    if (isinstance(values, list) and len(values) == 12
+                            and all(math.isfinite(float(v)) for v in values)):
+                        self.data[environment][key] = [float(v) for v in values]
+        except (OSError, ValueError, TypeError):
+            pass
+
+        self.environment_combo = QtWidgets.QComboBox()
+        self.environment_combo.addItem("Lab gripper", "lab")
+        self.environment_combo.addItem("Outdoor gripper", "outdoor")
+        index = self.environment_combo.findData(initial_environment)
+        self.environment_combo.setCurrentIndex(max(0, index))
+        self.current_environment = self.environment_combo.currentData()
+
+        self.table = QtWidgets.QTableWidget(12, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Joint", *[label for _, label in self.POSES]])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch)
+        for row in range(12):
+            item = QtWidgets.QTableWidgetItem(f"M{row + 1}")
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("NORMAL", "normal")
+        self.mode_combo.addItem("ENVELOP", "envelop")
+        self.live_table = QtWidgets.QTableWidget(12, 3)
+        self.live_table.setHorizontalHeaderLabels(["Joint", "Position", "Degrees"])
+        self.live_table.verticalHeader().setVisible(False)
+        self.live_table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.Stretch)
+        self.live_sliders = []
+        self.live_spins = []
+        for row in range(12):
+            joint_item = QtWidgets.QTableWidgetItem(f"M{row + 1}")
+            joint_item.setFlags(joint_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.live_table.setItem(row, 0, joint_item)
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(-36000, 36000)
+            slider.setSingleStep(25)
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-360.0, 360.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.25)
+            slider.valueChanged.connect(
+                lambda value, target=spin: target.setValue(value / 100.0))
+            spin.valueChanged.connect(
+                lambda value, target=slider: target.setValue(round(value * 100.0)))
+            slider.sliderReleased.connect(self._publish_live_pose)
+            spin.editingFinished.connect(self._publish_live_pose)
+            self.live_table.setCellWidget(row, 1, slider)
+            self.live_table.setCellWidget(row, 2, spin)
+            self.live_sliders.append(slider)
+            self.live_spins.append(spin)
+
+        start_driver_btn = QtWidgets.QPushButton("Start Gripper Driver")
+        capture_btn = QtWidgets.QPushButton("Read Current Gripper Joints")
+        send_btn = QtWidgets.QPushButton("Send Current Slider Pose")
+        save_open_btn = QtWidgets.QPushButton("Save Current as Open")
+        save_close_btn = QtWidgets.QPushButton("Save Current as Closed")
+        reset_env_btn = QtWidgets.QPushButton("Reset This Environment")
+        save_btn = QtWidgets.QPushButton("Save Calibration")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        save_btn.setDefault(True)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("Physical gripper", self.environment_combo)
+        form.addRow("Grasp mode", self.mode_combo)
+        driver_row = QtWidgets.QHBoxLayout()
+        driver_row.addWidget(start_driver_btn)
+        driver_row.addWidget(capture_btn)
+        driver_row.addWidget(send_btn)
+        save_pose_row = QtWidgets.QHBoxLayout()
+        save_pose_row.addWidget(save_open_btn)
+        save_pose_row.addWidget(save_close_btn)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addWidget(reset_env_btn)
+        button_row.addStretch(1)
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(save_btn)
+        note = QtWidgets.QLabel(
+            "Values are shown in degrees and saved internally in radians. "
+            "Moving a slider publishes all M1–M12 values when it is released. "
+            "Read Current Gripper Joints loads physical feedback into the sliders. "
+            "Restart the system after saving.")
+        note.setWordWrap(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(driver_row)
+        layout.addWidget(self.live_table)
+        layout.addLayout(save_pose_row)
+        layout.addWidget(QtWidgets.QLabel("Saved environment poses (degrees)"))
+        layout.addWidget(self.table)
+        layout.addWidget(note)
+        layout.addLayout(button_row)
+
+        self.environment_combo.currentIndexChanged.connect(
+            self._environment_changed)
+        self.mode_combo.currentIndexChanged.connect(self._load_live_open_pose)
+        start_driver_btn.clicked.connect(self._start_gripper_driver)
+        capture_btn.clicked.connect(self._capture_current)
+        send_btn.clicked.connect(self._publish_live_pose)
+        save_open_btn.clicked.connect(lambda: self._save_live_pose("open"))
+        save_close_btn.clicked.connect(lambda: self._save_live_pose("closed"))
+        reset_env_btn.clicked.connect(self._reset_environment)
+        save_btn.clicked.connect(self._save)
+        cancel_btn.clicked.connect(self.reject)
+        self._load_table()
+        self._load_live_open_pose()
+
+    def _commit_table(self):
+        for column, (key, _) in enumerate(self.POSES, start=1):
+            values = []
+            for row in range(12):
+                item = self.table.item(row, column)
+                try:
+                    degrees = float(item.text())
+                except (AttributeError, ValueError):
+                    raise ValueError(f"M{row + 1} {key} is not a number")
+                if not math.isfinite(degrees) or abs(degrees) > 360.0:
+                    raise ValueError(
+                        f"M{row + 1} {key} must be within +/-360 degrees")
+                values.append(math.radians(degrees))
+            self.data[self.current_environment][key] = values
+
+    def _load_table(self):
+        for column, (key, _) in enumerate(self.POSES, start=1):
+            for row, radians in enumerate(
+                    self.data[self.current_environment][key]):
+                self.table.setItem(
+                    row, column,
+                    QtWidgets.QTableWidgetItem(f"{math.degrees(radians):.3f}"))
+
+    def _environment_changed(self):
+        try:
+            self._commit_table()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid Joint Value", str(exc))
+            return
+        self.current_environment = self.environment_combo.currentData()
+        self._load_table()
+        self._load_live_open_pose()
+
+    def _reset_environment(self):
+        answer = QtWidgets.QMessageBox.question(
+            self, "Reset Gripper Calibration",
+            f"Reset all four {self.current_environment} poses to the current project defaults?")
+        if answer == QtWidgets.QMessageBox.Yes:
+            self.data[self.current_environment] = json.loads(json.dumps(
+                self.defaults[self.current_environment]))
+            self._load_table()
+            self._load_live_open_pose()
+
+    def _selected_pose_key(self, suffix):
+        return f"{self.mode_combo.currentData()}_{suffix}"
+
+    def _live_radians(self):
+        return [math.radians(spin.value()) for spin in self.live_spins]
+
+    def _set_live_radians(self, values):
+        for spin, slider, value in zip(
+                self.live_spins, self.live_sliders, values):
+            spin.blockSignals(True)
+            slider.blockSignals(True)
+            degrees = math.degrees(float(value))
+            spin.setValue(degrees)
+            slider.setValue(round(degrees * 100.0))
+            slider.blockSignals(False)
+            spin.blockSignals(False)
+
+    def _load_live_open_pose(self):
+        key = self._selected_pose_key("open")
+        self._set_live_radians(self.data[self.current_environment][key])
+
+    def _capture_current(self):
+        command = (
+            f"source {shlex.quote(str(WS / 'install/setup.bash'))} && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-6} && "
+            "ros2 topic echo --once /gripper/joint_states --field position")
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command], capture_output=True, text=True,
+                timeout=4.0, check=True)
+            values = [float(value) for value in re.findall(
+                r"[-+]?(?:\d+\.?(?:\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+                result.stdout)]
+            if len(values) != 12:
+                raise ValueError(
+                    f"expected 12 joint positions, received {len(values)}")
+        except (subprocess.SubprocessError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could Not Read Gripper",
+                f"Start the gripper driver and try again.\n\n{exc}")
+            return
+        self._set_live_radians(values)
+
+    def _publish_live_pose(self):
+        values = self._live_radians()
+        payload = ", ".join(f"{value:.9f}" for value in values)
+        command = (
+            f"source {shlex.quote(str(WS / 'install/setup.bash'))} && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-6} && "
+            "ros2 topic pub --once /gripper/target_joint "
+            "std_msgs/msg/Float32MultiArray "
+            f"\"{{data: [{payload}]}}\"")
+        try:
+            subprocess.Popen(
+                ["bash", "-lc", command], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could Not Command Gripper", str(exc))
+
+    def _driver_is_running(self):
+        command = (
+            f"source {shlex.quote(str(WS / 'install/setup.bash'))} && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-6} && "
+            "ros2 node list --no-daemon")
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command], capture_output=True, text=True,
+                timeout=3.0, check=True)
+        except subprocess.SubprocessError:
+            return False
+        return any("delto_3f_driver" in line for line in result.stdout.splitlines())
+
+    def _start_gripper_driver(self):
+        if self._driver_is_running():
+            QtWidgets.QMessageBox.information(
+                self, "Gripper Driver", "The gripper driver is already running.")
+            return
+        log_path = Path("/tmp/ur10e_gripper_calibration_driver.log")
+        command = (
+            f"source {shlex.quote(str(WS / 'install/setup.bash'))} && "
+            "export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-6} && "
+            "ros2 launch delto_3f_driver delto_3f_bringup.launch.py "
+            "launch_rviz:=false")
+        try:
+            log_handle = log_path.open("a")
+            self._driver_process = subprocess.Popen(
+                ["bash", "-lc", command], stdout=log_handle,
+                stderr=subprocess.STDOUT, start_new_session=True)
+            log_handle.close()
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could Not Start Gripper Driver", str(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Gripper Driver Starting",
+            f"Driver started for ROS domain ${{ROS_DOMAIN_ID:-6}}.\n"
+            f"Wait a few seconds, then read the current joints.\n\nLog: {log_path}")
+
+    def _write_calibration(self):
+        GRIPPER_CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GRIPPER_CALIBRATION_FILE.write_text(
+            json.dumps(self.data, indent=2) + "\n")
+
+    def _save_live_pose(self, suffix):
+        try:
+            self._commit_table()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid Joint Value", str(exc))
+            return
+        key = self._selected_pose_key(suffix)
+        self.data[self.current_environment][key] = self._live_radians()
+        self._load_table()
+        self._write_calibration()
+        QtWidgets.QMessageBox.information(
+            self, "Gripper Pose Saved",
+            f"Saved current sliders as {self.current_environment.upper()} "
+            f"{key.replace('_', ' ').upper()}.")
+
+    def _save(self):
+        try:
+            self._commit_table()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid Joint Value", str(exc))
+            return
+        self._write_calibration()
+        QtWidgets.QMessageBox.information(
+            self, "Calibration Saved",
+            f"Saved Lab and Outdoor gripper poses to:\n{GRIPPER_CALIBRATION_FILE}\n\n"
+            "Restart the robot system to apply them.")
+        self.accept()
 
 
 class LaunchDialog(QtWidgets.QDialog):
@@ -125,15 +449,19 @@ class LaunchDialog(QtWidgets.QDialog):
         start_hand_eye_btn = QtWidgets.QPushButton("Start Hand-Eye")
         start_extrinsic_btn = QtWidgets.QPushButton("Start Extrinsic")
         open_profiles_btn = QtWidgets.QPushButton("Open Profile Folder")
+        gripper_calibration_btn = QtWidgets.QPushButton("Gripper Calibration")
         generate_board_btn.setToolTip("Generate the selected ChArUco/chessboard print target")
         start_hand_eye_btn.setToolTip("Launch UR bringup + main/RViz + hand-eye calibration")
         start_extrinsic_btn.setToolTip("Launch ZED One to ZED X Mini extrinsic calibration")
         open_profiles_btn.setToolTip("Open the camera calibration profile YAML folder")
+        gripper_calibration_btn.setToolTip(
+            "Set NORMAL/ENVELOP open and closed M1-M12 poses separately for Lab and Outdoor")
         calibration_actions_layout = QtWidgets.QGridLayout()
         calibration_actions_layout.addWidget(generate_board_btn, 0, 0)
         calibration_actions_layout.addWidget(start_hand_eye_btn, 0, 1)
         calibration_actions_layout.addWidget(start_extrinsic_btn, 1, 0)
         calibration_actions_layout.addWidget(open_profiles_btn, 1, 1)
+        calibration_actions_layout.addWidget(gripper_calibration_btn, 2, 0, 1, 2)
         calibration_actions_box = self._group_box("Calibration Actions", calibration_actions_layout)
 
         preset_row = QtWidgets.QHBoxLayout()
@@ -195,6 +523,7 @@ class LaunchDialog(QtWidgets.QDialog):
         start_hand_eye_btn.clicked.connect(self.start_hand_eye)
         start_extrinsic_btn.clicked.connect(self.start_extrinsic)
         open_profiles_btn.clicked.connect(self.open_profile_folder)
+        gripper_calibration_btn.clicked.connect(self.open_gripper_calibration)
         start_btn.clicked.connect(self.start_system)
         copy_btn.clicked.connect(self.copy_command)
         close_btn.clicked.connect(self.reject)
@@ -367,6 +696,11 @@ class LaunchDialog(QtWidgets.QDialog):
     def start_system(self):
         if self.launch_args(self.build_args()):
             self.accept()
+
+    def open_gripper_calibration(self):
+        dialog = GripperCalibrationDialog(
+            self, self.environment_combo.currentData())
+        dialog.exec_()
 
     def generate_board(self):
         target = self.target_combo.currentData()

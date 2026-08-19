@@ -26,6 +26,10 @@ CAMERA_PROFILE_DIR = (
     Path(WS) / "src" / "ur10e_curobo" / "ur10e_curobo"
     / "vision" / "calibration_profiles"
 )
+GRIPPER_CALIBRATION_FILE = Path(os.environ.get(
+    "UR10E_GRIPPER_CALIBRATION_FILE",
+    "~/.config/datepalm/gripper_calibration.json",
+)).expanduser()
 PRESETS = {
     "harvest": ["main", "vision", "zedx_mini"],
     "field": ["main", "vision", "zedx_mini"],
@@ -157,6 +161,7 @@ def get_commands(
     profile_source = (
         f"{source_with_camera} "
         f"&& export UR10E_GRIPPER_PROFILE={gripper_profile} "
+        f"&& export UR10E_GRIPPER_CALIBRATION_FILE={GRIPPER_CALIBRATION_FILE} "
         f"&& export UR10E_GRIPPER_ENABLED={'true' if gripper_enabled else 'false'}"
     )
     hw = "true" if fake_hardware else "false"
