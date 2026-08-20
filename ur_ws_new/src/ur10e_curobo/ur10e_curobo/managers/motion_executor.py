@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PointStamped, Twist
+from geometry_msgs.msg import Twist
 from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -85,16 +85,12 @@ class MotionExecutor:
             10
         )
 
-        vision_enabled = self._config.cfg.perception.enabled
-        if vision_enabled:
-            # Use the detected trunk position before constructing the planner world.
-            world_config = self._wait_for_trunk_and_build_world(timeout=40.0)
-        else:
-            world_config = copy.deepcopy(WORLD_CONFIG)
-            self._node.get_logger().info(
-                "Vision disabled: skipping trunk detection wait and using "
-                "configured static obstacles"
-            )
+        # Static planning geometry is ready immediately. Trunk perception is
+        # not part of motion-node initialization and cannot delay startup.
+        world_config = copy.deepcopy(WORLD_CONFIG)
+        self._node.get_logger().info(
+            "Static planning world loaded; trunk detection is not required"
+        )
 
         # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
         from ..static_obstacles import _obs_to_spec
@@ -241,59 +237,6 @@ class MotionExecutor:
             f"{profile_urdf} (calibration="
             f"{camera_profile.get('camera_profile', '-')})")
         return robot_config
-
-    def _wait_for_trunk_and_build_world(self, timeout: float = 15.0, collect_secs: float = 2.0) -> dict:
-        """Wait for trunk position from vision, collect samples, then build WORLD_CONFIG."""
-        import numpy as np
-        self._node.get_logger().info(
-            f"Waiting up to {timeout:.0f}s for trunk detection on /trunk_position..."
-        )
-        samples = []
-
-        def _cb(msg):
-            samples.append((msg.point.x, msg.point.y))
-
-        sub = self._node.create_subscription(PointStamped, "/trunk_position", _cb, 10)
-
-        # Wait for first message
-        t0 = time.time()
-        while len(samples) == 0 and (time.time() - t0) < timeout:
-            rclpy.spin_once(self._node, timeout_sec=0.5)
-
-        # Collect more samples for averaging
-        if len(samples) > 0:
-            self._node.get_logger().info(
-                f"First trunk detection received, collecting {collect_secs:.0f}s of samples..."
-            )
-            t1 = time.time()
-            while (time.time() - t1) < collect_secs:
-                rclpy.spin_once(self._node, timeout_sec=0.1)
-
-        self._node.destroy_subscription(sub)
-
-        world_config = copy.deepcopy(WORLD_CONFIG)
-
-        if len(samples) > 0:
-            arr = np.array(samples)
-            tx = float(np.median(arr[:, 0]))
-            ty = float(np.median(arr[:, 1]))
-            self._node.get_logger().info(
-                f"Trunk detected! {len(samples)} samples → trunk at x={tx:.3f}, y={ty:.3f}"
-            )
-            if "cuboid" in world_config and "trunk" in world_config["cuboid"]:
-                world_config["cuboid"]["trunk"]["pose"][0] = tx
-                world_config["cuboid"]["trunk"]["pose"][1] = ty
-            # Also update static obstacles for RViz
-            for obs in STATIC_OBSTACLES:
-                if obs["name"] in ("trunk", "trunk_visual"):
-                    obs["pose"][0] = tx
-                    obs["pose"][1] = ty
-        else:
-            self._node.get_logger().warn(
-                "No trunk detected — using default trunk position from config"
-            )
-
-        return world_config
 
     # ============ Public Methods ============
 

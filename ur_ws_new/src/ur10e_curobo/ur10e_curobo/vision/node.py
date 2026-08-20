@@ -32,6 +32,7 @@ from .config import (
     LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
+    FRUIT_CAMERA_Z_MIN, FRUIT_CAMERA_Z_MAX,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
     SHOW_FINGER_CONTACTS, FINGERTIP_CONTACT_RADIUS_M,
     FINGER_CONTACT_RADIAL_FRACTION, FINGER_CONTACT_ROTATION_SAMPLES,
@@ -1749,8 +1750,14 @@ class VisionNode:
                         f"near_but_OUTSIDE_mask={_out_near}/{int(_out.shape[0])}"
                         f" | cam=[{Xc:.3f},{Yc:.3f},{Zc:.3f}]{_base_str}")
 
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > ZEDMINI_DEPTH_Z_MAX:
-                mark_reject("Z out of range")
+            if not np.isfinite(Zc):
+                mark_reject("Invalid fruit depth")
+                return None
+            if not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX:
+                mark_reject(
+                    f"Fruit depth {Zc:.2f}m outside "
+                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
+                )
                 return None
 
             # Heatmap + vis_ratio — use EDT depth map so vis_ratio matches stereo mode.
@@ -1872,8 +1879,14 @@ class VisionNode:
                 _outside_p5, _outside_p50,
             )
 
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > ZEDMINI_DEPTH_Z_MAX:
-                mark_reject("Z out of range")
+            if not np.isfinite(Zc):
+                mark_reject("Invalid fruit depth")
+                return None
+            if not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX:
+                mark_reject(
+                    f"Fruit depth {Zc:.2f}m outside "
+                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
+                )
                 return None
 
             # Only compute heatmap for the previous best fruit (same as ZED Mini path).

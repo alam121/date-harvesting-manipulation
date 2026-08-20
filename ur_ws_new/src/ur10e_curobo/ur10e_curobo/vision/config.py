@@ -164,6 +164,14 @@ ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED On
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
 ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
 ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
+# Fruit-only acceptance window. This is intentionally narrower than the camera
+# depth range so nearby red gripper fingertips cannot become harvesting goals.
+FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.20"))
+FRUIT_CAMERA_Z_MAX = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MAX", "0.70"))
+if not 0.0 < FRUIT_CAMERA_Z_MIN < FRUIT_CAMERA_Z_MAX:
+    raise ValueError(
+        "Expected 0 < UR10E_FRUIT_CAMERA_Z_MIN < UR10E_FRUIT_CAMERA_Z_MAX"
+    )
 ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame
 # TO ZED One Mono camera frame).  Fill in after extrinsic calibration.

@@ -199,30 +199,6 @@ _TABLE_OBSTACLE = {
     "pose": [0.0, 0.0, -0.1, 1, 0, 0, 0],  # x, y, z, qw, qx, qy, qz
     "color": (1.0, 0.0, 0.0, 1.0),  # Red
 }
-_TRUNK_OBSTACLE = {
-    "name": "trunk",
-    "type": "cylinder",
-    "radius": 0.02,    # 2cm radius = 4cm diameter trunk
-    "height": 1.2,     # 1.2m visible trunk section
-    "pose": (
-        [1.40, 0.16, 0.6, 1, 0, 0, 0]
-        if X_FORWARD_Y_LATERAL
-        else [0.16, -1.00, 0.6, 1, 0, 0, 0]
-    ),
-    "color": (0.55, 0.27, 0.07, 1.0),  # Brown
-}
-_TRUNK_VISUAL = {
-    # RViz-only trunk helper. Drawn at the real trunk radius so it matches the
-    # cuRobo obstacle (as it appeared before the wider outdoor marker was added).
-    "name": "trunk_visual",
-    "type": "cylinder",
-    "radius": _TRUNK_OBSTACLE["radius"],
-    "height": _TRUNK_OBSTACLE["height"],
-    "pose": list(_TRUNK_OBSTACLE["pose"]),
-    "color": (0.80, 0.42, 0.12, 0.72),
-    "collision": False,
-}
-
 _GOLFCART_BASE_PLATE_OBSTACLE = {
     # Outdoor-only robot mounting plate extracted from
     # ~/Downloads/Golfcart_pallet.step. The four STEP screw circles are centered
@@ -319,7 +295,7 @@ _GOLFCART_PALLET_OBSTACLE = {
 # Do not model the large table in either environment. The golf-cart pallet
 # support/collision approximation is included in BOTH lab and outdoor. This
 # applies to both cuRobo planning and RViz, which derive from STATIC_OBSTACLES.
-STATIC_OBSTACLES = [_GOLFCART_PALLET_OBSTACLE, _TRUNK_OBSTACLE, _TRUNK_VISUAL]
+STATIC_OBSTACLES = [_GOLFCART_PALLET_OBSTACLE]
 
 # Auto-generate WORLD_CONFIG for cuRobo from STATIC_OBSTACLES.
 # cuRobo's OBB collision checker only reads "cuboid" — cylinders are not loaded.
