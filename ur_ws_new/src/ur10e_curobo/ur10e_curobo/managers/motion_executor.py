@@ -68,6 +68,11 @@ class MotionExecutor:
 
     def initialize(self) -> None:
         """Initialize cuRobo planner, obstacles, and motion infrastructure."""
+        # ConfigManager has already applied ROS parameter overrides before the
+        # motion manager is initialized.  Keep voxel subscriptions/timers in
+        # step with perception.enabled, including external-vision deployments.
+        vision_enabled = bool(self._config.cfg.perception.enabled)
+
         # Publishers
         self.trajectory_pub = self._node.create_publisher(
             JointTrajectory,
