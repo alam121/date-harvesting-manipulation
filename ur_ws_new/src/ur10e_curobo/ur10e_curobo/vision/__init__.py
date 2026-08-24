@@ -46,6 +46,10 @@ def main():
         "--use_zedx_mini_only", action="store_true",
         help="Use ZED X Mini stereo camera for both RGB detection and depth"
     )
+    parser.add_argument(
+        "--raw_yolo_view", action="store_true",
+        help="Display raw YOLO boxes/masks only; disable 3D processing and goal publishing"
+    )
     args = parser.parse_args()
 
     node = VisionNode(args)

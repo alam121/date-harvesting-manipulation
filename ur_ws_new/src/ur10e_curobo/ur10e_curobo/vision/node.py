@@ -221,6 +221,15 @@ class VisionNode:
         _exec = self.executor
         Thread(target=_exec.shutdown, daemon=True).start()
 
+    def _request_exit(self):
+        """Stop both perception workers and the blocking ROS executor."""
+        if self.exit_signal:
+            return
+        self.exit_signal = True
+        executor = self.executor
+        if executor is not None:
+            Thread(target=executor.shutdown, daemon=True).start()
+
     def run(self):
         """Main entry point."""
         import torch
@@ -459,14 +468,16 @@ class VisionNode:
 
         self.node.create_subscription(StdString, "/camera_command", camera_cmd_cb, 10)
 
-        # TF listener
-        self.tf_buffer = Buffer()
-        TransformListener(self.tf_buffer, self.node)
-
-        # Wait for TFs
-        required_tfs = [("base_link", self.cam_frame), ("gripper_tip", self.cam_frame)]
-        for target, source in required_tfs:
-            wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
+        raw_yolo_view = bool(getattr(self.args, "raw_yolo_view", False))
+        # Raw inspection is camera-local and must neither require nor wait for
+        # a robot TF tree. Normal harvesting retains the existing TF setup.
+        self.tf_buffer = None
+        if not raw_yolo_view:
+            self.tf_buffer = Buffer()
+            TransformListener(self.tf_buffer, self.node)
+            required_tfs = [("base_link", self.cam_frame), ("gripper_tip", self.cam_frame)]
+            for target, source in required_tfs:
+                wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
 
         use_lidar   = getattr(self.args, "use_lidar",    False)
         use_zed_mini = getattr(self.args, "use_zed_mini", False)
@@ -490,14 +501,14 @@ class VisionNode:
             disto  = left_cam.disto
             print(f"[ZedXOne] {cam_w}x{cam_h}  fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
-            if use_lidar:
+            if use_lidar and not raw_yolo_view:
                 def _cloud_cb(msg):
                     pts = parse_pointcloud2(msg)
                     with self._cloud_lock:
                         self._latest_cloud = pts
                 self.node.create_subscription(PointCloud2, LIDAR_TOPIC, _cloud_cb, fast_qos)
                 self.node.get_logger().info(f"[LiDAR] subscribed to {LIDAR_TOPIC}")
-            else:
+            elif not raw_yolo_view:
                 # ZED Mini depth — warp into ZED One's frame and image space.
                 # ZED Mini XYZ is in ZED Mini's frame; we must transform every point
                 # into ZED One's frame (T_CAM_ZEDMINI) and project to ZED One's image.
@@ -668,9 +679,57 @@ class VisionNode:
                     frame_data = _viz_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps, viz_only, uv_lidar, pts_lidar = frame_data
+                (img_ocv, tgts, rej_tgts, b_idx, net_fps, l_fps,
+                 viz_only, uv_lidar, pts_lidar, raw_timing) = frame_data
                 try:
                     _vt0 = time()
+                    if bool(getattr(self.args, "raw_yolo_view", False)):
+                        # Deliberately isolated inspection view: no VisionVisualizer,
+                        # ROS image conversion/publication, fingertip verification,
+                        # target tracking, depth, or TF work.
+                        display_image = cv2.cvtColor(img_ocv, cv2.COLOR_BGRA2BGR)
+                        for item in viz_only:
+                            polygon = item.get("polygon")
+                            if polygon is not None and len(polygon) > 2:
+                                cv2.polylines(
+                                    display_image,
+                                    [np.asarray(polygon, dtype=np.int32)],
+                                    True, (0, 220, 255), 2)
+                            x1, y1, x2, y2 = item["bb"]
+                            cv2.rectangle(display_image, (x1, y1), (x2, y2),
+                                          (0, 255, 0), 2)
+                            label = f"{item['class']} {item['conf']:.2f}"
+                            cv2.putText(display_image, label, (x1, max(18, y1 - 5)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                        (0, 255, 0), 2, cv2.LINE_AA)
+                        cv2.putText(
+                            display_image, f"YOLO {net_fps:.1f} FPS",
+                            (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                            (255, 255, 0), 2, cv2.LINE_AA)
+                        if raw_timing:
+                            age_ms = max(
+                                0.0, (time() - raw_timing["capture_time"]) * 1000.0)
+                            timing_text = (
+                                f"frame {raw_timing['frame_id']} age {age_ms:.0f}ms | "
+                                f"pre {raw_timing['preprocess_ms']:.1f} "
+                                f"infer {raw_timing['inference_ms']:.1f} "
+                                f"post {raw_timing['postprocess_ms']:.1f} "
+                                f"maskCPU {raw_timing['decode_mask_ms']:.1f}ms | "
+                                f"dropped/30 {raw_timing['dropped_interval']}")
+                            cv2.putText(
+                                display_image, timing_text, (12, 56),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                                (255, 255, 0), 1, cv2.LINE_AA)
+                        cv2.imshow("Raw YOLO Model View", display_image)
+                        key = cv2.waitKey(1) & 0xFF
+                        try:
+                            window_closed = cv2.getWindowProperty(
+                                "Raw YOLO Model View", cv2.WND_PROP_VISIBLE) < 1
+                        except cv2.error:
+                            window_closed = True
+                        if key in (ord("q"), 27) or window_closed:
+                            self._request_exit()
+                        continue
                     stamp = self.node.get_clock().now().to_msg()
                     raw_stream_active = (
                         self._raw_stream_enabled or time() < self._raw_stream_until)
@@ -703,10 +762,6 @@ class VisionNode:
                     verification = self.visualizer.last_fingertip_verification
                     self.fingertip_verification_pub.publish(
                         StdString(data=verification))
-                    if verification != getattr(self, "_last_fingertip_verification", None):
-                        self._last_fingertip_verification = verification
-                        self.node.get_logger().info(
-                            f"[FINGERTIP_VERIFY] {verification}")
                     _vt1 = time()
                     if not getattr(self, "_printed_bottom_pixel_post_render", False):
                         _bottom = display_image[-12:, :, :3]
@@ -760,16 +815,24 @@ class VisionNode:
             nonlocal loop_fps, zed
             t_prev = time()
             current_dets = None
+            current_raw_viz = []
+            cached_processed_targets = None
             trunk_boxes  = []
             bunch_boxes  = []
             _YOLO_STALE_DRIFT = 0.008  # 8 mm — discard cached dets if camera drifted this far
             _last_viz_t = 0.0          # wall time of last visualization enqueue
-            _VIZ_MIN_INTERVAL = 0.066  # max ~15fps annotated images (~1 camera frame)
+            # Keep RViz/control local on Jetson, but cap only the expensive
+            # annotated camera encoding/publication to 10 FPS. Detection, robot
+            # state, commands and motion feedback retain their normal rates.
+            _VIZ_MIN_INTERVAL = 0.100
             _initial_voxel_cloud_sent = False
             _initial_voxel_cloud_burst_remaining = 3
+            _depth_capture_pending = False
+            _full_profile_count = 0
 
             def _enqueue_viz_frame(targets, rejected_targets, best_idx, viz_only,
-                                   uv_lidar=None, pts_lidar=None):
+                                   uv_lidar=None, pts_lidar=None,
+                                   source_image=None, raw_timing=None):
                 """Queue one visualization frame without blocking the perception loop."""
                 nonlocal _last_viz_t
                 _now = time()
@@ -777,7 +840,8 @@ class VisionNode:
                     return
                 try:
                     _viz_queue.put_nowait((
-                        image_left_ocv.copy(),
+                        (source_image.copy() if source_image is not None
+                         else image_left_ocv.copy()),
                         targets, rejected_targets,
                         best_idx,
                         self.yolo_thread.net_fps,
@@ -785,6 +849,7 @@ class VisionNode:
                         viz_only,
                         uv_lidar,
                         pts_lidar,
+                        raw_timing,
                     ))
                     _last_viz_t = _now
                 except queue.Full:
@@ -794,6 +859,19 @@ class VisionNode:
                 _enqueue_viz_frame([], [], None, [], None, None)
 
             while not self.exit_signal:
+                fresh_detections = False
+                # ZED X Mini neural depth is the other major GPU workload. In
+                # full harvesting mode, compute it only for a frame that will
+                # consume a newly completed YOLO result. RGB grabbing remains
+                # at camera rate. If inference completes during a no-depth grab,
+                # defer that result for one iteration and capture depth next.
+                _depth_enabled_this_grab = True
+                if (use_zedx_mini_only and
+                        not bool(getattr(self.args, "raw_yolo_view", False))):
+                    _depth_enabled_this_grab = (
+                        _depth_capture_pending or
+                        self.yolo_thread.dets_ready.is_set())
+                    runtime_params.enable_depth = _depth_enabled_this_grab
                 grab_status = zed.grab() if use_mono_depth else zed.grab(runtime_params)
                 if grab_status != sl.ERROR_CODE.SUCCESS:
                     self.exit_signal = True
@@ -841,9 +919,29 @@ class VisionNode:
                         self.yolo_thread.paused = False
                         self._vision_paused_acked = False
                     self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
-                    if not _reacquire or self._reacquire_frame_skip == 0:
-                        self.yolo_thread.set_image(image_left.get_data())
+                    _hold_result_for_depth = (
+                        use_zedx_mini_only and
+                        not bool(getattr(self.args, "raw_yolo_view", False)) and
+                        self.yolo_thread.dets_ready.is_set())
+                    if ((not _reacquire or self._reacquire_frame_skip == 0) and
+                            not _hold_result_for_depth):
+                        self.yolo_thread.set_image(image_left.get_data(), capture_time=t_now)
                 _t1 = time()
+
+                # Raw model inspection intentionally stops here. It uses only
+                # RGB acquisition, TensorRT inference and the small CV2 overlay.
+                # In particular, do not touch TF, depth, tracking or goals.
+                if bool(getattr(self.args, "raw_yolo_view", False)):
+                    if self.yolo_thread.dets_ready.is_set():
+                        self.yolo_thread.dets_ready.clear()
+                        raw_result = self.yolo_thread.get_raw_result()
+                        if raw_result is not None:
+                            current_raw_viz = raw_result["detections"]
+                            _enqueue_viz_frame(
+                                [], [], None, current_raw_viz,
+                                source_image=raw_result["image"],
+                                raw_timing=raw_result["timing"])
+                    continue
 
                 # Refresh per-frame TF cache — one lookup per frame instead of
                 # one per detection (was 8+ tf_buffer.transform calls at ~20ms each).
@@ -880,8 +978,15 @@ class VisionNode:
                 # the loop runs at camera fps rather than YOLO inference fps.
                 _cur_t_now = self._cached_tf_base[1] if self._cached_tf_base is not None else None
                 if self.yolo_thread.dets_ready.is_set():
+                    if use_zedx_mini_only and not _depth_enabled_this_grab:
+                        _depth_capture_pending = True
+                        continue
                     self.yolo_thread.dets_ready.clear()
+                    _depth_capture_pending = False
                     current_dets = self.yolo_thread.get_detections()
+                    current_raw_viz = self.yolo_thread.get_raw_viz()
+                    _latest_yolo_timing = self.yolo_thread.get_latest_timing()
+                    fresh_detections = True
                     trunk_boxes  = self.yolo_thread.get_trunk_boxes()
                     # Record where the camera was when this result was accepted
                     self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
@@ -899,9 +1004,18 @@ class VisionNode:
                         # Camera has moved — publish raw frame so display stays live during motion.
                         _enqueue_raw_viz_frame()
                         continue
+                    if cached_processed_targets is not None:
+                        # No new YOLO observation: the target/depth result is
+                        # already cached. Previously we still retrieved and
+                        # traversed the full HD1080 XYZ map at camera FPS, then
+                        # discarded the duplicate processing result. Wait for
+                        # the next inference result instead. This preserves all
+                        # new-detection updates while freeing CPU/memory bandwidth.
+                        continue
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
                 pc_np_orig = None
+                _depth_t0 = time()
                 if use_zed_mini:
                     # ── ZED Mini dense depth path ─────────────────────────
                     # Dense HxW depth map at ZED One display resolution —
@@ -946,6 +1060,7 @@ class VisionNode:
                     zed.retrieve_measure(point_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
                                         sl.Resolution(disp_w, disp_h))
                     pc_np = point_cloud.get_data()[:, :, :3]
+                _depth_ms = (time() - _depth_t0) * 1000.0
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
@@ -964,8 +1079,44 @@ class VisionNode:
                 )
                 _t3 = time()
 
-                # Temporal stabilization
-                targets = self.tracker.stabilize_detections(targets)
+                if fresh_detections:
+                    # Update temporal state once per new inference result, not
+                    # once per reused camera-loop detection.
+                    targets = self.tracker.stabilize_detections(targets)
+
+                if (fresh_detections and use_zedx_mini_only and
+                        not bool(getattr(self.args, "raw_yolo_view", False)) and
+                        (not _reacquire or self._reacquire_frame_skip == 0)):
+                    # On Jetson, Ultralytics postprocessing and per-date depth/
+                    # geometry extraction both consume substantial CPU. Running
+                    # them concurrently made each stage 2-4x slower. Queue the
+                    # next immutable RGB frame only after target extraction has
+                    # finished, while it is still synchronized with this grab.
+                    self.yolo_thread.set_image(
+                        image_left.get_data(), capture_time=t_now)
+
+                if fresh_detections:
+                    _full_profile_count += 1
+                    if _full_profile_count % 30 == 0:
+                        _yt = _latest_yolo_timing or {}
+                        _target_ms = (_t3 - _t2) * 1000.0
+                        _total_ms = (
+                            float(_yt.get("predict_wall_ms", 0.0)) +
+                            _depth_ms + _target_ms)
+                        print(
+                            "[VISION_PIPELINE_TIMING] "
+                            f"id={_yt.get('frame_id', -1)} "
+                            f"yolo={float(_yt.get('predict_wall_ms', 0.0)):.1f}ms "
+                            f"depth={_depth_ms:.1f}ms "
+                            f"targets={_target_ms:.1f}ms "
+                            f"serial_sum={_total_ms:.1f}ms "
+                            f"yolo_fps={self.yolo_thread.net_fps:.1f} "
+                            f"loop_fps={loop_fps:.1f} "
+                            f"detections={len(current_dets) if current_dets is not None else 0} "
+                            f"extracted={getattr(self, '_last_extracted_target_count', 0)} "
+                            f"tracked={len(targets)} rejected={len(rejected_targets)} "
+                            f"objects_ms=[{','.join(f'{v:.1f}' for v in getattr(self, '_last_object_processing_ms', []))}]"
+                        )
                 _tp1 = time()
 
                 # --- mode-gated operations -------------------------------------------
@@ -1106,6 +1257,8 @@ class VisionNode:
             self.executor.spin()
         finally:
             self.exit_signal = True
+            if bool(getattr(self.args, "raw_yolo_view", False)):
+                cv2.destroyAllWindows()
             perception_thread.join(timeout=3.0)
             if self.yolo_thread is not None:
                 self.yolo_thread.stop()
@@ -1116,7 +1269,9 @@ class VisionNode:
                 self._zed_mini = None
             if zed is not None:
                 zed.close()
-            rclpy.shutdown()
+            # Safe for CV-window exit, Ctrl-C and executor-triggered shutdown.
+            # More than one path may have already shut the shared context down.
+            self.node.context.try_shutdown()
             if getattr(self, '_refresh_requested', False):
                 import os
                 restart_argv = getattr(self, "_refresh_argv", None) or sys.argv
@@ -1160,7 +1315,9 @@ class VisionNode:
             self._camera_type = "ZED X One Mono"
             self._camera_resolution = "QHDPLUS"
             self._camera_fps = "15 requested"
-            if use_lidar:
+            if bool(getattr(self.args, "raw_yolo_view", False)):
+                self._camera_mode = "raw RGB + TensorRT only (depth/TF/ROS image off)"
+            elif use_lidar:
                 self._camera_mode = "mono RGB + Livox depth"
             elif use_zed_mini:
                 self._camera_mode = "mono RGB + ZED X Mini depth"
@@ -1168,7 +1325,7 @@ class VisionNode:
                 self._camera_mode = "mono RGB"
             apply_zed_camera_settings(zed)
 
-            if use_zed_mini:
+            if use_zed_mini and not bool(getattr(self.args, "raw_yolo_view", False)):
                 # ZED X Mini — stereo Camera opened for depth only
                 print("Initializing ZED X Mini (depth camera)...")
                 zed_mini = sl.Camera()
@@ -1199,7 +1356,11 @@ class VisionNode:
                 self._zed_mini = zed_mini
                 self._depth_camera_text = f"ZED X Mini HD1080 @ {ZEDMINI_DEPTH_FPS}fps"
             else:
-                self._depth_camera_text = "Livox" if use_lidar else "-"
+                self._depth_camera_text = (
+                    "disabled (raw YOLO mode)"
+                    if bool(getattr(self.args, "raw_yolo_view", False))
+                    else ("Livox" if use_lidar else "-")
+                )
 
         else:
             # ZED stereo — standard Camera API. In Mini-only mode this opens the
@@ -1222,9 +1383,11 @@ class VisionNode:
             # on overlapping front views. Keep this change isolated to native
             # ZED X Mini RGBD; ZED One + external-depth modes are unaffected.
             init_params.depth_mode = (
-                sl.DEPTH_MODE.NEURAL
-                if use_zedx_mini_only
-                else sl.DEPTH_MODE.NEURAL_LIGHT
+                sl.DEPTH_MODE.NONE
+                if bool(getattr(self.args, "raw_yolo_view", False))
+                else (sl.DEPTH_MODE.NEURAL
+                      if use_zedx_mini_only
+                      else sl.DEPTH_MODE.NEURAL_LIGHT)
             )
             init_params.depth_minimum_distance = (
                 ZEDMINI_DEPTH_Z_MIN if use_zedx_mini_only else 0.15
@@ -1253,19 +1416,23 @@ class VisionNode:
                 "camera default"
             )
             self._camera_mode = (
-                "ZED X Mini stereo RGB + ZED X Mini depth"
-                if use_zedx_mini_only else
-                "stereo RGB + ZED depth"
+                "raw RGB + TensorRT only (depth/TF/ROS image off)"
+                if bool(getattr(self.args, "raw_yolo_view", False)) else
+                ("ZED X Mini stereo RGB + ZED X Mini depth"
+                 if use_zedx_mini_only else "stereo RGB + ZED depth")
             )
             self._camera_hdr_enabled = False
             self._depth_camera_text = (
-                "ZED X Mini native stereo depth"
-                if use_zedx_mini_only else
-                "ZED stereo depth"
+                "disabled (raw YOLO mode)"
+                if bool(getattr(self.args, "raw_yolo_view", False)) else
+                ("ZED X Mini native stereo depth"
+                 if use_zedx_mini_only else "ZED stereo depth")
             )
             apply_zed_stereo_settings(zed)
-            zed.enable_positional_tracking(sl.PositionalTrackingParameters())
-            if not use_zedx_mini_only:
+            if not bool(getattr(self.args, "raw_yolo_view", False)):
+                zed.enable_positional_tracking(sl.PositionalTrackingParameters())
+            if not use_zedx_mini_only and not bool(
+                    getattr(self.args, "raw_yolo_view", False)):
                 obj_param = sl.ObjectDetectionParameters()
                 obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
                 obj_param.enable_tracking = True
@@ -1277,6 +1444,7 @@ class VisionNode:
             weights=self.args.weights,
             img_size=self.args.img_size,
             conf_thres=self.args.conf_thres,
+            raw_view=bool(getattr(self.args, "raw_yolo_view", False)),
         )
         Thread(target=self.yolo_thread.run, daemon=True).start()
         self._publish_camera_status()
@@ -1462,6 +1630,7 @@ class VisionNode:
         targets = []
         rejected_targets = []
         viz_only = []  # kept for API compat but always empty now
+        object_times_ms = []
 
         # use_zed_mini also iterates raw YOLO dets (ZED One has no object-detection API)
         obj_list = (
@@ -1500,6 +1669,7 @@ class VisionNode:
                 continue
 
             try:
+                _object_t0 = time()
                 target = self._extract_target_3d(
                     o, mask_mat, pc_np, x1, y1, x2, y2,
                     display_resolution, intrinsics, mark_reject,
@@ -1510,10 +1680,14 @@ class VisionNode:
                 )
                 if target is not None:
                     targets.append(target)
+                object_times_ms.append((time() - _object_t0) * 1000.0)
             except Exception as e:
+                object_times_ms.append((time() - _object_t0) * 1000.0)
                 print(f"[WARN] 3D extraction failed: {e}")
                 mark_reject("3D extraction failed")
 
+        self._last_object_processing_ms = object_times_ms
+        self._last_extracted_target_count = len(targets)
         return targets, rejected_targets, viz_only
 
     def _extract_target_3d(
@@ -1585,8 +1759,12 @@ class VisionNode:
             depth_std = float(np.std(pts_front[:, 2]))
             vis_ratio = min(1.0, in_mask_pts.shape[0] / max(1, int(0.1 * mask_bool.sum())))
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
-            if not np.isfinite(Zc) or Zc <= 0.0 or Zc > LIDAR_Z_MAX:
-                mark_reject("Z out of range")
+            if (not np.isfinite(Zc)
+                    or not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX):
+                mark_reject(
+                    f"Fruit depth {Zc:.2f}m outside "
+                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
+                )
                 return None
 
             heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None

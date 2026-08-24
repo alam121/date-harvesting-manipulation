@@ -20,7 +20,8 @@ DEFAULT_MODELS_DIR = _SRC_MODELS
 MODELS_DIR = os.getenv("UR10E_MODELS_DIR", str(DEFAULT_MODELS_DIR))
 
 
-DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_26April.engine")
+DEFAULT_WEIGHTS = os.path.join(
+    MODELS_DIR, "yolo26_small_zedone4k_3classes_jetson.engine")
 
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_s_p2.engine")
 
@@ -78,8 +79,8 @@ TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius
 
 # Rendering knobs to save CPU (publishing unaffected)
 DRAW_ONLY_BEST = False
-DRAW_TOP_N = 3
-SHOW_REJECTED = False
+DRAW_TOP_N = 10
+SHOW_REJECTED = True
 SKIP_DRAW = False
 SHOW_CLASSIFICATION_ZONES = False
 SHOW_GAP_DEBUG = False

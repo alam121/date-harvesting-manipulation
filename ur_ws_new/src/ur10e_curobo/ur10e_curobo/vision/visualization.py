@@ -756,8 +756,9 @@ class VisionVisualizer:
             x1, y1, x2, y2 = v["bb"]
             cls = v.get("class", "?")
             conf = v.get("conf", 0.0)
+            cls_lower = str(cls).lower()
 
-            if cls == "bunch":
+            if cls_lower == "bunch":
                 polygon = v.get("polygon")
                 if polygon is not None and len(polygon) > 2:
                     try:
@@ -776,11 +777,20 @@ class VisionVisualizer:
                             cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55),
                             BUNCH_COLOR, self._thick(2), cv2.LINE_AA)
             else:
-                cv2.rectangle(image, (x1, y1), (x2, y2), TRUNK_COLOR, self._thick(2))
+                color = (
+                    (40, 230, 40, 255)
+                    if "date" in cls_lower else TRUNK_COLOR
+                )
+                polygon = v.get("polygon")
+                if polygon is not None and len(polygon) > 2:
+                    cv2.polylines(
+                        image, [polygon.reshape((-1, 1, 2))], True,
+                        color, self._thick(2), cv2.LINE_AA)
+                cv2.rectangle(image, (x1, y1), (x2, y2), color, self._thick(2))
                 cv2.putText(image, f"{cls} {conf:.0%}",
                             (x1 + round(self._len(4)), y1 + round(self._len(18))),
                             cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55),
-                            TRUNK_COLOR, self._thick(2), cv2.LINE_AA)
+                            color, self._thick(2), cv2.LINE_AA)
 
     def draw_lidar_points(
         self,

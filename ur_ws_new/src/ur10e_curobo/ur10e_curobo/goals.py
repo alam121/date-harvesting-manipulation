@@ -469,6 +469,11 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
                 f"direction_match={score:.3f} "
                 f"angular_error={error_deg:.1f}deg")
     available = [item for item in evaluated if item["label"] not in excluded]
+    forced_label = getattr(node, "_corridor_forced_label", None)
+    if forced_label is not None:
+        forced = [item for item in available if item["label"] == forced_label]
+        if forced:
+            available = forced
     if bool(getattr(node, "_corridor_tip_fallback_active", False)):
         # Centre fallback is a bounded reachability recovery, not another full
         # nine-angle search. Try straight first, then the two nearest headings;
@@ -487,8 +492,9 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
             "no corridors remain after Cartesian failures")
         return nominal, "NONE"
     best = (available[0] if bool(getattr(
-        node, "_corridor_tip_fallback_active", False))
+        node, "_corridor_tip_fallback_active", False)) or forced_label is not None
         else max(available, key=lambda item: item["score"]))
+    node._corridor_axis_polarity_ambiguous = bool(axis_valid)
     node.get_logger().info(
         f"[APPROACH_SIDE_SELECTED] class={class_label} side={best['label']} "
         f"source={direction_source} "
@@ -1272,6 +1278,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
                                     waypoint_count=2):
     """Validate APPROACH and fixed-orientation straight FINAL before motion."""
     node._corridor_preflight_approach_js = None
+    node._corridor_preflight_cost_deg = float("inf")
     if start_js is None or getattr(node, "_cuda_faulted", False):
         return False, "NO_IK_STATE"
     try:
@@ -1325,6 +1332,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             return False, "APPROACH_IK"
         approach_delta = max(
             abs(a - b) for a, b in zip(approach_js, start_js))
+        chain_max_delta = approach_delta
         max_approach_delta = math.radians(float(getattr(
             node.cfg.planner,
             "corridor_preflight_approach_max_joint_delta_deg", 75.0)))
@@ -1346,10 +1354,14 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             if max(abs(a - b) for a, b in zip(
                     candidate, previous)) > math.radians(30.0):
                 return False, f"FINAL_BRANCH_SWITCH_{index}"
+            chain_max_delta = max(
+                chain_max_delta,
+                max(abs(a - b) for a, b in zip(candidate, previous)))
             previous = candidate
         # Execute the exact branch that passed this chain. Re-solving APPROACH
         # later can select a different branch and produce a multi-metre detour.
         node._corridor_preflight_approach_js = list(approach_js)
+        node._corridor_preflight_cost_deg = math.degrees(chain_max_delta)
         return True, "OK"
     except Exception as exc:
         node.get_logger().warn(f"[CORRIDOR_PREFLIGHT] IK exception: {exc}")
@@ -3170,6 +3182,8 @@ def plan_and_execute(node):
     node._corridor_exclusions = set()
     node._corridor_retry_goal = None
     node._corridor_tip_fallback_active = False
+    node._corridor_forced_label = None
+    node._corridor_pair_eval = None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _yolo = getattr(node, 'yolo_thread', None)  # local inference_lock only (same process)
@@ -3257,6 +3271,8 @@ def plan_and_execute(node):
             node._corridor_retry_goal = list(goal[:3])
             node._corridor_retry_tip_anchor = None
             node._corridor_tip_fallback_active = False
+            node._corridor_forced_label = None
+            node._corridor_pair_eval = None
         if _tip_anchor is not None:
             node._corridor_retry_tip_anchor = _tip_anchor.tolist()
         elif _same_corridor_goal:
@@ -3293,7 +3309,7 @@ def plan_and_execute(node):
                 "auto_envelop_axis_from_vertical_deg", 45.0))
             _confidence_threshold = float(getattr(
                 node.cfg.gripper,
-                "auto_envelop_min_axis_confidence", 0.35))
+                "auto_envelop_min_axis_confidence", 0.30))
             _goal_grasp_mode = (
                 "ENVELOP"
                 if (_axis_stable
@@ -4157,7 +4173,87 @@ def plan_and_execute(node):
             node.get_logger().info(
                 f"[CORRIDOR_PREFLIGHT] candidate={_active_corridor} "
                 f"result={'PASS' if _pf_ok else 'REJECT'} reason={_pf_reason} "
+                f"branch_cost={getattr(node, '_corridor_preflight_cost_deg', float('inf')):.1f}deg "
                 "stage=BEFORE_CONFIRM motion=NONE")
+
+            # A fitted ellipse provides an undirected major axis: LEFT and
+            # RIGHT signs are both geometrically valid. Preflight the mirrored
+            # corridor before confirmation and select the safe branch with the
+            # smaller maximum joint change from the current HOME branch.
+            _pair = getattr(node, "_corridor_pair_eval", None)
+            _is_axis_pair = bool(getattr(
+                node, "_corridor_axis_polarity_ambiguous", False))
+            _mirror = None
+            if isinstance(_active_corridor, str):
+                if _active_corridor.startswith("FROM_LEFT_"):
+                    _mirror = _active_corridor.replace(
+                        "FROM_LEFT_", "FROM_RIGHT_", 1)
+                elif _active_corridor.startswith("FROM_RIGHT_"):
+                    _mirror = _active_corridor.replace(
+                        "FROM_RIGHT_", "FROM_LEFT_", 1)
+            if _is_axis_pair and _mirror is not None:
+                if _pair is None:
+                    node._corridor_pair_eval = {
+                        "first_label": _active_corridor,
+                        "first_ok": bool(_pf_ok),
+                        "first_reason": _pf_reason,
+                        "first_cost": float(getattr(
+                            node, "_corridor_preflight_cost_deg", float("inf"))),
+                        "mirror_label": _mirror,
+                        "done": False,
+                    }
+                    node._corridor_forced_label = _mirror
+                    node.get_logger().info(
+                        "[CORRIDOR_PAIR] "
+                        f"first={_active_corridor} "
+                        f"result={'PASS' if _pf_ok else 'REJECT'}; "
+                        f"testing_mirror={_mirror} motion=NONE")
+                    node.goal_poses.insert(0, goal)
+                    _vision_resume()
+                    unlock_target(node)
+                    continue
+                if (not _pair.get("done", False)
+                        and _active_corridor == _pair.get("mirror_label")):
+                    _mirror_cost = float(getattr(
+                        node, "_corridor_preflight_cost_deg", float("inf")))
+                    _first_ok = bool(_pair.get("first_ok", False))
+                    _first_cost = float(_pair.get("first_cost", float("inf")))
+                    if _pf_ok and (not _first_ok or _mirror_cost < _first_cost):
+                        _selected = _active_corridor
+                        _selected_cost = _mirror_cost
+                        _pair["done"] = True
+                        node._corridor_forced_label = None
+                    elif _first_ok:
+                        _selected = str(_pair["first_label"])
+                        _selected_cost = _first_cost
+                        _pair["done"] = True
+                        node._corridor_forced_label = _selected
+                        node.get_logger().info(
+                            "[CORRIDOR_PAIR] "
+                            f"first={_pair['first_label']}:{_first_cost:.1f}deg "
+                            f"mirror={_active_corridor}:"
+                            f"{'PASS' if _pf_ok else 'REJECT'}:"
+                            f"{_mirror_cost:.1f}deg selected={_selected}; "
+                            "reloading selected branch motion=NONE")
+                        node.goal_poses.insert(0, goal)
+                        _vision_resume()
+                        unlock_target(node)
+                        continue
+                    else:
+                        # Both failed; fall through to the existing bounded
+                        # corridor retry logic below.
+                        _selected = "NONE"
+                        _selected_cost = float("inf")
+                        _pair["done"] = True
+                        node._corridor_forced_label = None
+                    node.get_logger().info(
+                        "[CORRIDOR_PAIR] "
+                        f"first={_pair['first_label']}:"
+                        f"{'PASS' if _first_ok else 'REJECT'}:"
+                        f"{_first_cost:.1f}deg mirror={_active_corridor}:"
+                        f"{'PASS' if _pf_ok else 'REJECT'}:"
+                        f"{_mirror_cost:.1f}deg selected={_selected} "
+                        f"selected_cost={_selected_cost:.1f}deg motion=NONE")
             if not _pf_ok:
                 _roll_applied = abs(float(getattr(
                     node, "_approach_finger_roll_applied_deg", 0.0))) > 0.1
@@ -4221,6 +4317,30 @@ def plan_and_execute(node):
                     _vision_resume()
                     unlock_target(node)
                 continue
+
+            # Freeze the exact FINAL TCP predicted for this goal after corridor
+            # and mode selection. The operator may cancel the preview, place
+            # the robot manually, and measure manual-minus-predicted correction.
+            node.final_tcp_teach_prediction = {
+                "tcp_pose": list(_pf_final),
+                "goal_xyz": [float(x), float(y), float(z)],
+                "grasp_mode": str(getattr(
+                    node, "active_goal_grasp_mode", "NORMAL")).upper(),
+                "target_class": (
+                    "VERY_LOW_CENTER" if is_very_low_center else
+                    "LOW_CENTER" if is_low else "MID_HIGH_CENTER"),
+                "corridor": str(_active_corridor),
+                "created_time": time.time(),
+            }
+            node.final_tcp_teach_suggestion = None
+            node.get_logger().info(
+                "[TEACH_FINAL_PREDICTED] "
+                f"mode={node.final_tcp_teach_prediction['grasp_mode']} "
+                f"class={node.final_tcp_teach_prediction['target_class']} "
+                f"corridor={_active_corridor} "
+                f"tcp=[{_pf_final[0]:.3f},{_pf_final[1]:.3f},"
+                f"{_pf_final[2]:.3f}] ready=MEASURE_AFTER_CANCEL_AND_MANUAL_PLACE")
+            node._publish_goal_info()
 
         # === DEBUG PLAN PREVIEW (RViz visualization) ===
         if node.cfg.planner.debug_plan_preview:
@@ -5048,33 +5168,10 @@ def plan_and_execute(node):
         if _verify_s > 0.0:
             node.latest_fingertip_verification = None
             node.latest_fingertip_verification_time = 0.0
-            node.get_logger().info(
-                f"[FINGERTIP_VERIFY] Observing FINAL pose for {_verify_s:.1f}s")
             _vision_resume()
             time.sleep(_verify_s)
             _vision_pause()
             _verification = getattr(node, "latest_fingertip_verification", None)
-            if _verification and _verification.startswith("FIT "):
-                node.get_logger().info(
-                    "[FINGERTIP_VERIFY] WITHIN: date is inside the detected "
-                    f"physical fingertip triangle; possible result=ALIGNED | {_verification}")
-            elif _verification and _verification.startswith("POSSIBLE_FIT "):
-                node.get_logger().info(
-                    "[FINGERTIP_VERIFY] POSSIBLY WITHIN: date is centered between "
-                    "the two visible physical fingertips; confidence is lower because "
-                    f"the third tip is occluded | possible result=ALIGNED_2_TIPS | {_verification}")
-            elif _verification and _verification.startswith("NOT_FIT "):
-                node.get_logger().warn(
-                    "[FINGERTIP_VERIFY] NOT WITHIN: date is not sufficiently "
-                    f"inside the fingertip triangle; possible result=MISALIGNED | {_verification}")
-            elif _verification and _verification.startswith("NEED_2_TIPS"):
-                node.get_logger().warn(
-                    "[FINGERTIP_VERIFY] INCONCLUSIVE: fewer than two physical "
-                    f"red fingertips were detected; possible result=OCCLUDED/LOW_LIGHT | {_verification}")
-            else:
-                node.get_logger().warn(
-                    "[FINGERTIP_VERIFY] INCONCLUSIVE: no fresh selected-date fit "
-                    f"was available; possible result=NO_TARGET/NO_FRAME | {_verification or 'NO_RESULT'}")
 
             # Phase 5 is deliberately observation-only. Convert the measured
             # image residual into a bounded image-plane suggestion for sign and
@@ -5709,6 +5806,8 @@ def plan_and_execute(node):
         # Release target lock and reset tracking state for next goal
         unlock_target(node)
         node.reset_goal_tracking()
+        node._corridor_forced_label = None
+        node._corridor_pair_eval = None
 
         if len(node.goal_poses) == 0:
             # Cancel idle timer when cycle completes

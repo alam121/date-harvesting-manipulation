@@ -1,6 +1,8 @@
 """YOLO inference thread for background processing."""
 
 import json
+import os
+from collections import deque
 from threading import Lock, Event
 from time import time
 from typing import Optional
@@ -11,6 +13,7 @@ import torch
 from ultralytics import YOLO
 
 from .detection import detections_to_custom_masks
+from .direct_trt_decoder import DirectTensorRTSegmenter
 
 
 def engine_imgsz(weights: str) -> Optional[int]:
@@ -39,10 +42,12 @@ def engine_imgsz(weights: str) -> Optional[int]:
 class YoloThread:
     """Background thread for YOLO inference."""
 
-    def __init__(self, weights: str, img_size=640, conf_thres: float = 0.35):
+    def __init__(self, weights: str, img_size=640, conf_thres: float = 0.35,
+                 raw_view: bool = False):
         self.weights = weights
         self.img_size = img_size
         self.conf_thres = conf_thres
+        self.raw_view = raw_view
 
         self.lock = Lock()
         self.run_event = Event()
@@ -63,9 +68,21 @@ class YoloThread:
         self.detections = None       # fruit-only detections (for ZED)
         self.trunk_boxes = []        # trunk bbox list: [(x1,y1,x2,y2), ...]
         self.bunch_boxes = []        # bunch bbox list: [(x1,y1,x2,y2), ...]
+        self.raw_viz = []            # unfiltered YOLO boxes/classes for model inspection
+        self.raw_result = None        # exact source frame + timings for raw inspection
         self.net_fps = 0.0
+        self._next_frame_id = 0
+        self._pending_frame_id = -1
+        self._pending_capture_time = 0.0
+        self._dropped_frames = 0
+        self._profile_count = 0
+        self._last_profile_dropped = 0
+        self._recent_dropped_interval = 0
+        self._fps_window = deque(maxlen=20)
 
         self._model: Optional[YOLO] = None
+        self._direct_model = None
+        self._direct_decoder_enabled = False
         self.class_names: dict = {}  # {class_id: class_name} from model
 
     def run(self) -> None:
@@ -87,8 +104,26 @@ class YoloThread:
                   f"'{self.weights}' (compiled for {native}); using {native}.")
             self.img_size = native
 
-        self._model = YOLO(self.weights, task='segment')
-        self.class_names = getattr(self._model, 'names', {})
+        use_direct = (
+            str(self.weights).endswith(".engine") and
+            os.getenv("UR10E_DIRECT_TRT_DECODER", "1").strip().lower()
+            not in {"0", "false", "no", "off"})
+        # Read class names from the engine metadata before choosing a backend.
+        engine_names = {}
+        if str(self.weights).endswith(".engine"):
+            try:
+                with open(self.weights, "rb") as fh:
+                    meta_len = int.from_bytes(fh.read(4), "little")
+                    metadata = json.loads(fh.read(meta_len).decode("utf-8"))
+                engine_names = {
+                    int(key): value for key, value in metadata.get("names", {}).items()}
+            except Exception:
+                engine_names = {}
+        if use_direct:
+            self.class_names = engine_names
+        else:
+            self._model = YOLO(self.weights, task='segment')
+            self.class_names = getattr(self._model, 'names', {})
 
         # Separate fruit vs trunk vs bunch class IDs
         skip_names = {"stem"}
@@ -100,11 +135,27 @@ class YoloThread:
             cid for cid, name in self.class_names.items()
             if name.lower() == "bunch"
         )
-        # Classes to run inference on: fruit + trunk + bunch (skip stem only)
-        self._detect_class_ids = [
+        fruit_class_ids = [
             cid for cid, name in self.class_names.items()
-            if name.lower() not in skip_names
+            if name.lower() not in skip_names | {"trunk", "bunch"}
         ]
+        # Harvesting and raw inspection both operate on the three selected
+        # dates only. Trunk/bunch obstacle processing has been removed from this
+        # workflow, so do not spend inference/postprocessing time on those masks.
+        self._detect_class_ids = fruit_class_ids
+        if use_direct:
+            try:
+                self._direct_model = DirectTensorRTSegmenter(
+                    self.weights, self.img_size, self.class_names, device,
+                    self.conf_thres, self._detect_class_ids, 3)
+                self._direct_decoder_enabled = True
+                print("[YoloThread] Direct TensorRT decoder ENABLED "
+                      "(set UR10E_DIRECT_TRT_DECODER=0 for Ultralytics fallback).")
+            except Exception as exc:
+                print(f"[YoloThread] Direct decoder initialization failed: {exc}; "
+                      "falling back to Ultralytics.")
+                self._model = YOLO(self.weights, task='segment')
+                self.class_names = getattr(self._model, 'names', self.class_names)
         print(f"Network Initialized... classes: {self.class_names}")
         print(f"  Detect class IDs: {self._detect_class_ids} (skipping: {skip_names})")
         print(f"  Trunk class IDs: {self._trunk_class_ids}")
@@ -116,35 +167,123 @@ class YoloThread:
 
             self.idle_event.clear()
             with self.lock:
-                img = cv2.cvtColor(self.image_net, cv2.COLOR_RGBA2RGB)
+                source_image = self.image_net
+                frame_id = self._pending_frame_id
+                capture_time = self._pending_capture_time
+
+            preprocess_start = time()
+            img = cv2.cvtColor(source_image, cv2.COLOR_RGBA2RGB)
+            predict_start = time()
 
             t0 = time()
             with self.inference_lock:
-                det = self._model.predict(
-                     img,
-                     save=False,
-                     retina_masks=False,
-                     imgsz=self.img_size,
-                     conf=self.conf_thres,
-                     iou=0.3,
-                     max_det=10,
-                     device=device,
-                     verbose=False,
-                     classes=self._detect_class_ids if self._detect_class_ids else None,
-                 )[0]
+                if self._direct_decoder_enabled:
+                    try:
+                        det = self._direct_model.predict(img)
+                    except Exception as exc:
+                        print(f"[YoloThread] Direct decode failed: {exc}; "
+                              "switching permanently to Ultralytics fallback.")
+                        self._direct_decoder_enabled = False
+                        self._model = YOLO(self.weights, task='segment')
+                        det = self._model.predict(
+                            img, save=False, retina_masks=False,
+                            imgsz=self.img_size, conf=self.conf_thres, iou=0.3,
+                            max_det=3, device=device, verbose=False,
+                            classes=self._detect_class_ids or None)[0]
+                else:
+                    det = self._model.predict(
+                         img,
+                         save=False,
+                         retina_masks=False,
+                         imgsz=self.img_size,
+                         conf=self.conf_thres,
+                         iou=0.3,
+                         max_det=3,
+                         device=device,
+                         verbose=False,
+                         classes=self._detect_class_ids if self._detect_class_ids else None,
+                     )[0]
 
             dt = time() - t0
-            self.net_fps = (1.0 / dt) if dt > 0 else 0.0
+            predict_end = time()
+            if dt > 0:
+                self._fps_window.append(1.0 / dt)
+            self.net_fps = (
+                sum(self._fps_window) / len(self._fps_window)
+                if self._fps_window else 0.0)
             self._log_inference_time(dt)
 
-            fruit_dets, trunk_boxes, bunch_boxes = detections_to_custom_masks(
-                det, trunk_class_ids=self._trunk_class_ids,
-                bunch_class_ids=self._bunch_class_ids
-            )
+            decode_start = time()
+            fruit_dets, trunk_boxes, bunch_boxes, raw_viz = (
+                detections_to_custom_masks(
+                    det,
+                    trunk_class_ids=self._trunk_class_ids,
+                    bunch_class_ids=self._bunch_class_ids,
+                    class_names=self.class_names,
+                    build_custom_masks=not self.raw_view,
+                ))
+            if self.raw_view:
+                raw_viz = raw_viz[:3]
+            decode_end = time()
+            speed = getattr(det, "speed", {}) or {}
+            timing = {
+                "frame_id": frame_id,
+                "capture_time": capture_time,
+                "capture_to_start_ms": max(0.0, (preprocess_start - capture_time) * 1000.0),
+                "color_ms": (predict_start - preprocess_start) * 1000.0,
+                "predict_wall_ms": (predict_end - predict_start) * 1000.0,
+                "preprocess_ms": float(speed.get("preprocess", 0.0)),
+                "inference_ms": float(speed.get("inference", 0.0)),
+                "postprocess_ms": float(speed.get("postprocess", 0.0)),
+                "decode_mask_ms": (decode_end - decode_start) * 1000.0,
+                "ready_time": decode_end,
+                "dropped": self._dropped_frames,
+                "dropped_interval": self._recent_dropped_interval,
+            }
             with self.lock:
                 self.detections = fruit_dets
                 self.trunk_boxes = trunk_boxes
                 self.bunch_boxes = bunch_boxes
+                self.raw_viz = raw_viz
+                self.raw_result = {
+                    "image": source_image,
+                    "detections": raw_viz,
+                    "timing": timing,
+                }
+
+            self._profile_count += 1
+            if self._profile_count % 30 == 0:
+                dropped_interval = (
+                    self._dropped_frames - self._last_profile_dropped)
+                self._last_profile_dropped = self._dropped_frames
+                self._recent_dropped_interval = dropped_interval
+                timing["dropped_interval"] = dropped_interval
+                if self.raw_view:
+                    print(
+                        "[RAW_TIMING] "
+                        f"id={frame_id} queue={timing['capture_to_start_ms']:.1f}ms "
+                        f"color={timing['color_ms']:.1f}ms "
+                        f"pre={timing['preprocess_ms']:.1f}ms "
+                        f"infer={timing['inference_ms']:.1f}ms "
+                        f"post={timing['postprocess_ms']:.1f}ms "
+                        f"mask_cpu={timing['decode_mask_ms']:.1f}ms "
+                        f"predict_wall={timing['predict_wall_ms']:.1f}ms "
+                        f"fps_avg={self.net_fps:.1f} "
+                        f"dropped_30={dropped_interval}"
+                    )
+                else:
+                    print(
+                        "[YOLO_TIMING] "
+                        f"id={frame_id} queue={timing['capture_to_start_ms']:.1f}ms "
+                        f"color={timing['color_ms']:.1f}ms "
+                        f"pre={timing['preprocess_ms']:.1f}ms "
+                        f"infer={timing['inference_ms']:.1f}ms "
+                        f"post={timing['postprocess_ms']:.1f}ms "
+                        f"mask_cpu={timing['decode_mask_ms']:.1f}ms "
+                        f"predict_wall={timing['predict_wall_ms']:.1f}ms "
+                        f"fps_avg={self.net_fps:.1f} "
+                        f"dropped_30={dropped_interval}"
+                    )
 
             self.run_event.clear()
             self.dets_ready.set()
@@ -152,12 +291,18 @@ class YoloThread:
 
         self.stopped.set()  # signal that the loop has fully exited
 
-    def set_image(self, image: np.ndarray) -> None:
+    def set_image(self, image: np.ndarray, capture_time: Optional[float] = None) -> None:
         """Set new image for inference. Dropped silently when paused."""
-        if self.paused:
+        if self.paused or self.run_event.is_set():
+            self._dropped_frames += 1
             return
         with self.lock:
-            self.image_net = image
+            # ZED reuses its SDK image buffer on the next grab. Own this frame
+            # so inference never observes a buffer being rewritten underneath it.
+            self.image_net = image.copy()
+            self._pending_frame_id = self._next_frame_id
+            self._next_frame_id += 1
+            self._pending_capture_time = capture_time if capture_time is not None else time()
             self.run_event.set()
 
     def _log_inference_time(self, dt: float) -> None:
@@ -203,6 +348,29 @@ class YoloThread:
         """Get latest bunch bounding boxes (thread-safe)."""
         with self.lock:
             return list(self.bunch_boxes)
+
+    def get_raw_viz(self):
+        """Return raw YOLO detections before depth/scoring/tracking filters."""
+        with self.lock:
+            return list(self.raw_viz)
+
+    def get_raw_result(self):
+        """Return detections with the exact immutable frame used for inference."""
+        with self.lock:
+            if self.raw_result is None:
+                return None
+            return {
+                "image": self.raw_result["image"],
+                "detections": list(self.raw_result["detections"]),
+                "timing": dict(self.raw_result["timing"]),
+            }
+
+    def get_latest_timing(self):
+        """Return timing for the latest completed inference without its image."""
+        with self.lock:
+            if self.raw_result is None:
+                return None
+            return dict(self.raw_result["timing"])
 
     def stop(self) -> None:
         """Signal thread to stop."""

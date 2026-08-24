@@ -5,6 +5,7 @@ import subprocess
 import os
 import re
 import ast
+import shlex
 from pathlib import Path
 
 WS = str(Path(__file__).resolve().parent)
@@ -30,6 +31,7 @@ GRIPPER_CALIBRATION_FILE = Path(os.environ.get(
     "UR10E_GRIPPER_CALIBRATION_FILE",
     "~/.config/datepalm/gripper_calibration.json",
 )).expanduser()
+MODEL_DIR = Path(WS) / "src" / "zed_date_detector" / "models"
 PRESETS = {
     "harvest": ["main", "vision", "zedx_mini"],
     "field": ["main", "vision", "zedx_mini"],
@@ -178,6 +180,11 @@ def get_commands(
         vision_flags = " --use_lidar"
     else:
         vision_flags = ""
+    if os.environ.get("UR10E_RAW_YOLO_VIEW", "0") == "1":
+        vision_flags += " --raw_yolo_view"
+    yolo_weights = os.environ.get("UR10E_YOLO_WEIGHTS", "").strip()
+    if yolo_weights:
+        vision_flags += f" --weights {shlex.quote(yolo_weights)}"
     cmds = {
         "ur": (
             f'{ur_prefix}{profile_source} && ros2 launch ur_bringup ur_control.launch.py '
@@ -529,6 +536,16 @@ def main():
     use_lidar     = "lidar" in args
     use_zed_mini  = "zed_mini" in args
     use_zedx_mini_only = "zedx_mini" in args
+    raw_yolo_view = "raw_yolo" in args
+    os.environ["UR10E_RAW_YOLO_VIEW"] = "1" if raw_yolo_view else "0"
+    model_tokens = [a.split("=", 1)[1] for a in args if a.startswith("model=")]
+    if model_tokens:
+        model_name = Path(model_tokens[-1]).name
+        model_path = MODEL_DIR / model_name
+        if model_path.suffix != ".engine" or not model_path.is_file():
+            print(f"YOLO engine not found: {model_path}", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_WEIGHTS"] = str(model_path)
     hand_eye_target = "chessboard" if "chessboard" in args else "charuco"
     if any(a in args for a in ("hd1080", "1080", "1080p")):
         hand_eye_resolution = "hd1080"
@@ -538,8 +555,8 @@ def main():
         hand_eye_resolution = "qhdplus"
     args = [
         a for a in args
-        if a not in (
-            "fake", "lidar", "zed_mini", "zedx_mini", "charuco", "aruco", "chessboard",
+        if not a.startswith("model=") and a not in (
+            "fake", "lidar", "zed_mini", "zedx_mini", "raw_yolo", "charuco", "aruco", "chessboard",
             "qhdplus", "qhd+", "4k", "hd1080", "1080", "1080p",
             "robot_old", "old_robot",
             "lab", "outdoor", "field_env",
@@ -612,6 +629,27 @@ def main():
     # When main is specified, use panel-integrated RViz
     use_panel = "main" in nodes
     use_vision = "vision" in nodes
+
+    if raw_yolo_view:
+        if not use_vision:
+            print("raw_yolo requires the vision node", file=sys.stderr)
+            sys.exit(2)
+        command = get_commands(
+            fake_hardware=False,
+            use_panel=False,
+            use_lidar=use_lidar,
+            use_zed_mini=use_zed_mini,
+            use_zedx_mini_only=use_zedx_mini_only,
+            use_vision=True,
+            hand_eye_target=hand_eye_target,
+            hand_eye_resolution=hand_eye_resolution,
+            robot_profile=robot_profile,
+            environment=environment,
+            gripper_profile=gripper_profile,
+            gripper_enabled=False,
+        )["vision"].removeprefix("sleep 12 && ")
+        print("Launching standalone Raw YOLO view (no UR bringup, cuRobo, or RViz)")
+        os.execl("/bin/bash", "bash", "-lc", command)
 
     # Reorder: main, vision, teleop, gui, rqt, calibrate, hand_eye, extrinsic
     ordered = []

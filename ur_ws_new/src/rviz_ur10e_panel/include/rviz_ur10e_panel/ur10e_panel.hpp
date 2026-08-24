@@ -227,6 +227,8 @@ private:
   int grab_count_ = 0;
   int slip_count_ = 0;
   int miss_count_ = 0;
+  std::array<double, 3> taught_closure_offsets_m_{};
+  bool taught_closure_update_pending_ = false;
 
   // Stability recording
   bool stability_recording_ = false;

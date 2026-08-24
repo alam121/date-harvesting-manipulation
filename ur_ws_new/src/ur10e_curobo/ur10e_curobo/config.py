@@ -704,7 +704,7 @@ class Gripper:
     use_suction: bool = False
     grasp_mode: str = "AUTO"             # AUTO chooses NORMAL/ENVELOP per accepted goal
     auto_envelop_axis_from_vertical_deg: float = 45.0
-    auto_envelop_min_axis_confidence: float = 0.35
+    auto_envelop_min_axis_confidence: float = 0.30
     normal_depth_extra_m: float = 0.0
     normal_z_extra_m: float = 0.0
     envelop_depth_extra_m: float = 0.024 # place fruit 24mm deeper than NORMAL

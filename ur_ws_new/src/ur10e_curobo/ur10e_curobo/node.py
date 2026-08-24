@@ -1478,6 +1478,193 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().info(
                     "Final grasp offsets updated from RViz (metres): "
                     + ", ".join(f"{value:+.3f}" for value in values))
+        elif cmd == "measure_final_tcp_correction":
+            prediction = getattr(self, "final_tcp_teach_prediction", None)
+            velocities = getattr(self, "current_joint_velocities", None)
+            moving = (
+                velocities is None
+                or any(abs(float(value)) > 0.02 for value in velocities))
+            current = self._motion_mgr.get_end_effector_pose()
+            if self._motion_lock.locked() or self.motion_phase != "IDLE" or moving:
+                self.get_logger().warn(
+                    "[TEACH_FINAL] rejected: robot must be settled and IDLE")
+            elif prediction is None:
+                self.get_logger().warn(
+                    "[TEACH_FINAL] rejected: no predicted FINAL TCP; preview a goal first")
+            elif current is None or len(current) < 7:
+                self.get_logger().warn(
+                    "[TEACH_FINAL] rejected: measured TCP unavailable")
+            elif time.time() - float(prediction.get("created_time", 0.0)) > 600.0:
+                self.get_logger().warn(
+                    "[TEACH_FINAL] rejected: predicted pose is older than 10 minutes")
+            else:
+                predicted = np.asarray(prediction["tcp_pose"][:3], dtype=float)
+                measured = np.asarray(current[:3], dtype=float)
+                delta_base = measured - predicted
+                pred_q = np.asarray(prediction["tcp_pose"][3:7], dtype=float)
+                cur_q = np.asarray(current[3:7], dtype=float)
+                pred_q /= max(float(np.linalg.norm(pred_q)), 1e-12)
+                cur_q /= max(float(np.linalg.norm(cur_q)), 1e-12)
+                orientation_error_deg = math.degrees(
+                    2.0 * math.acos(float(np.clip(
+                        abs(float(np.dot(pred_q, cur_q))), 0.0, 1.0))))
+                qw, qx, qy, qz = pred_q.tolist()
+                rotation = np.array([
+                    [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                    [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                    [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)],
+                ], dtype=float)
+                tool_axis = rotation[:, 2]
+                # Solve both non-orthogonal controls together. A sequential dot
+                # projection would double-count Z whenever the tool axis tilts.
+                basis = np.column_stack((
+                    tool_axis, np.array([0.0, 0.0, 1.0], dtype=float)))
+                depth_delta, z_delta = np.linalg.lstsq(
+                    basis, delta_base, rcond=None)[0].tolist()
+                depth_delta = float(depth_delta)
+                z_delta = float(z_delta)
+                residual_lateral = delta_base - basis @ np.array(
+                    [depth_delta, z_delta], dtype=float)
+                lateral_mm = float(np.linalg.norm(residual_lateral)) * 1000.0
+                correction_mm = float(np.linalg.norm(delta_base)) * 1000.0
+                mode = str(prediction.get("grasp_mode", "NORMAL")).upper()
+                prefix = "envelop" if mode == "ENVELOP" else "normal"
+                old_depth = float(getattr(
+                    self.cfg.gripper, f"{prefix}_depth_extra_m"))
+                old_z = float(getattr(
+                    self.cfg.gripper, f"{prefix}_z_extra_m"))
+                proposed_depth = old_depth + depth_delta
+                proposed_z = old_z + z_delta
+                applicable = (
+                    correction_mm <= 30.0
+                    and orientation_error_deg <= 10.0
+                    and lateral_mm <= 8.0
+                    and abs(proposed_depth) <= 0.050
+                    and abs(proposed_z) <= 0.050)
+                self.final_tcp_teach_suggestion = {
+                    "mode": mode,
+                    "target_class": prediction.get("target_class", "UNKNOWN"),
+                    "depth_delta_m": depth_delta,
+                    "z_delta_m": z_delta,
+                    "lateral_residual_m": lateral_mm / 1000.0,
+                    "orientation_error_deg": orientation_error_deg,
+                    "proposed_depth_m": proposed_depth,
+                    "proposed_z_m": proposed_z,
+                    "applicable": applicable,
+                    "created_time": time.time(),
+                }
+                level = self.get_logger().info if applicable else self.get_logger().warn
+                level(
+                    f"[TEACH_FINAL] {'VALID_SUGGESTION' if applicable else 'REJECTED_SUGGESTION'} "
+                    f"mode={mode} class={prediction.get('target_class')} "
+                    f"manual_minus_predicted_mm=[{delta_base[0]*1000:+.1f},"
+                    f"{delta_base[1]*1000:+.1f},{delta_base[2]*1000:+.1f}] "
+                    f"depth_delta={depth_delta*1000:+.1f}mm "
+                    f"z_delta={z_delta*1000:+.1f}mm "
+                    f"lateral_residual={lateral_mm:.1f}mm "
+                    f"orientation_error={orientation_error_deg:.1f}deg "
+                    f"proposed=[depth:{proposed_depth*1000:+.1f},"
+                    f"z:{proposed_z*1000:+.1f}]mm applied=NO")
+                self._publish_goal_info()
+        elif cmd == "apply_final_tcp_correction":
+            suggestion = getattr(self, "final_tcp_teach_suggestion", None)
+            if self.motion_phase != "IDLE" or self._motion_lock.locked():
+                self.get_logger().warn(
+                    "[TEACH_FINAL_APPLY] rejected: robot motion is active")
+            elif not suggestion or not bool(suggestion.get("applicable", False)):
+                self.get_logger().warn(
+                    "[TEACH_FINAL_APPLY] rejected: no valid measured suggestion")
+            elif time.time() - float(suggestion.get("created_time", 0.0)) > 300.0:
+                self.get_logger().warn(
+                    "[TEACH_FINAL_APPLY] rejected: suggestion older than 5 minutes")
+            else:
+                mode = str(suggestion["mode"]).upper()
+                prefix = "envelop" if mode == "ENVELOP" else "normal"
+                setattr(self.cfg.gripper, f"{prefix}_depth_extra_m",
+                        float(suggestion["proposed_depth_m"]))
+                setattr(self.cfg.gripper, f"{prefix}_z_extra_m",
+                        float(suggestion["proposed_z_m"]))
+                self.get_logger().info(
+                    "[TEACH_FINAL_APPLY] applied "
+                    f"mode={mode} depth={suggestion['proposed_depth_m']*1000:+.1f}mm "
+                    f"z={suggestion['proposed_z_m']*1000:+.1f}mm "
+                    "effective=NEXT_GRASP closure_geometry=UNCHANGED")
+                self.final_tcp_teach_suggestion = None
+                self._publish_goal_info()
+        elif cmd == "clear_final_tcp_correction":
+            self.final_tcp_teach_prediction = None
+            self.final_tcp_teach_suggestion = None
+            self.get_logger().info("[TEACH_FINAL] prediction and suggestion cleared")
+            self._publish_goal_info()
+        elif cmd == "teach_closure_center_from_current_pose":
+            # Diagnostic teaching only. A raw detected date goal is not the
+            # planner's final grasp point: depth, Z, grasp-mode and approach
+            # corrections are applied later. Therefore R^T(goal - TCP) cannot
+            # safely replace the physical tool geometry without validation.
+            velocities = getattr(self, "current_joint_velocities", None)
+            moving = (
+                velocities is None
+                or any(abs(float(value)) > 0.02 for value in velocities)
+            )
+            goal_xyz = (
+                list(self.latest_goal_pose[:3])
+                if self.latest_goal_pose is not None else None
+            )
+            tcp_pose = self._motion_mgr.get_end_effector_pose()
+            if self._motion_lock.locked() or self.motion_phase != "IDLE" or moving:
+                self.get_logger().warn(
+                    "[TEACH_CLOSURE] rejected: robot must be settled and IDLE")
+            elif goal_xyz is None:
+                self.get_logger().warn(
+                    "[TEACH_CLOSURE] rejected: subscribe/freeze a date goal first")
+            elif tcp_pose is None or len(tcp_pose) < 7:
+                self.get_logger().warn(
+                    "[TEACH_CLOSURE] rejected: measured TCP pose unavailable")
+            else:
+                qw, qx, qy, qz = [float(value) for value in tcp_pose[3:7]]
+                norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+                if norm < 1e-9:
+                    self.get_logger().warn(
+                        "[TEACH_CLOSURE] rejected: invalid TCP orientation")
+                else:
+                    qw, qx, qy, qz = (
+                        qw/norm, qx/norm, qy/norm, qz/norm)
+                    rotation = np.array([
+                        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                        [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                        [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)],
+                    ], dtype=float)
+                    delta_base = np.asarray(goal_xyz, dtype=float) - np.asarray(
+                        tcp_pose[:3], dtype=float)
+                    offset_tool = rotation.T @ delta_base
+                    calibrated = np.asarray(
+                        [-0.004553, 0.000100, -0.016223], dtype=float)
+                    deviation = float(np.linalg.norm(offset_tool - calibrated))
+                    magnitude = float(np.linalg.norm(offset_tool))
+                    # Physical closure geometry should remain near its measured
+                    # calibration. Large results mean final target corrections,
+                    # camera error or manual placement were absorbed into it.
+                    if magnitude > 0.040 or deviation > 0.020:
+                        self.get_logger().warn(
+                            "[TEACH_CLOSURE] REJECTED_NOT_APPLIED "
+                            f"suggested_tool_mm=[{offset_tool[0]*1000:+.2f},"
+                            f"{offset_tool[1]*1000:+.2f},{offset_tool[2]*1000:+.2f}] "
+                            f"magnitude={magnitude*1000:.1f}mm "
+                            f"deviation_from_calibration={deviation*1000:.1f}mm; "
+                            "raw goal includes separate FINAL corrections")
+                    else:
+                        # Keep this as a suggestion until multiple poses agree;
+                        # the operator can explicitly enter it with Apply.
+                        self.last_taught_closure_offset_m = offset_tool.tolist()
+                        self.get_logger().info(
+                            "[TEACH_CLOSURE] VALID_SUGGESTION_NOT_APPLIED "
+                            f"goal=[{goal_xyz[0]:.3f},{goal_xyz[1]:.3f},{goal_xyz[2]:.3f}] "
+                            f"tcp=[{tcp_pose[0]:.3f},{tcp_pose[1]:.3f},{tcp_pose[2]:.3f}] "
+                            f"offset_tool_mm=[{offset_tool[0]*1000:+.2f},"
+                            f"{offset_tool[1]*1000:+.2f},{offset_tool[2]*1000:+.2f}] "
+                            "use Apply Closure Center to accept explicitly"
+                        )
+                        self._publish_goal_info()
         elif cmd.startswith("set_closure_center_offsets "):
             _joint_velocities = getattr(self, "current_joint_velocities", None)
             _physically_moving = (
@@ -1832,6 +2019,25 @@ class UR10eCuroboMoveIt(Node):
                 self.cfg.gripper, "grasp_mode", "NORMAL")).upper(),
             "active_goal_grasp_mode": str(getattr(
                 self, "active_goal_grasp_mode", "NORMAL")).upper(),
+            "grasp_mode_offsets_m": {
+                "normal": [
+                    float(self.cfg.gripper.normal_depth_extra_m),
+                    float(self.cfg.gripper.normal_z_extra_m),
+                ],
+                "envelop": [
+                    float(self.cfg.gripper.envelop_depth_extra_m),
+                    float(self.cfg.gripper.envelop_z_extra_m),
+                ],
+            },
+            "closure_center_offsets_m": list(getattr(
+                self.cfg.planner, "closure_center_offset_tcp_m",
+                [-0.004553, 0.000100, -0.016223])),
+            "last_taught_closure_offset_m": getattr(
+                self, "last_taught_closure_offset_m", None),
+            "final_tcp_teach_prediction": getattr(
+                self, "final_tcp_teach_prediction", None),
+            "final_tcp_teach_suggestion": getattr(
+                self, "final_tcp_teach_suggestion", None),
             "session_recording": bool(getattr(self, "session_recording", False)),
             "session_item_count": len(getattr(self, "session_items", []) or []),
             "session_saved_path": getattr(self, "session_saved_path", ""),

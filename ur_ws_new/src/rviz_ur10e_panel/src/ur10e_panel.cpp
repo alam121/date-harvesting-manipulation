@@ -295,6 +295,27 @@ bool jsonBoolValue(const std::string & data, const char * key, bool fallback)
   return fallback;
 }
 
+bool jsonTripleValue(
+  const std::string & data, const char * key, std::array<double, 3> & values)
+{
+  const std::string needle = std::string("\"") + key + "\"";
+  const auto pos = data.find(needle);
+  if (pos == std::string::npos) return false;
+  const auto colon = data.find(':', pos);
+  if (colon == std::string::npos) return false;
+  const auto value_start = data.find_first_not_of(" \t\r\n", colon + 1);
+  if (value_start == std::string::npos || data.compare(value_start, 4, "null") == 0) {
+    return false;
+  }
+  const auto open = data.find('[', value_start);
+  const auto close = data.find(']', open);
+  if (open == std::string::npos || close == std::string::npos) return false;
+  std::string raw = data.substr(open + 1, close - open - 1);
+  std::replace(raw.begin(), raw.end(), ',', ' ');
+  std::istringstream stream(raw);
+  return static_cast<bool>(stream >> values[0] >> values[1] >> values[2]);
+}
+
 }  // namespace
 
 UR10ePanel::UR10ePanel(QWidget * parent)
@@ -453,6 +474,37 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   });
   closure_layout->addWidget(reset_closure, 2, 2);
 
+  auto * teach_closure = new QPushButton("Measure Closure Offset Suggestion");
+  teach_closure->setStyleSheet(
+    "background-color: #00796b; color: white; font-weight: bold;");
+  teach_closure->setToolTip(
+    "With a subscribed date goal frozen, manually place the settled open gripper "
+    "at the ideal grasp position. Calculates a guarded suggestion only; it is "
+    "never applied automatically.");
+  connect(teach_closure, &QPushButton::clicked, this, [this]() {
+    const auto answer = QMessageBox::question(
+      this, "Teach Closure Center",
+      "Before capturing:\n\n"
+      "1. Subscribe to the target date goal.\n"
+      "2. Put the robot in freedrive and manually position the OPEN gripper so "
+      "the date is at the ideal three-finger closure center.\n"
+      "3. Exit freedrive and wait until the robot is completely still.\n\n"
+      "Measure a closure-center suggestion now? It will NOT be applied automatically.",
+      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer == QMessageBox::Yes) {
+      publishCmd("teach_closure_center_from_current_pose");
+      status_label_->setText(
+        "Measuring guarded suggestion... current offsets remain unchanged");
+    }
+  });
+  closure_layout->addWidget(teach_closure, 3, 0, 1, 3);
+  auto * teach_note = new QLabel(
+    "Diagnostic only. Raw goal XYZ does not include FINAL depth/Z adjustments, "
+    "so suggestions are never applied automatically. Check TEACH_CLOSURE log.");
+  teach_note->setWordWrap(true);
+  teach_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  closure_layout->addWidget(teach_note, 4, 0, 1, 3);
+
   // Runtime gripper grasp mode. This publishes through the same /ui_command
   // path as the other grasp settings; the motion node accepts it only in IDLE.
   auto * grasp_mode_group = new QGroupBox("Gripper Grasp Mode");
@@ -528,6 +580,58 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   mode_final_note->setWordWrap(true);
   mode_final_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
   mode_final_layout->addWidget(mode_final_note, 4, 0, 1, 3);
+  auto * measure_final_tcp = new QPushButton(
+    "Measure Manual - Predicted Final TCP");
+  measure_final_tcp->setStyleSheet(
+    "background-color: #1565c0; color: white; font-weight: bold;");
+  measure_final_tcp->setToolTip(
+    "After cancelling a valid plan preview, manually place the settled robot "
+    "at the ideal final grasp pose. Produces a suggestion only.");
+  connect(measure_final_tcp, &QPushButton::clicked, this, [this]() {
+    const auto answer = QMessageBox::question(
+      this, "Measure Final TCP Correction",
+      "Required sequence:\n\n"
+      "1. Subscribe to one date and execute until PLAN PREVIEW appears.\n"
+      "2. Cancel the preview (do not execute it).\n"
+      "3. In freedrive, place the OPEN gripper at the ideal final grasp pose.\n"
+      "4. Exit freedrive and wait until the robot is completely still.\n\n"
+      "Measure manual TCP minus the saved predicted FINAL TCP now?",
+      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer == QMessageBox::Yes) {
+      publishCmd("measure_final_tcp_correction");
+      status_label_->setText(
+        "Measuring final TCP correction; suggestion is not applied");
+    }
+  });
+  mode_final_layout->addWidget(measure_final_tcp, 5, 0, 1, 3);
+  auto * apply_final_tcp = new QPushButton("Apply Valid Taught Suggestion");
+  apply_final_tcp->setStyleSheet(
+    "background-color: #ef6c00; color: white; font-weight: bold;");
+  connect(apply_final_tcp, &QPushButton::clicked, this, [this]() {
+    const auto answer = QMessageBox::warning(
+      this, "Apply Final TCP Suggestion",
+      "Apply the most recent VALID suggestion to the selected NORMAL or "
+      "ENVELOP depth/Z adjustments?\n\nThe physical closure-center calibration "
+      "will not be changed.",
+      QMessageBox::Apply | QMessageBox::Cancel, QMessageBox::Cancel);
+    if (answer == QMessageBox::Apply) {
+      publishCmd("apply_final_tcp_correction");
+      status_label_->setText("Final TCP suggestion apply requested");
+    }
+  });
+  mode_final_layout->addWidget(apply_final_tcp, 6, 0, 1, 2);
+  auto * clear_final_tcp = new QPushButton("Clear Taught Suggestion");
+  connect(clear_final_tcp, &QPushButton::clicked, this, [this]() {
+    publishCmd("clear_final_tcp_correction");
+    status_label_->setText("Final TCP teaching state cleared");
+  });
+  mode_final_layout->addWidget(clear_final_tcp, 6, 2);
+  auto * teach_final_note = new QLabel(
+    "Safety: correction <=30mm, orientation error <=10deg, unsupported lateral "
+    "residual <=8mm. Runtime only; inspect TEACH_FINAL log before Apply.");
+  teach_final_note->setWordWrap(true);
+  teach_final_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  mode_final_layout->addWidget(teach_final_note, 7, 0, 1, 3);
 
   // Motion phase + reacquire result (side by side)
   auto * phase_row = new QHBoxLayout();
@@ -1239,7 +1343,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(exit_btn, &QPushButton::clicked, this, &UR10ePanel::onExit);
   sys_layout->addWidget(exit_btn, 1, 0, 1, 2);
 
-  settings_tab_layout->addWidget(sys_group);
+  settings_tab_layout->insertWidget(0, sys_group);
 
   // Joint Positions
   auto * joint_group = new QGroupBox("Joint Positions (rad)");
@@ -1727,6 +1831,17 @@ void UR10ePanel::setupRos()
       gripper_fake_ = jsonBoolValue(data, "gripper_fake", gripper_fake_);
       gripper_disabled_ = jsonBoolValue(data, "gripper_disabled", gripper_disabled_);
       gripper_suction_ = jsonBoolValue(data, "gripper_suction", gripper_suction_);
+      std::array<double, 3> taught_offsets{};
+      if (jsonTripleValue(data, "last_taught_closure_offset_m", taught_offsets)) {
+        const bool changed =
+          std::abs(taught_offsets[0] - taught_closure_offsets_m_[0]) > 1e-9 ||
+          std::abs(taught_offsets[1] - taught_closure_offsets_m_[1]) > 1e-9 ||
+          std::abs(taught_offsets[2] - taught_closure_offsets_m_[2]) > 1e-9;
+        if (changed) {
+          taught_closure_offsets_m_ = taught_offsets;
+          taught_closure_update_pending_ = true;
+        }
+      }
       session_recording_ = jsonBoolValue(data, "session_recording", session_recording_);
       session_item_count_ = static_cast<int>(
         jsonNumberValue(data, "session_item_count", session_item_count_));
@@ -2740,6 +2855,18 @@ void UR10ePanel::onVelocityPreset()
 void UR10ePanel::updateDisplay()
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
+
+  if (taught_closure_update_pending_) {
+    closure_x_in_->setValue(taught_closure_offsets_m_[0] * 1000.0);
+    closure_y_in_->setValue(taught_closure_offsets_m_[1] * 1000.0);
+    closure_z_in_->setValue(taught_closure_offsets_m_[2] * 1000.0);
+    status_label_->setText(QString(
+      "Closure center taught: X %1, Y %2, Z %3 mm (runtime applied)")
+      .arg(taught_closure_offsets_m_[0] * 1000.0, 0, 'f', 2)
+      .arg(taught_closure_offsets_m_[1] * 1000.0, 0, 'f', 2)
+      .arg(taught_closure_offsets_m_[2] * 1000.0, 0, 'f', 2));
+    taught_closure_update_pending_ = false;
+  }
 
   if (!robot_config_text_.empty()) {
     config_label_->setText(QString::fromStdString(robot_config_text_));

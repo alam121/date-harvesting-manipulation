@@ -337,6 +337,8 @@ class GripperCalibrationDialog(QtWidgets.QDialog):
             f"Saved Lab and Outdoor gripper poses to:\n{GRIPPER_CALIBRATION_FILE}\n\n"
             "Restart the robot system to apply them.")
         self.accept()
+MODEL_DIR = WS / "src" / "zed_date_detector" / "models"
+DEFAULT_MODEL = "yolo26_small_zedone4k_3classes_jetson.engine"
 
 
 class LaunchDialog(QtWidgets.QDialog):
@@ -384,6 +386,24 @@ class LaunchDialog(QtWidgets.QDialog):
 
         self.main_cb = QtWidgets.QCheckBox("Main cuRobo control + RViz panel")
         self.vision_cb = QtWidgets.QCheckBox("Vision")
+        self.raw_yolo_cb = QtWidgets.QCheckBox("Raw YOLO view (no goals)")
+        self.raw_yolo_cb.setToolTip(
+            "Show raw model boxes, masks, classes and confidence; skip depth, scoring and goal publishing."
+        )
+        self.yolo_model_combo = QtWidgets.QComboBox()
+        engine_names = sorted(path.name for path in MODEL_DIR.glob("*.engine"))
+        if DEFAULT_MODEL in engine_names:
+            engine_names.remove(DEFAULT_MODEL)
+            engine_names.insert(0, DEFAULT_MODEL)
+        for name in engine_names:
+            label = f"{name} (default)" if name == DEFAULT_MODEL else name
+            self.yolo_model_combo.addItem(label, name)
+        saved_model = self.settings.value("yolo_model", DEFAULT_MODEL)
+        if saved_model == "yolo26_small_zedone4k_3classes.engine":
+            saved_model = DEFAULT_MODEL
+        self._set_combo_data(self.yolo_model_combo, saved_model)
+        self.yolo_model_combo.setToolTip(
+            "TensorRT engine used by Raw YOLO inspection")
         self.teleop_cb = QtWidgets.QCheckBox("Teleop")
         self.gui_cb = QtWidgets.QCheckBox("Desktop GUI")
         self.calibrate_cb = QtWidgets.QCheckBox("Grasp force calibration")
@@ -438,6 +458,8 @@ class LaunchDialog(QtWidgets.QDialog):
 
         camera_layout = QtWidgets.QFormLayout()
         camera_layout.addRow("Camera / depth", self.camera_combo)
+        camera_layout.addRow("Model inspection", self.raw_yolo_cb)
+        camera_layout.addRow("YOLO engine", self.yolo_model_combo)
         camera_box = self._group_box("Vision", camera_layout)
 
         hand_eye_layout = QtWidgets.QFormLayout()
@@ -496,6 +518,8 @@ class LaunchDialog(QtWidgets.QDialog):
             self.use_gripper_cb,
             self.main_cb,
             self.vision_cb,
+            self.raw_yolo_cb,
+            self.yolo_model_combo,
             self.teleop_cb,
             self.gui_cb,
             self.calibrate_cb,
@@ -512,6 +536,8 @@ class LaunchDialog(QtWidgets.QDialog):
         self.camera_combo.currentIndexChanged.connect(self._sync_hand_eye_resolution)
         self.camera_combo.currentIndexChanged.connect(self._remember_camera_mode)
         self.vision_cb.toggled.connect(self._sync_vision_enabled)
+        self.raw_yolo_cb.toggled.connect(self._sync_raw_yolo_mode)
+        self.yolo_model_combo.currentIndexChanged.connect(self._remember_yolo_model)
         self.robot_profile_combo.currentIndexChanged.connect(self._remember_profiles)
         self.environment_combo.currentIndexChanged.connect(self._remember_profiles)
         self.gripper_profile_combo.currentIndexChanged.connect(self._on_gripper_profile_changed)
@@ -588,6 +614,16 @@ class LaunchDialog(QtWidgets.QDialog):
             self.camera_combo.setCurrentIndex(self.camera_combo.findData("none"))
         elif self.camera_combo.currentData() == "none":
             self.camera_combo.setCurrentIndex(self.camera_combo.findData("zedx_mini"))
+
+    def _sync_raw_yolo_mode(self, enabled):
+        """Raw model inspection runs the camera/YOLO process only."""
+        if enabled:
+            self.vision_cb.setChecked(True)
+            self.main_cb.setChecked(False)
+            self.teleop_cb.setChecked(False)
+            self.gui_cb.setChecked(False)
+            self.calibrate_cb.setChecked(False)
+        self.update_command()
         self.update_command()
 
     def _sync_gripper_enabled(self):
@@ -630,6 +666,10 @@ class LaunchDialog(QtWidgets.QDialog):
         self.settings.setValue("camera_mode", self.camera_combo.currentData())
         self.update_command()
 
+    def _remember_yolo_model(self):
+        self.settings.setValue("yolo_model", self.yolo_model_combo.currentData())
+        self.update_command()
+
     def base_args(self):
         args = [
             f"robot_{self.robot_profile_combo.currentData()}",
@@ -656,6 +696,11 @@ class LaunchDialog(QtWidgets.QDialog):
         if self.vision_cb.isChecked() and camera_arg is not None:
             args.append("vision")
             args.append(camera_arg)
+            if self.raw_yolo_cb.isChecked():
+                args.append("raw_yolo")
+                model_name = self.yolo_model_combo.currentData()
+                if model_name:
+                    args.append(f"model={model_name}")
 
         if self.teleop_cb.isChecked():
             args.append("teleop")
@@ -694,6 +739,10 @@ class LaunchDialog(QtWidgets.QDialog):
         return True
 
     def start_system(self):
+        if self.raw_yolo_cb.isChecked():
+            if self.launch_args(self.build_args()):
+                self.accept()
+            return
         if self.launch_args(self.build_args()):
             self.accept()
 
