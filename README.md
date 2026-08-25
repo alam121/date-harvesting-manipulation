@@ -220,6 +220,93 @@ For detailed launch and manual terminal commands, see:
 
 - [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md)
 
+## YOLO TensorRT Engine Export
+
+Build every production TensorRT engine on the exact Jetson that will run the
+harvesting system. TensorRT selects device-specific kernels while building the
+engine; copying an engine from another Jetson model can reduce performance and
+produces a device-model compatibility warning at runtime.
+
+The repository exporter is [bin/quantinze.py](bin/quantinze.py). Despite its
+historical filename, its default operation is FP16 TensorRT export, not INT8
+quantization. The exporter uses a fixed input shape and batch size, verifies the
+embedded engine metadata, prevents accidental overwrites, and writes a
+`.build.json` manifest containing the source/engine hashes and build-device
+versions.
+
+Before exporting, enable the target Jetson's production performance mode:
+
+```bash
+sudo nvpmodel -m 0
+sudo jetson_clocks
+
+nvpmodel -q
+sudo jetson_clocks --show
+```
+
+Recommended accuracy-first FP16 export and benchmark:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm
+
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1248 \
+  --name date_model_1248_fp16 \
+  --benchmark-image /path/to/representative_zed_frame.png \
+  --runs 100
+```
+
+For a faster candidate, export a separate 1024 engine rather than attempting
+to change the size of an existing fixed-shape engine:
+
+```bash
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1024 \
+  --name date_model_1024_fp16 \
+  --benchmark-image /path/to/representative_zed_frame.png \
+  --runs 100
+```
+
+Do not select an engine using filename or file size alone. Compare engines on
+the same recorded ZED frames and check detection count, confidence, mask IoU,
+centroid stability, small/distant-date recall, fingertip false positives, and
+direct-decoder timing. Then validate the candidate with the live raw model view.
+
+```bash
+source /opt/ros/humble/setup.bash
+source ur_ws_new/install/setup.bash
+
+ros2 run ur10e_curobo vision \
+  --use_zedx_mini_only \
+  --raw_yolo_view \
+  --weights /path/to/candidate.engine
+```
+
+FP16 is the production baseline. INT8 is experimental because calibration can
+degrade small-date masks and target centroids. An INT8 build requires an
+explicit representative dataset containing lab/outdoor lighting, partial and
+distant dates, empty scenes, and red fingertips as hard negatives:
+
+```bash
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1024 \
+  --int8 \
+  --data /path/to/data.yaml \
+  --name date_model_1024_int8 \
+  --benchmark-image /path/to/representative_zed_frame.png
+```
+
+Reject or rebuild an engine if TensorRT reports:
+
+```text
+Using an engine plan file across different models of devices is not recommended
+```
+
+The runtime uses the direct TensorRT segmentation decoder by default. Set
+`UR10E_DIRECT_TRT_DECODER=0` only when comparing against the slower Ultralytics
+fallback. The engine is fixed at export time, so runtime `img_size` cannot make
+a 1248 engine execute as a 1024 engine.
+
 ## RViz Operator Workflow
 
 The RViz panel is the primary operator surface.
