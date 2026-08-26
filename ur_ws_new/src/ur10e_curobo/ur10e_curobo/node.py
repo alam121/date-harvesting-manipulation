@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray, String, Float32
@@ -107,8 +107,15 @@ class UR10eCuroboMoveIt(Node):
 
         # GUI integration: command subscriber and info publishers
         self.create_subscription(String, "/ui_command", self._ui_command_cb, 10)
-        self.create_subscription(Image, "/vision/raw", self._camera_raw_image_cb, 10)
-        self.create_subscription(Image, "/vision/display", self._camera_display_image_cb, 10)
+        # Camera images are best-effort, depth-1 streams. Matching sensor-data
+        # QoS prevents large frames from back-pressuring perception and keeps
+        # snapshots/recording compatible with the vision publishers.
+        self.create_subscription(
+            Image, "/vision/raw", self._camera_raw_image_cb,
+            qos_profile_sensor_data)
+        self.create_subscription(
+            Image, "/vision/display", self._camera_display_image_cb,
+            qos_profile_sensor_data)
         self.velocity_scale_pub = self.create_publisher(Float32, "/velocity_scale", 10)
         self.goal_info_pub = self.create_publisher(String, "/goal_info", 10)
         self.exclude_pub = self.create_publisher(Float32MultiArray, "/exclude_fruit_positions", 10)
