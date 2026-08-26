@@ -626,7 +626,11 @@ class Planner:
     log_corridor_candidates: bool = False
     tool_axis_tip_aim_enabled: bool = True
     tool_axis_tip_max_age_s: float = 0.50
+    # The detected tip is naturally displaced from the fruit centroid.  Keep
+    # the proven 80 mm association gate; 15 mm rejected valid date tips and
+    # forced a corridor-only grasp that contacted with one finger first.
     tool_axis_tip_max_goal_distance_m: float = 0.08
+    tool_axis_tip_require_safe_candidate: bool = False
     tool_axis_tip_max_swing_deg: float = 45.0
     tool_axis_tip_fallback_after_corridors: int = 2  # then retry from detected centre
 
@@ -641,9 +645,9 @@ class Planner:
     phase5_center_deadband_px: float = 4.0      # residual below this is reported as centered
     reverse_initial_wait: float = 0.15          # s; minimum wait after publishing partial reverse
     reverse_final_settle: float = 0.05          # s; settle after reverse stops before hold check
-    reverse_dt_multiplier: float = 5.0          # slow straight-line reverse: 60ms at min_dt=12ms
-    reverse_velocity_scale: float = 0.18        # dedicated low joint-velocity cap for reverse only
-    reverse_acceleration_scale: float = 0.18    # dedicated joint acceleration limit multiplier
+    reverse_dt_multiplier: float = 4.0          # smooth straight-line reverse: 48ms at min_dt=12ms
+    reverse_velocity_scale: float = 0.22        # dedicated low joint-velocity cap for reverse only
+    reverse_acceleration_scale: float = 0.20    # dedicated joint acceleration limit multiplier
     reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
     grasp_post_close_settle_s: float = 0.05      # closure loop is synchronous; only sensor settle remains
     grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
