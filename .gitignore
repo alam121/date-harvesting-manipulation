@@ -38,3 +38,16 @@ ur_ws_new/src/zed_date_detector/models/yolov8m-seg.pt
 zed_output*
 Date_detection/
 ur_ws_new/src/zed_date_detector/zed_date_detector/Date_detection/
+
+# Local tools and runtime experiment artifacts
+.local/
+ur_ws_new/demos/
+ur_ws_new/skills/
+bin/camera_display_*.png
+bin/camera_raw_*.png
+bin/direct_decoder_test.png
+bin/output.jpg
+
+# Calibration tools create timestamped safety backups beside active profiles.
+# Active YAML profiles remain tracked; only generated backup copies are ignored.
+ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/*.backup_*
