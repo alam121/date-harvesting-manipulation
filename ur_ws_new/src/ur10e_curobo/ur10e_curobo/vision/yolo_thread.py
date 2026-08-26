@@ -43,11 +43,12 @@ class YoloThread:
     """Background thread for YOLO inference."""
 
     def __init__(self, weights: str, img_size=640, conf_thres: float = 0.35,
-                 raw_view: bool = False):
+                 raw_view: bool = False, use_numpy_masks: bool = False):
         self.weights = weights
         self.img_size = img_size
         self.conf_thres = conf_thres
         self.raw_view = raw_view
+        self.use_numpy_masks = bool(use_numpy_masks)
 
         self.lock = Lock()
         self.run_event = Event()
@@ -221,6 +222,7 @@ class YoloThread:
                     bunch_class_ids=self._bunch_class_ids,
                     class_names=self.class_names,
                     build_custom_masks=not self.raw_view,
+                    use_numpy_masks=self.use_numpy_masks and not self.raw_view,
                 ))
             if self.raw_view:
                 raw_viz = raw_viz[:3]
