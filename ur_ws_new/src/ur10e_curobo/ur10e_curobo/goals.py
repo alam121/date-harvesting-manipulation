@@ -1284,48 +1284,37 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
     try:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        def solve(pose, seed, require_continuous=False):
+        def solve(pose, seed):
+            # cuRobo's IK solver already searches ik_solver.num_seeds (32 by
+            # default) candidates in parallel inside ONE solve_single() call,
+            # regularized toward retract_config (== seed here) so it already
+            # favors the branch closest to the current joint state -- that's
+            # what the old manual 5-seed Python retry loop was trying to
+            # approximate by hand, at ~6x the cost of one plain call (measured
+            # ~127ms sequential-loop vs ~22ms single call on this hardware),
+            # since each of its 5 calls *also* internally ran the same 32-seed
+            # search. Kept to a single plain-shape call so it matches the
+            # solve state MotionGen.warmup() already CUDA-graphs -- passing a
+            # custom num_seeds/return_seeds here breaks the graph on this
+            # cuRobo/CUDA build ("changing goal type, cuda graph reset not
+            # available"). Trade-off vs. the old code: this no longer retries
+            # with hand-nudged wrist seeds when the first result isn't
+            # continuous enough -- it may reject a few corridors the manual
+            # nudge would have rescued, but never accepts a worse branch than
+            # the manual loop would have, and the continuity/branch-switch
+            # checks below still run on whatever this returns.
             pos = torch.tensor([pose[:3]], dtype=torch.float32, device=dev)
             quat = torch.tensor([pose[3:]], dtype=torch.float32, device=dev)
             retract_t = torch.tensor([seed], dtype=torch.float32, device=dev)
             goal_pose = Pose(position=pos, quaternion=quat)
-
-            # Match the runtime FINAL solver's deterministic alternate-seed
-            # search.  A single cuRobo seed can either report no solution or
-            # return a distant kinematic branch even when a nearby continuous
-            # solution exists for this Cartesian waypoint.
-            # Try the normal seed first. Most reachable waypoints should cost
-            # exactly one IK call. Only retry a discontinuous/failed FINAL
-            # waypoint, and keep that retry set deliberately small so corridor
-            # preflight cannot add tens of seconds before confirmation.
-            seeds = [list(seed)]
-            for joint_index, offset in (
-                    (4, 0.08), (4, -0.08), (5, 0.08), (5, -0.08)):
-                alternate = list(seed)
-                alternate[joint_index] += offset
-                seeds.append(alternate)
-
-            best = None
-            best_delta = float("inf")
-            for candidate_seed in seeds:
-                seed_t = torch.tensor(
-                    [candidate_seed], dtype=torch.float32,
-                    device=dev).unsqueeze(0)
-                result = node.motion_gen.ik_solver.solve_single(
-                    goal_pose, seed_config=seed_t,
-                    retract_config=retract_t)
-                if not result.success.item():
-                    continue
-                candidate = nearest_joint_config(
-                    seed,
-                    result.js_solution.position.squeeze().cpu().tolist())
-                delta = max(abs(a - b) for a, b in zip(candidate, seed))
-                if delta < best_delta:
-                    best = candidate
-                    best_delta = delta
-                if not require_continuous or delta <= math.radians(30.0):
-                    return candidate
-            return best
+            seed_t = torch.tensor(
+                [seed], dtype=torch.float32, device=dev).unsqueeze(0)
+            result = node.motion_gen.ik_solver.solve_single(
+                goal_pose, seed_config=seed_t, retract_config=retract_t)
+            if not result.success.item():
+                return None
+            return nearest_joint_config(
+                seed, result.js_solution.position.squeeze().cpu().tolist())
 
         approach_js = solve(approach_pose, start_js)
         if approach_js is None:
@@ -1346,9 +1335,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
                 approach_pose[i] + alpha * (final_pose[i] - approach_pose[i])
                 for i in range(3)
             ]
-            candidate = solve(
-                [*xyz, *final_pose[3:]], previous,
-                require_continuous=True)
+            candidate = solve([*xyz, *final_pose[3:]], previous)
             if candidate is None:
                 return False, f"FINAL_WAYPOINT_{index}"
             if max(abs(a - b) for a, b in zip(
@@ -1571,6 +1558,14 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
     best_observed_clearance = float('-inf')
     orientations_tested = 0
     early_stop = False
+    # Diagnostic counters so a -inf failure says WHY: IK never solved this pose,
+    # vs. IK solved but every branch needed a bigger reconfiguration than
+    # max_delta allows, vs. branches were close enough but self-collision
+    # (forearm/flange) clearance was too tight.
+    ik_fail_count = 0
+    delta_filtered_count = 0
+    clearance_filtered_count = 0
+    smallest_rejected_delta = float('inf')
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
@@ -1621,11 +1616,15 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
 
             for branch_idx in range(min(len(solutions), len(success))):
                 if not bool(success[branch_idx].item()):
+                    ik_fail_count += 1
                     continue
                 goal_js = nearest_joint_config(
                     start_js, solutions[branch_idx].detach().cpu().tolist())
                 deltas = [abs(g - s) for g, s in zip(goal_js, start_js)]
                 if max(deltas) > max_delta:
+                    delta_filtered_count += 1
+                    smallest_rejected_delta = min(
+                        smallest_rejected_delta, math.degrees(max(deltas)))
                     continue
 
                 states = []
@@ -1641,6 +1640,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
                 best_observed_clearance = max(
                     best_observed_clearance, min(clearance, destination))
                 if clearance < threshold_mm or destination < threshold_mm:
+                    clearance_filtered_count += 1
                     continue
 
                 cart_path = forward_kinematics_batch(node, states)
@@ -1694,9 +1694,27 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
             node,
             f"clamp clearance below {threshold_mm:.0f} mm",
             f"best={best_observed_clearance:.1f}mm")
+        # best=-inf means clearance was never even computed for a single branch:
+        # every candidate was rejected earlier, at the IK-solve or joint-delta
+        # filter. Report which one so this isn't a guessing game next time.
+        if best_observed_clearance == float('-inf'):
+            _reject_reason = (
+                f"IK never solved ({ik_fail_count} branches failed)"
+                if delta_filtered_count == 0 else
+                f"nearest reachable branch needed "
+                f"{smallest_rejected_delta:.0f}deg reconfiguration "
+                f"(cap {math.degrees(max_delta):.0f}deg); "
+                f"{delta_filtered_count} branch(es) filtered by delta, "
+                f"{ik_fail_count} failed IK outright")
+        else:
+            _reject_reason = (
+                f"best branch clearance {best_observed_clearance:.1f}mm "
+                f"below required {threshold_mm:.1f}mm "
+                f"({clearance_filtered_count} branch(es) filtered by clearance)")
         node.get_logger().error(
             f"[PREFLIGHT] No safe IK branch found for VERY LOW approach "
-            f"(best={best_observed_clearance:.1f}mm, required={threshold_mm:.1f}mm)")
+            f"(best={best_observed_clearance:.1f}mm, required={threshold_mm:.1f}mm) — "
+            f"{_reject_reason}")
         return None
 
     max_clearance = max(item["clearance"] for item in candidates)
@@ -3250,17 +3268,49 @@ def plan_and_execute(node):
         _tip_goal_match = (
             math.dist(list(_tip_candidate), [x, y, z])
             if _tip_candidate is not None else float("inf"))
+        _tip_max_goal_distance = float(getattr(
+            node.cfg.planner, "tool_axis_tip_max_goal_distance_m", 0.015))
+        _tip_axis_stable = bool(getattr(
+            node, "fruit_major_axis_stable", False))
+        _tip_selection = getattr(node, "safe_grasp_candidate", None)
+        _tip_candidate_unambiguous = bool(
+            isinstance(_tip_selection, dict)
+            and _tip_selection.get("available", False))
+        _tip_require_safe_candidate = bool(getattr(
+            node.cfg.planner, "tool_axis_tip_require_safe_candidate", True))
+        _tip_aim_enabled = bool(getattr(
+            node.cfg.planner, "tool_axis_tip_aim_enabled", True))
         if (
-            bool(getattr(node.cfg.planner, "tool_axis_tip_aim_enabled", True))
+            _tip_aim_enabled
             and _tip_candidate is not None
             and bool(getattr(node, "date_tip_stable", False))
+            and _tip_axis_stable
+            and (not _tip_require_safe_candidate or _tip_candidate_unambiguous)
             and _tip_age <= float(getattr(
                 node.cfg.planner, "tool_axis_tip_max_age_s", 0.50))
-            and _tip_goal_match <= float(getattr(
-                node.cfg.planner,
-                "tool_axis_tip_max_goal_distance_m", 0.08))
+            and _tip_goal_match <= _tip_max_goal_distance
         ):
             _tip_anchor = np.asarray(_tip_candidate, dtype=float)
+        elif _tip_aim_enabled and _tip_candidate is not None:
+            _tip_reasons = []
+            if not bool(getattr(node, "date_tip_stable", False)):
+                _tip_reasons.append("TIP_UNSTABLE")
+            if not _tip_axis_stable:
+                _tip_reasons.append("DATE_AXIS_UNSTABLE")
+            if (_tip_require_safe_candidate and
+                    not _tip_candidate_unambiguous):
+                _tip_reasons.append("YAW_AMBIGUOUS")
+            if _tip_age > float(getattr(
+                    node.cfg.planner, "tool_axis_tip_max_age_s", 0.50)):
+                _tip_reasons.append("TIP_STALE")
+            if _tip_goal_match > _tip_max_goal_distance:
+                _tip_reasons.append(
+                    f"GOAL_MISMATCH_{_tip_goal_match * 1000.0:.1f}MM")
+            node.get_logger().warn(
+                "[TOOL_AXIS_AIM_REJECTED] "
+                f"reason={'+'.join(_tip_reasons) if _tip_reasons else 'DISABLED'} "
+                f"limit={_tip_max_goal_distance * 1000.0:.1f}mm "
+                "fallback=CALIBRATED_CORRIDOR")
         _retry_goal = getattr(node, "_corridor_retry_goal", None)
         _same_corridor_goal = bool(
             _retry_goal is not None
@@ -3331,6 +3381,10 @@ def plan_and_execute(node):
         node.active_goal_grasp_mode = _goal_grasp_mode
         node._corridor_retry_grasp_mode = _goal_grasp_mode
         _active_corridor = None
+        # Diagnostic timers only (no behavior change): measure where the time
+        # actually goes on a corridor mirror-pair trip -- pose computation vs.
+        # the IK/cartesian preflight itself -- before deciding how to speed it up.
+        _pose_compute_ms = None
         if _log_cycle_start:
             _img_norm_for_log = getattr(node, "fruit_image_norm", None)
             _bunch_rel_x_for_log = getattr(node, "fruit_bunch_rel_x", None)
@@ -3908,6 +3962,7 @@ def plan_and_execute(node):
                 f"fruit_radius={fruit_radius}")
 
         elif is_low:
+            _pose_compute_t0 = time.time()
             fruit_lat = lateral_value(x, y)
             is_low_lateral = (
                 side_approach_enabled and
@@ -4045,6 +4100,7 @@ def plan_and_execute(node):
                     f"y_offset={_y_offset:+.3f}, z_offset={_z_offset:+.3f}"
                     + (f", pitch={_vlc_pitch:+.1f}deg" if is_very_low_center else "")
                     + (f", side_dir=[{low_side_dir[0]:.3f},{low_side_dir[1]:.3f},{low_side_dir[2]:.3f}]" if low_side_dir is not None else ""))
+            _pose_compute_ms = (time.time() - _pose_compute_t0) * 1000.0
         else:
             side_blend =0.0
             orientation = minimize_rotation_orientation(cur_quat, target_quat, blend_weight=side_blend)
@@ -4166,14 +4222,20 @@ def plan_and_execute(node):
                 _pf_grasp, orientation, _pf_closure_offset)
             _pf_final = [*_pf_tcp, *orientation]
             _pf_start = _valid_joint_positions()
+            _pf_ik_t0 = time.time()
             _pf_ok, _pf_reason = _preflight_approach_final_chain(
                 node, _pf_start, approach, _pf_final,
                 waypoint_count=max(1, int(getattr(
                     node.cfg.planner, "direct_final_cart_waypoints", 2))))
+            _pf_ik_ms = (time.time() - _pf_ik_t0) * 1000.0
+            _pose_compute_ms_str = (
+                f"{_pose_compute_ms:.0f}" if _pose_compute_ms is not None else "NA")
             node.get_logger().info(
                 f"[CORRIDOR_PREFLIGHT] candidate={_active_corridor} "
                 f"result={'PASS' if _pf_ok else 'REJECT'} reason={_pf_reason} "
                 f"branch_cost={getattr(node, '_corridor_preflight_cost_deg', float('inf')):.1f}deg "
+                f"pose_compute_ms={_pose_compute_ms_str} "
+                f"ik_preflight_ms={_pf_ik_ms:.0f} "
                 "stage=BEFORE_CONFIRM motion=NONE")
 
             # A fitted ellipse provides an undirected major axis: LEFT and
