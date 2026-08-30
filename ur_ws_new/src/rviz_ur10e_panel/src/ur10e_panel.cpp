@@ -387,10 +387,10 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     input->setSuffix(" mm");
     return input;
   };
-  low_center_depth_in_ = make_offset_input(-35.0);
-  low_center_z_in_ = make_offset_input(7.0);
-  mid_center_depth_in_ = make_offset_input(-35.0);
-  mid_center_z_in_ = make_offset_input(7.0);
+  low_center_depth_in_ = make_offset_input(-5.0);
+  low_center_z_in_ = make_offset_input(0.0);
+  mid_center_depth_in_ = make_offset_input(-5.0);
+  mid_center_z_in_ = make_offset_input(0.0);
   low_side_depth_in_ = make_offset_input(0.0);
   low_left_z_in_ = make_offset_input(20.0);
   low_right_z_in_ = make_offset_input(10.0);
@@ -422,10 +422,10 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   reset_final_offsets->setToolTip(
     "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
   connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
-    low_center_depth_in_->setValue(-35.0);
-    low_center_z_in_->setValue(7.0);
-    mid_center_depth_in_->setValue(-35.0);
-    mid_center_z_in_->setValue(7.0);
+    low_center_depth_in_->setValue(-5.0);
+    low_center_z_in_->setValue(0.0);
+    mid_center_depth_in_->setValue(-5.0);
+    mid_center_z_in_->setValue(0.0);
     low_side_depth_in_->setValue(0.0);
     low_left_z_in_->setValue(20.0);
     low_right_z_in_->setValue(10.0);
@@ -438,9 +438,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   // This is separate from target depth/Z and is applied to the next grasp only.
   auto * closure_group = new QGroupBox("Closure Center Offset (tool frame, mm)");
   auto * closure_layout = new QGridLayout(closure_group);
-  closure_x_in_ = make_offset_input(-4.553);
-  closure_y_in_ = make_offset_input(0.100);
-  closure_z_in_ = make_offset_input(-16.223);
+  closure_x_in_ = make_offset_input(0.0);
+  closure_y_in_ = make_offset_input(0.0);
+  closure_z_in_ = make_offset_input(0.0);
   for (auto * input : {closure_x_in_, closure_y_in_, closure_z_in_}) {
     input->setDecimals(3);
   }
@@ -466,9 +466,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   closure_layout->addWidget(apply_closure, 2, 0, 1, 2);
   auto * reset_closure = new QPushButton("Reset to Defaults");
   connect(reset_closure, &QPushButton::clicked, this, [this, apply_closure]() {
-    closure_x_in_->setValue(-4.553);
-    closure_y_in_->setValue(0.100);
-    closure_z_in_->setValue(-16.223);
+    closure_x_in_->setValue(0.0);
+    closure_y_in_->setValue(0.0);
+    closure_z_in_->setValue(0.0);
     apply_closure->click();
     status_label_->setText("Closure-center offset reset to defaults");
   });

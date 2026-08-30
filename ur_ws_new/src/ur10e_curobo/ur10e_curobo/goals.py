@@ -5443,9 +5443,6 @@ def plan_and_execute(node):
         # 4. Drop-off and return
         if _check_stop():
             break
-        time.sleep(float(getattr(
-            node.cfg.planner, "grasp_post_close_settle_s", 0.05)))
-
         # Wrist rotation to detach fruit from stem
         if _log_cycle_start:
             node.get_logger().info("Post-grip wrist rotation DISABLED for testing")

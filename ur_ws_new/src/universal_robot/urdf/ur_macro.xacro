@@ -566,7 +566,7 @@
     <joint name="${tf_prefix}gripper_link_to_tip" type="fixed">
   		<parent link="${tf_prefix}delto_base_link"/>
   		<child link="${tf_prefix}gripper_tip"/>
-  		<origin xyz="0 0.014 0.09" rpy="0 0 0"/> <!-- Match the box length -->
+		<origin xyz="0 0 0.115" rpy="0 0 0"/> <!-- Centered at the start of the fingertip pads -->
 		</joint>
 		
 

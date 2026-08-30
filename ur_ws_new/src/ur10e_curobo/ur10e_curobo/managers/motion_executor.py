@@ -113,6 +113,10 @@ class MotionExecutor:
             # room). Without this the OBB cache is sized to the initial world and adding the
             # walls fails with "number of OBB is larger than collision cache".
             collision_cache={"obb": 64, "mesh": 10},
+            # cuRobo default is 4 parallel trajopt seeds per plan; testing a
+            # lower value (see Planner.num_trajopt_seeds) to cut GPU time
+            # cuRobo takes from YOLO on every approach/final/dropoff/home move.
+            num_trajopt_seeds=self._config.cfg.planner.num_trajopt_seeds,
         )
 
         self.motion_gen = MotionGen(self.motion_gen_config)

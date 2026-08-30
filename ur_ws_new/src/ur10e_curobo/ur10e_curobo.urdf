@@ -1044,8 +1044,8 @@
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>
     <child link="gripper_tip"/>
-    <origin rpy="0 0 0" xyz="0 0 0.1"/>
-    <!-- Match the box length -->
+    <origin rpy="0 0 0" xyz="0 0 0.115"/>
+    <!-- Centered at the start of the fingertip pads -->
   </joint>
   <!-- Gripper tip frame -->
   <link name="gripper_tip"/>

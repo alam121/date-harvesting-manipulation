@@ -407,6 +407,13 @@ class JointsPreset:
 class Planner:
     urdf_config: str = "ur10e.yml"
     interpolation_dt: float = 0.004
+    # cuRobo default is 4: runs 4 parallel full trajectory optimizations per
+    # plan and keeps the best, on every approach/final/dropoff/return_home
+    # move. That's a real, repeated GPU cost competing with YOLO. Testing
+    # a lower value here (this motion is short, repetitive, small-workspace
+    # reaches, not open-ended novel scenes) -- watch plan success rate and
+    # trajectory smoothness on real grasps before trusting a value long-term.
+    num_trajopt_seeds: int = int(os.environ.get("UR10E_NUM_TRAJOPT_SEEDS", "2"))
     speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
 
@@ -576,23 +583,23 @@ class Planner:
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
 
-    # Negative final depth moves the old robot farther forward along -Y,
-    # deeper into the date cluster.
-    low_center_final_depth_offset: float = -0.035
-    low_center_final_y_offset: float = -0.035   # legacy alias for low_center_final_depth_offset
-    low_center_final_z_offset: float = 0.007    # m; calibrated 7mm above detected low-center point
+    # Scratch retune: stop 5mm shallower than the zero-depth baseline. Previous
+    # tuned values were depth=-0.027m and Z=+0.007m for both centre classes.
+    # Z remains zero and the physical TCP-to-closure correction is disabled.
+    low_center_final_depth_offset: float = -0.010
+    low_center_final_y_offset: float = -0.010   # legacy alias for low_center_final_depth_offset
+    low_center_final_z_offset: float = 0.0
 
-    mid_center_final_depth_offset: float = -0.035
-    mid_center_final_y_offset: float = -0.035   # legacy alias for mid_center_final_depth_offset
-    mid_center_final_z_offset: float = 0.007    # same calibrated FINAL Z as LOW center
+    mid_center_final_depth_offset: float = -0.010
+    mid_center_final_y_offset: float = -0.010   # legacy alias for mid_center_final_depth_offset
+    mid_center_final_z_offset: float = 0.0
     mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
 
-    # Physical centre of the three fingertip bodies at the calibrated fully
-    # closed harvesting posture, expressed in gripper_tip coordinates (metres).
-    # FINAL commands compensate this rotated offset so the closure centre,
-    # rather than the nominal gripper_tip frame, reaches the grasp point.
+    # Scratch baseline: gripper_tip is now located at the physical fingertip
+    # centre, so no second TCP-to-closure correction is applied. Previous
+    # calibrated values were [-0.004553, +0.000100, -0.016223] m.
     closure_center_offset_tcp_m: List[float] = field(
-        default_factory=lambda: [-0.004553, 0.000100, -0.016223])
+        default_factory=lambda: [0.0, 0.0, 0.0])
     # visual F1/F2/F3 -> hardware force-channel indices. Keep identity until
     # the controlled single-finger correspondence test establishes otherwise.
     grasp_visual_to_force_map: List[int] = field(
@@ -649,7 +656,7 @@ class Planner:
     reverse_velocity_scale: float = 0.22        # dedicated low joint-velocity cap for reverse only
     reverse_acceleration_scale: float = 0.20    # dedicated joint acceleration limit multiplier
     reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
-    grasp_post_close_settle_s: float = 0.05      # closure loop is synchronous; only sensor settle remains
+    grasp_post_close_settle_s: float = 0.50      # visible hold after fingers finish closing
     grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
     skip_redundant_visual_grasp_after_temporal: bool = True  # reuse fresh after-reverse frame path
 

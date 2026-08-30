@@ -43,7 +43,9 @@
     <parent link="${parent}"/>
     <child  link="${prefix}delto_base_link"/>
     <!-- tweak these if your gripper origin isn’t at tool0 -->
-    <origin xyz="0 0 0.106" rpy="0 0 -0.40"/>
+    <!-- Match the physical mounting: isolated finger below the upper pair.
+         This adds a 90-degree clockwise visual roll about the tool axis. -->
+    <origin xyz="0 0 0.106" rpy="0 0 -1.97079632679"/>
   </joint>
 
    <link name="${prefix}F1_01">
