@@ -22,19 +22,20 @@ NEW_GRIPPER_OPEN_POSITION = [
 NEW_GRIPPER_CLOSE_DELTA = 2.5673 - 2.1260
 NEW_GRIPPER_OPEN_EXTRA_DEG = 7.0
 
-# Outdoor gripper postures measured from /gripper/joint_states.  This second
-# physical DG-3F-M has slightly different zero/alignment values from the Lab
+# Postures measured from /gripper/joint_states on the second physical DG-3F-M
+# unit, which has slightly different zero/alignment values from the other
 # unit, so keep its complete 12-joint targets rather than applying a delta.
-OUTDOOR_NORMAL_OPEN_POSITION = [
+# Applied to the "lab" environment -- see default_environment_calibrations().
+LAB_NORMAL_OPEN_POSITION = [
     0.4350, -0.1130, 2.0250, -0.3700,
     -1.1330, 0.0000, 1.6580, -0.0930,
     0.3770, 0.1710, 2.0320, -0.4400,
 ]
 
-OUTDOOR_NORMAL_CLOSED_POSITION = [
-    0.3140, -0.1120, 1.9600, 0.1260,
-    -1.1340, 0.0000, 1.9390, -0.1100,
-    0.3870, 0.1760, 1.8030, 0.3580,
+LAB_NORMAL_CLOSED_POSITION = [
+    0.3300, -0.0720, 2.0370, -0.1780,
+    -1.0770, 0.0510, 1.9880, -0.0310,
+    0.4080, 0.1450, 2.1680, -0.1540,
 ]
 
 # Measured physical postures for the enveloping three-finger grasp. These are
@@ -104,10 +105,12 @@ def default_environment_calibrations():
         environment: {name: values.copy() for name, values in poses.items()}
         for environment in ("lab", "outdoor")
     }
-    calibrations["outdoor"]["normal_open"] = (
-        OUTDOOR_NORMAL_OPEN_POSITION.copy())
-    calibrations["outdoor"]["normal_closed"] = (
-        OUTDOOR_NORMAL_CLOSED_POSITION.copy())
+    # The measured second-unit postures (LAB_NORMAL_*) apply to "lab", and
+    # "outdoor" keeps the computed NEW_GRIPPER-derived default.
+    calibrations["lab"]["normal_open"] = (
+        LAB_NORMAL_OPEN_POSITION.copy())
+    calibrations["lab"]["normal_closed"] = (
+        LAB_NORMAL_CLOSED_POSITION.copy())
     return calibrations
 
 

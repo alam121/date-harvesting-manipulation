@@ -27,6 +27,82 @@ def read_key(timeout=0.1):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+def ease_out_tail(states: List[List[float]], tail_count: int) -> List[List[float]]:
+    """Re-parameterize the last `tail_count` waypoints of a joint-space path
+    along arc length using an ease-out curve, so the path approaches its
+    endpoint with decaying rate of change instead of a hard stop.
+
+    build_trajectory() forces every trajectory's first and last waypoint to
+    zero velocity, but with uneased, evenly-arc-spaced samples the
+    second-to-last waypoint can still imply a large central-difference
+    velocity right up to that forced drop -- an abrupt one-dt velocity cliff
+    at the very end, not a smooth deceleration. Remapping the tail's arc-length
+    progress with f(u)=u+u^2-u^3 (slope 1 at u=0, slope 0 at u=1) makes equal
+    fixed-dt time steps correspond to shrinking arc-length steps near the end,
+    which is what actually produces a decelerating velocity profile from a
+    dt-only trajectory. Interpolating on the existing polyline preserves its
+    path -- only the spacing of samples along it changes.
+
+    Returns a new list of the same length as `states`; the input is not
+    mutated. If `states` has fewer than 4 points, or the requested tail is
+    degenerate (zero arc length), it is returned unchanged.
+    """
+    n = len(states)
+    if n < 4:
+        return list(states)
+    tail_count = min(max(0, int(tail_count)), n - 1)
+    if tail_count < 2:
+        return list(states)
+    tail_start = n - tail_count - 1
+    tail_path = np.asarray(states[tail_start:], dtype=float)
+    segment_lengths = np.linalg.norm(np.diff(tail_path, axis=0), axis=1)
+    arc = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    if arc[-1] <= 1e-9:
+        return list(states)
+    u = np.linspace(0.0, 1.0, tail_count + 1)
+    eased_u = u + u * u - u * u * u
+    sample_arc = eased_u * arc[-1]
+    eased_tail = np.column_stack([
+        np.interp(sample_arc, arc, tail_path[:, joint_idx])
+        for joint_idx in range(tail_path.shape[1])
+    ])
+    out = list(states)
+    out[tail_start:] = eased_tail.tolist()
+    return out
+
+
+def ease_in_head(states: List[List[float]], head_count: int) -> List[List[float]]:
+    """Mirror of ease_out_tail() for the START of a path: re-parameterize the
+    first `head_count` waypoints so the path leaves its start with a rising
+    rate of change instead of jumping straight to full speed.
+
+    build_trajectory() forces the first waypoint to zero velocity (and the
+    controller gets one dt to reach it from wherever it actually is), but with
+    uneased, evenly-arc-spaced samples the SECOND waypoint can already imply a
+    large central-difference velocity -- a one-dt jump from rest straight to
+    the trajectory's cruising speed, not a smooth acceleration. This is the
+    mirror-image of the tail problem ease_out_tail() fixes, and reuses its
+    exact arc-length + eased-u math on the reversed head segment (an ease-out
+    read backwards is an ease-in) so the two stay numerically consistent.
+
+    Returns a new list of the same length as `states`; the input is not
+    mutated. If `states` has fewer than 4 points, or the requested head is
+    degenerate (zero arc length), it is returned unchanged.
+    """
+    n = len(states)
+    if n < 4:
+        return list(states)
+    head_count = min(max(0, int(head_count)), n - 1)
+    if head_count < 2:
+        return list(states)
+    head_end = head_count + 1
+    reversed_head = list(reversed(states[:head_end]))
+    eased_reversed = ease_out_tail(reversed_head, head_count)
+    out = list(states)
+    out[:head_end] = list(reversed(eased_reversed))
+    return out
+
+
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float = 0.1, dt: float = 0.02,
                      stop_flag: Optional[Callable[[], bool]] = None,
                      max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8,

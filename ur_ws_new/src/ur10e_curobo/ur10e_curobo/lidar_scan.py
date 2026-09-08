@@ -1,8 +1,4 @@
-import os
-import subprocess
-import threading
 import time
-from datetime import datetime
 import math
 import numpy as np
 
@@ -10,37 +6,7 @@ from . import fk as fk_mod
 from . import markers as markers_mod
 from . import motions as motions_mod
 from .config import PLAN_CFG_SCAN_PREFLIGHT
-from .goals import yaw_only_align_local_axis
-
-
-def _stop_bag_recording_async(node, bag_proc, bag_path: str):
-    """Stop rosbag without delaying the robot return motion."""
-    if bag_proc is None:
-        return
-    try:
-        bag_proc.terminate()
-    except Exception as e:
-        node.get_logger().warn(f"Lidar scan: failed to stop bag recorder: {e}")
-        return
-
-    def wait_for_bag_stop():
-        try:
-            bag_proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            try:
-                bag_proc.kill()
-                bag_proc.wait(timeout=1.0)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        try:
-            node.get_logger().info(f"Lidar scan: bag recorder finalized at {bag_path}")
-        except Exception:
-            pass
-
-    threading.Thread(target=wait_for_bag_stop, daemon=True).start()
-
+from .goals import bounded_yaw_align_local_axis, _log_forearm_flange_clearance
 
 def _current_tcp_pose(node, *, attempts: int = 3, sleep_s: float = 0.05):
     """Return the best available current TCP pose, allowing brief FK/cache hiccups."""
@@ -158,7 +124,8 @@ def _scan_basis_and_angles(node, center, cur, n: int, arc: float):
     return radial, tangent, angles, "current"
 
 
-def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = True):
+def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = True,
+                            stop_check=None):
     cfg = node.cfg.lidar_scan
     center, ref_quat, source = _scan_center(node)
     if center is None:
@@ -207,13 +174,26 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     center_xy = np.array(center[:2], dtype=float)
     z = float(center[2]) + float(getattr(cfg, "semicircle_z_offset_m", 0.0))
 
-    def make_pose(a, r):
+    configured_yaw_limit = float(getattr(
+        cfg, "semicircle_face_target_max_yaw_deg", 10.0))
+
+    def make_pose(a, r, yaw_limit_deg=None):
         offset_xy = r * (math.cos(a) * radial + math.sin(a) * tangent)
         xyz = [float(center_xy[0] + offset_xy[0]), float(center_xy[1] + offset_xy[1]), z]
         quat = list(ref_quat)
         if bool(getattr(cfg, "semicircle_face_target", True)):
             desired = [center[0] - xyz[0], center[1] - xyz[1], center[2] - xyz[2]]
-            quat = yaw_only_align_local_axis(ref_quat, desired, local_axis=local_axis)
+            yaw_limit = (
+                configured_yaw_limit
+                if yaw_limit_deg is None
+                else float(yaw_limit_deg)
+            )
+            quat, _, _ = bounded_yaw_align_local_axis(
+                ref_quat,
+                desired,
+                local_axis=local_axis,
+                max_delta_deg=yaw_limit,
+            )
         return xyz + list(quat)
 
     radius_candidates = [
@@ -223,6 +203,45 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     if radius not in radius_candidates:
         radius_candidates.append(radius)
     radius_candidates = list(dict.fromkeys(radius_candidates))
+    yaw_candidates = list(dict.fromkeys([
+        max(0.0, configured_yaw_limit),
+        max(0.0, configured_yaw_limit * 0.5),
+        0.0,
+    ]))
+    candidate_specs = [
+        (candidate_radius, candidate_yaw)
+        for candidate_radius in radius_candidates
+        for candidate_yaw in yaw_candidates
+    ]
+
+    def candidate_specs_for_angle(angle_deg):
+        if not bool(getattr(cfg, "semicircle_fast_yaw_order", True)):
+            return list(candidate_specs)
+        angle = abs(float(angle_deg)) % 360.0
+        if angle > 180.0:
+            angle = 360.0 - angle
+        max_yaw = max(yaw_candidates)
+        half_yaw = max_yaw * 0.5
+        if angle <= 15.0:
+            preferred_yaws = [half_yaw, 0.0, max_yaw]
+        elif angle < 75.0:
+            preferred_yaws = [0.0, half_yaw, max_yaw]
+        else:
+            preferred_yaws = [max_yaw, half_yaw, 0.0]
+        preferred_yaws = list(dict.fromkeys(preferred_yaws))
+        return [
+            (candidate_radius, candidate_yaw)
+            for candidate_radius in radius_candidates
+            for candidate_yaw in preferred_yaws
+        ]
+
+    def candidate_row_for_angle(angle_deg):
+        specs = candidate_specs_for_angle(angle_deg)
+        return (
+            [make_pose(math.radians(float(angle_deg)), r, yaw) for r, yaw in specs],
+            [r for r, _yaw in specs],
+            [yaw for _r, yaw in specs],
+        )
     if log and bool(getattr(cfg, "semicircle_adaptive_scan", True)):
         node.get_logger().info(
             "Lidar scan: adaptive radius candidates close-first="
@@ -232,29 +251,57 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     for a in angles:
         poses.append(make_pose(float(a), radius))
 
+    used_local_fallback = False
     if log:
         if bool(getattr(cfg, "semicircle_adaptive_scan", True)):
-            candidate_rows = [
-                [make_pose(float(a), r) for r in radius_candidates]
+            candidate_data = [
+                candidate_row_for_angle(math.degrees(float(a)))
                 for a in angles
             ]
+            candidate_rows = [data[0] for data in candidate_data]
             poses = _filter_adaptive_cartesian_scan_sequence(
-                node, candidate_rows, log=log)
+                node,
+                candidate_rows,
+                slot_angles_deg=[math.degrees(float(a)) for a in angles],
+                radius_candidate_rows=[data[1] for data in candidate_data],
+                yaw_candidate_rows=[data[2] for data in candidate_data],
+                bridge_row_factory=candidate_row_for_angle,
+                stop_check=stop_check,
+                log=log,
+            )
         else:
             poses = _filter_cartesian_scan_sequence(node, poses, log=log)
         if len(poses) < 2:
             poses = _local_close_scan_fallback(node, cur, log=log)
             if len(poses) < 2:
                 return []
+            used_local_fallback = True
 
     if publish_preview:
         markers_mod.publish_lidar_scan_preview(node, poses, valid=False)
-    if log:
+    if log and not used_local_fallback:
+        retained_angles = [
+            round(float(t["angle_deg"]), 1)
+            for t in poses
+            if isinstance(t, dict) and "angle_deg" in t
+        ]
+        retained_radii = [
+            round(float(t["radius_m"]), 3)
+            for t in poses
+            if isinstance(t, dict) and "radius_m" in t
+        ]
+        retained_yaws = [
+            round(float(t["yaw_limit_deg"]), 1)
+            for t in poses
+            if isinstance(t, dict) and "yaw_limit_deg" in t
+        ]
         node.get_logger().info(
             f"Lidar scan: generated {len(poses)} semicircle points around {source} "
-            f"center={[round(v, 3) for v in center]} radius={radius:.2f}m "
+            f"center={[round(v, 3) for v in center]} "
+            f"radii={retained_radii or [round(radius, 3)]}m "
+            f"yaw_limits={retained_yaws or [round(configured_yaw_limit, 1)]}deg "
             f"z={z:.3f}m angle_mode={angle_mode} "
-            f"angles={[round(math.degrees(float(a)), 1) for a in angles]}")
+            f"angles={retained_angles or [round(math.degrees(float(a)), 1) for a in angles]}")
     return poses
 
 
@@ -396,18 +443,29 @@ def _cartesian_scan_candidate(node, prev_joints, pose, label: str,
     plan = motions_mod._plan_cartesian_states_from_joints(
         node, prev_joints, pose, label, plan_cfg=PLAN_CFG_SCAN_PREFLIGHT)
     if plan is None:
-        return None
+        return None, "PLAN_OR_IK_FAIL"
     states, curobo_dt = plan
     states = _unwrap_states_near_previous(prev_joints, states)
     if not _scan_joint_motion_ok(
             node, prev_joints, states, label, log_rejection=log_rejection):
-        return None
+        max_total, max_step = _scan_joint_motion_metrics(prev_joints, states)
+        total_cap = math.radians(float(getattr(
+            node.cfg.lidar_scan, "semicircle_max_joint_delta_deg", 75.0)))
+        reason = "JOINT_DELTA" if max_total > total_cap else "JOINT_STEP"
+        return None, reason
+    clamp_mm, _, _ = _log_forearm_flange_clearance(
+        node, states, label, log_result=False)
+    clamp_threshold_mm = float(getattr(
+        node.cfg.planner, "clamp_safety_threshold_mm", 45.0))
+    if not math.isfinite(clamp_mm) or clamp_mm < clamp_threshold_mm:
+        clearance_text = "UNKNOWN" if not math.isfinite(clamp_mm) else f"{clamp_mm:.1f}mm"
+        return None, f"CLAMP_CLEARANCE_{clearance_text}"
     if not motions_mod._manual_cartesian_path_inside_safe_zone(node, states, label):
-        return None
+        return None, "SAFE_ZONE"
     if require_horizontal and not _states_stay_horizontal(
             node, states, target_z=float(pose[2]), label=label,
             log_rejection=log_rejection):
-        return None
+        return None, "Z_PLANE"
     max_total, max_step = _scan_joint_motion_metrics(prev_joints, states)
     return {
         "pose": pose,
@@ -415,75 +473,224 @@ def _cartesian_scan_candidate(node, prev_joints, pose, label: str,
         "dt": curobo_dt,
         "end_joints": list(states[-1]),
         "score": max_total + 0.5 * max_step + 0.0005 * len(states),
-    }
+    }, "OK"
 
 
-def _filter_adaptive_cartesian_scan_sequence(node, candidate_rows, *, log: bool = True):
-    """Choose a smooth reachable scan sweep; radius/angle samples may be skipped."""
+def _filter_adaptive_cartesian_scan_sequence(
+        node, candidate_rows, *, slot_angles_deg=None,
+        radius_candidates_m=None, yaw_candidates_deg=None,
+        radius_candidate_rows=None, yaw_candidate_rows=None,
+        bridge_row_factory=None,
+        stop_check=None,
+        log: bool = True):
+    """Choose a smooth reachable scan sweep; radius/angle samples may be skipped.
+
+    stop_check, if given, is polled before each angle slot's (expensive, IK/
+    collision preflight-based) test_row() call -- e.g. a callable that reports
+    whether a goal has already been (re)detected, making the rest of this sweep
+    moot. Without it, a full sweep (every angle slot times every radius/yaw
+    candidate) always runs to completion even when the goal it was searching
+    for shows up seconds into the computation, wasting the remaining time.
+    """
     if node.current_joint_positions is None:
         return []
     cfg = node.cfg.lidar_scan
     max_failed = max(1, int(getattr(cfg, "semicircle_max_failed_candidates", 3)))
     min_points = max(2, int(getattr(cfg, "semicircle_min_points", 3)))
+    slot_angles_deg = list(slot_angles_deg or range(len(candidate_rows)))
+    radius_candidates_m = list(radius_candidates_m or range(
+        max((len(row) for row in candidate_rows), default=0)))
+    yaw_candidates_deg = list(yaw_candidates_deg or [0.0] * len(radius_candidates_m))
+    radius_candidate_rows = list(radius_candidate_rows or [
+        list(radius_candidates_m) for _row in candidate_rows
+    ])
+    yaw_candidate_rows = list(yaw_candidate_rows or [
+        list(yaw_candidates_deg) for _row in candidate_rows
+    ])
+    original_angles = {round(float(a), 6) for a in slot_angles_deg}
+    bridge_step_deg = max(1.0, float(getattr(
+        cfg, "semicircle_joint_bridge_step_deg", 10.0)))
 
-    def evaluate(rows, direction_label):
+    def evaluate(indexed_rows, direction_label):
         kept = []
+        diagnostics = []
         prev_joints = list(node.current_joint_positions)
         failed = 0
         total_score = 0.0
-        for i, row in enumerate(rows, 1):
+        stopped_at_joint_boundary = False
+        def test_row(row, angle_deg, label_suffix, row_radii, row_yaws):
             best = None
+            rejected = []
             for j, pose in enumerate(row, 1):
-                cand = _cartesian_scan_candidate(
+                cand, reason = _cartesian_scan_candidate(
                     node,
                     prev_joints,
                     pose,
-                    f"SCAN_PREFLIGHT_{direction_label}_{i}_{j}",
+                    f"SCAN_PREFLIGHT_{direction_label}_{label_suffix}_{j}",
                     require_horizontal=bool(kept),
                     log_rejection=False,
                 )
                 if cand is not None:
                     best = cand
+                    best["angle_deg"] = float(angle_deg)
+                    best["radius_m"] = float(row_radii[j - 1])
+                    best["yaw_limit_deg"] = float(row_yaws[j - 1])
                     break
-            if best is None:
-                failed += 1
-                if not kept and failed >= max_failed:
-                    break
-                continue
+                rejected.append(
+                    f"{float(row_radii[j - 1]):.2f}m/"
+                    f"yaw{float(row_yaws[j - 1]):.0f}:{reason}")
+            return best, rejected
+
+        def keep_candidate(best, rejected, *, is_bridge):
+            nonlocal prev_joints, total_score, failed
             kept.append({
                 "pose": best["pose"],
                 "states": best["states"],
                 "dt": best["dt"],
+                "angle_deg": best["angle_deg"],
+                "radius_m": best["radius_m"],
+                "yaw_limit_deg": best["yaw_limit_deg"],
+                "is_bridge": bool(is_bridge),
             })
+            diagnostics.append(
+                (best["angle_deg"], best["radius_m"], rejected))
             prev_joints = best["end_joints"]
             total_score += best["score"]
             failed = 0
-        return kept, total_score
+
+        for sequence_i, (slot_i, row) in enumerate(indexed_rows, 1):
+            if stop_check is not None and stop_check():
+                diagnostics.append(
+                    (float(slot_angles_deg[slot_i]), None, ["ABORTED_GOAL_FOUND"]))
+                break
+            angle_deg = float(slot_angles_deg[slot_i])
+            best, rejected = test_row(
+                row,
+                angle_deg,
+                str(sequence_i),
+                radius_candidate_rows[slot_i],
+                yaw_candidate_rows[slot_i],
+            )
+
+            # A coarse 30-degree arc step can make the IK solver jump branches.
+            # Insert 10-degree poses only after such a failure, then retry the
+            # requested slot from the newly continued joint posture.
+            joint_discontinuity = bool(rejected) and all(
+                reason.endswith(("JOINT_DELTA", "JOINT_STEP"))
+                for reason in rejected
+            )
+            if (
+                best is None
+                and joint_discontinuity
+                and kept
+                and bridge_row_factory is not None
+            ):
+                previous_angle = float(kept[-1]["angle_deg"])
+                gap = angle_deg - previous_angle
+                bridge_count = max(0, int(math.ceil(abs(gap) / bridge_step_deg)) - 1)
+                bridge_ok = True
+                for bridge_i in range(1, bridge_count + 1):
+                    bridge_angle = previous_angle + math.copysign(
+                        min(bridge_step_deg * bridge_i, abs(gap)), gap)
+                    bridge_data = bridge_row_factory(bridge_angle)
+                    if isinstance(bridge_data, tuple) and len(bridge_data) == 3:
+                        bridge_row, bridge_radii, bridge_yaws = bridge_data
+                    else:
+                        bridge_row = bridge_data
+                        bridge_radii = radius_candidates_m
+                        bridge_yaws = yaw_candidates_deg
+                    bridge, bridge_rejected = test_row(
+                        bridge_row,
+                        bridge_angle,
+                        f"{sequence_i}_BRIDGE_{bridge_i}",
+                        bridge_radii,
+                        bridge_yaws,
+                    )
+                    if bridge is None:
+                        diagnostics.append(
+                            (bridge_angle, None, bridge_rejected + ["BRIDGE_FAILED"]))
+                        bridge_ok = False
+                        stopped_at_joint_boundary = True
+                        break
+                    keep_candidate(bridge, bridge_rejected, is_bridge=True)
+                if bridge_ok:
+                    best, rejected = test_row(
+                        row,
+                        angle_deg,
+                        f"{sequence_i}_RETRY",
+                        radius_candidate_rows[slot_i],
+                        yaw_candidate_rows[slot_i],
+                    )
+
+            if best is None:
+                diagnostics.append(
+                    (angle_deg, None, rejected))
+                failed += 1
+                # Do not skip across an unreachable IK boundary and later accept
+                # an isolated angle. That would no longer be a continuous arc.
+                if stopped_at_joint_boundary:
+                    break
+                if not kept and failed >= max_failed:
+                    break
+                continue
+            keep_candidate(best, rejected, is_bridge=False)
+        tested_slots = {d[0] for d in diagnostics}
+        for slot_i, _row in indexed_rows:
+            angle = float(slot_angles_deg[slot_i])
+            if angle not in tested_slots:
+                reason = (
+                    "NOT_TESTED_ARC_DISCONTINUITY"
+                    if stopped_at_joint_boundary
+                    else "NOT_TESTED_EARLY_ABORT"
+                )
+                diagnostics.append((angle, None, [reason]))
+        return kept, total_score, diagnostics
+
+    indexed_rows = list(enumerate(candidate_rows))
 
     preferred = str(getattr(cfg, "semicircle_preflight_direction", "reverse")).strip().lower()
     if preferred not in ("forward", "reverse", "both"):
         preferred = "reverse"
 
     if preferred == "both":
-        fwd, fwd_score = evaluate(candidate_rows, "FWD")
-        rev, rev_score = evaluate(list(reversed(candidate_rows)), "REV")
+        fwd, fwd_score, fwd_diag = evaluate(indexed_rows, "FWD")
+        rev, rev_score, rev_diag = evaluate(list(reversed(indexed_rows)), "REV")
         if len(rev) > len(fwd) or (len(rev) == len(fwd) and rev_score < fwd_score):
-            kept, direction, score = rev, "reverse", rev_score
+            kept, direction, score, diagnostics = rev, "reverse", rev_score, rev_diag
         else:
-            kept, direction, score = fwd, "forward", fwd_score
+            kept, direction, score, diagnostics = fwd, "forward", fwd_score, fwd_diag
     else:
-        primary_rows = list(reversed(candidate_rows)) if preferred == "reverse" else candidate_rows
-        kept, score = evaluate(primary_rows, preferred[:3].upper())
+        primary_rows = list(reversed(indexed_rows)) if preferred == "reverse" else indexed_rows
+        kept, score, diagnostics = evaluate(primary_rows, preferred[:3].upper())
         direction = preferred
         if (
             len(kept) < min_points
             and bool(getattr(cfg, "semicircle_preflight_fallback_opposite", True))
         ):
             opposite = "forward" if preferred == "reverse" else "reverse"
-            opposite_rows = candidate_rows if opposite == "forward" else list(reversed(candidate_rows))
-            alt, alt_score = evaluate(opposite_rows, opposite[:3].upper())
+            opposite_rows = indexed_rows if opposite == "forward" else list(reversed(indexed_rows))
+            alt, alt_score, alt_diag = evaluate(opposite_rows, opposite[:3].upper())
             if len(alt) > len(kept) or (len(alt) == len(kept) and alt_score < score):
-                kept, direction, score = alt, opposite, alt_score
+                kept, direction, score, diagnostics = alt, opposite, alt_score, alt_diag
+
+    if log:
+        for angle, selected_radius, rejected in sorted(diagnostics, key=lambda item: item[0]):
+            if selected_radius is not None:
+                rejected_text = f" prior_rejected={','.join(rejected)}" if rejected else ""
+                result = (
+                    "BRIDGE_KEPT"
+                    if round(float(angle), 6) not in original_angles
+                    else "KEPT"
+                )
+                node.get_logger().info(
+                    f"[LIDAR_SLOT] angle={angle:.1f}deg result={result} "
+                    f"radius={selected_radius:.2f}m "
+                    f"yaw_limit={next((float(t['yaw_limit_deg']) for t in kept if abs(float(t['angle_deg']) - float(angle)) < 1e-6), 0.0):.1f}deg"
+                    f"{rejected_text}")
+            else:
+                node.get_logger().warn(
+                    f"[LIDAR_SLOT] angle={angle:.1f}deg result=REJECTED "
+                    f"reasons={','.join(rejected) or 'UNKNOWN'}")
 
     if len(kept) < min_points:
         if log:
@@ -493,9 +700,13 @@ def _filter_adaptive_cartesian_scan_sequence(node, candidate_rows, *, log: bool 
         return []
 
     if log:
+        original_kept = sum(
+            1 for target in kept if not bool(target.get("is_bridge", False)))
+        bridge_kept = len(kept) - original_kept
+        bridge_text = f" + {bridge_kept} bridge" if bridge_kept else ""
         node.get_logger().info(
-            f"Lidar scan: adaptive {direction} sweep kept {len(kept)}/"
-            f"{len(candidate_rows)} angle slots score={score:.3f}")
+            f"Lidar scan: adaptive {direction} sweep kept {original_kept}/"
+            f"{len(candidate_rows)} angle slots{bridge_text} score={score:.3f}")
     return kept
 
 
@@ -786,6 +997,15 @@ def _execute_scan_pose(node, pose, label, speed_factor, *, require_horizontal: b
     states = _unwrap_states_near_previous(start_joints, states)
     if not _scan_joint_motion_ok(node, start_joints, states, label):
         return False
+    clamp_mm, _, _ = _log_forearm_flange_clearance(
+        node, states, label, log_result=True)
+    clamp_threshold_mm = float(getattr(
+        node.cfg.planner, "clamp_safety_threshold_mm", 45.0))
+    if not math.isfinite(clamp_mm) or clamp_mm < clamp_threshold_mm:
+        node.get_logger().error(
+            f"[LIDAR_CLAMP_GUARD] {label}: rejected before motion "
+            f"(clearance={clamp_mm:.1f}mm, required={clamp_threshold_mm:.1f}mm)")
+        return False
     if not motions_mod._manual_cartesian_path_inside_safe_zone(node, states, label):
         return False
     if require_horizontal and not _states_stay_horizontal(
@@ -811,6 +1031,15 @@ def _execute_scan_target(node, target, label, speed_factor, *, require_horizonta
         start_joints = list(node.current_joint_positions)
         states = _unwrap_states_near_previous(start_joints, cached_states)
         if not _scan_joint_motion_ok(node, start_joints, states, label):
+            return False
+        clamp_mm, _, _ = _log_forearm_flange_clearance(
+            node, states, label, log_result=True)
+        clamp_threshold_mm = float(getattr(
+            node.cfg.planner, "clamp_safety_threshold_mm", 45.0))
+        if not math.isfinite(clamp_mm) or clamp_mm < clamp_threshold_mm:
+            node.get_logger().error(
+                f"[LIDAR_CLAMP_GUARD] {label}: rejected before motion "
+                f"(clearance={clamp_mm:.1f}mm, required={clamp_threshold_mm:.1f}mm)")
             return False
         if not motions_mod._manual_cartesian_path_inside_safe_zone(node, states, label):
             return False
@@ -864,7 +1093,8 @@ def _execute_scan_joint(node, joints, label, speed_factor):
     )
 
 
-def run_lidar_scan(node):
+def run_lidar_scan(node, *, stop_when_goal_found: bool = False,
+                   return_home: bool = True):
     """
     Sweep the arm through a semicircle around the selected scan center while
     recording /livox/lidar and /livox/imu to a ROS 2 bag file.
@@ -874,13 +1104,19 @@ def run_lidar_scan(node):
     to use cfg.lidar_scan.scan_waypoints as legacy joint-space waypoints.
     """
     cfg = node.cfg.lidar_scan
+    goal_found = False
+
+    def _goal_available():
+        return bool(stop_when_goal_found and len(node.goal_poses) > 0)
     use_semicircle = bool(getattr(cfg, "use_semicircle", True))
     targets = _cached_scan_targets(node) if use_semicircle else None
     if targets:
         node.get_logger().info(
             f"Lidar scan: using cached validated preview ({len(targets)} poses)")
     else:
-        targets = _semicircle_scan_poses(node) if use_semicircle else cfg.scan_waypoints
+        targets = (
+            _semicircle_scan_poses(node, stop_check=_goal_available)
+            if use_semicircle else cfg.scan_waypoints)
         if use_semicircle and targets and all(
                 isinstance(t, dict) and _target_states(t) is not None for t in targets):
             node._latest_lidar_scan_targets = targets
@@ -891,23 +1127,22 @@ def run_lidar_scan(node):
             node._latest_lidar_scan_targets_time = time.time()
 
     if not targets:
+        if _goal_available():
+            node.get_logger().info(
+                "[AUTO_HARVEST] Goal found during scan target planning; "
+                "skipping sweep for stationary reacquisition")
+            return True
         node.get_logger().error("Lidar scan: no scan targets available")
-        return
-
-    bag_dir = os.path.expanduser(cfg.bag_dir)
-    os.makedirs(bag_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bag_path = os.path.join(bag_dir, f"lidar_scan_{timestamp}")
+        return False
 
     node.get_logger().info(
-        f"Lidar scan: {len(targets)} {'poses' if use_semicircle else 'waypoints'}, "
-        f"recording to {bag_path}"
+        f"Lidar scan: {len(targets)} "
+        f"{'poses' if use_semicircle else 'waypoints'}"
     )
     node.motion_phase = "LIDAR_SCAN"
-    bag_proc = None
 
     try:
-        # Move to scan start before recording so motion artefacts are not captured
+        # Move to the first validated scan pose before beginning the sweep.
         node.get_logger().info("Lidar scan: moving to start position")
         if use_semicircle:
             ok = _execute_scan_target(
@@ -916,21 +1151,28 @@ def run_lidar_scan(node):
         else:
             ok = _execute_scan_joint(node, targets[0], "SCAN_START", cfg.speed_factor)
         if not ok or node.stop_requested:
+            if _goal_available():
+                goal_found = True
+                node.get_logger().info(
+                    "[AUTO_HARVEST] Goal found while moving to scan start; "
+                    "holding discovery pose")
+                return True
             node.get_logger().warn("Lidar scan: could not reach start position, aborting")
-            return
+            return False
 
-        # Start ros2 bag record
-        bag_proc = subprocess.Popen(
-            ["ros2", "bag", "record", "-o", bag_path,
-             "/livox/lidar", "/livox/imu"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        node.get_logger().info("Lidar scan: bag recording started")
-        time.sleep(1.0)  # allow recorder to initialise before moving
+        if _goal_available():
+            goal_found = True
+            node.get_logger().info(
+                "[AUTO_HARVEST] Goal found at scan start; stopping LiDAR sweep")
 
         # Sweep through remaining waypoints
         for i, target in enumerate(targets[1:], 1):
+            if goal_found or _goal_available():
+                goal_found = True
+                node.get_logger().info(
+                    f"[AUTO_HARVEST] Goal found after scan point {max(0, i - 1)}; "
+                    "stopping sweep for stationary reacquisition")
+                break
             if node.stop_requested:
                 node.get_logger().info("Lidar scan: interrupted by stop request")
                 break
@@ -941,22 +1183,29 @@ def run_lidar_scan(node):
                 ok = _execute_scan_target(
                     node, target, f"SCAN_{i}", cfg.speed_factor,
                     require_horizontal=True)
+                if _goal_available():
+                    goal_found = True
+                    node.get_logger().info(
+                        f"[AUTO_HARVEST] Goal found during scan segment {i}; "
+                        "stopping sweep for stationary reacquisition")
+                    break
                 if not ok:
                     node.get_logger().warn(f"Lidar scan: skipped point {i}; move failed")
             else:
                 _execute_scan_joint(node, target, f"SCAN_{i}", cfg.speed_factor)
             time.sleep(0.3)  # brief dwell at each waypoint for full LiDAR sweep
 
-        node.get_logger().info(f"Lidar scan motion complete — stopping bag at {bag_path}")
+        node.get_logger().info(
+            "Lidar scan stopped on detected goal"
+            if goal_found else "Lidar scan motion complete")
 
     except Exception as e:
         node.get_logger().error(f"Lidar scan error: {e}")
 
     finally:
-        if bag_proc is not None:
-            _stop_bag_recording_async(node, bag_proc, bag_path)
-        if not node.stop_requested:
+        if not node.stop_requested and return_home and not goal_found:
             node.motion_phase = "LIDAR_SCAN_HOME"
             node.get_logger().info("Lidar scan: returning HOME")
             motions_mod.move_to_home_position(node)
         node.motion_phase = "IDLE"
+    return goal_found

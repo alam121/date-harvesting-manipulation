@@ -97,7 +97,7 @@ from .config import (
     LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG,
     X_FORWARD_Y_LATERAL,
 )
-from .utils import build_trajectory, wait_until_xyz
+from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt
 from .motions import move_to_dropoff_position, move_to_home_position
@@ -433,7 +433,7 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
         inward = rotated(-math.radians(bounded_axis_deg))
         valid = True
         direction_source = "selected_date_axis"
-        node.get_logger().info(
+        node.get_logger().debug(
             f"[APPROACH_AXIS_SOURCE] class={class_label} "
             f"axis={axis_angle_deg:+.1f}deg applied={bounded_axis_deg:+.1f}deg "
             f"confidence={axis_confidence:.2f} stable={axis_stable} "
@@ -494,7 +494,33 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
     best = (available[0] if bool(getattr(
         node, "_corridor_tip_fallback_active", False)) or forced_label is not None
         else max(available, key=lambda item: item["score"]))
-    node._corridor_axis_polarity_ambiguous = bool(axis_valid)
+    # Polarity is ambiguous only when the MIRRORED corridor is genuinely
+    # competitive, not merely because the axis is valid. A fitted ellipse gives
+    # an undirected major axis, so LEFT/RIGHT can both be geometrically valid --
+    # but when the chosen heading matches the inward direction far better than
+    # its mirror (e.g. 0.997 vs 0.814, a 31deg margin), the polarity is decided
+    # and preflighting the mirror is ~1s of wasted IK per goal. Only treat it as
+    # a genuine pair when the two are within corridor_polarity_margin of each
+    # other, which is the case this pair evaluation exists to resolve.
+    _mirror_label = None
+    if isinstance(best.get("label"), str):
+        if best["label"].startswith("FROM_LEFT_"):
+            _mirror_label = best["label"].replace("FROM_LEFT_", "FROM_RIGHT_", 1)
+        elif best["label"].startswith("FROM_RIGHT_"):
+            _mirror_label = best["label"].replace("FROM_RIGHT_", "FROM_LEFT_", 1)
+    _mirror_item = next(
+        (item for item in evaluated if item["label"] == _mirror_label), None)
+    _polarity_margin = float(getattr(planner, "corridor_polarity_margin", 0.10))
+    _polarity_ambiguous = bool(
+        axis_valid and _mirror_item is not None
+        and (float(best["score"]) - float(_mirror_item["score"])) < _polarity_margin)
+    if axis_valid and not _polarity_ambiguous and _mirror_item is not None:
+        node.get_logger().debug(
+            f"[CORRIDOR_POLARITY] decided: {best['label']} "
+            f"match={float(best['score']):.3f} vs mirror {_mirror_label} "
+            f"match={float(_mirror_item['score']):.3f} "
+            f"(margin>={_polarity_margin:.2f}); skipping mirror preflight")
+    node._corridor_axis_polarity_ambiguous = _polarity_ambiguous
     node.get_logger().info(
         f"[APPROACH_SIDE_SELECTED] class={class_label} side={best['label']} "
         f"source={direction_source} "
@@ -848,9 +874,12 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
 
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
-                    store_trajectory=True, num_steps=None, goal_js_override=None):
+                    store_trajectory=True, num_steps=None, goal_js_override=None,
+                    require_cartesian=False):
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
+    _direct_t0 = time.perf_counter()
+    _record_motion = getattr(node, "_record_motion_plan_event", None)
     if node.current_joint_positions is None:
         for _ in range(20):
             time.sleep(0.05)
@@ -1007,10 +1036,14 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     # left+low fruits.  Instead, solve IK at N evenly-spaced Cartesian positions
     # along the straight EE line — each seeded from the previous solution so the
     # arm stays on the same kinematic branch throughout.
-    _N_CART = max(0, int(getattr(planner, "direct_final_cart_waypoints", 2)))
+    _N_CART = max(0, int(getattr(
+        planner,
+        "direct_approach_cart_waypoints" if require_cartesian
+        else "direct_final_cart_waypoints",
+        3 if require_cartesian else 2)))
     _states_built = False
     states = []
-    _use_cartesian_ik = label == "FINAL" and _N_CART > 0
+    _use_cartesian_ik = (label == "FINAL" or require_cartesian) and _N_CART > 0
     if _use_cartesian_ik and _cur_ee is not None and not getattr(node, "_cuda_faulted", False):
         try:
             _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1137,6 +1170,19 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             node.get_logger().warn(f"[DIRECT] {label}: Cartesian IK path failed: {_ce}")
 
     if not _states_built:
+        if require_cartesian:
+            if callable(_record_motion):
+                _record_motion(
+                    stage="PLAN", label=label, motion_type=motion_type,
+                    planner="direct_cartesian_ik", result="FAILED",
+                    reason="CARTESIAN_CORRIDOR_UNAVAILABLE",
+                    planning_ms=round((time.perf_counter() - _direct_t0) * 1000.0, 1),
+                    cartesian_waypoints=int(_N_CART),
+                    target_xyz_m=[float(v) for v in target_pose_list[:3]])
+            node.get_logger().error(
+                f"[DIRECT] {label}: required straight Cartesian corridor unavailable; "
+                "rejecting instead of using a sideways joint-space path")
+            return False
         if label == "FINAL":
             if bool(getattr(planner, "strict_final_cartesian_only", True)):
                 node.get_logger().error(
@@ -1214,9 +1260,40 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         return False
 
     cart_path = forward_kinematics_batch(node, states)
+    _lateral_deviation_m = 0.0
+    if len(cart_path) >= 2:
+        _p0 = np.asarray([cart_path[0].x, cart_path[0].y, cart_path[0].z], dtype=float)
+        _p1 = np.asarray([cart_path[-1].x, cart_path[-1].y, cart_path[-1].z], dtype=float)
+        _line = _p1 - _p0
+        _line_norm = float(np.linalg.norm(_line))
+        if _line_norm > 1e-9:
+            _axis = _line / _line_norm
+            for _p in cart_path:
+                _delta = np.asarray([_p.x, _p.y, _p.z], dtype=float) - _p0
+                _perp = _delta - float(np.dot(_delta, _axis)) * _axis
+                _lateral_deviation_m = max(
+                    _lateral_deviation_m, float(np.linalg.norm(_perp)))
+    node.get_logger().info(
+        f"[PATH_LATERAL] {label}: max_deviation="
+        f"{_lateral_deviation_m * 1000.0:.1f}mm "
+        f"cartesian_required={require_cartesian}")
     node._planned_cartesian_path = cart_path  # keep PATH_DEV in sync with this motion
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
+    if callable(_record_motion):
+        _record_motion(
+            stage="PLAN", label=label, motion_type=motion_type,
+            planner="direct_cartesian_ik" if _states_built else "direct_joint_ik",
+            result="SUCCESS",
+            planning_ms=round((time.perf_counter() - _direct_t0) * 1000.0, 1),
+            trajectory_samples=len(states), dt_s=round(float(dt), 5),
+            trajectory_duration_s=round(float(dt) * max(len(states) - 1, 0), 3),
+            max_joint_delta_deg=round(math.degrees(float(best_delta)), 2),
+            cartesian_waypoints=int(_N_CART if _states_built else 0),
+            lateral_deviation_mm=round(_lateral_deviation_m * 1000.0, 1),
+            clamp_clearance_mm=round(float(_clamp_mm), 1),
+            clamp_required_mm=round(float(_clamp_threshold), 1),
+            target_xyz_m=[float(v) for v in target_pose_list[:3]])
 
     # Wait target: only use FK of the truncated endpoint when THIS trajectory was
     # truncated.  Using the node flag (_approach_truncated) instead caused the flag
@@ -1237,6 +1314,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         node, _wait_xyz, tol=_endpoint_tol, timeout=8.0,
         target_quat=target_quat)
     blend_motion(node)
+    _execution_ms = (time.perf_counter() - _direct_t0) * 1000.0
 
     # Abort goal if robot has stalled twice — something is obstructing or IK is wrong
     if not reached and getattr(node, '_goal_stall_count', 0) >= 2:
@@ -1257,6 +1335,13 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if cur_pose:
         final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
         if _is_final and final_dist > _endpoint_tol:
+            if callable(_record_motion):
+                _record_motion(
+                    stage="ENDPOINT", label=label, motion_type=motion_type,
+                    result="FAILED", reason="ENDPOINT_ERROR",
+                    endpoint_error_mm=round(final_dist * 1000.0, 1),
+                    tolerance_mm=round(_endpoint_tol * 1000.0, 1),
+                    elapsed_ms=round(_execution_ms, 1))
             node.get_logger().warn(
                 f"[DIRECT] {label}: endpoint error={final_dist*1000:.1f}mm "
                 f"exceeds {_endpoint_tol*1000:.1f}mm — treating as failure")
@@ -1271,16 +1356,43 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             node.stored_trajectory_states = []
         node.stored_trajectory_states.extend(states)
 
+    if callable(_record_motion):
+        _endpoint_error = None
+        if cur_pose:
+            _endpoint_error = math.sqrt(sum(
+                (a - b) ** 2 for a, b in zip(
+                    cur_pose[:3], target_pose_list[:3]))) * 1000.0
+        _record_motion(
+            stage="ENDPOINT", label=label, motion_type=motion_type,
+            result="REACHED" if reached else "SETTLED",
+            endpoint_error_mm=(round(_endpoint_error, 1)
+                               if _endpoint_error is not None else None),
+            tolerance_mm=round(_endpoint_tol * 1000.0, 1),
+            elapsed_ms=round(_execution_ms, 1))
+
     return True
 
 
 def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
                                     waypoint_count=2):
-    """Validate APPROACH and fixed-orientation straight FINAL before motion."""
+    """Validate APPROACH and fixed-orientation straight FINAL before motion.
+
+    Holds the YOLO inference lock across the whole IK burst. plan_and_send()
+    already does this for plan_single -- YOLO TRT and cuRobo kernels contending
+    on the shared Jetson GPU is both slower and the source of device-side
+    asserts -- but this preflight was solving unlocked, so its chain of solves
+    raced vision inference at ~7Hz. Taking the lock once for the burst costs at
+    most one in-flight inference (~140ms) and then runs uncontended, instead of
+    every solve fighting for the GPU.
+    """
     node._corridor_preflight_approach_js = None
     node._corridor_preflight_cost_deg = float("inf")
     if start_js is None or getattr(node, "_cuda_faulted", False):
         return False, "NO_IK_STATE"
+    _yolo = getattr(node, 'yolo_thread', None)
+    _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    if _yolo_lock:
+        _yolo_lock.acquire()
     try:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1353,6 +1465,9 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
     except Exception as exc:
         node.get_logger().warn(f"[CORRIDOR_PREFLIGHT] IK exception: {exc}")
         return False, "IK_EXCEPTION"
+    finally:
+        if _yolo_lock:
+            _yolo_lock.release()
 
 
 def _log_forearm_flange_clearance(node, states: list, label: str, log_result: bool = True):
@@ -1512,8 +1627,19 @@ def _log_forearm_flange_clearance(node, states: list, label: str, log_result: bo
         return float('-inf'), 0, float('-inf')
 
 
-def _select_safe_approach_candidate(node, approach_pose, start_js):
-    """Preflight several IK branches and return the lowest-cost safe one."""
+def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None):
+    """Preflight several IK branches and return the lowest-cost safe one.
+
+    When goal_xyz is given, each orientation candidate is also validated at the
+    ALIGNMENT staging pose (the outer standoff point plan_and_execute() steps
+    back to before the straight Cartesian entry -- see approach_alignment_extra_m
+    below). Previously only the APPROACH pose itself was swept for clearance;
+    ALIGNMENT was a separate point discovered only by actually attempting a full
+    trajectory to it, so a clamp failure there wasted a full motion attempt and
+    then a full goal retry with no way to pick a different orientation. Rejecting
+    the same orientations here that would fail ALIGNMENT too means the caller can
+    reuse the validated alignment_pose/alignment_goal_js directly.
+    """
     if getattr(node, "_cuda_faulted", False):
         return None
 
@@ -1522,6 +1648,9 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
         float(getattr(planner, "clamp_safety_threshold_mm", 45.0)),
         float(getattr(planner, "very_low_preflight_min_clearance_mm", 50.0)),
     )
+    _alignment_enabled = bool(getattr(planner, "approach_alignment_enabled", True))
+    _alignment_extra = max(0.0, float(getattr(planner, "approach_alignment_extra_m", 0.08)))
+    _check_alignment = bool(_alignment_enabled and _alignment_extra > 0.005 and goal_xyz is not None)
     max_ratio = float(getattr(planner, "approach_max_path_ratio", 2.5))
     max_delta = math.radians(float(
         getattr(planner, "very_low_ik_max_joint_delta_deg", 75.0)))
@@ -1664,10 +1793,68 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
                 if straight > 0.02 and ratio > max_ratio:
                     continue
 
+                # Also validate the ALIGNMENT staging pose (same orientation, stepped
+                # back approach_alignment_extra_m along goal-approach axis) at this
+                # candidate before accepting it -- otherwise a good APPROACH orientation
+                # can still fail the later real ALIGNMENT move with no way to recover.
+                alignment_pose = None
+                alignment_goal_js = None
+                alignment_clearance = float('inf')
+                if _check_alignment:
+                    _toward = np.asarray(goal_xyz, dtype=float) - np.asarray(pose[:3], dtype=float)
+                    _toward_norm = float(np.linalg.norm(_toward))
+                    if _toward_norm > 0.020:
+                        _align_xyz = (
+                            np.asarray(pose[:3], dtype=float)
+                            - _alignment_extra * (_toward / _toward_norm))
+                        alignment_pose = [
+                            float(_align_xyz[0]), float(_align_xyz[1]),
+                            float(_align_xyz[2]), *quat]
+                        _align_pos_t = torch.tensor(
+                            [alignment_pose[:3]], dtype=torch.float32, device=device)
+                        _align_quat_t = torch.tensor(
+                            [alignment_pose[3:]], dtype=torch.float32, device=device)
+                        try:
+                            _align_result = node.motion_gen.ik_solver.solve_single(
+                                Pose(position=_align_pos_t, quaternion=_align_quat_t),
+                                seed_config=seed, retract_config=retract,
+                                return_seeds=return_seeds)
+                        except Exception:
+                            continue
+                        _align_solutions = _align_result.js_solution.position
+                        _align_success = _align_result.success
+                        if _align_solutions.ndim == 3:
+                            _align_solutions = _align_solutions[0]
+                        if _align_success.ndim == 2:
+                            _align_success = _align_success[0]
+                        if not bool(_align_success[0].item()):
+                            continue
+                        alignment_goal_js = nearest_joint_config(
+                            start_js, _align_solutions[0].detach().cpu().tolist())
+                        _align_deltas = [
+                            abs(g - s) for g, s in zip(alignment_goal_js, start_js)]
+                        if max(_align_deltas) > max_delta:
+                            continue
+                        _align_states = []
+                        for idx in range(31):
+                            alpha = idx / 30.0
+                            smooth = (1.0 - math.cos(math.pi * alpha)) / 2.0
+                            _align_states.append([
+                                s + smooth * (g - s)
+                                for s, g in zip(start_js, alignment_goal_js)
+                            ])
+                        alignment_clearance, _, _align_dest = _log_forearm_flange_clearance(
+                            node, _align_states, "PREFLIGHT", log_result=False)
+                        alignment_clearance = min(alignment_clearance, _align_dest)
+                        if alignment_clearance < threshold_mm:
+                            clearance_filtered_count += 1
+                            continue
+
                 joint_cost = sum(deltas) + 1.5 * max(deltas)
                 angle_cost = math.radians(
                     abs(wrist_deg) + abs(pitch_deg)) * 0.15
-                clearance_bonus = min(clearance, 100.0) * 0.001
+                effective_clearance = min(clearance, alignment_clearance)
+                clearance_bonus = min(effective_clearance, 100.0) * 0.001
                 score = joint_cost + angle_cost - clearance_bonus
                 candidates.append({
                     "score": score,
@@ -1675,12 +1862,14 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
                     "goal_js": goal_js,
                     "pitch_deg": pitch_deg,
                     "wrist_deg": wrist_deg,
-                    "clearance": clearance,
+                    "clearance": effective_clearance,
                     "path_len": path_len,
                     "ratio": ratio,
                     "branch": branch_idx,
+                    "alignment_pose": alignment_pose,
+                    "alignment_goal_js": alignment_goal_js,
                 })
-                if clearance >= early_accept_mm:
+                if effective_clearance >= early_accept_mm:
                     break
 
             new_candidates = candidates[orientation_candidate_start:]
@@ -1739,7 +1928,87 @@ def _select_safe_approach_candidate(node, approach_pose, start_js):
     return best
 
 
-def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False) -> bool:
+def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
+                                    target_pose_list, dt, label="ENTRY",
+                                    duration_s=None):
+    """Joint states for a straight-line Cartesian entry, for appending to a plan.
+
+    Same construction _direct_ik_move() uses for its required-Cartesian leg:
+    IK at evenly spaced points along the straight EE line, each seeded from the
+    previous solution so the arm stays on one kinematic branch, orientation
+    slerped so the wrist rotates gradually rather than snapping. The difference
+    is that it starts from a GIVEN joint config (a planned trajectory's
+    endpoint) rather than the arm's live pose, so it can be concatenated onto
+    that plan and executed as one continuous motion.
+
+    Density is chosen so the leg takes duration_s at the caller's dt. With a
+    uniform dt, sample spacing IS speed -- so this keeps the near-fruit entry
+    slow even when the staging leg it is appended to runs fast.
+
+    Returns the states AFTER the junction (start_js is not repeated), or None
+    if the straight corridor is not achievable.
+    """
+    planner = node.cfg.planner
+    n_wp = max(1, int(getattr(planner, "direct_approach_cart_waypoints", 3)))
+    if duration_s is None:
+        duration_s = float(getattr(planner, "approach_entry_duration_s", 1.5))
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_quat = list(target_pose_list[3:])
+
+    wp_js = [list(start_js)]
+    prev_js = list(start_js)
+    for k in range(1, n_wp + 2):        # intermediate points, then the endpoint
+        a = k / (n_wp + 1)
+        wp_xyz = [start_xyz[i] + a * (target_pose_list[i] - start_xyz[i])
+                  for i in range(3)]
+        wp_quat = quat_slerp(list(start_quat), target_quat, min(a, 1.0))
+        try:
+            r = node.motion_gen.ik_solver.solve_single(
+                Pose(position=torch.tensor([wp_xyz], dtype=torch.float32, device=dev),
+                     quaternion=torch.tensor([wp_quat], dtype=torch.float32, device=dev)),
+                seed_config=torch.tensor(
+                    [prev_js], dtype=torch.float32, device=dev).unsqueeze(0),
+                retract_config=torch.tensor([prev_js], dtype=torch.float32, device=dev))
+        except Exception as exc:
+            node.get_logger().warn(f"[ENTRY] {label}: IK exception at {k}: {exc}")
+            return None
+        if not bool(r.success.item()):
+            node.get_logger().warn(
+                f"[ENTRY] {label}: straight-line IK failed at point {k}/{n_wp + 1}")
+            return None
+        js = nearest_joint_config(
+            prev_js, r.js_solution.position.squeeze().cpu().tolist())
+        if max(abs(a2 - b2) for a2, b2 in zip(js, prev_js)) > 0.52:   # ~30deg
+            node.get_logger().warn(
+                f"[ENTRY] {label}: branch switch at point {k}; corridor unusable")
+            return None
+        wp_js.append(js)
+        prev_js = js
+
+    segments = len(wp_js) - 1
+    total_steps = max(segments * 4, int(round(max(duration_s, 0.05) / max(dt, 1e-4))))
+    steps_per = max(4, total_steps // segments)
+    out = []
+    for si in range(segments):
+        s0, s1 = wp_js[si], wp_js[si + 1]
+        for i in range(1, steps_per + 1):      # skip i=0: junction not repeated
+            t = i / steps_per
+            out.append([s0[j] + t * (s1[j] - s0[j]) for j in range(len(s0))])
+    node.get_logger().info(
+        f"[ENTRY] {label}: straight leg {len(wp_js)} IK waypoints -> "
+        f"{len(out)} states, {len(out) * dt:.2f}s at dt={dt * 1000:.0f}ms")
+    return out
+
+
+def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False, extend_fn=None) -> bool:
+    """Plan to goal_pose and publish it as one trajectory.
+
+    extend_fn, when given, is called as extend_fn(last_planned_js, dt) after
+    planning and returns extra joint states to append into the SAME trajectory,
+    so a follow-on leg runs continuously instead of being published separately
+    (separate messages each begin and end at zero velocity, which forces a full
+    stop between them). Returning an empty/None result rejects the whole move.
+    """
 
     # 1) Plan with cuRobo — hold YOLO inference_lock so YOLO and cuRobo
     # never run CUDA kernels concurrently on the shared Jetson GPU.
@@ -1747,6 +2016,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     lock = getattr(node, '_planning_lock', None)
     _yolo = getattr(node, 'yolo_thread', None)
     _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    _plan_t0 = time.perf_counter()
     if _yolo_lock: _yolo_lock.acquire()
     if lock: lock.acquire()
     try:
@@ -1754,8 +2024,16 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     finally:
         if lock: lock.release()
         if _yolo_lock: _yolo_lock.release()
+    _planning_ms = (time.perf_counter() - _plan_t0) * 1000.0
+    _record_motion = getattr(node, "_record_motion_plan_event", None)
     if not res.success:
         status = getattr(res, 'status', 'unknown')
+        if callable(_record_motion):
+            _record_motion(
+                stage="PLAN", label=label, motion_type=motion_type,
+                planner="curobo.plan_single", result="FAILED",
+                status=str(status), planning_ms=round(_planning_ms, 1),
+                goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
         # Flush any deferred async CUDA errors before the next planning call
         try:
@@ -1765,6 +2043,14 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         except Exception:
             pass
         return False
+
+    if callable(_record_motion):
+        _record_motion(
+            stage="PLAN", label=label, motion_type=motion_type,
+            planner="curobo.plan_single", result="SUCCESS",
+            status=str(getattr(res, 'status', 'SUCCESS')),
+            planning_ms=round(_planning_ms, 1),
+            goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
 
     states = interpolated_positions(res)
     curobo_dt = get_curobo_dt(res)
@@ -1819,7 +2105,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         node.get_logger().warn(f"All replans had joint wraparound for {label} — rejecting")
         return False
 
-    if label == "APPROACH":
+    if label.startswith("APPROACH"):
         _step, _joint, _idx = _max_joint_step(states)
         _limit = math.radians(float(getattr(node.cfg.planner, "approach_max_joint_step_deg", 12.0)))
         if _step > _limit:
@@ -1912,6 +2198,9 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         straight = math.sqrt((pts[-1].x - pts[0].x)**2 + (pts[-1].y - pts[0].y)**2 + (pts[-1].z - pts[0].z)**2)
         return total, straight
 
+    _path_len_diag = None
+    _straight_diag = None
+    _path_ratio_diag = None
     if goal_xyz is not None and len(states) >= 2:
         path_len, straight = _sampled_path_len(states)
         if path_len is not None and straight is not None:
@@ -1952,6 +2241,9 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                     )
             states = best_states
             final_ratio = best_path_len / max(straight, 0.001)
+            _path_len_diag = best_path_len
+            _straight_diag = straight
+            _path_ratio_diag = final_ratio
             node._last_plan_ratio = final_ratio
             if label.startswith("APPROACH"):
                 max_ratio = float(getattr(
@@ -1994,6 +2286,58 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                 f"(removed {original_len - len(states)} overshoot, closest dist={min_dist*100:.1f}cm)"
             )
 
+    # 2) Speed scaling — computed here, BEFORE the optional continuation leg
+    #    below, because that leg sizes its own waypoint density against this dt
+    #    (uniform dt means density sets speed: denser samples = slower motion
+    #    over the same distance).
+    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)   # e.g. 0.02 s
+    planner = node.cfg.planner
+    global_scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
+    if motion_type == "alignment":
+        type_scale = getattr(planner, "speed_alignment", 1.0)
+    elif motion_type == "approach":
+        type_scale = getattr(planner, "speed_approach", 1.0)
+    elif motion_type == "final":
+        type_scale = getattr(planner, "speed_final", 1.0)
+    elif motion_type in ["home", "dropoff", "predropoff"]:
+        type_scale = getattr(planner, f"speed_{motion_type}", 1.0)
+    else:
+        type_scale = getattr(planner, "speed_home", 1.0)  # default
+    scale = global_scale * type_scale
+    # Never go faster than cuRobo's own interpolation timing: the positions were
+    # planned for curobo_dt intervals; compressing them produces velocities and
+    # accelerations that exceed what the robot can physically follow → jerks.
+    # Scale > 1 ("go faster") has no effect — cuRobo already runs at max speed.
+    raw_dt = base_dt / max(scale, 1e-6)
+    dt = min(max(raw_dt, curobo_dt), planner.max_dt)
+    base_vel = 0.08        # slightly gentler than 0.1
+    vel = min(base_vel * scale, 0.25)   # hard cap for safety
+
+    # 2b) Optional continuation leg, appended into THIS trajectory.
+    #
+    # build_trajectory() zeroes only the first and last waypoint, so anything
+    # appended here flows through continuously -- no stop, no zero-velocity
+    # handoff. Publishing the two legs as separate messages (the old behaviour)
+    # structurally forced a full stop between them, since each message begins
+    # and ends at rest. The extension is generated from the PLANNED endpoint
+    # (states[-1]), not the arm's live pose, so the junction is continuous in
+    # joint space. It runs after the overshoot trim above (so the trim still
+    # keys off this leg's own goal_xyz) and before the clamp check below (so
+    # clearance is verified across the whole merged path).
+    if extend_fn is not None:
+        try:
+            _extra = extend_fn(list(states[-1]), float(dt))
+        except Exception as _ex:
+            node.get_logger().error(f"[{label}] continuation leg raised: {_ex}")
+            return False
+        if not _extra:
+            node.get_logger().error(
+                f"[{label}] continuation leg unavailable; rejecting rather than "
+                "publishing a staging move that stops short of the target")
+            return False
+        states = list(states) + list(_extra)
+        cart_path = forward_kinematics_batch(node, states)
+
     node._planned_cartesian_path = cart_path
     node._planned_label = label
 
@@ -2023,43 +2367,30 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         node._approach_clamp_rejected = True
         return False
 
-    node._planned_cartesian_path = cart_path
     # 1d) Visualize planned path in RViz (blue line) — reuse pre-computed points
     publish_planned_path(node, states, label, cartesian_points=cart_path)
 
-    # 2) Speed scaling
-    #    - global scalar from node.speed_scale
-    #    - per-motion scalar from cfg.planner
-    base_dt = getattr(node.cfg.planner, "base_dt", 0.02)   # e.g. 0.02 s
-    planner = node.cfg.planner
-
-    global_scale = max(getattr(node, "speed_scale", 1.0), 1e-6)
-
-    if motion_type == "approach":
-        type_scale = getattr(planner, "speed_approach", 1.0)
-    elif motion_type == "final":
-        type_scale = getattr(planner, "speed_final", 1.0)
-    elif motion_type in ["home", "dropoff", "predropoff"]:
-        type_scale = getattr(planner, f"speed_{motion_type}", 1.0)
-    else:
-        type_scale = getattr(planner, "speed_home", 1.0)  # default
-
-    scale = global_scale * type_scale
-
-    # 3) UR10e-friendly dt and velocity
-    raw_dt = base_dt / max(scale, 1e-6)
-    # Never go faster than cuRobo's own interpolation timing: the positions were
-    # planned for curobo_dt intervals; compressing them produces velocities and
-    # accelerations that exceed what the robot can physically follow → jerks.
-    # Scale > 1 ("go faster") has no effect — cuRobo already runs at max speed.
-    dt = min(max(raw_dt, curobo_dt), planner.max_dt)
-
-    # Velocity: linear scaling with cap
-    base_vel = 0.08        # slightly gentler than 0.1
-    vel = base_vel * scale
-    vel = min(vel, 0.25)   # hard cap for safety
-
-    # 4) Build trajectory — constant speed, no ramping
+    # 4) Build trajectory — constant speed, except FINAL's tail below.
+    # FINAL runs at dt=max_dt (12.5Hz) and hands off into GRASP/REVERSE, which
+    # run at a much higher rate (REVERSE's own tail is already eased — see
+    # execute_partial_reverse). Without easing, FINAL's own forced-zero-velocity
+    # endpoint (build_trajectory always zeroes the last waypoint) is preceded by
+    # waypoints still moving at the full approach rate -- an abrupt one-dt brake
+    # right at the handoff. Ease the last few waypoints the same way REVERSE's
+    # tail already is, so FINAL itself decelerates into that handoff.
+    if motion_type == "final":
+        _final_tail = max(4, int(getattr(planner, "final_decel_tail_points", 8)))
+        states = ease_out_tail(states, _final_tail)
+    # ALIGNMENT is typically the first real motion of a new goal, right after a
+    # HOME/return move that runs at min_dt (100Hz, motions.py Formula A) via a
+    # completely separate trajectory message. ALIGNMENT's own dt here is much
+    # larger (speed_alignment, ~40ms/25Hz), and build_trajectory only forces
+    # waypoint[0] to zero velocity -- waypoint[1] can already be at full cruising
+    # speed, a one-dt jump from rest. Ease the head the same way FINAL's tail is
+    # eased, so the first motion of a cycle also ramps up instead of snapping.
+    elif motion_type == "alignment":
+        _alignment_head = max(4, int(getattr(planner, "alignment_ease_head_points", 8)))
+        states = ease_in_head(states, _alignment_head)
     traj = build_trajectory(
         node.joint_order,
         states,
@@ -2077,6 +2408,23 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         return False
 
     node.trajectory_pub.publish(traj)
+
+    if callable(_record_motion):
+        _record_motion(
+            stage="EXECUTE", label=label, motion_type=motion_type,
+            planner="curobo.plan_single", result="PUBLISHED",
+            trajectory_samples=len(states), dt_s=round(float(dt), 5),
+            trajectory_duration_s=round(float(dt) * max(len(states) - 1, 0), 3),
+            path_length_m=(round(float(_path_len_diag), 4)
+                           if _path_len_diag is not None else None),
+            straight_distance_m=(round(float(_straight_diag), 4)
+                                 if _straight_diag is not None else None),
+            path_ratio=(round(float(_path_ratio_diag), 3)
+                        if _path_ratio_diag is not None else None),
+            clamp_clearance_mm=round(float(_clamp_mm), 1),
+            clamp_required_mm=round(float(_clamp_threshold), 1),
+            speed_scale=round(float(scale), 3),
+            goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
 
     # Store trajectory for later reversal if requested
     if store_trajectory:
@@ -2165,22 +2513,24 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
 
     node.get_logger().info(f"Executing reversed trajectory with {len(reversed_states)} waypoints")
     node.trajectory_pub.publish(traj)
+    _record_motion = getattr(node, "_record_motion_plan_event", None)
+    if callable(_record_motion):
+        _record_motion(
+            stage="EXECUTE", label="REVERSE_FULL", motion_type=motion_type,
+            planner="stored_trajectory_reverse", result="PUBLISHED",
+            trajectory_samples=len(reversed_states), dt_s=round(float(dt), 5),
+            trajectory_duration_s=round(
+                float(dt) * max(len(reversed_states) - 1, 0), 3),
+            speed_scale=round(float(scale), 3))
     return True
 
 
-def execute_partial_reverse(node, clearance_m: float = 0.35):
-    """
-    Reverse only enough of the stored trajectory to pull back `clearance_m` from
-    the grasp position, then stop. This clears the date bunch so cuRobo can plan
-    directly to dropoff without hitting fruit.
-    """
-    if not hasattr(node, 'stored_trajectory_states') or not node.stored_trajectory_states:
-        node.get_logger().warn("No stored trajectory for partial reverse.")
-        return False
-
-    stored = node.stored_trajectory_states
+def _prepare_partial_reverse_states(node, clearance_m: float):
+    """Select the reverse prefix and its predicted endpoint without moving."""
+    stored = getattr(node, 'stored_trajectory_states', None)
+    if not stored:
+        return None, 0
     reversed_states = list(reversed(stored))
-    node.stored_trajectory_states = []
 
     # Use FK to find how many waypoints = clearance_m of Cartesian distance
     grasp_fk = forward_kinematics(node, reversed_states[0])
@@ -2218,6 +2568,26 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
                     f"Partial reverse: all waypoints consumed — truncating to {keep} "
                     f"(dropping last 15% to avoid wrist-snap near home)"
                 )
+    return partial, len(reversed_states)
+
+
+def execute_partial_reverse(node, clearance_m: float = 0.35,
+                            prepared_states=None,
+                            original_state_count: int = 0):
+    """
+    Reverse only enough of the stored trajectory to pull back `clearance_m` from
+    the grasp position. ``prepared_states`` allows drop-off planning to run from
+    the predicted endpoint concurrently with this physical reverse.
+    """
+    if prepared_states is None:
+        partial, original_state_count = _prepare_partial_reverse_states(
+            node, clearance_m)
+    else:
+        partial = [list(q) for q in prepared_states]
+    if not partial:
+        node.get_logger().warn("No stored trajectory for partial reverse.")
+        return False
+    node.stored_trajectory_states = []
 
     # Wait for the arm to fully stop before publishing the reverse trajectory.
     # A fixed sleep isn't reliable — poll velocities until settled or timeout.
@@ -2247,7 +2617,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
 
     if getattr(node.cfg.planner, "log_phase_timings", False):
         node.get_logger().info(
-            f"Partial reverse: {len(partial)}/{len(reversed_states)} waypoints "
+            f"Partial reverse: {len(partial)}/{original_state_count} waypoints "
             f"({clearance_m*100:.0f}cm clearance)"
         )
 
@@ -2259,31 +2629,40 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
     dt = getattr(planner, "min_dt", 0.012) * float(
         getattr(planner, "reverse_dt_multiplier", 1.7))
 
+    # Decouple reverse duration from how densely the approach happened to be
+    # sampled. This replays the STORED approach path sample-for-sample, so its
+    # duration is len(partial)*dt -- meaning any change to approach sampling
+    # silently rescales the reverse. That bit us directly: densifying the entry
+    # leg to hold its own 1.5s (148 states over the same 80mm instead of ~62)
+    # made the reverse *longer* even though dt had been halved. Resample to a
+    # target wall-clock duration instead, preserving the path exactly (first and
+    # last states are always kept) and only changing sample spacing.
+    _target_s = float(getattr(planner, "reverse_duration_s", 0.0))
+    if _target_s > 0.0 and len(partial) > 2:
+        _want = max(8, int(round(_target_s / max(dt, 1e-4))))
+        if _want < len(partial):
+            _src = len(partial) - 1
+            _idx = [round(i * _src / (_want - 1)) for i in range(_want)]
+            _seen = set()
+            _keep = [i for i in _idx if not (i in _seen or _seen.add(i))]
+            if _keep[-1] != _src:
+                _keep.append(_src)
+            node.get_logger().info(
+                f"[REVERSE] resampled {len(partial)} -> {len(_keep)} states "
+                f"({len(partial) * dt:.2f}s -> {len(_keep) * dt:.2f}s at dt={dt * 1000:.0f}ms)")
+            partial = [partial[i] for i in _keep]
+
     # Shape the final section into a real ease-out. Duplicate endpoint samples do
     # not decelerate: central differences merely become zero after the first
-    # duplicate, leaving an abrupt one-dt velocity drop. Remap progress along the
-    # existing final path with f(u)=u+u²-u³, whose slope starts at 1 and reaches 0
-    # at the endpoint. Interpolating on the existing polyline preserves its path.
+    # duplicate, leaving an abrupt one-dt velocity drop. ease_out_tail() remaps
+    # progress along the existing final path with f(u)=u+u²-u³, whose slope
+    # starts at 1 and reaches 0 at the endpoint (utils.py).
     DECEL_TAIL = max(
         8, int(getattr(planner, "reverse_decel_tail_points", 14)))
-    if len(partial) >= 4:
-        _tail_count = min(DECEL_TAIL, len(partial) - 1)
-        _tail_start = len(partial) - _tail_count - 1
-        _tail_path = np.asarray(partial[_tail_start:], dtype=float)
-        _segment_lengths = np.linalg.norm(np.diff(_tail_path, axis=0), axis=1)
-        _arc = np.concatenate(([0.0], np.cumsum(_segment_lengths)))
-        if _arc[-1] > 1e-9:
-            _u = np.linspace(0.0, 1.0, _tail_count + 1)
-            _eased_u = _u + _u * _u - _u * _u * _u
-            _sample_arc = _eased_u * _arc[-1]
-            _eased_tail = np.column_stack([
-                np.interp(_sample_arc, _arc, _tail_path[:, joint_idx])
-                for joint_idx in range(_tail_path.shape[1])
-            ])
-            partial[_tail_start:] = _eased_tail.tolist()
-    # A short stationary hold gives the controller an explicit settled endpoint;
-    # slowdown itself is provided by the eased samples above.
-    partial = partial + [list(partial[-1])] * 3
+    partial = ease_out_tail(partial, DECEL_TAIL)
+    # The eased tail already reaches zero slope. Do not append stationary
+    # duplicate points: DROP-OFF is pre-planned concurrently and is dispatched
+    # as soon as this endpoint is confirmed.
 
     reverse_velocity_scale = float(
         getattr(planner, "reverse_velocity_scale", 0.35))
@@ -2300,6 +2679,18 @@ def execute_partial_reverse(node, clearance_m: float = 0.35):
     )
 
     node.trajectory_pub.publish(traj)
+    _record_motion = getattr(node, "_record_motion_plan_event", None)
+    if callable(_record_motion):
+        _record_motion(
+            stage="EXECUTE", label="REVERSE_PARTIAL",
+            motion_type="reverse", planner="stored_trajectory_reverse",
+            result="PUBLISHED", trajectory_samples=len(partial),
+            dt_s=round(float(dt), 5),
+            trajectory_duration_s=round(
+                float(dt) * max(len(partial) - 1, 0), 3),
+            requested_clearance_m=round(float(clearance_m), 3),
+            velocity_scale=round(reverse_velocity_scale, 3),
+            acceleration_scale=round(reverse_acceleration_scale, 3))
 
     # Wait for the commanded reverse endpoint, not merely for a moment of zero
     # velocity.  The controller may still be idle for a short time after publish;
@@ -2757,7 +3148,7 @@ def subscribe_to_goal_pose(node):
             if (_depth_cached is not None and
                     time.time() - _depth_cached[0] <= 1.0):
                 _dv = _depth_cached[1]
-                node.get_logger().info(
+                node.get_logger().debug(
                     "[GOAL_DEPTH] "
                     f"cam=[{_dv[0]:.3f},{_dv[1]:.3f},{_dv[2]:.3f}]m "
                     f"z_p5/p50/p95={_dv[3]:.3f}/{_dv[4]:.3f}/{_dv[5]:.3f}m "
@@ -3161,7 +3552,7 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
 
     node._prev_blend_dir = d_norm.tolist()
 
-    node.get_logger().info(
+    node.get_logger().debug(
         f"[DIR] {_status} | "
         f"source={'fruit_direction' if fruit_dir is not None else 'camera-ray'} | "
         f"d_blend=[{d_norm[0]:.3f},{d_norm[1]:.3f},{d_norm[2]:.3f}]"
@@ -3174,6 +3565,10 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
 
 # Main goal-execution pipeline — runs through all saved goals and performs motion + gripper actions in sequence.
 def plan_and_execute(node):
+
+    # Auto-harvest uses this explicit result to count only cycles that reached
+    # the normal end of grasp, reverse, drop-off, and return handling.
+    node._last_completed_harvest_cycles = 0
 
     def _valid_joint_positions(wait_s: float = 1.0):
         deadline = time.time() + wait_s
@@ -3255,6 +3650,9 @@ def plan_and_execute(node):
         _cycle_idx += 1
         _cycle_t0 = time.time()
         _timing = {}
+        _begin_motion_log = getattr(node, "_begin_motion_cycle_log", None)
+        if callable(_begin_motion_log):
+            _begin_motion_log(_cycle_idx)
         _log_cycle_start = getattr(node.cfg.planner, "log_cycle_start", False)
         _log_phase_timings = getattr(node.cfg.planner, "log_phase_timings", False)
         if getattr(node, "_slip_retry_count", 0) <= 0:
@@ -3280,6 +3678,20 @@ def plan_and_execute(node):
             node.cfg.planner, "tool_axis_tip_require_safe_candidate", True))
         _tip_aim_enabled = bool(getattr(
             node.cfg.planner, "tool_axis_tip_aim_enabled", True))
+        _retry_goal = getattr(node, "_corridor_retry_goal", None)
+        _same_corridor_goal = bool(
+            _retry_goal is not None
+            and math.dist(list(goal[:3]), list(_retry_goal)) <= 0.005)
+        _frozen_retry_tip = (
+            getattr(node, "_corridor_retry_tip_anchor", None)
+            if _same_corridor_goal else None)
+        node._active_tool_axis_result = "NO_TIP"
+        node._active_tool_axis_reason = "NO_TIP_AVAILABLE"
+        node._active_tool_axis_tip_age_s = (
+            round(float(_tip_age), 3) if math.isfinite(_tip_age) else None)
+        node._active_tool_axis_goal_match_mm = (
+            round(float(_tip_goal_match) * 1000.0, 1)
+            if math.isfinite(_tip_goal_match) else None)
         if (
             _tip_aim_enabled
             and _tip_candidate is not None
@@ -3291,6 +3703,21 @@ def plan_and_execute(node):
             and _tip_goal_match <= _tip_max_goal_distance
         ):
             _tip_anchor = np.asarray(_tip_candidate, dtype=float)
+            node._active_tool_axis_result = "DATE_TIP_ACCEPTED"
+            node._active_tool_axis_reason = "STABLE"
+        elif _tip_aim_enabled and _frozen_retry_tip is not None:
+            # Corridor preflight retries intentionally keep the same frozen
+            # perception snapshot. Do not call that snapshot stale and claim a
+            # calibrated fallback while subsequently restoring and using it.
+            _tip_anchor = np.asarray(_frozen_retry_tip, dtype=float)
+            _tip_goal_match = math.dist(_tip_anchor.tolist(), [x, y, z])
+            node._active_tool_axis_result = "DATE_TIP_FROZEN_RETRY"
+            node._active_tool_axis_reason = "SAME_GOAL_SNAPSHOT"
+            node._active_tool_axis_goal_match_mm = round(
+                float(_tip_goal_match) * 1000.0, 1)
+            node.get_logger().info(
+                "[TOOL_AXIS_AIM] source=FROZEN_RETRY "
+                f"goal_match={_tip_goal_match * 1000.0:.1f}mm")
         elif _tip_aim_enabled and _tip_candidate is not None:
             _tip_reasons = []
             if not bool(getattr(node, "date_tip_stable", False)):
@@ -3311,10 +3738,9 @@ def plan_and_execute(node):
                 f"reason={'+'.join(_tip_reasons) if _tip_reasons else 'DISABLED'} "
                 f"limit={_tip_max_goal_distance * 1000.0:.1f}mm "
                 "fallback=CALIBRATED_CORRIDOR")
-        _retry_goal = getattr(node, "_corridor_retry_goal", None)
-        _same_corridor_goal = bool(
-            _retry_goal is not None
-            and math.dist(list(goal[:3]), list(_retry_goal)) <= 0.005)
+            node._active_tool_axis_result = "CALIBRATED_CORRIDOR"
+            node._active_tool_axis_reason = "+".join(
+                _tip_reasons) if _tip_reasons else "DISABLED"
         if not _same_corridor_goal:
             node._corridor_exclusions = set()
             node._corridor_roll_disabled = set()
@@ -3334,7 +3760,7 @@ def plan_and_execute(node):
                     _tip_anchor.tolist(), [x, y, z])
         if bool(getattr(node, "_corridor_tip_fallback_active", False)):
             _tip_anchor = None
-            node.get_logger().info(
+            node.get_logger().debug(
                 "[TOOL_AXIS_AIM] mode=CENTRE_FALLBACK "
                 "tip_anchor=DISABLED_FOR_THIS_GOAL")
 
@@ -3366,7 +3792,7 @@ def plan_and_execute(node):
                     and _axis_confidence >= _confidence_threshold
                     and _axis_from_vertical >= _axis_threshold)
                 else "NORMAL")
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[GRASP_MODE_AUTO] selected={_goal_grasp_mode} "
                 f"axis_from_vertical={_axis_from_vertical:.1f}deg "
                 f"threshold={_axis_threshold:.1f}deg "
@@ -3378,6 +3804,12 @@ def plan_and_execute(node):
                 _configured_grasp_mode
                 if _configured_grasp_mode in ("NORMAL", "ENVELOP")
                 else "NORMAL")
+        if not _same_corridor_goal:
+            _grasp_style = (
+                "wrap" if _goal_grasp_mode == "ENVELOP" else "pinch")
+            node.get_logger().info(
+                f"[GRASP_MODE] selected={_goal_grasp_mode} "
+                f"style={_grasp_style} source={_configured_grasp_mode}")
         node.active_goal_grasp_mode = _goal_grasp_mode
         node._corridor_retry_grasp_mode = _goal_grasp_mode
         _active_corridor = None
@@ -3615,7 +4047,7 @@ def plan_and_execute(node):
                     if n > 1e-6:
                         d_blend = ee_to_fruit / n
                         if _log_cycle_start:
-                            node.get_logger().info(
+                            node.get_logger().debug(
                                 f"[DIR] NEW (geometric from EE at {side_label}) | "
                                 f"d_blend=[{d_blend[0]:.3f},{d_blend[1]:.3f},{d_blend[2]:.3f}]")
                 if is_side_approach and node.cfg.planner.reacquire_after_approach:
@@ -3681,7 +4113,7 @@ def plan_and_execute(node):
         fruit_lat = lateral_value(x, y)
         _height_log = "VERY_LOW" if is_very_low_center else ("LOW" if is_low else "MID_HIGH")
         if _log_cycle_start:
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[DECISION] height={_height_log} source={_height_source} "
                 f"side={_img_side if _img_norm is not None else '3D'} "
                 f"side_home={is_side_approach} side_home_reacq={side_home_reacquired} "
@@ -3728,7 +4160,7 @@ def plan_and_execute(node):
                 (_vision_roll_deg - _roll_default + 60.0) % 120.0 - 60.0)
 
         if _dynamic_roll and is_low and not is_side_approach:
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[TOOL_ROLL] selected={_center_tool_roll_deg:+.1f}deg "
                 f"source={_center_tool_roll_source} "
                 f"vision_valid={bool(getattr(node, 'fruit_contact_roll_valid', False))} "
@@ -3768,7 +4200,7 @@ def plan_and_execute(node):
                     node.cfg.planner, "low_center_yaw_align_max_deg", 35.0)),
             )
             forward = quat_rotate_vec(aligned, (0.0, 0.0, 1.0))
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[CENTER_YAW] requested={math.degrees(raw_delta):+.1f}deg "
                 f"applied={math.degrees(raw_delta - remaining):+.1f}deg "
                 f"remaining={math.degrees(remaining):+.1f}deg "
@@ -3795,13 +4227,13 @@ def plan_and_execute(node):
             requested_deg = math.degrees(angle)
             applied_deg = float(np.clip(requested_deg, -max_deg, max_deg))
             if not enabled or confidence < min_conf or not stable:
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_DATE_AXIS] applied=+0.0deg "
                     f"requested={requested_deg:+.1f}deg confidence={confidence:.2f} "
                     f"threshold={min_conf:.2f} stable={stable} samples={samples} "
                     f"spread={spread_deg:.1f}deg decision=KEEP_DEFAULT")
                 return list(orientation_in)
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[APPROACH_DATE_AXIS] requested={requested_deg:+.1f}deg "
                 f"applied={applied_deg:+.1f}deg confidence={confidence:.2f} "
                 f"stable={stable} samples={samples} spread={spread_deg:.1f}deg "
@@ -3818,20 +4250,20 @@ def plan_and_execute(node):
                 requested_deg = (
                     float(selection.get("delta_deg", 0.0))
                     if selection else 0.0)
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
                     "applied=+0.0deg decision=LOG_ONLY_DISABLED "
                     "orientation=CALIBRATED_FIXED")
                 return list(orientation_in)
             if _active_corridor in getattr(
                     node, "_corridor_roll_disabled", set()):
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_FINGER_ROLL] corridor={_active_corridor} "
                     "applied=+0.0deg decision=IK_FALLBACK_NO_ROLL")
                 return list(orientation_in)
             selection = getattr(node, "safe_grasp_candidate", None)
             if not selection:
-                node.get_logger().info(
+                node.get_logger().debug(
                     "[APPROACH_FINGER_ROLL] applied=+0.0deg decision=NO_CANDIDATE")
                 return list(orientation_in)
             target_match = math.dist(
@@ -3854,7 +4286,7 @@ def plan_and_execute(node):
                 "approach_candidate_roll_max_deg", 15.0))
             if (target_match > match_limit or score < min_score
                     or minimum_score < min_finger_score):
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
                     "applied=+0.0deg decision=QUALITY_REJECT "
                     f"match={target_match*1000:.1f}mm "
@@ -3862,7 +4294,7 @@ def plan_and_execute(node):
                 return list(orientation_in)
             applied_deg = float(np.clip(requested_deg, -max_deg, max_deg))
             node._approach_finger_roll_applied_deg = applied_deg
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[APPROACH_FINGER_ROLL] requested={requested_deg:+.1f}deg "
                 f"applied={applied_deg:+.1f}deg limit={max_deg:.1f}deg "
                 f"match={target_match*1000:.1f}mm Q={score:.3f} "
@@ -4065,7 +4497,7 @@ def plan_and_execute(node):
                     _tip_approach_tcp, _ = closure_center_corrected_tcp(
                         _tip_approach_closure, orientation, _tip_offset_tcp)
                     approach[:3] = list(_tip_approach_tcp)
-                    node.get_logger().info(
+                    node.get_logger().debug(
                         f"[TOOL_AXIS_AIM] class={_low_class} "
                         "source=DATE_TIP_3D geometry=COLLINEAR "
                         f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
@@ -4134,7 +4566,7 @@ def plan_and_execute(node):
                 _tip_approach_tcp, _ = closure_center_corrected_tcp(
                     _tip_approach_closure, orientation, _tip_offset_tcp)
                 ax, ay, az = _tip_approach_tcp
-                node.get_logger().info(
+                node.get_logger().debug(
                     "[TOOL_AXIS_AIM] class=MID_HIGH source=DATE_TIP_3D "
                     "geometry=COLLINEAR "
                     f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
@@ -4230,7 +4662,7 @@ def plan_and_execute(node):
             _pf_ik_ms = (time.time() - _pf_ik_t0) * 1000.0
             _pose_compute_ms_str = (
                 f"{_pose_compute_ms:.0f}" if _pose_compute_ms is not None else "NA")
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[CORRIDOR_PREFLIGHT] candidate={_active_corridor} "
                 f"result={'PASS' if _pf_ok else 'REJECT'} reason={_pf_reason} "
                 f"branch_cost={getattr(node, '_corridor_preflight_cost_deg', float('inf')):.1f}deg "
@@ -4265,7 +4697,7 @@ def plan_and_execute(node):
                         "done": False,
                     }
                     node._corridor_forced_label = _mirror
-                    node.get_logger().info(
+                    node.get_logger().debug(
                         "[CORRIDOR_PAIR] "
                         f"first={_active_corridor} "
                         f"result={'PASS' if _pf_ok else 'REJECT'}; "
@@ -4290,7 +4722,7 @@ def plan_and_execute(node):
                         _selected_cost = _first_cost
                         _pair["done"] = True
                         node._corridor_forced_label = _selected
-                        node.get_logger().info(
+                        node.get_logger().debug(
                             "[CORRIDOR_PAIR] "
                             f"first={_pair['first_label']}:{_first_cost:.1f}deg "
                             f"mirror={_active_corridor}:"
@@ -4308,7 +4740,7 @@ def plan_and_execute(node):
                         _selected_cost = float("inf")
                         _pair["done"] = True
                         node._corridor_forced_label = None
-                    node.get_logger().info(
+                    node.get_logger().debug(
                         "[CORRIDOR_PAIR] "
                         f"first={_pair['first_label']}:"
                         f"{'PASS' if _first_ok else 'REJECT'}:"
@@ -4394,8 +4826,11 @@ def plan_and_execute(node):
                 "corridor": str(_active_corridor),
                 "created_time": time.time(),
             }
+            node._active_motion_corridor = str(_active_corridor or "UNSPECIFIED")
+            node._active_motion_target_class = str(
+                node.final_tcp_teach_prediction["target_class"])
             node.final_tcp_teach_suggestion = None
-            node.get_logger().info(
+            node.get_logger().debug(
                 "[TEACH_FINAL_PREDICTED] "
                 f"mode={node.final_tcp_teach_prediction['grasp_mode']} "
                 f"class={node.final_tcp_teach_prediction['target_class']} "
@@ -4514,7 +4949,7 @@ def plan_and_execute(node):
                     unlock_target(node)
                     continue
                 _preflight_candidate = _select_safe_approach_candidate(
-                    node, approach, _preflight_start)
+                    node, approach, _preflight_start, goal_xyz=[x, y, z])
                 if _preflight_candidate is None:
                     move_to_home_position(node)
                     if _check_stop(): break
@@ -4524,11 +4959,171 @@ def plan_and_execute(node):
                 approach = list(_preflight_candidate["pose"])
                 orientation = list(approach[3:])
 
+            # HOME -> APPROACH is otherwise a joint interpolation. Its endpoint can
+            # be labelled STRAIGHT while the TCP still swings sideways through the
+            # fruit volume. Stage farther behind the selected approach first; only
+            # the outer HOME -> ALIGNMENT leg may curve. The near-fruit
+            # ALIGNMENT -> APPROACH leg is required to follow Cartesian waypoints.
+            _alignment_cartesian_done = False
+            _alignment_enabled = bool(getattr(
+                node.cfg.planner, "approach_alignment_enabled", True))
+            if _alignment_enabled and not is_side_approach:
+                _toward_goal = np.asarray([x, y, z], dtype=float) - np.asarray(
+                    approach[:3], dtype=float)
+                _toward_norm = float(np.linalg.norm(_toward_goal))
+                _alignment_extra = max(0.0, float(getattr(
+                    node.cfg.planner, "approach_alignment_extra_m", 0.08)))
+                if _toward_norm > 0.020 and _alignment_extra > 0.005:
+                    _toward_axis = _toward_goal / _toward_norm
+                    _alignment_xyz = (
+                        np.asarray(approach[:3], dtype=float)
+                        - _alignment_extra * _toward_axis)
+                    _alignment_pose = [
+                        float(_alignment_xyz[0]), float(_alignment_xyz[1]),
+                        float(_alignment_xyz[2]), *list(approach[3:])]
+
+                    # Cheap preflight: verify the near-fruit ALIGNMENT->APPROACH
+                    # Cartesian entry leg (executed below via _direct_ik_move,
+                    # require_cartesian=True) is actually reachable BEFORE paying
+                    # for the real outer HOME->ALIGNMENT motion. Previously this
+                    # was only discovered by physically driving out to ALIGNMENT
+                    # (real motion, tens of cm) and back home again on failure --
+                    # a full round trip for a fact knowable from geometry alone,
+                    # since neither pose depends on how the arm got to ALIGNMENT.
+                    # Mirrors _direct_ik_move's own "IK too far" check/threshold
+                    # exactly (goals.py, _MAX_DIRECT_DELTA_RAD = 1.05rad when no
+                    # preselected branch) so a corridor rejected here would have
+                    # been rejected there too, just after a wasted 10s+ round trip.
+                    if _preflight_candidate is None:
+                        try:
+                            _align_seed_js = _valid_joint_positions()
+                            if _align_seed_js is not None:
+                                _a_pos = torch.tensor(
+                                    [_alignment_pose[:3]], dtype=torch.float32, device=device)
+                                _a_quat = torch.tensor(
+                                    [_alignment_pose[3:]], dtype=torch.float32, device=device)
+                                _a_seed = torch.tensor(
+                                    [_align_seed_js], dtype=torch.float32, device=device).unsqueeze(0)
+                                _a_retract = torch.tensor(
+                                    [_align_seed_js], dtype=torch.float32, device=device)
+                                _a_result = node.motion_gen.ik_solver.solve_single(
+                                    Pose(position=_a_pos, quaternion=_a_quat),
+                                    seed_config=_a_seed, retract_config=_a_retract)
+                                if bool(_a_result.success.item()):
+                                    _align_js = nearest_joint_config(
+                                        _align_seed_js,
+                                        _a_result.js_solution.position.squeeze().cpu().tolist())
+                                    _app_pos = torch.tensor(
+                                        [approach[:3]], dtype=torch.float32, device=device)
+                                    _app_quat = torch.tensor(
+                                        [approach[3:]], dtype=torch.float32, device=device)
+                                    _app_seed = torch.tensor(
+                                        [_align_js], dtype=torch.float32, device=device).unsqueeze(0)
+                                    _app_retract = torch.tensor(
+                                        [_align_js], dtype=torch.float32, device=device)
+                                    _app_result = node.motion_gen.ik_solver.solve_single(
+                                        Pose(position=_app_pos, quaternion=_app_quat),
+                                        seed_config=_app_seed, retract_config=_app_retract)
+                                    if bool(_app_result.success.item()):
+                                        _app_from_align_js = nearest_joint_config(
+                                            _align_js,
+                                            _app_result.js_solution.position.squeeze().cpu().tolist())
+                                        _entry_delta = max(
+                                            abs(a - b) for a, b in
+                                            zip(_app_from_align_js, _align_js))
+                                        if _entry_delta > 1.05:
+                                            node.get_logger().warn(
+                                                "[APPROACH_ALIGNMENT] entry-leg preflight: "
+                                                f"ALIGNMENT->APPROACH needs {math.degrees(_entry_delta):.1f}deg "
+                                                "(cap 60deg); rejecting corridor before outer motion")
+                                            _vision_resume()
+                                            unlock_target(node)
+                                            continue
+                        except Exception as _exc:
+                            node.get_logger().debug(
+                                f"[APPROACH_ALIGNMENT] entry-leg preflight skipped: {_exc}")
+
+                    node.get_logger().info(
+                        "[APPROACH_ALIGNMENT] "
+                        f"outer=[{_alignment_pose[0]:.3f},"
+                        f"{_alignment_pose[1]:.3f},{_alignment_pose[2]:.3f}] "
+                        f"approach=[{approach[0]:.3f},{approach[1]:.3f},"
+                        f"{approach[2]:.3f}] straight_leg="
+                        f"{_alignment_extra * 1000.0:.0f}mm")
+                    _alignment_start_joints = _valid_joint_positions()
+                    if _alignment_start_joints is None:
+                        _alignment_ok = False
+                    else:
+                        _alignment_start = JointState.from_position(
+                            torch.tensor(
+                                [_alignment_start_joints], dtype=torch.float32,
+                                device=device),
+                            joint_names=node.joint_order)
+                        # Staging leg and the straight Cartesian entry are planned
+                        # separately but published as ONE trajectory. Two separate
+                        # messages structurally forced a full stop between them --
+                        # build_trajectory() zeroes the first and last waypoint of
+                        # every message, so the arm had to brake to rest at the
+                        # staging pose and start again. Appending the entry leg here
+                        # keeps a single continuous motion through the staging pose:
+                        # no mid-way stop, no zero-velocity handoff to jerk against,
+                        # and one planning round instead of two. The safety property
+                        # is unchanged -- the last leg is still generated as straight
+                        # Cartesian IK waypoints, just concatenated instead of sent
+                        # on its own. Entry density is sized to hold that leg at
+                        # approach_entry_duration_s even though the staging leg now
+                        # runs fast (uniform dt => spacing is speed).
+                        def _entry_leg(_last_js, _dt, _pose=list(_alignment_pose),
+                                       _target=list(approach)):
+                            _extra = straight_cartesian_entry_states(
+                                node, _last_js, _pose[:3], _pose[3:], _target,
+                                _dt, label="APPROACH_CARTESIAN")
+                            if _extra:
+                                # Reverse replays only the near-fruit leg, as before.
+                                if not hasattr(node, 'stored_trajectory_states'):
+                                    node.stored_trajectory_states = []
+                                node.stored_trajectory_states.extend(_extra)
+                            return _extra
+
+                        _alignment_ok = plan_and_send(
+                            node, _alignment_start,
+                            Pose.from_list(_alignment_pose),
+                            label="APPROACH_STAGED",
+                            motion_type="alignment",
+                            goal_xyz=_alignment_pose[:3],
+                            store_trajectory=False,
+                            extend_fn=_entry_leg)
+                    if not _alignment_ok:
+                        node.get_logger().error(
+                            "[APPROACH_STAGED] staged approach failed (staging plan or "
+                            "straight Cartesian entry); rejecting goal instead of "
+                            "substituting a side-swing path")
+                        move_to_home_position(node)
+                        if _check_stop(): break
+                        _vision_resume()
+                        unlock_target(node)
+                        continue
+                    # One continuous motion now ends at the approach pose, so wait
+                    # for that (not the staging pose) before FINAL takes over.
+                    _approach_ok = wait_until_xyz(node, approach[:3], tol=0.008)
+                    if _check_stop(): break
+                    if not _approach_ok:
+                        node.get_logger().error(
+                            "[APPROACH_STAGED] approach pose not reached; rejecting goal")
+                        move_to_home_position(node)
+                        if _check_stop(): break
+                        _vision_resume()
+                        unlock_target(node)
+                        continue
+                    _alignment_cartesian_done = True
+
             _ap_dist = math.sqrt(sum((cur_pose[i] - approach[i])**2 for i in range(3))) if cur_pose else 999.0
             _skip_approach_wait = False
             if _log_phase_timings:
                 node.get_logger().info(f"EE-to-approach distance: {_ap_dist*100:.1f}cm")
-            if _preflight_candidate is not None:
+            if _alignment_cartesian_done:
+                pass
+            elif _preflight_candidate is not None:
                 node._approach_clamp_rejected = False
                 node._approach_safety_rejected = False
                 node._approach_truncated = False
@@ -4620,7 +5215,8 @@ def plan_and_execute(node):
                         getattr(node, '_approach_safety_rejected', False)):
                     _safe_start = _valid_joint_positions()
                     _safe_candidate = (
-                        _select_safe_approach_candidate(node, approach, _safe_start)
+                        _select_safe_approach_candidate(
+                            node, approach, _safe_start, goal_xyz=[x, y, z])
                         if _safe_start is not None else None)
                     if _safe_candidate is not None:
                         node._approach_clamp_rejected = False
@@ -4744,7 +5340,7 @@ def plan_and_execute(node):
                     _commanded_approach_orientation))))
                 _orient_error_deg = math.degrees(2.0 * math.acos(_qdot))
                 orientation = list(_measured_approach_orientation)
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[ORIENTATION_LOCK] source=MEASURED_APPROACH "
                     f"command_error={_orient_error_deg:.2f}deg "
                     "FINAL=TRANSLATION_ONLY")
@@ -4761,9 +5357,15 @@ def plan_and_execute(node):
         # so don't repeat it after moving to the side approach standoff.
         _t_reacq = time.time()
         _skip_reacq_low_center = False
+        # A required reacquisition is always performed from the actual approach
+        # pose.  A prior side-HOME reacquisition is useful for approach planning,
+        # but it is not a substitute for confirming the fruit immediately before
+        # final insertion.
+        _require_final_reacquire = bool(getattr(
+            node.cfg.planner, "require_reacquire_before_grasp", False))
         _do_reacq_after_approach = (
-            node.cfg.planner.reacquire_after_approach and
-            not side_home_reacquired
+            bool(node.cfg.planner.reacquire_after_approach)
+            and (_require_final_reacquire or not side_home_reacquired)
         )
         if _do_reacq_after_approach:
             _vision_resume()
@@ -4821,8 +5423,7 @@ def plan_and_execute(node):
         if (
             _do_reacq_after_approach
             and node.reacquire_result != "OK"
-            and bool(getattr(
-                node.cfg.planner, "require_reacquire_before_grasp", True))
+            and _require_final_reacquire
         ):
             node.get_logger().warn(
                 "[REACQ] Required close-view confirmation failed — "
@@ -4920,7 +5521,7 @@ def plan_and_execute(node):
                 _final_approach_yaw_applied = abs(_yaw_applied) > math.radians(0.1)
                 _final_forward = quat_rotate_vec(
                     orientation, (0.0, 0.0, 1.0))
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[FINAL_APPROACH_YAW] source=fruit_direction "
                     f"requested={math.degrees(_yaw_raw):+.1f}deg "
                     f"applied={math.degrees(_yaw_applied):+.1f}deg "
@@ -4945,7 +5546,7 @@ def plan_and_execute(node):
          _mode_z_extra, _mode_axis) = _apply_mode_final_adjustment(
             desired_grasp_xyz, orientation)
         gx, gy, gz = desired_grasp_xyz
-        node.get_logger().info(
+        node.get_logger().debug(
             f"[GRIPPER_MODE] mode={_grasp_mode} "
             f"depth_extra={_mode_depth_extra*1000:+.1f}mm "
             f"z_extra={_mode_z_extra*1000:+.1f}mm "
@@ -5026,7 +5627,7 @@ def plan_and_execute(node):
                         node.get_logger().warn(
                             f"[PHASE4_YAW] IK preflight exception: "
                             f"{_candidate_ik_error}")
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[PHASE4_YAW] safe_psi={_selection.get('psi_deg', 0.0):.1f}deg "
                     f"local_delta={_candidate_delta_deg:+.1f}deg "
                     f"target_match={_candidate_match*1000:.1f}mm "
@@ -5060,7 +5661,7 @@ def plan_and_execute(node):
         _goal_forward = x if X_FORWARD_Y_LATERAL else -y
         _target_forward = tcp_xyz[0] if X_FORWARD_Y_LATERAL else -tcp_xyz[1]
         _forward_delta_mm = (_target_forward - _goal_forward) * 1000.0
-        node.get_logger().info(
+        node.get_logger().debug(
             f"[CLOSURE_CENTER] desired=[{gx:.3f},{gy:.3f},{gz:.3f}] "
             f"offset_tcp=[{closure_offset_tcp[0]:+.4f},{closure_offset_tcp[1]:+.4f},"
             f"{closure_offset_tcp[2]:+.4f}] "
@@ -5074,7 +5675,7 @@ def plan_and_execute(node):
                 f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
                 f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}]")
         else:
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[FINAL_TARGET] goal=[{x:.3f},{y:.3f},{z:.3f}] "
                 f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
                 f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}] "
@@ -5261,21 +5862,68 @@ def plan_and_execute(node):
                         and abs(_dy_px) <= _deadband_px
                         and _state == "FIT")
                     _result = "CENTERED" if _centered else "CORRECTION_SUGGESTED"
-                    node.get_logger().info(
+                    node.get_logger().debug(
                         f"[PHASE5_CENTER] mode=OBSERVE_ONLY result={_result} tips=3 "
                         f"containment={_containment:.2f} error_px=[{_dx_px:+.1f},{_dy_px:+.1f}] "
                         f"suggest_image_mm=[u:{_du_mm:+.1f},v:{_dv_mm:+.1f}] "
                         f"scale={_px_per_mm:.1f}px/mm clamp={_limit_mm:.1f}mm "
                         "robot_correction=NOT_APPLIED camera_to_tool_mapping=UNVALIDATED")
                 else:
-                    node.get_logger().warn(
+                    node.get_logger().debug(
                         "[PHASE5_CENTER] mode=OBSERVE_ONLY result=INCONCLUSIVE "
                         f"robot_correction=NOT_APPLIED reason={_verification or 'NO_RESULT'}")
 
+        # Prepare the reverse prefix and kick off DROP-OFF planning BEFORE the
+        # gripper closes, not just before the reverse motion. The plan depends
+        # only on stored_trajectory_states (set during approach) and FK -- nothing
+        # the grasp produces -- so it can start ~2.5s earlier and use the gripper
+        # close window as well as the reverse. Previously it only had the ~2.5s
+        # reverse to finish in, and a cuRobo plan contending with YOLO for the GPU
+        # often overran that, leaving the arm standing still on the join() below
+        # (the pause after reverse).
+        # Reverse along the stored approach path.
+        # Side-approach fruits need more clearance to clear the bunch before dropoff planning.
+        _reverse_clearance = (
+            float(getattr(node.cfg.planner, "side_home_partial_reverse_m", 0.30))
+            if is_side_approach
+            else float(getattr(node.cfg.planner, "center_partial_reverse_m", 0.20))
+        )
+
+        # Select the reverse endpoint before motion and plan DROP-OFF from that
+        # exact joint state while the arm is physically reversing. This removes
+        # the old stationary post-reverse planning pause.
+        _prepared_reverse, _reverse_state_count = _prepare_partial_reverse_states(
+            node, _reverse_clearance)
+        import threading as _threading
+        _dropoff_preplan_result = [None]
+        _dropoff_plan_start = (
+            list(node.home_joints) if is_side_approach
+            else (list(_prepared_reverse[-1]) if _prepared_reverse else None)
+        )
+
+        def _bg_preplan_dropoff():
+            try:
+                if _dropoff_plan_start is None:
+                    return
+                _tgt = nearest_joint_config(_dropoff_plan_start, node.dropoff_joints)
+                result = preplan_js(
+                    node, _tgt, _dropoff_plan_start, "DROPOFF", "dropoff")
+                _dropoff_preplan_result[0] = result
+                if result is not None and not getattr(
+                        node.cfg.planner, "concise_console_logs", False):
+                    node.get_logger().info("[PREPLAN] Dropoff pre-plan ready during reverse")
+                elif result is None:
+                    node.get_logger().warn(
+                        "[PREPLAN] Dropoff pre-plan returned no trajectory")
+            except Exception as _e:
+                node.get_logger().warn(f"[PREPLAN] Dropoff pre-plan failed: {_e}")
+
+        _preplan_thread = _threading.Thread(
+            target=_bg_preplan_dropoff, daemon=True)
+        _preplan_thread.start()
+
         _t_grasp = time.time()
         node.control_gripper("CLOSE")
-        time.sleep(float(getattr(
-            node.cfg.planner, "grasp_post_close_settle_s", 0.10)))
         if _check_stop():
             break
         # Notify vision system about grasp attempt for fruit tracking
@@ -5432,13 +6080,16 @@ def plan_and_execute(node):
         _grasp_pair_before_frame = None
         _grasp_pair_timeout = float(getattr(
             node.cfg.planner, "grasp_pair_capture_timeout_s", 0.25))
-        try:
-            _grasp_pair_before_frame = node.capture_grasp_pair_frame(
-                _grasp_pair_attempt_id, "before_reverse",
-                timeout=_grasp_pair_timeout)
-        except Exception as _e:
-            node.get_logger().warn(
-                f"[GRASP_PAIR] {_grasp_pair_attempt_id} before_reverse failed: {_e}")
+        _post_reverse_verify = bool(getattr(
+            node.cfg.planner, "post_reverse_verification_enabled", False))
+        if _post_reverse_verify:
+            try:
+                _grasp_pair_before_frame = node.capture_grasp_pair_frame(
+                    _grasp_pair_attempt_id, "before_reverse",
+                    timeout=_grasp_pair_timeout)
+            except Exception as _e:
+                node.get_logger().warn(
+                    f"[GRASP_PAIR] {_grasp_pair_attempt_id} before_reverse failed: {_e}")
 
         # 4. Drop-off and return
         if _check_stop():
@@ -5453,19 +6104,15 @@ def plan_and_execute(node):
         if getattr(node, "_cuda_faulted", False):
             try_cuda_recovery(node)
 
-        # Reverse along the stored approach path.
-        # Side-approach fruits need more clearance to clear the bunch before dropoff planning.
-        _reverse_clearance = (
-            float(getattr(node.cfg.planner, "side_home_partial_reverse_m", 0.30))
-            if is_side_approach
-            else float(getattr(node.cfg.planner, "center_partial_reverse_m", 0.20))
-        )
-        _t_reverse_hold = time.time()
+
+        _t_reverse = time.time()
         node.motion_phase = "REVERSING"
         _reverse_endpoint_reached = execute_partial_reverse(
-            node, clearance_m=_reverse_clearance)
+            node, clearance_m=_reverse_clearance,
+            prepared_states=_prepared_reverse,
+            original_state_count=_reverse_state_count)
         _grasp_pair_after_frame = None
-        if _reverse_endpoint_reached:
+        if _post_reverse_verify and _reverse_endpoint_reached:
             try:
                 _grasp_pair_after_frame = node.capture_grasp_pair_frame(
                     _grasp_pair_attempt_id, "after_reverse",
@@ -5474,7 +6121,7 @@ def plan_and_execute(node):
                 node.get_logger().warn(
                     f"[GRASP_PAIR] {_grasp_pair_attempt_id} "
                     f"after_reverse failed: {_e}")
-        else:
+        elif _post_reverse_verify:
             node.get_logger().warn(
                 f"[GRASP_PAIR] {_grasp_pair_attempt_id} after_reverse NOT captured: "
                 "reverse endpoint was not confirmed")
@@ -5490,7 +6137,7 @@ def plan_and_execute(node):
                     _grasp_pair_after_frame,
                 )
                 node.temporal_grasp_result = _temporal.label
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[TEMPORAL_GRASP] {_temporal.label} | "
                     f"after_score={_temporal.after_score:.3f} "
                     f"appearance_corr={_temporal.appearance_correlation:.3f} | "
@@ -5502,107 +6149,24 @@ def plan_and_execute(node):
                     f"[TEMPORAL_GRASP] UNCERTAIN | classifier failed: {_e} "
                     "(logging only)")
 
-        # Pre-plan dropoff in background:
-        # - Center approach: plan from current (post-reverse) joints — runs during hold check (~0.35s)
-        # - Side approach:   plan from center home joints (robot goes there first) — runs during
-        #                    hold check + center home motion (~2-3s), plenty of time
-        import threading as _threading
-        _dropoff_preplan_result = [None]  # [(traj, states)] or [None]
-        _dropoff_plan_start = (
-            list(node.home_joints) if is_side_approach
-            else (list(node.current_joint_positions) if node.current_joint_positions else None)
-        )
-
-        def _bg_preplan_dropoff():
-            try:
-                if _dropoff_plan_start is None:
-                    return
-                _tgt = nearest_joint_config(_dropoff_plan_start, node.dropoff_joints)
-                result = preplan_js(node, _tgt, _dropoff_plan_start, "DROPOFF", "dropoff")
-                _dropoff_preplan_result[0] = result
-                if result is not None:
-                    if not getattr(
-                            node.cfg.planner, "concise_console_logs", False):
-                        node.get_logger().info("[PREPLAN] Dropoff pre-plan ready")
-                else:
-                    node.get_logger().warn("[PREPLAN] Dropoff pre-plan returned no trajectory")
-            except Exception as _e:
-                node.get_logger().warn(f"[PREPLAN] Dropoff pre-plan failed: {_e}")
-
-        _preplan_thread = _threading.Thread(target=_bg_preplan_dropoff, daemon=True)
-        _preplan_thread.start()
-
-        # Check whether the fruit is still held after reversing away from the bunch.
-        # If the fruit was only touched or slipped out during reverse, force deltas
-        # usually drop back near the close baseline.
+        # No post-reverse force sampling in direct-handoff mode. Contact was
+        # already classified at close; pausing here made the arm visibly wait
+        # before DROP-OFF. Keep the field unknown so it cannot trigger a retry.
         node.fruit_held_after_reverse = None
-        try:
-            _hold_base = list(gc.baseline_force[:3])
-            time.sleep(getattr(node.cfg.planner, "hold_check_settle_s", 0.05))
-            _samples = []
-            _sample_deadline = time.time() + getattr(node.cfg.planner, "hold_check_window_s", 0.30)
-            _sample_dt = getattr(node.cfg.planner, "hold_check_sample_dt", 0.04)
-            while time.time() < _sample_deadline:
-                _hold_force = list(gc.force_data[:3])
-                _samples.append([
-                    abs(float(_hold_force[i]) - float(_hold_base[i])) for i in range(3)
-                ])
-                time.sleep(_sample_dt)
-            if _samples:
-                _hold_deltas = np.median(np.array(_samples, dtype=float), axis=0).tolist()
-            else:
-                _hold_deltas = [0.0, 0.0, 0.0]
-            _hold_finger_threshold = float(getattr(
-                node.cfg.planner, "hold_force_finger_threshold_n", 3.0))
-            _hold_min_fingers = int(getattr(
-                node.cfg.planner, "hold_force_min_fingers", 2))
-            _hold_strong_single = float(getattr(
-                node.cfg.planner, "hold_force_strong_single_n", 8.0))
-            _hold_sum_threshold = float(getattr(
-                node.cfg.planner, "hold_force_sum_threshold_n", 12.0))
-            _hold_fingers = sum(
-                1 for d in _hold_deltas if d >= _hold_finger_threshold)
-            _hold_max = max(_hold_deltas) if _hold_deltas else 0.0
-            _hold_sum = sum(_hold_deltas)
-            # After reverse the fruit can settle against one finger/cup wall, so
-            # 2-finger contact is ideal but not required. Accept one strong,
-            # persistent contact or enough total force as "held".
-            _hold_ok = (
-                _hold_fingers >= _hold_min_fingers or
-                _hold_max >= _hold_strong_single or
-                _hold_sum >= _hold_sum_threshold
-            )
-            node.fruit_held_after_reverse = _hold_ok
-            if not getattr(node.cfg.planner, "concise_console_logs", False):
-                node.get_logger().info(
-                    f"[HOLD_CHECK] after reverse: "
-                    f"{'FORCE_PRESENT' if _hold_ok else 'FORCE_LOW'} "
-                    f"(not ground truth) | "
-                    f"deltas=[{_hold_deltas[0]:.2f},{_hold_deltas[1]:.2f},"
-                    f"{_hold_deltas[2]:.2f}]N fingers={_hold_fingers}/3 "
-                    f"max={_hold_max:.2f}N sum={_hold_sum:.2f}N "
-                    f"samples={len(_samples)}"
-                )
-            if not _hold_ok:
-                node.get_logger().warn(
-                    "[HOLD_CHECK] Low post-reverse force; grasp result remains UNKNOWN "
-                    "until operator-labelled calibration is complete."
-                )
-        except Exception as _e:
-            node.get_logger().warn(f"[HOLD_CHECK] after reverse failed: {_e}")
 
         # Logging-only camera verification.  This is deliberately independent
         # of force classification and cannot trigger retry or robot motion.
         _skip_redundant_visual = bool(getattr(
             node.cfg.planner,
             "skip_redundant_visual_grasp_after_temporal", True))
-        if not (_skip_redundant_visual
-                and _grasp_pair_after_frame is not None):
+        if (_post_reverse_verify
+                and not (_skip_redundant_visual
+                         and _grasp_pair_after_frame is not None)):
             try:
                 _visual = node.verify_visual_grasp(frame_count=5, timeout=0.8)
                 node.visual_grasp_result = _visual.label
                 if not getattr(node.cfg.planner, "concise_console_logs", False):
-                    node.get_logger().info(
+                    node.get_logger().debug(
                         f"[VISUAL_GRASP] {_visual.label} | score={_visual.score:.3f} "
                         f"red_pixels={_visual.red_pixels} | {_visual.reason} "
                         "(logging only; no automatic retry)"
@@ -5612,12 +6176,11 @@ def plan_and_execute(node):
                 node.get_logger().warn(
                     f"[VISUAL_GRASP] UNCERTAIN | verifier failed: {_e} "
                     "(logging only)")
-        _timing["reverse_hold"] = time.time() - _t_reverse_hold
+        _timing["reverse"] = time.time() - _t_reverse
         if _log_phase_timings:
             node.get_logger().info(
-                f"[TIMING] reverse_hold={_timing['reverse_hold']:.2f}s "
-                f"force_signal={getattr(node, 'fruit_held_after_reverse', None)} "
-                "(not ground truth)")
+                f"[TIMING] reverse={_timing['reverse']:.2f}s "
+                "post_reverse_hold=0.00s")
 
         _MAX_SLIP_RETRIES = int(getattr(
             node.cfg.planner, "max_force_grasp_retries", 2))
@@ -5733,6 +6296,31 @@ def plan_and_execute(node):
         _dropoff_direct = True
         node.motion_phase = "DROPOFF"
         _preplan_ok = False
+
+        # Pre-plan the return HOME while the arm is physically doing DROP-OFF,
+        # the same way DROP-OFF itself is pre-planned during the reverse. HOME
+        # was costing a fresh ~1.05s plan with the arm standing still, even
+        # though both ends are effectively fixed: the start is the drop-off
+        # endpoint and the target is the constant home_joints. Dropping off takes
+        # ~2.3s, which is ample. If it isn't ready (or fails) we simply fall back
+        # to planning HOME the old way, so this can only save time.
+        _home_preplan_result = [None]
+        _home_plan_start = (
+            list(_dropoff_preplan_result[0][1][-1])
+            if _dropoff_preplan_result[0] is not None
+            else list(node.dropoff_joints))
+
+        def _bg_preplan_home():
+            try:
+                _tgt = nearest_joint_config(_home_plan_start, node.home_joints)
+                _home_preplan_result[0] = preplan_js(
+                    node, _tgt, _home_plan_start, "HOME", "home")
+            except Exception as _e:
+                node.get_logger().warn(f"[PREPLAN] HOME pre-plan failed: {_e}")
+
+        _home_thread = _threading.Thread(target=_bg_preplan_home, daemon=True)
+        _home_thread.start()
+
         if _dropoff_preplan_result[0] is not None:
             _pre_traj, _pre_states = _dropoff_preplan_result[0]
             _preplan_ok = execute_preplan(node, _pre_traj, _pre_states, "DROPOFF")
@@ -5768,6 +6356,23 @@ def plan_and_execute(node):
 
         # Smart return: if there are more goals, try direct approach instead of going home first
         _t_return_home = time.time()
+
+        def _return_home():
+            """Use the HOME trajectory pre-planned during DROP-OFF when it is
+            ready; otherwise plan it now exactly as before."""
+            _pre = None
+            if _home_thread.is_alive():
+                _home_thread.join(timeout=float(getattr(
+                    node.cfg.planner, "dropoff_preplan_wait_s", 15.0)))
+            if not _home_thread.is_alive():
+                _pre = _home_preplan_result[0]
+            if _pre is not None:
+                _traj, _states = _pre
+                if execute_preplan(node, _traj, _states, "HOME"):
+                    return True
+                node.get_logger().warn(
+                    "[PREPLAN] HOME pre-plan did not execute; replanning")
+            return move_to_home_position(node)
         if node.goal_poses:
             # Peek at next goal (don't pop it yet)
             next_goal = node.goal_poses.peek(0)
@@ -5819,16 +6424,16 @@ def plan_and_execute(node):
                         node.get_logger().info(
                             f"Direct path to next goal BLOCKED — going HOME first")
                         node.motion_phase = "HOME"
-                        move_to_home_position(node)
+                        _return_home()
                 else:
                     node.motion_phase = "HOME"
-                    move_to_home_position(node)
+                    _return_home()
             else:
                 node.motion_phase = "HOME"
-                move_to_home_position(node)
+                _return_home()
         else:
             node.motion_phase = "HOME"
-            move_to_home_position(node)
+            _return_home()
 
         # Back at home — resume YOLO so it can detect the next fruit.
         _timing["return_home"] = time.time() - _t_return_home
@@ -5861,6 +6466,51 @@ def plan_and_execute(node):
             f"[CYCLE {_cycle_idx}] DONE total={_cycle_total:.2f}s "
             f"force_signal={getattr(node, 'fruit_held_after_reverse', None)} "
             f"reacq={node.reacquire_result or 'NA'} {_timing_summary}")
+        _append_cycle_log = getattr(node, "_append_harvest_log", None)
+        if callable(_append_cycle_log):
+            _append_cycle_log({
+                "event": "CYCLE_COMPLETE",
+                "cycle": _cycle_idx,
+                "goal_xyz_m": [float(x), float(y), float(z)],
+                "grasp_mode": str(getattr(
+                    node, "active_goal_grasp_mode", "NORMAL")),
+                "target_class": str(getattr(
+                    node, "_active_motion_target_class", "UNKNOWN")),
+                "selected_corridor": str(getattr(
+                    node, "_active_motion_corridor", "UNSPECIFIED")),
+                "tool_axis_result": str(getattr(
+                    node, "_active_tool_axis_result", "UNKNOWN")),
+                "tool_axis_reason": str(getattr(
+                    node, "_active_tool_axis_reason", "UNKNOWN")),
+                "tool_axis_tip_age_s": getattr(
+                    node, "_active_tool_axis_tip_age_s", None),
+                "tool_axis_goal_match_mm": getattr(
+                    node, "_active_tool_axis_goal_match_mm", None),
+                "grasp_prediction": str(prediction),
+                "grasp_action": str(action),
+                "first_contact_step": int(first_contact),
+                "total_close_steps": int(gc.steps),
+                "force_deltas": [float(value) for value in deltas[:3]],
+                "fruit_held_after_reverse": getattr(
+                    node, "fruit_held_after_reverse", None),
+                "reacquire_result": str(node.reacquire_result or "NA"),
+                "temporal_grasp_result": str(getattr(
+                    node, "temporal_grasp_result", "NA")),
+                "visual_grasp_result": str(getattr(
+                    node, "visual_grasp_result", "NA")),
+                "phase_timing_s": {
+                    str(name): round(float(seconds), 3)
+                    for name, seconds in _timing.items()
+                },
+                "motion_planning": (
+                    node._motion_cycle_summary()
+                    if callable(getattr(node, "_motion_cycle_summary", None))
+                    else {}
+                ),
+                "total_s": round(float(_cycle_total), 3),
+                "status": "COMPLETED",
+            })
+        node._last_completed_harvest_cycles += 1
 
         # Release target lock and reset tracking state for next goal
         unlock_target(node)

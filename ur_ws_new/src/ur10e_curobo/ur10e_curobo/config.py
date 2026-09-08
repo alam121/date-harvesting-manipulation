@@ -161,12 +161,43 @@ _OLD_OUTDOOR_JOINTS = {
     ],
 }
 
+# Final-grasp depth/Z offsets and TCP-to-closure corrections depend on the
+# environment (fruit size/position calibration differs lab vs outdoor), same
+# as the joint presets above. Seeded identically for both environments for
+# now -- tune one side independently as real per-environment grasp data
+# comes in; only the keys you change take effect.
+_LAB_GRASP_OFFSETS = {
+    "low_side_final_depth_offset": 0.0,
+    "low_left_final_z_offset": 0.020,
+    "low_right_final_z_offset": 0.010,
+    "low_center_final_depth_offset": -0.010,
+    "low_center_final_z_offset": 0.0,
+    "mid_center_final_depth_offset": -0.010,
+    "mid_center_final_z_offset": 0.0,
+    "mid_center_slip_final_z_offset": 0.020,
+    "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+    "envelop_closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+}
+
+_OUTDOOR_GRASP_OFFSETS = {
+    "low_side_final_depth_offset": 0.0,
+    "low_left_final_z_offset": 0.020,
+    "low_right_final_z_offset": 0.010,
+    "low_center_final_depth_offset": -0.010,
+    "low_center_final_z_offset": 0.0,
+    "mid_center_final_depth_offset": -0.010,
+    "mid_center_final_z_offset": 0.0,
+    "mid_center_slip_final_z_offset": 0.020,
+    "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+    "envelop_closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+}
+
 ROBOT_PROFILES = {
     "old": {
         "x_forward_y_lateral": False,
         "environments": {
-            "lab": {"joints": _OLD_LAB_JOINTS},
-            "outdoor": {"joints": _OLD_OUTDOOR_JOINTS},
+            "lab": {"joints": _OLD_LAB_JOINTS, "grasp_offsets": _LAB_GRASP_OFFSETS},
+            "outdoor": {"joints": _OLD_OUTDOOR_JOINTS, "grasp_offsets": _OUTDOOR_GRASP_OFFSETS},
         },
     },
 }
@@ -189,6 +220,11 @@ ACTIVE_ENVIRONMENT = _ENVIRONMENTS[ENVIRONMENT]
 
 def _profile_joints(name: str) -> List[float]:
     return list(ACTIVE_ENVIRONMENT["joints"][name])
+
+
+def _profile_offset(name: str):
+    value = ACTIVE_ENVIRONMENT["grasp_offsets"][name]
+    return list(value) if isinstance(value, list) else value
 
 # ---------- Static Obstacles (single source of truth) ----------
 # Define obstacles once here, used for both cuRobo planning and RViz visualization
@@ -425,8 +461,25 @@ class Planner:
     speed_home: float = 0.11        # faster return; effective scale=0.55 with global=5
     speed_dropoff: float = 0.18     # faster carrying move; effective scale=0.90
     speed_predropoff: float = 0.2  # for pre-dropoff reverse
-    speed_approach: float = 0.06   # effective scale=0.30 with global=5
-    speed_final: float = 0.06      # effective scale=0.30 for precise final grasp
+    # Only FINAL is genuinely near the fruit and needs to be slow. Everything
+    # before it is gross motion well outside the fruit corridor.
+    #
+    # dt = base_dt / (speed_scale(0.5) * this), clamped to [curobo_dt, max_dt]:
+    #   4.0 -> 10ms, the same rate HOME/DROPOFF already run at safely
+    #   2.0 -> 20ms,  0.8 -> 50ms,  0.06 -> clamped to max_dt = 80ms
+    #
+    # speed_alignment now sets the dt for the WHOLE staged approach, since the
+    # straight entry leg is appended into the same trajectory (see plan_and_send
+    # extend_fn). The entry leg does not inherit this speed: its own duration is
+    # held by approach_entry_duration_s below, via sample density.
+    speed_alignment: float = 4.0  # staged approach (dt 10ms, HOME rate)
+    speed_approach: float = 2.0   # standalone approach path (dt 20ms)
+    speed_final: float = 0.06     # precise, deliberately slow near the fruit
+    # Wall-clock duration held for the straight near-fruit entry leg regardless
+    # of how fast the staging leg runs. Previously this leg was 41 samples at
+    # 50ms = ~2.05s; keeping it close to that preserves the careful entry while
+    # the approach to it got faster.
+    approach_entry_duration_s: float = 1.5
 
     # Final base-frame guard for vision goals. A stable but physically impossible
     # background-depth estimate must never enter the motion queue.
@@ -495,6 +548,9 @@ class Planner:
     direct_branch_retry_min_dist: float = 0.15  # m; skip expensive branch search for close moves
     direct_branch_retry_seeds: int = 8          # extra perturbed IK seeds when branch retry is needed
     direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
+    approach_alignment_enabled: bool = True     # stage outside fruit before entering approach standoff
+    approach_alignment_extra_m: float = 0.08    # extra distance behind the existing approach pose
+    direct_approach_cart_waypoints: int = 3     # enforce straight alignment -> approach motion
     direct_final_joint_fallback_max_delta_deg: float = 25.0  # allow FINAL joint fallback only for small endpoint moves
     strict_final_cartesian_only: bool = True  # never replace straight FINAL insertion with a joint/planner curve
     very_low_ik_return_seeds: int = 8           # IK branches scored before moving to a very-low goal
@@ -575,10 +631,15 @@ class Planner:
 
 
 
-    low_side_final_depth_offset: float = 0.0
-    low_side_final_y_offset: float = 0.0        # legacy alias for low_side_final_depth_offset
-    low_left_final_z_offset: float = 0.020      # m; left side-low gripper center offset
-    low_right_final_z_offset: float = 0.010     # m; right side-low gripper center offset
+    # Lab vs outdoor: see _LAB_GRASP_OFFSETS / _OUTDOOR_GRASP_OFFSETS above.
+    low_side_final_depth_offset: float = field(
+        default_factory=lambda: _profile_offset("low_side_final_depth_offset"))
+    low_side_final_y_offset: float = field(       # legacy alias for low_side_final_depth_offset
+        default_factory=lambda: _profile_offset("low_side_final_depth_offset"))
+    low_left_final_z_offset: float = field(       # m; left side-low gripper center offset
+        default_factory=lambda: _profile_offset("low_left_final_z_offset"))
+    low_right_final_z_offset: float = field(      # m; right side-low gripper center offset
+        default_factory=lambda: _profile_offset("low_right_final_z_offset"))
 
     low_side_final_front_tilt_deg: float = 10.0 # max final +Z/front tilt toward fruit
     mid_center_approach_pitch_deg: float = 0.0 # local tool X pitch for MID/HIGH center; keep 0.0 to preserve approach→final orientation continuity
@@ -586,20 +647,29 @@ class Planner:
     # Scratch retune: stop 5mm shallower than the zero-depth baseline. Previous
     # tuned values were depth=-0.027m and Z=+0.007m for both centre classes.
     # Z remains zero and the physical TCP-to-closure correction is disabled.
-    low_center_final_depth_offset: float = -0.010
-    low_center_final_y_offset: float = -0.010   # legacy alias for low_center_final_depth_offset
-    low_center_final_z_offset: float = 0.0
+    # Lab vs outdoor: see _LAB_GRASP_OFFSETS / _OUTDOOR_GRASP_OFFSETS above.
+    low_center_final_depth_offset: float = field(
+        default_factory=lambda: _profile_offset("low_center_final_depth_offset"))
+    low_center_final_y_offset: float = field(   # legacy alias for low_center_final_depth_offset
+        default_factory=lambda: _profile_offset("low_center_final_depth_offset"))
+    low_center_final_z_offset: float = field(
+        default_factory=lambda: _profile_offset("low_center_final_z_offset"))
 
-    mid_center_final_depth_offset: float = -0.010
-    mid_center_final_y_offset: float = -0.010   # legacy alias for mid_center_final_depth_offset
-    mid_center_final_z_offset: float = 0.0
-    mid_center_slip_final_z_offset: float = 0.020 # m; slightly lower final target during slip retry
+    mid_center_final_depth_offset: float = field(
+        default_factory=lambda: _profile_offset("mid_center_final_depth_offset"))
+    mid_center_final_y_offset: float = field(   # legacy alias for mid_center_final_depth_offset
+        default_factory=lambda: _profile_offset("mid_center_final_depth_offset"))
+    mid_center_final_z_offset: float = field(
+        default_factory=lambda: _profile_offset("mid_center_final_z_offset"))
+    mid_center_slip_final_z_offset: float = field(  # m; slightly lower final target during slip retry
+        default_factory=lambda: _profile_offset("mid_center_slip_final_z_offset"))
 
-    # Scratch baseline: gripper_tip is now located at the physical fingertip
-    # centre, so no second TCP-to-closure correction is applied. Previous
-    # calibrated values were [-0.004553, +0.000100, -0.016223] m.
+    # Tool-frame TCP-to-physical-closure correction. Lab vs outdoor: see
+    # _LAB_GRASP_OFFSETS / _OUTDOOR_GRASP_OFFSETS above.
     closure_center_offset_tcp_m: List[float] = field(
-        default_factory=lambda: [0.0, 0.0, 0.0])
+        default_factory=lambda: _profile_offset("closure_center_offset_tcp_m"))
+    envelop_closure_center_offset_tcp_m: List[float] = field(
+        default_factory=lambda: _profile_offset("envelop_closure_center_offset_tcp_m"))
     # visual F1/F2/F3 -> hardware force-channel indices. Keep identity until
     # the controlled single-finger correspondence test establishes otherwise.
     grasp_visual_to_force_map: List[int] = field(
@@ -613,7 +683,7 @@ class Planner:
     approach_date_axis_max_deg: float = 35.0
     approach_date_axis_min_confidence: float = 0.20
     approach_date_axis_stable_frames: int = 5
-    approach_date_axis_max_spread_deg: float = 8.0
+    approach_date_axis_max_spread_deg: float = 25.0
     approach_candidate_roll_enabled: bool = False # score/log only; keep calibrated finger orientation
     approach_candidate_roll_max_deg: float = 15.0
     approach_candidate_roll_target_match_m: float = 0.05
@@ -630,6 +700,13 @@ class Planner:
     mid_high_direction_min_horizontal: float = 0.15
     corridor_date_axis_enabled: bool = True
     corridor_date_axis_min_confidence: float = 0.20
+    # A fitted ellipse gives an UNDIRECTED major axis, so the mirrored LEFT/RIGHT
+    # corridor can be equally valid -- that is what the mirror preflight exists to
+    # resolve. But it used to run whenever the axis was merely valid, so a clearly
+    # decided heading (e.g. match 0.997 vs mirror 0.814) still paid ~1s of mirror
+    # IK per goal. Only treat polarity as ambiguous when the two direction_match
+    # scores are within this margin of each other.
+    corridor_polarity_margin: float = 0.10
     log_corridor_candidates: bool = False
     tool_axis_tip_aim_enabled: bool = True
     tool_axis_tip_max_age_s: float = 0.50
@@ -650,15 +727,50 @@ class Planner:
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves
     phase5_center_max_correction_mm: float = 3.0 # clamp each logged image-axis suggestion
     phase5_center_deadband_px: float = 4.0      # residual below this is reported as centered
-    reverse_initial_wait: float = 0.15          # s; minimum wait after publishing partial reverse
-    reverse_final_settle: float = 0.05          # s; settle after reverse stops before hold check
-    reverse_dt_multiplier: float = 4.0          # smooth straight-line reverse: 48ms at min_dt=12ms
-    reverse_velocity_scale: float = 0.22        # dedicated low joint-velocity cap for reverse only
+    reverse_initial_wait: float = 0.08          # s; minimum wait after publishing partial reverse (capped at call site to 0.25*expected_duration)
+    reverse_final_settle: float = 0.0           # direct handoff to pre-planned DROP-OFF
+    # Reverse was slow for three stacked reasons: this 4x timestep, the velocity
+    # cap below, and the decel tail. The timestep dominates -- 4.0 gave dt=40ms
+    # vs HOME's 10ms. 2.0 (dt=20ms) halves the whole reverse AND halves the decel
+    # tail's wall-clock time, without touching the tail's point count.
+    reverse_dt_multiplier: float = 2.0          # dt = this * min_dt => 20ms
+    # Target wall-clock duration for the partial reverse. The reverse replays the
+    # stored approach path sample-for-sample, so without this its duration is a
+    # side effect of how densely the approach was sampled (densifying the entry
+    # leg to 148 states made the reverse LONGER despite dt being halved).
+    # Resampling to this target keeps the path identical and only changes sample
+    # spacing. 0 disables resampling and restores the old sample-for-sample replay.
+    reverse_duration_s: float = 1.4
+    # Halving dt doubles the central-difference velocities (measured 0.11-0.16
+    # rad/s -> 0.22-0.32). At the old 0.22 the cap was 1.5*0.22 = 0.33 rad/s, so
+    # they would land right on it and get clipped -- and clipping scales velocity
+    # while positions stay put, making (pos, vel) inconsistent for the controller.
+    # 0.35 (the code's own fallback default) restores headroom: cap = 0.525 rad/s.
+    reverse_velocity_scale: float = 0.35        # dedicated joint-velocity cap for reverse only
     reverse_acceleration_scale: float = 0.20    # dedicated joint acceleration limit multiplier
-    reverse_decel_tail_points: int = 20         # final path samples reshaped into a zero-slope ease-out
+    # Final path samples reshaped into a zero-slope ease-out (see ease_out_tail).
+    # At the reverse dt of ~40ms, 20 points meant 0.8s of deliberate crawl -- about
+    # the last third of the reverse's duration covering very little distance. 8
+    # still decelerates smoothly into the forced zero-velocity endpoint (avoiding
+    # the one-timestep hard brake this exists to prevent) in ~0.32s instead.
+    # The stop itself only exists because reverse and DROP-OFF are published as
+    # separate trajectories; merging them would remove the need for a tail at all.
+    reverse_decel_tail_points: int = 8
+    # FINAL runs at dt=max_dt (12.5Hz, see max_dt below) and hands off into
+    # GRASP/REVERSE at a much higher rate. Ease FINAL's own tail the same way
+    # REVERSE's tail already is, so it decelerates into that handoff instead of
+    # hard-braking at the forced-zero-velocity endpoint. See plan_and_send().
+    final_decel_tail_points: int = 8
+    # ALIGNMENT is usually the first real motion after a HOME/return move (which
+    # runs at min_dt=100Hz via a separate trajectory message, motions.py). Ease
+    # ALIGNMENT's own head the mirror-image way FINAL's tail is eased, so the
+    # first motion of a new cycle ramps up instead of jumping straight to speed.
+    # See plan_and_send().
+    alignment_ease_head_points: int = 8
     grasp_post_close_settle_s: float = 0.50      # visible hold after fingers finish closing
     grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
     skip_redundant_visual_grasp_after_temporal: bool = True  # reuse fresh after-reverse frame path
+    post_reverse_verification_enabled: bool = False  # no camera/force pause; dispatch pre-planned dropoff immediately
 
 
     hold_check_settle_s: float = 0.03           # s; force settle before post-reverse hold samples
@@ -718,17 +830,38 @@ class Gripper:
     auto_envelop_min_axis_confidence: float = 0.30
     normal_depth_extra_m: float = 0.0
     normal_z_extra_m: float = 0.0
-    envelop_depth_extra_m: float = 0.024 # place fruit 24mm deeper than NORMAL
+    envelop_depth_extra_m: float = 0.017 # place fruit 17mm deeper than NORMAL
     envelop_z_extra_m: float = 0.005
     adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
+    stop_closing_on_force: bool = False  # always command the full closed posture for now
     closing_steps: int = 10
     step_delay_s: float = 0.05
+    close_feedback_trim_enabled: bool = True
+    close_feedback_trim_iterations: int = 4
+    close_feedback_trim_tolerance_rad: float = 0.0175  # about 1 degree
+    close_feedback_trim_max_correction_rad: float = 0.1745  # 10 degrees
+    close_feedback_trim_settle_s: float = 0.25
+    holding_force_enabled: bool = True
+    holding_force_command: int = 50  # DG-3F-M units: 0.1 N (50 = 5 N)
+    holding_force_settle_s: float = 0.15
+    holding_release_settle_s: float = 0.05
     opening_steps: int = 6
     opening_step_delay_s: float = 0.06
     open_settle_s: float = 0.10
     open_hold_repeats: int = 3
     open_hold_interval_s: float = 0.04
+    # Non-tactile contact validation learned from the four labelled closures
+    # captured on 2026-08-30. Current values are amperes from JointState.effort.
+    # Position obstruction is measured on the largest-travel motor in each
+    # environment-specific calibrated finger posture.
+    nontactile_contact_validation: bool = True
+    nontactile_current_delta_a: List[float] = field(
+        default_factory=lambda: [0.220, 0.120, 0.220])
+    nontactile_remaining_fraction: List[float] = field(
+        default_factory=lambda: [0.75, 0.55, 0.75])
+    nontactile_min_contact_fingers: int = 2
+    nontactile_feedback_max_age_s: float = 0.30
 
 @dataclass
 class Grasp:
@@ -753,10 +886,13 @@ class LidarScan:
     semicircle_start_deg: float = 0.0                 # front half in base frame; 0=+X, 90=+Y
     semicircle_end_deg: float = 180.0                 # opposite of the previous back-side sweep
     semicircle_z_offset_m: float = 0.0
-    semicircle_face_target: bool = False              # keep current tool orientation; arc shape matters more than exact center-facing
+    semicircle_face_target: bool = True               # yaw at every arc point so the LiDAR/tool axis faces the scan center
+    semicircle_face_target_max_yaw_deg: float = 10.0  # small inward bias without forcing wrist/IK branch changes across the arc
+    semicircle_fast_yaw_order: bool = True            # try the likely-safe yaw first by base angle; retain all yaw fallbacks
     semicircle_local_axis: List[float] = field(
         default_factory=lambda: [0.0, 0.0, 1.0])
     semicircle_adaptive_scan: bool = True             # allow skipped angles/variable radius instead of forcing a perfect arc
+    semicircle_joint_bridge_step_deg: float = 10.0    # insert only as needed when a coarse arc step causes an IK-branch jump
     semicircle_radius_candidates_m: List[float] = field(
         default_factory=lambda: [0.22, 0.35])
     semicircle_min_points: int = 3
