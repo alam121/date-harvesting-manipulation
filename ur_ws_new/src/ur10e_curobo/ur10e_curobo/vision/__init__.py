@@ -23,12 +23,20 @@ def main():
     )
     parser.add_argument("--svo", type=str, default=None, help="Optional SVO file for playback")
     parser.add_argument(
+        "--video", type=str, default=None,
+        help="Optional MP4/AVI/MOV/MKV file for standalone Raw YOLO playback"
+    )
+    parser.add_argument(
         "--img_size", type=int, default=DEFAULT_IMG_SIZE,
         help=f"YOLO inference size in pixels (default: {DEFAULT_IMG_SIZE})"
     )
     parser.add_argument(
         "--conf_thres", type=float, default=DEFAULT_CONF_THRES,
         help=f"YOLO confidence threshold (default: {DEFAULT_CONF_THRES})"
+    )
+    parser.add_argument(
+        "--max_det", type=int, default=3,
+        help="Maximum detections returned per inference frame (default: 3)"
     )
     parser.add_argument(
         "--hdr", type=int, default=1,
@@ -51,6 +59,20 @@ def main():
         help="Display raw YOLO boxes/masks only; disable 3D processing and goal publishing"
     )
     args = parser.parse_args()
+
+    if args.video or (args.svo and args.raw_yolo_view):
+        if not args.raw_yolo_view:
+            parser.error("file-video playback is supported only with --raw_yolo_view")
+        if args.svo:
+            # Keep ZED SVO decoding and TensorRT engine loading in different
+            # processes. Some Jetson/ZED SDK combinations segfault when both
+            # GPU runtimes coexist, even with depth disabled.
+            from .raw_svo import prepare_svo_video
+            args.video = str(prepare_svo_video(args.svo))
+            args.svo = None
+        from .raw_video import run_raw_video
+        run_raw_video(args)
+        return
 
     node = VisionNode(args)
     node.run()

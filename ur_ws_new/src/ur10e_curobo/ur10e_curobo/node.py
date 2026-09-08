@@ -71,6 +71,24 @@ class UR10eCuroboMoveIt(Node):
         self.session_loaded_path = ""
         self.session_dir = Path.home() / "ur10e_sessions"
         self._redo_goal_items = []
+        self.harvest_log_dir = Path(os.environ.get(
+            "UR10E_HARVEST_LOG_DIR", str(Path.home() / "harvest_logs")))
+        self.harvest_log_path = None
+        self._cycle_motion_events = []
+        self._active_harvest_cycle = None
+        try:
+            self.harvest_log_dir.mkdir(parents=True, exist_ok=True)
+            self.harvest_log_path = self.harvest_log_dir / (
+                f"harvest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            self._append_harvest_log({
+                "event": "RUN_START",
+                "robot_profile": ROBOT_PROFILE,
+                "environment": ENVIRONMENT,
+            })
+        except OSError as exc:
+            self.get_logger().warn(
+                f"Could not initialize persistent harvest log: {exc}")
+            self.harvest_log_path = None
 
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
@@ -84,6 +102,37 @@ class UR10eCuroboMoveIt(Node):
         # ========= PHASE 3: MotionExecutor =========
         self._motion_mgr = MotionExecutor(self, self._config_mgr, self._state_mgr)
         self._motion_mgr.initialize()
+        planner = self.cfg.planner
+        self._append_harvest_log({
+            "event": "MOTION_CONFIG",
+            "base_dt_s": getattr(planner, "base_dt", None),
+            "min_dt_s": getattr(planner, "min_dt", None),
+            "max_dt_s": getattr(planner, "max_dt", None),
+            "global_speed_multiplier": getattr(
+                planner, "global_speed_multiplier", None),
+            "speed_approach": getattr(planner, "speed_approach", None),
+            "speed_final": getattr(planner, "speed_final", None),
+            "speed_dropoff": getattr(planner, "speed_dropoff", None),
+            "speed_home": getattr(planner, "speed_home", None),
+            "approach_alignment_enabled": getattr(
+                planner, "approach_alignment_enabled", None),
+            "approach_alignment_extra_m": getattr(
+                planner, "approach_alignment_extra_m", None),
+            "direct_approach_cart_waypoints": getattr(
+                planner, "direct_approach_cart_waypoints", None),
+            "reverse_dt_multiplier": getattr(
+                planner, "reverse_dt_multiplier", None),
+            "reverse_velocity_scale": getattr(
+                planner, "reverse_velocity_scale", None),
+            "reverse_acceleration_scale": getattr(
+                planner, "reverse_acceleration_scale", None),
+            "clamp_safety_threshold_mm": getattr(
+                planner, "clamp_safety_threshold_mm", None),
+            "final_endpoint_tolerance_m": getattr(
+                planner, "final_endpoint_tolerance", None),
+            "safe_zone_enabled": bool(getattr(
+                self, "safe_zone_enabled", False)),
+        })
 
         # ======== Remaining pubs/subs (not handled by managers yet) ========
 
@@ -258,12 +307,74 @@ class UR10eCuroboMoveIt(Node):
         self.keyboard_thread = threading.Thread(target=self._wait_for_key_press, daemon=True)
         self.keyboard_thread.start()
         self.get_logger().info("UR10e cuRobo node initialized. Waiting for joint states…")
+        if self.harvest_log_path is not None:
+            self.get_logger().info(
+                f"Persistent harvest log: {self.harvest_log_path}")
 
         # Note: Perception is handled by external date_v1.9.py node
         # Voxel obstacles subscribe to /zed_depth_pointcloud from that node
 
         # Note: Teleop state, subscription, and timer moved to MotionExecutor
 
+    def _append_harvest_log(self, record):
+        """Append one durable JSON-text record to the current harvest run log."""
+        path = getattr(self, "harvest_log_path", None)
+        if path is None:
+            return False
+        payload = dict(record)
+        payload.setdefault("timestamp", datetime.now().isoformat(timespec="milliseconds"))
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            return True
+        except OSError as exc:
+            self.get_logger().warn(f"Could not write harvest log {path}: {exc}")
+            return False
+
+    def _record_motion_plan_event(self, **record):
+        """Persist a motion-planning event and retain it for the cycle summary."""
+        payload = dict(record)
+        payload.setdefault("event", "MOTION_PLAN")
+        payload.setdefault("cycle", self._active_harvest_cycle)
+        payload.setdefault("monotonic_s", round(time.monotonic(), 3))
+        self._cycle_motion_events.append(payload)
+        # Prevent a pathological retry loop from growing memory without bound.
+        if len(self._cycle_motion_events) > 250:
+            self._cycle_motion_events = self._cycle_motion_events[-250:]
+        return self._append_harvest_log(payload)
+
+    def _begin_motion_cycle_log(self, cycle):
+        self._active_harvest_cycle = int(cycle)
+        self._cycle_motion_events = []
+
+    def _motion_cycle_summary(self):
+        events = list(getattr(self, "_cycle_motion_events", []))
+        planning_ms = [
+            float(e.get("planning_ms", 0.0)) for e in events
+            if e.get("planning_ms") is not None
+        ]
+        failures = [e for e in events if e.get("result") in {
+            "FAILED", "REJECTED", "TIMEOUT", "CANCELLED"}]
+        return {
+            "event_count": len(events),
+            "plan_attempts": sum(1 for e in events if e.get("stage") == "PLAN"),
+            "successful_plans": sum(
+                1 for e in events
+                if e.get("stage") == "PLAN" and e.get("result") == "SUCCESS"),
+            "failed_or_rejected": len(failures),
+            "planning_total_ms": round(sum(planning_ms), 1),
+            "planning_max_ms": round(max(planning_ms), 1) if planning_ms else 0.0,
+            "planned_samples": sum(int(e.get("trajectory_samples", 0) or 0) for e in events),
+            "planned_duration_s": round(sum(
+                float(e.get("trajectory_duration_s", 0.0) or 0.0)
+                for e in events), 3),
+            "failure_reasons": [
+                str(e.get("reason") or e.get("status") or "UNKNOWN")
+                for e in failures
+            ],
+        }
     def set_vision_mode(self, mode: str):
         """Switch the vision node between 'full' (approach) and 'reacquire' modes."""
         if mode == "paused":
@@ -1685,14 +1796,18 @@ class UR10eCuroboMoveIt(Node):
                     f"moving={_physically_moving} phase={self.motion_phase})")
             else:
                 try:
-                    values = [float(value) for value in cmd.split()[1:]]
-                    self._config_mgr.set_closure_center_offsets(values)
+                    parts = cmd.split()
+                    mode = parts[1].lower() if parts[1].lower() in ("normal", "envelop") else "normal"
+                    value_parts = parts[2:] if parts[1].lower() in ("normal", "envelop") else parts[1:]
+                    values = [float(value) for value in value_parts]
+                    self._config_mgr.set_closure_center_offsets(values, mode=mode)
                 except ValueError as exc:
                     self.get_logger().error(
                         f"Closure-center update rejected: {exc}")
                 else:
                     self.get_logger().info(
                         "[CLOSURE_CENTER_SETTINGS] updated from RViz "
+                        f"mode={mode.upper()} "
                         f"offset_tcp_mm=[{values[0]*1000:+.1f},"
                         f"{values[1]*1000:+.1f},{values[2]*1000:+.1f}] "
                         "effective=NEXT_GRASP")
@@ -1737,6 +1852,9 @@ class UR10eCuroboMoveIt(Node):
         elif cmd.startswith("camera_model "):
             self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
             self.get_logger().info(f"Camera model requested: {cmd}")
+        elif cmd.startswith("camera_inference "):
+            self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
+            self.get_logger().info(f"Camera inference settings requested: {cmd}")
         elif cmd == "camera_snapshot":
             # The wait for a fresh frame must not occupy the default ROS
             # callback group; /vision/raw is received by that same group.
@@ -1757,6 +1875,15 @@ class UR10eCuroboMoveIt(Node):
             val = cmd.split()[1].lower()
             self.cfg.planner.debug_plan_preview = val in ("true", "1", "yes")
             self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
+        elif cmd.startswith("set_final_reacquire "):
+            val = cmd.split()[1].lower()
+            enabled = val in ("true", "1", "yes", "on")
+            self.cfg.planner.reacquire_after_approach = enabled
+            self.cfg.planner.require_reacquire_before_grasp = enabled
+            self.get_logger().info(
+                "[FINAL_REACQUIRE] "
+                f"{'REQUIRED' if enabled else 'DISABLED'} "
+                "scope=ALL_HARVEST_GOALS effective=NEXT_GOAL")
         elif cmd.startswith("set_reachability_cloud "):
             val = cmd.split()[1].lower()
             enabled = val in ("true", "1", "yes", "on")
@@ -1799,8 +1926,170 @@ class UR10eCuroboMoveIt(Node):
                 finally:
                     self._motion_lock.release()
             threading.Thread(target=run_lidar_scan_cmd, daemon=True).start()
+        elif cmd.startswith("auto_harvest"):
+            try:
+                parts = cmd.split()
+                requested_goals = int(parts[1]) if len(parts) > 1 else 3
+                requested_goals = max(1, min(requested_goals, 10))
+            except (ValueError, IndexError):
+                requested_goals = 3
+
+            def run_auto_harvest_cmd():
+                if not self._motion_lock.acquire(blocking=False):
+                    self.get_logger().warn(
+                        "Motion already in progress, ignoring AUTO_HARVEST command")
+                    return
+                try:
+                    self._run_auto_harvest(requested_goals)
+                finally:
+                    self._motion_lock.release()
+
+            threading.Thread(target=run_auto_harvest_cmd, daemon=True).start()
         else:
             self.get_logger().warn(f"Unknown UI command: {cmd}")
+
+    def _destroy_auto_goal_subscription(self):
+        if hasattr(self, 'goal_pose_sub'):
+            try:
+                self.destroy_subscription(self.goal_pose_sub)
+            except Exception:
+                pass
+            try:
+                del self.goal_pose_sub
+            except Exception:
+                pass
+
+    def _wait_for_auto_goal(self, timeout_s: float) -> bool:
+        deadline = time.time() + max(0.1, float(timeout_s))
+        while time.time() < deadline and getattr(self, 'running', True):
+            if getattr(self, 'stop_requested', False):
+                return False
+            if len(self.goal_poses) > 0:
+                return True
+            time.sleep(0.05)
+        return len(self.goal_poses) > 0
+
+    def _run_auto_harvest(self, requested_goals: int):
+        """Discover and harvest one stationary-reacquired goal at a time."""
+        from . import lidar_scan as lidar_scan_mod
+
+        target_count = max(1, min(int(requested_goals), 10))
+        completed = 0
+        search_round = 0
+        self.stop_requested = False
+        self._auto_harvest_active = True
+        original_preview = bool(self.cfg.planner.debug_plan_preview)
+        # The RViz button confirmation authorizes this bounded automatic batch.
+        # Keep publishing all normal safety logs/markers, but do not block for a
+        # separate confirmation at each discovered target.
+        self.cfg.planner.debug_plan_preview = False
+        self.get_logger().info(
+            f"[AUTO_HARVEST] START requested={target_count} "
+            "mode=DISCOVER_SCAN_REACQUIRE_EXECUTE")
+
+        try:
+            while (
+                completed < target_count
+                and getattr(self, 'running', True)
+                and not getattr(self, 'stop_requested', False)
+            ):
+                search_round += 1
+                self.goal_poses.clear()
+                getattr(self, "_reachability_goal_metadata", {}).clear()
+                goals_mod.subscribe_to_goal_pose(self)
+                visible = self._wait_for_auto_goal(
+                    float(getattr(
+                        self.cfg.planner, "subscribe_goal_max_wait_s", 1.2)) + 0.4)
+
+                if not visible:
+                    self._destroy_auto_goal_subscription()
+                    self.get_logger().info(
+                        f"[AUTO_HARVEST] No visible goal; starting LiDAR search "
+                        f"round={search_round}")
+                    # Arm a fresh subscriber while the scan progresses. Its
+                    # stable-goal callback publishes a stop trajectory.
+                    goals_mod.subscribe_to_goal_pose(self)
+                    found_during_scan = lidar_scan_mod.run_lidar_scan(
+                        self,
+                        stop_when_goal_found=True,
+                        return_home=True,
+                    )
+                    if getattr(self, 'stop_requested', False):
+                        break
+                    if not found_during_scan:
+                        self._destroy_auto_goal_subscription()
+                        self.get_logger().warn(
+                            f"[AUTO_HARVEST] No goal found in LiDAR search "
+                            f"round={search_round}; retrying")
+                        continue
+
+                    discovered = self.goal_poses.peek(0)
+                    if discovered is not None:
+                        self.get_logger().info(
+                            "[AUTO_HARVEST] Discovery stopped at "
+                            f"[{discovered[0]:.3f},{discovered[1]:.3f},"
+                            f"{discovered[2]:.3f}]; reacquiring from settled scan pose")
+
+                    # Discard the moving-camera measurement and obtain a fresh,
+                    # stable target from the pose where the scan stopped.
+                    self._destroy_auto_goal_subscription()
+                    self.goal_poses.clear()
+                    self.reset_goal_tracking()
+                    time.sleep(0.25)
+                    goals_mod.subscribe_to_goal_pose(self)
+                    visible = self._wait_for_auto_goal(
+                        float(getattr(
+                            self.cfg.planner, "subscribe_goal_max_wait_s", 1.2)) + 0.8)
+                    if not visible:
+                        self._destroy_auto_goal_subscription()
+                        self.get_logger().warn(
+                            "[AUTO_HARVEST] Goal disappeared during stationary "
+                            "reacquisition; resuming search")
+                        continue
+
+                self._destroy_auto_goal_subscription()
+                if not self.goal_poses:
+                    continue
+
+                # Execute exactly one selected target. plan_and_execute reports
+                # completed cycles separately from internal corridor retries.
+                while len(self.goal_poses) > 1:
+                    self.goal_poses.pop(-1)
+                self.get_logger().info(
+                    f"[AUTO_HARVEST] Executing goal {completed + 1}/{target_count}")
+                # Never reuse the result of a previous execution attempt.
+                self._last_completed_harvest_cycles = 0
+                self._prep_and_execute()
+                finished_now = int(getattr(
+                    self, "_last_completed_harvest_cycles", 0))
+                if finished_now > 0:
+                    completed += 1
+                    self.get_logger().info(
+                        f"[AUTO_HARVEST] PROGRESS completed={completed}/{target_count}")
+                else:
+                    self.get_logger().warn(
+                        "[AUTO_HARVEST] Goal did not complete; returning to discovery")
+
+                if getattr(self, "motion_phase", "IDLE") == "ERROR":
+                    self.get_logger().error(
+                        "[AUTO_HARVEST] Motion pipeline entered ERROR; aborting batch")
+                    break
+        finally:
+            self._destroy_auto_goal_subscription()
+            self.cfg.planner.debug_plan_preview = original_preview
+            self._auto_harvest_active = False
+            if completed >= target_count:
+                self.get_logger().info(
+                    f"[AUTO_HARVEST] DONE completed={completed}/{target_count} "
+                    "reason=TARGET_COUNT_REACHED")
+            elif getattr(self, 'stop_requested', False):
+                self.get_logger().warn(
+                    f"[AUTO_HARVEST] STOPPED completed={completed}/{target_count} "
+                    "reason=USER_STOP")
+            else:
+                self.get_logger().warn(
+                    f"[AUTO_HARVEST] ABORTED completed={completed}/{target_count} "
+                    f"reason={'MOTION_ERROR' if getattr(self, 'motion_phase', '') == 'ERROR' else 'NODE_STOPPED'}")
 
     def _run_calib_check(self):
         """
@@ -2039,6 +2328,9 @@ class UR10eCuroboMoveIt(Node):
             "closure_center_offsets_m": list(getattr(
                 self.cfg.planner, "closure_center_offset_tcp_m",
                 [-0.004553, 0.000100, -0.016223])),
+            "envelop_closure_center_offsets_m": list(getattr(
+                self.cfg.planner, "envelop_closure_center_offset_tcp_m",
+                [0.0, 0.005, 0.0])),
             "last_taught_closure_offset_m": getattr(
                 self, "last_taught_closure_offset_m", None),
             "final_tcp_teach_prediction": getattr(

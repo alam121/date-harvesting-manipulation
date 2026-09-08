@@ -26,7 +26,7 @@ DEFAULT_WEIGHTS = os.path.join(
 #DEFAULT_WEIGHTS = os.path.join(MODELS_DIR, "yolo26_s_p2.engine")
 
 # YOLO inference parameters
-DEFAULT_CONF_THRES = 0.5          # confidence threshold (lower = more detections)
+DEFAULT_CONF_THRES = 0.1          # confidence threshold (lower = more detections)
 DEFAULT_IMG_SIZE = 1248            # fallback only; for .engine weights the real
                                    # size is read from the engine at load time
                                    # (see engine_imgsz in yolo_thread.py) and

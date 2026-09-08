@@ -449,6 +449,38 @@ class VisionNode:
                 self.node.get_logger().info(
                     f"Camera model change requested: {path.name}; restarting vision.")
                 self._request_vision_restart(f"model change to {path.name}", argv=argv)
+            elif cmd.startswith("inference "):
+                values = {}
+                for token in cmd.split()[1:]:
+                    if "=" in token:
+                        key, value = token.split("=", 1)
+                        values[key.strip().lower()] = value.strip()
+                try:
+                    confidence = float(values.get("conf", self.args.conf_thres))
+                    max_detections = int(values.get("max_det", self.args.max_det))
+                except ValueError:
+                    self.node.get_logger().warn(
+                        f"Inference settings ignored: bad command '{cmd}'")
+                    return
+                if not 0.0 < confidence <= 1.0 or not 1 <= max_detections <= 100:
+                    self.node.get_logger().warn(
+                        "Inference settings ignored: confidence must be in (0,1] "
+                        "and max_det in [1,100]")
+                    return
+                self.args.conf_thres = confidence
+                self.args.max_det = max_detections
+                worker = self.yolo_thread
+                if worker is not None:
+                    worker.conf_thres = confidence
+                    worker.max_det = max_detections
+                    direct = getattr(worker, "_direct_model", None)
+                    if direct is not None:
+                        direct.conf = confidence
+                        direct.max_det = max_detections
+                self.node.get_logger().info(
+                    f"YOLO settings applied live: confidence={confidence:.2f}, "
+                    f"max_detections={max_detections}")
+                self._publish_camera_status()
             elif cmd.startswith("raw_stream "):
                 parts = cmd.split()
                 mode = parts[1].lower() if len(parts) > 1 else ""
@@ -662,7 +694,12 @@ class VisionNode:
         objects = sl.Objects() if not use_mono_depth else None
         point_cloud = sl.Mat() if not use_mono_depth else None
 
-        self.visualizer = VisionVisualizer(intrinsics, image_scale, display_scale)
+        self.visualizer = VisionVisualizer(
+            intrinsics,
+            image_scale,
+            display_scale,
+            clean_harvest_overlay=True,
+        )
         self.visualizer.show_classification_zones = self._show_classification_zones
         self.visualizer.show_gap_debug = self._show_gap_debug
 
@@ -1480,7 +1517,7 @@ class VisionNode:
                 input_type.set_from_svo_file(self.args.svo)
             zed = sl.Camera()
             init_params = sl.InitParameters(input_t=input_type, svo_real_time_mode=True)
-            if use_zedx_mini_only and ZEDMINI_SERIAL > 0:
+            if use_zedx_mini_only and ZEDMINI_SERIAL > 0 and not self.args.svo:
                 init_params.input.set_from_serial_number(ZEDMINI_SERIAL)
             init_params.camera_resolution = sl.RESOLUTION.HD1080
             if use_zedx_mini_only:
@@ -1553,6 +1590,7 @@ class VisionNode:
             weights=self.args.weights,
             img_size=self.args.img_size,
             conf_thres=self.args.conf_thres,
+            max_det=self.args.max_det,
             raw_view=bool(getattr(self.args, "raw_yolo_view", False)),
             use_numpy_masks=use_zedx_mini_only,
         )
@@ -1575,6 +1613,8 @@ class VisionNode:
             f"HDR: {'ON' if self._camera_hdr_enabled else 'OFF'}\n"
             f"Depth: {self._depth_camera_text}\n"
             f"Model: {model_name}\n"
+            f"YOLO confidence: {float(self.args.conf_thres):.2f}\n"
+            f"Maximum detections: {int(self.args.max_det)}\n"
             f"Path: {model_path}"
         )
         msg = StdString()
@@ -2785,13 +2825,13 @@ class VisionNode:
         """Freeze and publish the candidate set associated with a new target lock."""
         record = self._latest_grasp_candidate_record
         if record is None:
-            self.node.get_logger().warn(
+            self.node.get_logger().debug(
                 "[GRASP_CANDIDATES] no pre-lock candidate evaluation available")
             return
         age_s = time() - float(record["stamp"])
         distance_m = math.dist(lock_position, record["position"])
         if age_s > 2.0 or distance_m > TARGET_LOCK_RADIUS:
-            self.node.get_logger().warn(
+            self.node.get_logger().debug(
                 f"[GRASP_CANDIDATES] rejected stale/mismatched pre-lock set "
                 f"target_id={record['fruit_id']} age={age_s:.2f}s "
                 f"distance={distance_m*1000:.1f}mm")
@@ -2894,7 +2934,7 @@ class VisionNode:
             f"decision={'YAW_PROPOSED' if unambiguous else 'YAW_AMBIGUOUS'} "
             f"{safe_text}" + detail_text
         )
-        self.node.get_logger().info(summary)
+        self.node.get_logger().debug(summary)
         message = StdString()
         message.data = summary
         self.grasp_candidates_pub.publish(message)

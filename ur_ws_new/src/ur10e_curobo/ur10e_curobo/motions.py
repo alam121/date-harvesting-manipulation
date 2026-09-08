@@ -1564,6 +1564,8 @@ def plan_execute_js(
     lock = getattr(node, '_planning_lock', None)
     res = None
     graph_states = None
+    _planning_t0 = time.perf_counter()
+    _record_motion = getattr(node, "_record_motion_plan_event", None)
     home_graph_first = (
         label == "HOME" and bool(getattr(node, "safe_zone_enabled", False))
     )
@@ -1688,6 +1690,14 @@ def plan_execute_js(
         if _yolo_lock: _yolo_lock.release()
 
     if res is None or not res.success:
+        if callable(_record_motion):
+            _record_motion(
+                stage="PLAN", label=label, motion_type=motion_type,
+                planner="curobo.plan_single_js", result="FAILED",
+                status=str(getattr(res, 'status', 'None')),
+                valid_query=str(getattr(res, 'valid_query', None)),
+                planning_ms=round(
+                    (time.perf_counter() - _planning_t0) * 1000.0, 1))
         if label == "HOME":
             # The graph path is collision-free even when trajopt couldn't smooth it.
             if graph_states is not None and _execute_graph_states(
@@ -1727,6 +1737,17 @@ def plan_execute_js(
             f"({_raw_start_error*57.3:.1f}deg → ≤1.0deg steps)")
     curobo_dt = get_curobo_dt(res)
 
+    if callable(_record_motion):
+        _record_motion(
+            stage="PLAN", label=label, motion_type=motion_type,
+            planner="curobo.plan_single_js", result="SUCCESS",
+            status=str(getattr(res, 'status', 'SUCCESS')),
+            valid_query=str(getattr(res, 'valid_query', None)),
+            planning_ms=round(
+                (time.perf_counter() - _planning_t0) * 1000.0, 1),
+            raw_trajectory_samples=len(states),
+            measured_start_bridge_deg=round(math.degrees(_raw_start_error), 2))
+
     dt = curobo_dt / max(scale, 1e-6)
     dt = min(max(dt, planner.min_dt), planner.max_dt)
 
@@ -1742,6 +1763,14 @@ def plan_execute_js(
         node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
     if traj.points:
         node.trajectory_pub.publish(traj)
+        if callable(_record_motion):
+            _record_motion(
+                stage="EXECUTE", label=label, motion_type=motion_type,
+                planner="curobo.plan_single_js", result="PUBLISHED",
+                trajectory_samples=len(states), dt_s=round(float(dt), 5),
+                trajectory_duration_s=round(
+                    float(dt) * max(len(states) - 1, 0), 3),
+                speed_scale=round(float(scale), 3))
     else:
         node.get_logger().warn(f"Skipping publish for {label} — empty trajectory (stop requested?)")
         return False
@@ -1759,6 +1788,10 @@ def plan_execute_js(
     blend_motion(node)
     if not reached:
         node.get_logger().warn(f"Joint-space move to {label} did not reach target")
+    if callable(_record_motion):
+        _record_motion(
+            stage="ENDPOINT", label=label, motion_type=motion_type,
+            result="REACHED" if reached else "TIMEOUT")
     return reached
 
 

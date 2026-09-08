@@ -29,7 +29,10 @@ class Communication:
         self.client = None
         self.slaveID = 0
         self.dummy = dummy
-        self.lock = threading.Lock()
+        # A complete holding-force command consists of several Modbus writes.
+        # RLock lets the driver keep that sequence atomic while reusing the
+        # individually locked register helpers below.
+        self.lock = threading.RLock()
         # DG-3F-M register map from tesollodelto/dg3f_m_ros2.
         # The old DG-3F-B map used current position at input register 2 and
         # target position at holding register 72. DG-3F-M reads at 6 and
@@ -39,6 +42,12 @@ class Communication:
         self.target_position_register = 7
         self.current_register = 26
         self.velocity_register = 46
+        # DG-3F-M holding-register map from the TESOLLO Control Manual v2.0.0.
+        # Unit is 0.1 N; valid values are 0..200.
+        self.grasp_force_register = 296
+        self.grasp_action_register = 292
+        self.grasp_mode_register = 295
+        self.grasp_hold_position_register = 299
 
     def __del__(self):
         self.disconnect()
@@ -93,10 +102,14 @@ class Communication:
             return status
 
         # status = []
-        status = self.client.read_input_registers(
-            address=self.current_position_register,
-            count=Delto3F.MOTOR_NUM.value,
-            slave=self.slaveID).registers
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=self.current_position_register,
+                count=Delto3F.MOTOR_NUM.value,
+                slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid position response: {response}")
+        status = response.registers
 
         for i in range(Delto3F.MOTOR_NUM.value):
             # stats = self.client.read_input_registers(
@@ -114,10 +127,14 @@ class Communication:
     def _read_signed_input_registers(self, address, count):
         if self.dummy:
             return [0] * count
-        values = self.client.read_input_registers(
-            address=address,
-            count=count,
-            slave=self.slaveID).registers
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=address,
+                count=count,
+                slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid input-register response: {response}")
+        values = response.registers
         return [value if value < 32768 else value - 65536 for value in values]
 
     def get_current_raw(self):
@@ -183,6 +200,50 @@ class Communication:
             value=1,
             slave=self.slaveID)
 
+    def set_grasp_force(self, value: int):
+        value = max(0, min(200, int(value)))
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_force_register,
+                value=value,
+                slave=self.slaveID)
+
+    def get_grasp_force(self):
+        with self.lock:
+            response = self.client.read_holding_registers(
+                address=self.grasp_force_register,
+                count=1,
+                slave=self.slaveID)
+        if hasattr(response, "isError") and response.isError():
+            raise RuntimeError(f"grasp-force read failed: {response}")
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid grasp-force response: {response}")
+        return int(response.registers[0])
+
+    def set_grasp_action(self, enabled: bool):
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_action_register,
+                value=1 if enabled else 0,
+                slave=self.slaveID)
+
+    def set_grasp_mode(self, mode: int):
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_mode_register,
+                value=int(mode),
+                slave=self.slaveID)
+
+    def set_grasp_hold_positions(self, hold_mask: List[int]):
+        if len(hold_mask) != 12:
+            raise ValueError("DG-3F-M grasp hold mask must contain 12 values")
+        values = [1 if int(value) else 0 for value in hold_mask]
+        with self.lock:
+            return self.client.write_registers(
+                address=self.grasp_hold_position_register,
+                values=values,
+                slave=self.slaveID)
+
     def get_pgain(self):
         if self.dummy:
             rclpy.Node.get_logger().info(rclpy.Node.get_name() +
@@ -232,10 +293,7 @@ class Communication:
         if (mode == 0):
             self.grasp(False)
         else:
-            self.client.write_register(address=Delto3FHoldingRegisters.GRASP_MODE.value,
-                                       value=mode,
-                                       slave=self.slaveID)
-
+            self.set_grasp_mode(mode)
             self.grasp(True)
 
     def get_grasp_mode(self):
@@ -248,11 +306,7 @@ class Communication:
         return mode
 
     def grasp(self, isGrasp: bool):
-        with self.lock:
-            print("Grasp", isGrasp)
-            self.client.write_coil(address=Delto3FCoils.GRASP.value,
-                                   value=isGrasp,
-                                   slave=self.slaveID)
+        return self.set_grasp_action(isGrasp)
 
     def set_step(self, step):
 

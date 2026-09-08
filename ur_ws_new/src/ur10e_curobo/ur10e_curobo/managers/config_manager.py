@@ -95,6 +95,9 @@ class ConfigManager:
         self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
         self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
+        self._node.declare_parameter("planner.approach_alignment_enabled", self.cfg.planner.approach_alignment_enabled)
+        self._node.declare_parameter("planner.approach_alignment_extra_m", self.cfg.planner.approach_alignment_extra_m)
+        self._node.declare_parameter("planner.direct_approach_cart_waypoints", self.cfg.planner.direct_approach_cart_waypoints)
         self._node.declare_parameter("planner.direct_final_joint_fallback_max_delta_deg", self.cfg.planner.direct_final_joint_fallback_max_delta_deg)
         self._node.declare_parameter("planner.strict_final_cartesian_only", self.cfg.planner.strict_final_cartesian_only)
         self._node.declare_parameter("planner.low_left_standoff_lateral", self.cfg.planner.low_left_standoff_lateral)
@@ -116,6 +119,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.mid_center_final_depth_offset", self.cfg.planner.mid_center_final_depth_offset)
         self._node.declare_parameter("planner.mid_center_final_z_offset", self.cfg.planner.mid_center_final_z_offset)
         self._node.declare_parameter("planner.closure_center_offset_tcp_m", self.cfg.planner.closure_center_offset_tcp_m)
+        self._node.declare_parameter("planner.envelop_closure_center_offset_tcp_m", self.cfg.planner.envelop_closure_center_offset_tcp_m)
         self._node.declare_parameter("planner.grasp_visual_to_force_map", self.cfg.planner.grasp_visual_to_force_map)
         self._node.declare_parameter("planner.phase4_safe_final_yaw_enabled", self.cfg.planner.phase4_safe_final_yaw_enabled)
         self._node.declare_parameter("planner.phase4_safe_final_yaw_max_deg", self.cfg.planner.phase4_safe_final_yaw_max_deg)
@@ -221,6 +225,9 @@ class ConfigManager:
         self.cfg.planner.direct_branch_retry_min_dist = float(self._node.get_parameter("planner.direct_branch_retry_min_dist").value)
         self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
         self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
+        self.cfg.planner.approach_alignment_enabled = bool(self._node.get_parameter("planner.approach_alignment_enabled").value)
+        self.cfg.planner.approach_alignment_extra_m = float(self._node.get_parameter("planner.approach_alignment_extra_m").value)
+        self.cfg.planner.direct_approach_cart_waypoints = int(self._node.get_parameter("planner.direct_approach_cart_waypoints").value)
         self.cfg.planner.direct_final_joint_fallback_max_delta_deg = float(self._node.get_parameter("planner.direct_final_joint_fallback_max_delta_deg").value)
         self.cfg.planner.strict_final_cartesian_only = bool(self._node.get_parameter("planner.strict_final_cartesian_only").value)
         self.cfg.planner.low_left_standoff_lateral = float(self._node.get_parameter("planner.low_left_standoff_lateral").value)
@@ -243,6 +250,8 @@ class ConfigManager:
         self.cfg.planner.mid_center_final_z_offset = float(self._node.get_parameter("planner.mid_center_final_z_offset").value)
         self.cfg.planner.closure_center_offset_tcp_m = list(
             self._node.get_parameter("planner.closure_center_offset_tcp_m").value)
+        self.cfg.planner.envelop_closure_center_offset_tcp_m = list(
+            self._node.get_parameter("planner.envelop_closure_center_offset_tcp_m").value)
         self.cfg.planner.grasp_visual_to_force_map = list(
             self._node.get_parameter("planner.grasp_visual_to_force_map").value)
         self.cfg.planner.phase4_safe_final_yaw_enabled = bool(
@@ -455,6 +464,9 @@ class ConfigManager:
             "planner.direct_branch_retry_min_dist": (self.cfg.planner, "direct_branch_retry_min_dist", float),
             "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
             "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
+            "planner.approach_alignment_enabled": (self.cfg.planner, "approach_alignment_enabled", bool),
+            "planner.approach_alignment_extra_m": (self.cfg.planner, "approach_alignment_extra_m", float),
+            "planner.direct_approach_cart_waypoints": (self.cfg.planner, "direct_approach_cart_waypoints", int),
             "planner.direct_final_joint_fallback_max_delta_deg": (self.cfg.planner, "direct_final_joint_fallback_max_delta_deg", float),
             "planner.strict_final_cartesian_only": (self.cfg.planner, "strict_final_cartesian_only", bool),
             "planner.low_left_standoff_lateral": (self.cfg.planner, "low_left_standoff_lateral", float),
@@ -476,6 +488,7 @@ class ConfigManager:
             "planner.mid_center_final_depth_offset": (self.cfg.planner, "mid_center_final_depth_offset", float),
             "planner.mid_center_final_z_offset": (self.cfg.planner, "mid_center_final_z_offset", float),
             "planner.closure_center_offset_tcp_m": (self.cfg.planner, "closure_center_offset_tcp_m", list),
+            "planner.envelop_closure_center_offset_tcp_m": (self.cfg.planner, "envelop_closure_center_offset_tcp_m", list),
             "planner.grasp_visual_to_force_map": (self.cfg.planner, "grasp_visual_to_force_map", list),
             "planner.phase4_safe_final_yaw_enabled": (self.cfg.planner, "phase4_safe_final_yaw_enabled", bool),
             "planner.phase4_safe_final_yaw_max_deg": (self.cfg.planner, "phase4_safe_final_yaw_max_deg", float),
@@ -562,7 +575,7 @@ class ConfigManager:
         if rejected:
             raise ValueError("; ".join(rejected))
 
-    def set_closure_center_offsets(self, values) -> None:
+    def set_closure_center_offsets(self, values, mode="normal") -> None:
         """Apply the three tool-frame closure-centre offsets in metres."""
         if len(values) != 3:
             raise ValueError(
@@ -571,9 +584,13 @@ class ConfigManager:
             raise ValueError("closure-center offsets must be finite")
         if any(abs(float(value)) > 0.1 for value in values):
             raise ValueError("closure-center offsets must be within +/-0.1 m")
+        parameter_name = (
+            "planner.envelop_closure_center_offset_tcp_m"
+            if str(mode).lower() == "envelop"
+            else "planner.closure_center_offset_tcp_m")
         results = self._node.set_parameters([
             Parameter(
-                "planner.closure_center_offset_tcp_m",
+                parameter_name,
                 value=[float(value) for value in values])
         ])
         rejected = [result.reason for result in results if not result.successful]

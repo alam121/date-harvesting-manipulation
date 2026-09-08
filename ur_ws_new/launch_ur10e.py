@@ -185,6 +185,18 @@ def get_commands(
     yolo_weights = os.environ.get("UR10E_YOLO_WEIGHTS", "").strip()
     if yolo_weights:
         vision_flags += f" --weights {shlex.quote(yolo_weights)}"
+    yolo_confidence = os.environ.get("UR10E_YOLO_CONFIDENCE", "").strip()
+    if yolo_confidence:
+        vision_flags += f" --conf_thres {shlex.quote(yolo_confidence)}"
+    yolo_max_detections = os.environ.get("UR10E_YOLO_MAX_DETECTIONS", "").strip()
+    if yolo_max_detections:
+        vision_flags += f" --max_det {shlex.quote(yolo_max_detections)}"
+    svo_path = os.environ.get("UR10E_RAW_YOLO_SVO", "").strip()
+    video_path = os.environ.get("UR10E_RAW_YOLO_VIDEO", "").strip()
+    if svo_path:
+        vision_flags += f" --svo {shlex.quote(svo_path)}"
+    if video_path:
+        vision_flags += f" --video {shlex.quote(video_path)}"
     cmds = {
         "ur": (
             f'{ur_prefix}{profile_source} && ros2 launch ur_bringup ur_control.launch.py '
@@ -546,6 +558,44 @@ def main():
             print(f"YOLO engine not found: {model_path}", file=sys.stderr)
             sys.exit(2)
         os.environ["UR10E_YOLO_WEIGHTS"] = str(model_path)
+    confidence_tokens = [a.split("=", 1)[1] for a in args if a.startswith("conf=")]
+    if confidence_tokens:
+        try:
+            confidence = float(confidence_tokens[-1])
+        except ValueError:
+            print(f"Invalid YOLO confidence: {confidence_tokens[-1]!r}", file=sys.stderr)
+            sys.exit(2)
+        if not 0.0 < confidence <= 1.0:
+            print("YOLO confidence must be greater than 0 and at most 1", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_CONFIDENCE"] = f"{confidence:.6g}"
+    max_detection_tokens = [
+        a.split("=", 1)[1] for a in args if a.startswith("max_det=")]
+    if max_detection_tokens:
+        try:
+            max_detections = int(max_detection_tokens[-1])
+        except ValueError:
+            print(
+                f"Invalid maximum detections: {max_detection_tokens[-1]!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not 1 <= max_detections <= 100:
+            print("Maximum detections must be between 1 and 100", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_MAX_DETECTIONS"] = str(max_detections)
+    for token_prefix, env_name, allowed_suffixes in (
+        ("svo=", "UR10E_RAW_YOLO_SVO", {".svo", ".svo2"}),
+        ("video=", "UR10E_RAW_YOLO_VIDEO", {".mp4", ".avi", ".mov", ".mkv", ".m4v"}),
+    ):
+        source_tokens = [a.split("=", 1)[1] for a in args if a.startswith(token_prefix)]
+        if not source_tokens:
+            continue
+        source_path = Path(source_tokens[-1]).expanduser().resolve()
+        if not source_path.is_file() or source_path.suffix.lower() not in allowed_suffixes:
+            print(f"Raw YOLO input file is invalid: {source_path}", file=sys.stderr)
+            sys.exit(2)
+        os.environ[env_name] = str(source_path)
     hand_eye_target = "chessboard" if "chessboard" in args else "charuco"
     if any(a in args for a in ("hd1080", "1080", "1080p")):
         hand_eye_resolution = "hd1080"
@@ -555,7 +605,9 @@ def main():
         hand_eye_resolution = "qhdplus"
     args = [
         a for a in args
-        if not a.startswith("model=") and a not in (
+        if not a.startswith("model=") and not a.startswith("conf=")
+        and not a.startswith("max_det=") and not a.startswith("svo=")
+        and not a.startswith("video=") and a not in (
             "fake", "lidar", "zed_mini", "zedx_mini", "raw_yolo", "charuco", "aruco", "chessboard",
             "qhdplus", "qhd+", "4k", "hd1080", "1080", "1080p",
             "robot_old", "old_robot",

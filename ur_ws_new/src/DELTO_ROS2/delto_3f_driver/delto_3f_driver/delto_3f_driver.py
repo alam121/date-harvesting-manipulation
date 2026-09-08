@@ -47,6 +47,7 @@ class DeltoROSDriver(Node):
         self.declare_parameter('port', 10000)
         self.declare_parameter('slaveID', 1)
         self.declare_parameter('dummy', False)
+        self.declare_parameter('grasp_force', 50)
 
         self.joint_state_list = [0.0]*12
         self.current_joint_state = [0.0]*12
@@ -89,6 +90,12 @@ class DeltoROSDriver(Node):
             Int16MultiArray, 'gripper/write_register', self.write_register_callback, qos_profile=qos_profile)
         self.grasp_mode_sub = self.create_subscription(
             Int32, 'gripper/grasp_mode', callback=self.grasp_mode_callback, qos_profile=qos_profile)
+        self.grasp_force_sub = self.create_subscription(
+            Int32, 'gripper/set_grasp_force',
+            callback=self.grasp_force_callback, qos_profile=qos_profile)
+        self.holding_control_sub = self.create_subscription(
+            Int16MultiArray, 'gripper/holding_control',
+            callback=self.holding_control_callback, qos_profile=qos_profile)
         self.target_joint_sub = self.create_subscription(
             Float32MultiArray, 'gripper/target_joint', callback=self.target_joint_callback, qos_profile=qos_profile)
             
@@ -104,7 +111,12 @@ class DeltoROSDriver(Node):
             1/self.feedback_read_rate, self.read_joint_callback)
             
             # Start the force reading timer
-        self.force_timer = self.create_timer(0.5, self.publish_force_data)
+        # Publish the motor-current-derived contact channels at the physical
+        # feedback rate.  The previous 2 Hz stream was too slow to observe a
+        # 0.5 s closing motion and caused the grasp classifier to use stale
+        # samples.
+        self.force_timer = self.create_timer(
+            1.0 / self.feedback_read_rate, self.publish_force_data)
         
         self.fixed_joint_sub = self.create_subscription(
             Int16MultiArray, 'gripper/fixed_joint', self.fixed_joint_callback, qos_profile=qos_profile)
@@ -204,10 +216,82 @@ class DeltoROSDriver(Node):
                     self.get_logger().error(f"DG-3F-M control mode start failed: {response}")
                 else:
                     self.get_logger().info("DG-3F-M control mode started")
+                self._apply_grasp_force(
+                    int(self.get_parameter('grasp_force').value))
             except Exception as e:
                 self.get_logger().warn(f"Could not start DG-3F-M control mode: {e}")
         
         return is_connected
+
+    def _apply_grasp_force(self, value: int):
+        requested = max(0, min(200, int(value)))
+        response = self.delto_client.set_grasp_force(requested)
+        if hasattr(response, "isError") and response.isError():
+            raise RuntimeError(f"grasp-force write failed: {response}")
+        actual = self.delto_client.get_grasp_force()
+        if actual != requested:
+            raise RuntimeError(
+                f"grasp-force verification mismatch: requested={requested}, read={actual}")
+        self.get_logger().info(
+            f"DG-3F-M grasp force set to {actual} ({actual * 0.1:.1f} N)")
+
+    def grasp_force_callback(self, msg: Int32):
+        if not self.is_connected:
+            self.get_logger().error("Cannot set grasp force: connection lost")
+            return
+        try:
+            self._apply_grasp_force(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"Failed to set grasp force: {e}")
+
+    @staticmethod
+    def _checked_write(response, label):
+        if hasattr(response, "isError") and response.isError():
+            raise RuntimeError(f"{label} failed: {response}")
+
+    def holding_control_callback(self, msg: Int16MultiArray):
+        """Apply one ordered DG-3F-M hold command.
+
+        Payload: [action, mode, force_0p1N, hold_M1, ..., hold_M12].
+        A hold value of 1 locks that joint; 0 lets the grasp algorithm move it.
+        """
+        if len(msg.data) != 15:
+            self.get_logger().error(
+                f"Invalid holding control: expected 15 values, got {len(msg.data)}")
+            return
+        if not self.is_connected:
+            self.get_logger().error("Cannot set holding control: connection lost")
+            return
+        action, mode, force = (int(msg.data[0]), int(msg.data[1]), int(msg.data[2]))
+        hold_mask = [int(value) for value in msg.data[3:15]]
+        if action not in (0, 1) or mode not in (1, 2, 3, 4, 5, 6):
+            self.get_logger().error(
+                f"Invalid holding control action={action} mode={mode}")
+            return
+        try:
+            # Prevent the high-rate joint/current reads from being inserted
+            # between the ordered setup writes and GRASP_ACTION=1.
+            with self.delto_client.lock:
+                if action == 0:
+                    self._checked_write(
+                        self.delto_client.set_grasp_action(False), "grasp release")
+                    self.get_logger().info("DG-3F-M holding force released")
+                    return
+                self._checked_write(
+                    self.delto_client.set_grasp_mode(mode), "grasp mode")
+                self._checked_write(
+                    self.delto_client.set_grasp_force(force), "grasp force")
+                self._checked_write(
+                    self.delto_client.set_grasp_hold_positions(hold_mask),
+                    "grasp hold mask")
+                self._checked_write(
+                    self.delto_client.set_grasp_action(True), "grasp action")
+            self.get_logger().info(
+                f"DG-3F-M holding force active: mode={mode} "
+                f"force={max(0, min(200, force)) * 0.1:.1f}N "
+                f"free_motors={[i + 1 for i, held in enumerate(hold_mask) if not held]}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to apply holding control: {e}")
         
     # Publish joint state
     def read_joint_callback(self):
@@ -526,7 +610,12 @@ class DeltoROSDriver(Node):
         
         
     def publish_force_data(self):
-        """ Reads and publishes motor force values """
+        """Publish three motor-current-derived contact channels.
+
+        These values are estimates, not calibrated fingertip forces in N.
+        Full per-motor current feedback is also available in the ``effort``
+        field of ``/gripper/joint_states``.
+        """
         if not self.is_connected:
             self.get_logger().error("Connection lost")
             return

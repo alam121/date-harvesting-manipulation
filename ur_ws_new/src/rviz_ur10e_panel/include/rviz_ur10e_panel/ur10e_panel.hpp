@@ -87,6 +87,7 @@ private Q_SLOTS:
   void onCaptureStop();
   void onSubscribe();
   void onSubscribeMulti();
+  void onAutoHarvest();
   void onUpdateVoxel();
   void onExit();
   void onRefreshMain();
@@ -271,14 +272,20 @@ private:
   QLineEdit * x_in_, * y_in_, * z_in_;
   QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
   QSpinBox * multi_goal_count_spin_;
+  QSpinBox * auto_goal_count_spin_;
+  QCheckBox * require_final_reacquire_cb_;
   QDoubleSpinBox * low_center_depth_in_, * low_center_z_in_;
   QDoubleSpinBox * mid_center_depth_in_, * mid_center_z_in_;
   QDoubleSpinBox * low_side_depth_in_, * low_left_z_in_, * low_right_z_in_;
   QDoubleSpinBox * closure_x_in_, * closure_y_in_, * closure_z_in_;
+  QDoubleSpinBox * envelop_closure_x_in_, * envelop_closure_y_in_, * envelop_closure_z_in_;
   QCheckBox * debug_preview_cb_;
   QCheckBox * reachability_cloud_cb_;
   QCheckBox * lidar_scan_preview_cb_;
   QComboBox * camera_model_combo_;
+  QLabel * vision_inference_info_label_;
+  QDoubleSpinBox * vision_confidence_spin_;
+  QSpinBox * vision_max_detections_spin_;
   QLabel * camera_profile_label_;
   QLabel * camera_status_label_;
   QPushButton * zone_overlay_btn_;

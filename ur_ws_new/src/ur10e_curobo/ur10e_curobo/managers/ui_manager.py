@@ -163,6 +163,8 @@ class UIManager:
             pass  # handled by node.py's _ui_command_cb
         elif cmd.startswith("camera_model "):
             pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("camera_inference "):
+            pass  # handled by node.py's _ui_command_cb
         elif cmd.startswith("safe_zone_"):
             pass  # handled by node.py's _ui_command_cb
         elif cmd == "debug_world":

@@ -390,6 +390,23 @@ class LaunchDialog(QtWidgets.QDialog):
         self.raw_yolo_cb.setToolTip(
             "Show raw model boxes, masks, classes and confidence; skip depth, scoring and goal publishing."
         )
+        self.raw_source_combo = QtWidgets.QComboBox()
+        self.raw_source_combo.addItem("Live camera", "live")
+        self.raw_source_combo.addItem("ZED recording (.svo/.svo2)", "svo")
+        self.raw_source_combo.addItem("Video file (.mp4/.avi/.mov/.mkv)", "video")
+        self._set_combo_data(
+            self.raw_source_combo,
+            self.settings.value("raw_yolo_source", "live"),
+        )
+        self.raw_source_path = QtWidgets.QLineEdit(
+            self.settings.value("raw_yolo_source_path", ""))
+        self.raw_source_path.setPlaceholderText("Select an SVO or video file")
+        self.raw_source_browse = QtWidgets.QPushButton("Browse…")
+        raw_source_file_row = QtWidgets.QWidget()
+        raw_source_file_layout = QtWidgets.QHBoxLayout(raw_source_file_row)
+        raw_source_file_layout.setContentsMargins(0, 0, 0, 0)
+        raw_source_file_layout.addWidget(self.raw_source_path, 1)
+        raw_source_file_layout.addWidget(self.raw_source_browse)
         self.yolo_model_combo = QtWidgets.QComboBox()
         engine_names = sorted(path.name for path in MODEL_DIR.glob("*.engine"))
         if DEFAULT_MODEL in engine_names:
@@ -403,7 +420,24 @@ class LaunchDialog(QtWidgets.QDialog):
             saved_model = DEFAULT_MODEL
         self._set_combo_data(self.yolo_model_combo, saved_model)
         self.yolo_model_combo.setToolTip(
-            "TensorRT engine used by Raw YOLO inspection")
+            "TensorRT engine used by vision at startup, including the full "
+            "harvesting pipeline and Raw YOLO inspection")
+        self.yolo_confidence_spin = QtWidgets.QDoubleSpinBox()
+        self.yolo_confidence_spin.setRange(0.01, 1.00)
+        self.yolo_confidence_spin.setDecimals(2)
+        self.yolo_confidence_spin.setSingleStep(0.05)
+        self.yolo_confidence_spin.setValue(
+            float(self.settings.value("yolo_confidence", 0.10)))
+        self.yolo_confidence_spin.setToolTip(
+            "Minimum YOLO detection confidence. The same value is used by "
+            "Raw YOLO inspection and the full harvesting vision pipeline.")
+        self.yolo_max_detections_spin = QtWidgets.QSpinBox()
+        self.yolo_max_detections_spin.setRange(1, 100)
+        self.yolo_max_detections_spin.setValue(
+            int(self.settings.value("yolo_max_detections", 3)))
+        self.yolo_max_detections_spin.setToolTip(
+            "Maximum detections returned per YOLO inference frame. The same "
+            "limit is used by Raw YOLO and the full harvesting pipeline.")
         self.teleop_cb = QtWidgets.QCheckBox("Teleop")
         self.gui_cb = QtWidgets.QCheckBox("Desktop GUI")
         self.calibrate_cb = QtWidgets.QCheckBox("Grasp force calibration")
@@ -459,7 +493,11 @@ class LaunchDialog(QtWidgets.QDialog):
         camera_layout = QtWidgets.QFormLayout()
         camera_layout.addRow("Camera / depth", self.camera_combo)
         camera_layout.addRow("Model inspection", self.raw_yolo_cb)
+        camera_layout.addRow("Raw YOLO source", self.raw_source_combo)
+        camera_layout.addRow("Recording", raw_source_file_row)
         camera_layout.addRow("YOLO engine", self.yolo_model_combo)
+        camera_layout.addRow("YOLO confidence", self.yolo_confidence_spin)
+        camera_layout.addRow("Maximum detections", self.yolo_max_detections_spin)
         camera_box = self._group_box("Vision", camera_layout)
 
         hand_eye_layout = QtWidgets.QFormLayout()
@@ -519,6 +557,7 @@ class LaunchDialog(QtWidgets.QDialog):
             self.main_cb,
             self.vision_cb,
             self.raw_yolo_cb,
+            self.raw_source_combo,
             self.yolo_model_combo,
             self.teleop_cb,
             self.gui_cb,
@@ -531,6 +570,12 @@ class LaunchDialog(QtWidgets.QDialog):
                 widget.currentIndexChanged.connect(self.update_command)
             else:
                 widget.toggled.connect(self.update_command)
+        self.yolo_confidence_spin.valueChanged.connect(self._remember_yolo_confidence)
+        self.yolo_max_detections_spin.valueChanged.connect(
+            self._remember_yolo_max_detections)
+        self.raw_source_combo.currentIndexChanged.connect(self._sync_raw_source)
+        self.raw_source_path.textChanged.connect(self._remember_raw_source)
+        self.raw_source_browse.clicked.connect(self._browse_raw_source)
 
         self.camera_combo.currentIndexChanged.connect(self._sync_camera_choice)
         self.camera_combo.currentIndexChanged.connect(self._sync_hand_eye_resolution)
@@ -556,6 +601,7 @@ class LaunchDialog(QtWidgets.QDialog):
 
         self._sync_gripper_enabled()
         self._sync_hand_eye_resolution()
+        self._sync_raw_source()
         self.update_command()
 
     @staticmethod
@@ -623,8 +669,33 @@ class LaunchDialog(QtWidgets.QDialog):
             self.teleop_cb.setChecked(False)
             self.gui_cb.setChecked(False)
             self.calibrate_cb.setChecked(False)
+        self._sync_raw_source()
         self.update_command()
+
+    def _sync_raw_source(self):
+        source = self.raw_source_combo.currentData()
+        file_enabled = self.raw_yolo_cb.isChecked() and source != "live"
+        self.raw_source_combo.setEnabled(self.raw_yolo_cb.isChecked())
+        self.raw_source_path.setEnabled(file_enabled)
+        self.raw_source_browse.setEnabled(file_enabled)
+        self.settings.setValue("raw_yolo_source", source)
         self.update_command()
+
+    def _remember_raw_source(self):
+        self.settings.setValue("raw_yolo_source_path", self.raw_source_path.text())
+        self.update_command()
+
+    def _browse_raw_source(self):
+        source = self.raw_source_combo.currentData()
+        file_filter = (
+            "ZED recordings (*.svo *.svo2)"
+            if source == "svo" else
+            "Video files (*.mp4 *.avi *.mov *.mkv *.m4v);;All files (*)"
+        )
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Raw YOLO input", self.raw_source_path.text(), file_filter)
+        if path:
+            self.raw_source_path.setText(path)
 
     def _sync_gripper_enabled(self):
         self.gripper_profile_combo.setEnabled(self.use_gripper_cb.isChecked())
@@ -670,6 +741,15 @@ class LaunchDialog(QtWidgets.QDialog):
         self.settings.setValue("yolo_model", self.yolo_model_combo.currentData())
         self.update_command()
 
+    def _remember_yolo_confidence(self):
+        self.settings.setValue("yolo_confidence", self.yolo_confidence_spin.value())
+        self.update_command()
+
+    def _remember_yolo_max_detections(self):
+        self.settings.setValue(
+            "yolo_max_detections", self.yolo_max_detections_spin.value())
+        self.update_command()
+
     def base_args(self):
         args = [
             f"robot_{self.robot_profile_combo.currentData()}",
@@ -693,14 +773,29 @@ class LaunchDialog(QtWidgets.QDialog):
             args.append("main")
 
         camera_arg = self.selected_camera_arg()
+        if (self.raw_yolo_cb.isChecked() and
+                self.raw_source_combo.currentData() in ("svo", "video")):
+            # File playback does not depend on the currently selected live
+            # camera. Use the standard stereo code path for SVO; MP4 bypasses
+            # ZED initialization entirely.
+            camera_arg = "zedx_mini"
         if self.vision_cb.isChecked() and camera_arg is not None:
             args.append("vision")
             args.append(camera_arg)
             if self.raw_yolo_cb.isChecked():
                 args.append("raw_yolo")
-                model_name = self.yolo_model_combo.currentData()
-                if model_name:
-                    args.append(f"model={model_name}")
+                source = self.raw_source_combo.currentData()
+                source_path = self.raw_source_path.text().strip()
+                if source != "live" and source_path:
+                    args.append(f"{source}={source_path}")
+            # The selected engine applies to every vision mode. Previously it
+            # was forwarded only for Raw YOLO, causing the full harvesting
+            # pipeline to silently start with its hard-coded default engine.
+            model_name = self.yolo_model_combo.currentData()
+            if model_name:
+                args.append(f"model={model_name}")
+            args.append(f"conf={self.yolo_confidence_spin.value():.2f}")
+            args.append(f"max_det={self.yolo_max_detections_spin.value()}")
 
         if self.teleop_cb.isChecked():
             args.append("teleop")
@@ -711,7 +806,7 @@ class LaunchDialog(QtWidgets.QDialog):
         return args
 
     def update_command(self):
-        self.command_edit.setText(" ".join(["launch_ur10e"] + self.build_args()))
+        self.command_edit.setText(shlex.join(["launch_ur10e"] + self.build_args()))
 
     def copy_command(self):
         QtWidgets.QApplication.clipboard().setText(self.command_edit.text())
@@ -740,6 +835,18 @@ class LaunchDialog(QtWidgets.QDialog):
 
     def start_system(self):
         if self.raw_yolo_cb.isChecked():
+            source = self.raw_source_combo.currentData()
+            if source != "live":
+                path = Path(self.raw_source_path.text().strip()).expanduser()
+                allowed = (
+                    {".svo", ".svo2"} if source == "svo"
+                    else {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
+                )
+                if not path.is_file() or path.suffix.lower() not in allowed:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Invalid Raw YOLO Input",
+                        f"Select an existing {source.upper()} file.")
+                    return
             if self.launch_args(self.build_args()):
                 self.accept()
             return

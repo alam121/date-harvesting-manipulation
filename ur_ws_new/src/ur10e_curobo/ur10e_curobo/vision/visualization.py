@@ -19,12 +19,21 @@ from .scoring import estimate_fruit_radius
 class VisionVisualizer:
     """Handles all visualization for the vision node."""
 
-    def __init__(self, intrinsics: Dict[str, float], image_scale: List[float], display_scale: float = 0.6):
+    def __init__(
+        self,
+        intrinsics: Dict[str, float],
+        image_scale: List[float],
+        display_scale: float = 0.6,
+        clean_harvest_overlay: bool = False,
+    ):
         self.intrinsics = intrinsics
         self.image_scale = image_scale
         self.display_scale = display_scale
         self.show_classification_zones = SHOW_CLASSIFICATION_ZONES
         self.show_gap_debug = SHOW_GAP_DEBUG
+        # Full harvesting needs an unobstructed view of the fruit.  Raw-YOLO
+        # playback keeps the original class/confidence rendering.
+        self.clean_harvest_overlay = clean_harvest_overlay
         self._s = 1.0  # active draw scale, set per-frame in render_frame
         self.last_fingertip_verification = "NO_TARGET"
 
@@ -252,7 +261,60 @@ class VisionVisualizer:
         mask_resized = target["mask_resized"]
         Zc = target["Zc"]
 
-        # Overlay mask
+        # In the harvesting view, show the segmentation as an outline instead
+        # of tinting the fruit.  The old 45% mask + best-target heatmap made it
+        # difficult for the operator to see the actual date surface.
+        if self.clean_harvest_overlay:
+            try:
+                contours, _ = cv2.findContours(
+                    (mask_resized > 0).astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                shifted = [
+                    contour + np.asarray([[[x1, y1]]], dtype=contour.dtype)
+                    for contour in contours
+                ]
+                contour_color = (
+                    (0, 255, 255, 255) if is_best else (40, 230, 40, 255)
+                )
+                if shifted:
+                    cv2.drawContours(
+                        image, shifted, -1, contour_color,
+                        self._thick(2), cv2.LINE_AA)
+            except Exception as e:
+                print(f"[WARN] Mask contour failed: {e}")
+        else:
+            self._draw_target_mask_overlay(
+                image, target, is_best, x1, y1, x2, y2, mask_resized)
+
+        # Bounding box: yellow for the selected goal, green for other valid
+        # dates.  It is deliberately outline-only.
+        box_color = (0, 255, 255, 255) if is_best else (40, 230, 40, 255)
+        cv2.rectangle(
+            image, (x1, y1), (x2, y2), box_color,
+            self._thick(3 if is_best else 2), cv2.LINE_AA)
+
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+
+        if self.clean_harvest_overlay:
+            marker_size = self._radius(12 if is_best else 8)
+            cv2.drawMarker(
+                image, (cx, cy), box_color, cv2.MARKER_CROSS,
+                marker_size, self._thick(2), cv2.LINE_AA)
+            self._draw_external_date_label(
+                image, target, x1, y1, x2, y2, is_best, box_color)
+            return
+
+        # Detailed diagnostic overlay retained for non-harvesting consumers.
+        self._draw_detailed_target_annotations(
+            image, target, cx, cy, x1, y1, x2, y2, is_best, idx)
+
+    def _draw_target_mask_overlay(
+        self, image, target, is_best, x1, y1, x2, y2, mask_resized,
+    ) -> None:
+        """Draw the legacy diagnostic mask/heatmap overlay."""
         try:
             h_roi, w_roi = mask_resized.shape
             colored_mask = np.zeros((h_roi, w_roi, 4), dtype=np.uint8)
@@ -300,13 +362,10 @@ class VisionVisualizer:
         except Exception as e:
             print(f"[WARN] Mask overlay failed: {e}")
 
-        # Bounding box
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0, 255), self._thick(2))
-
-        # 2D centroid dot
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-
+    def _draw_detailed_target_annotations(
+        self, image, target, cx, cy, x1, y1, x2, y2, is_best, idx,
+    ) -> None:
+        """Draw the original detailed target diagnostics."""
         candidate_rank = target.get("candidate_rank")
         if is_best:
             color = (255, 0, 0, 255)
@@ -338,6 +397,40 @@ class VisionVisualizer:
             self.draw_fingertip_contacts(image, target)
 
         self._draw_target_labels(image, target, cx, cy, is_best, idx)
+
+    def _draw_external_date_label(
+        self, image, target, x1, y1, x2, y2, is_best, color,
+    ) -> None:
+        """Place a compact label outside the date box, never over the fruit."""
+        text = "SELECTED" if is_best else "DATE"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = self._font(0.55)
+        thickness = self._thick(2)
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, font, scale, thickness)
+        pad = self._radius(4)
+        image_h, image_w = image.shape[:2]
+        label_x = max(0, min(x1, image_w - text_w - 2 * pad))
+        if y1 >= text_h + baseline + 3 * pad:
+            bg_y2 = y1 - self._radius(3)
+            bg_y1 = bg_y2 - text_h - baseline - 2 * pad
+        else:
+            bg_y1 = min(image_h - text_h - baseline - 2 * pad, y2 + self._radius(3))
+            bg_y2 = bg_y1 + text_h + baseline + 2 * pad
+        bg_y1 = max(0, bg_y1)
+        bg_y2 = min(image_h - 1, bg_y2)
+        cv2.rectangle(
+            image, (label_x, bg_y1),
+            (label_x + text_w + 2 * pad, bg_y2),
+            (20, 20, 20, 255), -1)
+        cv2.rectangle(
+            image, (label_x, bg_y1),
+            (label_x + text_w + 2 * pad, bg_y2),
+            color, self._thick(1), cv2.LINE_AA)
+        text_y = min(bg_y2 - pad - baseline, image_h - baseline - 1)
+        cv2.putText(
+            image, text, (label_x + pad, text_y), font, scale,
+            color, thickness, cv2.LINE_AA)
 
     def draw_fingertip_contacts(
         self,
@@ -476,20 +569,23 @@ class VisionVisualizer:
             for index, point in enumerate((p1i, p2i), 1):
                 cv2.circle(image, point, self._radius(9), (255, 255, 0, 255),
                            self._thick(3), cv2.LINE_AA)
-                cv2.putText(image, f"R{index}", (point[0] + 5, point[1] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
-                            (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
-            cv2.putText(image, self.last_fingertip_verification,
-                        (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                        self._font(0.58), color, self._thick(2), cv2.LINE_AA)
+                if not self.clean_harvest_overlay:
+                    cv2.putText(image, f"R{index}", (point[0] + 5, point[1] - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                                (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
+            if not self.clean_harvest_overlay:
+                cv2.putText(image, self.last_fingertip_verification,
+                            (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                            self._font(0.58), color, self._thick(2), cv2.LINE_AA)
             return
 
         if len(points) != 3:
             self.last_fingertip_verification = f"NEED_2_TIPS detected={len(points)}"
-            cv2.putText(
-                image, self.last_fingertip_verification,
-                (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                self._font(0.62), (0, 165, 255, 255), self._thick(2), cv2.LINE_AA)
+            if not self.clean_harvest_overlay:
+                cv2.putText(
+                    image, self.last_fingertip_verification,
+                    (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                    self._font(0.62), (0, 165, 255, 255), self._thick(2), cv2.LINE_AA)
             return
 
         triangle = np.asarray(points, dtype=np.float32)
@@ -527,12 +623,14 @@ class VisionVisualizer:
             center = (int(round(point[0])), int(round(point[1])))
             cv2.circle(image, center, self._radius(9), (255, 255, 0, 255),
                        self._thick(3), cv2.LINE_AA)
-            cv2.putText(image, f"R{index}", (center[0] + 5, center[1] - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
-                        (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
-        cv2.putText(image, self.last_fingertip_verification,
-                    (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                    self._font(0.58), color, self._thick(2), cv2.LINE_AA)
+            if not self.clean_harvest_overlay:
+                cv2.putText(image, f"R{index}", (center[0] + 5, center[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                            (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
+        if not self.clean_harvest_overlay:
+            cv2.putText(image, self.last_fingertip_verification,
+                        (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                        self._font(0.58), color, self._thick(2), cv2.LINE_AA)
 
     def _draw_approach_arrows(
         self,

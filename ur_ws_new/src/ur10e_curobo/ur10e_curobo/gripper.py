@@ -322,6 +322,8 @@ def control_gripper(node, action: str, fruit_radius: float = None):
 
         node.classifier.start_closing()
         node.gripper_controller.run_closure_loop()
+        node.classifier.set_contact_evidence(getattr(
+            node.gripper_controller, "contact_evidence", None))
         node.classifier.mark_close_done()
         node.gripper_closed = True
         return

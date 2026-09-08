@@ -400,11 +400,11 @@ class StateManager:
     def _grasp_candidates_cb(self, msg: String) -> None:
         """Mirror Phase-3 evaluation results into the main application log."""
         if msg.data:
-            self._node.get_logger().info(msg.data)
+            self._node.get_logger().debug(msg.data)
             mapping = list(getattr(
                 self._config.cfg.planner, "grasp_visual_to_force_map", [0, 1, 2]))
             if len(mapping) == 3:
-                self._node.get_logger().info(
+                self._node.get_logger().debug(
                     "[GRASP_CHANNEL_MAP] "
                     f"visual_F1->force{int(mapping[0]) + 1} "
                     f"visual_F2->force{int(mapping[1]) + 1} "

@@ -8,7 +8,7 @@ import time
 # NOTE: Calibrate these values by running with DEBUG_FORCES=True
 #       and observing the force readings for each scenario
 # ============================================================
-DEBUG_FORCES = True  # Set True to log forces for calibration
+DEBUG_FORCES = False  # Enable temporarily only for force-template calibration
 
 # ---- Templates (tune for your dates) ----
 # Forces are POSITIVE for Delto gripper (motor current based)
@@ -69,6 +69,8 @@ class GraspOutcomeClassifier:
         self.last_target_time = 0.0     # we emulate "target quiet" using start_closing() time
         self.hold_start_t = 0.0
         self.max_stage_seen = -1
+        self.contact_evidence = None
+        self.close_done = False
 
     # ---- drive the state from your main code ----
     def start_closing(self, now: Optional[float] = None):
@@ -77,11 +79,15 @@ class GraspOutcomeClassifier:
         self.last_target_time = t       # start the "quiet" timer now
         self.hold_start_t = 0.0
         self.max_stage_seen = -1
+        self.contact_evidence = None
+        self.close_done = False
 
     def start_opening(self):
         self.phase = "IDLE"
         self.hold_start_t = 0.0
         self.max_stage_seen = -1
+        self.contact_evidence = None
+        self.close_done = False
 
     def on_force(self, forces_3: List[float]):
         """Call from your /gripper/force callback (pass first 3 channels)."""
@@ -95,12 +101,10 @@ class GraspOutcomeClassifier:
     def tick(self, now: Optional[float] = None):
         """Call from a fast ROS timer (e.g., 20–50 Hz)."""
         t = now or time.time()
-        if self.phase == "CLOSING":
-            # If we've been "closing" for long enough with no new targets fed in,
-            # consider that motion ended and start holding.
-            if (t - self.last_target_time) >= self.dead_time_thresh_s:
-                self.phase = "HOLDING"
-                self.hold_start_t = t
+        # The close controller explicitly calls mark_close_done() after its
+        # position-feedback trim and contact snapshot. Do not use elapsed time
+        # to finalize here: a slow physical close can exceed the old timeout
+        # and otherwise emit a premature result without contact evidence.
 
         if self.phase == "HOLDING":
             if (t - self.hold_start_t) >= self.hold_time_s:
@@ -112,8 +116,13 @@ class GraspOutcomeClassifier:
 
     def mark_close_done(self, now=None):
         # skip dead-time heuristic and start hold *now*
+        self.close_done = True
         self.phase = "HOLDING"
         self.hold_start_t = (now or time.time())
+
+    def set_contact_evidence(self, evidence):
+        """Attach position/current evidence from the Delto close controller."""
+        self.contact_evidence = evidence if isinstance(evidence, dict) else None
 
     # ---- decision ----
     def _finalize(self):
@@ -121,7 +130,17 @@ class GraspOutcomeClassifier:
         end_name = classify_triplet(self.last_forces)
         end_stage = STAGE[end_name]
 
-        if end_stage < self.max_stage_seen:
+        evidence = self.contact_evidence
+        if evidence and evidence.get('valid') and not evidence.get('grasp_detected'):
+            # An empty closure can generate high current at the mechanical end
+            # position.  Position obstruction plus current is authoritative.
+            label = "NO_GRAB"
+            end_name = "CLOSED_NOTHING"
+        elif evidence and evidence.get('valid') and evidence.get('grasp_detected'):
+            contact_count = int(evidence.get('contact_count', 0))
+            label = "GRABBED"
+            end_name = "PROPER" if contact_count >= 3 else "WEAK"
+        elif end_stage < self.max_stage_seen:
             label = "SLIPPED"
         elif end_stage >= STAGE["WEAK"]:
             label = "GRABBED"
@@ -143,5 +162,3 @@ class GraspOutcomeClassifier:
             if label == "GRABBED" and end_name == "PROPER":
                 print(f"[grasp] 💡 Good grab! If grip was solid, use these as PROPER template:")
                 print(f"[grasp]    PROPER = [{f[0]:.2f}, {f[1]:.2f}, {f[2]:.2f}]")
-        else:
-            print(f"[grasp] final forces={self.last_forces} → end={end_name}")

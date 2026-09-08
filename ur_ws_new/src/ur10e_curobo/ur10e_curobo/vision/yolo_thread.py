@@ -43,10 +43,12 @@ class YoloThread:
     """Background thread for YOLO inference."""
 
     def __init__(self, weights: str, img_size=640, conf_thres: float = 0.35,
+                 max_det: int = 3,
                  raw_view: bool = False, use_numpy_masks: bool = False):
         self.weights = weights
         self.img_size = img_size
         self.conf_thres = conf_thres
+        self.max_det = max(1, int(max_det))
         self.raw_view = raw_view
         self.use_numpy_masks = bool(use_numpy_masks)
 
@@ -148,7 +150,7 @@ class YoloThread:
             try:
                 self._direct_model = DirectTensorRTSegmenter(
                     self.weights, self.img_size, self.class_names, device,
-                    self.conf_thres, self._detect_class_ids, 3)
+                    self.conf_thres, self._detect_class_ids, self.max_det)
                 self._direct_decoder_enabled = True
                 print("[YoloThread] Direct TensorRT decoder ENABLED "
                       "(set UR10E_DIRECT_TRT_DECODER=0 for Ultralytics fallback).")
@@ -189,7 +191,7 @@ class YoloThread:
                         det = self._model.predict(
                             img, save=False, retina_masks=False,
                             imgsz=self.img_size, conf=self.conf_thres, iou=0.3,
-                            max_det=3, device=device, verbose=False,
+                            max_det=self.max_det, device=device, verbose=False,
                             classes=self._detect_class_ids or None)[0]
                 else:
                     det = self._model.predict(
@@ -199,7 +201,7 @@ class YoloThread:
                          imgsz=self.img_size,
                          conf=self.conf_thres,
                          iou=0.3,
-                         max_det=3,
+                         max_det=self.max_det,
                          device=device,
                          verbose=False,
                          classes=self._detect_class_ids if self._detect_class_ids else None,
@@ -225,7 +227,7 @@ class YoloThread:
                     use_numpy_masks=self.use_numpy_masks and not self.raw_view,
                 ))
             if self.raw_view:
-                raw_viz = raw_viz[:3]
+                raw_viz = raw_viz[:self.max_det]
             decode_end = time()
             speed = getattr(det, "speed", {}) or {}
             timing = {

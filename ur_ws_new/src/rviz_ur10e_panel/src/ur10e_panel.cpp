@@ -387,9 +387,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     input->setSuffix(" mm");
     return input;
   };
-  low_center_depth_in_ = make_offset_input(-5.0);
+  low_center_depth_in_ = make_offset_input(-10.0);
   low_center_z_in_ = make_offset_input(0.0);
-  mid_center_depth_in_ = make_offset_input(-5.0);
+  mid_center_depth_in_ = make_offset_input(-10.0);
   mid_center_z_in_ = make_offset_input(0.0);
   low_side_depth_in_ = make_offset_input(0.0);
   low_left_z_in_ = make_offset_input(20.0);
@@ -422,9 +422,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   reset_final_offsets->setToolTip(
     "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
   connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
-    low_center_depth_in_->setValue(-5.0);
+    low_center_depth_in_->setValue(-10.0);
     low_center_z_in_->setValue(0.0);
-    mid_center_depth_in_->setValue(-5.0);
+    mid_center_depth_in_->setValue(-10.0);
     mid_center_z_in_->setValue(0.0);
     low_side_depth_in_->setValue(0.0);
     low_left_z_in_->setValue(20.0);
@@ -439,40 +439,61 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * closure_group = new QGroupBox("Closure Center Offset (tool frame, mm)");
   auto * closure_layout = new QGridLayout(closure_group);
   closure_x_in_ = make_offset_input(0.0);
-  closure_y_in_ = make_offset_input(0.0);
+  closure_y_in_ = make_offset_input(5.0);
   closure_z_in_ = make_offset_input(0.0);
-  for (auto * input : {closure_x_in_, closure_y_in_, closure_z_in_}) {
+  envelop_closure_x_in_ = make_offset_input(0.0);
+  envelop_closure_y_in_ = make_offset_input(5.0);
+  envelop_closure_z_in_ = make_offset_input(0.0);
+  for (auto * input : {
+      closure_x_in_, closure_y_in_, closure_z_in_,
+      envelop_closure_x_in_, envelop_closure_y_in_, envelop_closure_z_in_}) {
     input->setDecimals(3);
   }
-  closure_layout->addWidget(new QLabel("X"), 0, 0);
-  closure_layout->addWidget(new QLabel("Y"), 0, 1);
-  closure_layout->addWidget(new QLabel("Z"), 0, 2);
-  closure_layout->addWidget(closure_x_in_, 1, 0);
-  closure_layout->addWidget(closure_y_in_, 1, 1);
-  closure_layout->addWidget(closure_z_in_, 1, 2);
-  auto * apply_closure = new QPushButton("Apply Closure Center");
+  closure_layout->addWidget(new QLabel("Mode"), 0, 0);
+  closure_layout->addWidget(new QLabel("X"), 0, 1);
+  closure_layout->addWidget(new QLabel("Y"), 0, 2);
+  closure_layout->addWidget(new QLabel("Z"), 0, 3);
+  closure_layout->addWidget(new QLabel("Normal"), 1, 0);
+  closure_layout->addWidget(closure_x_in_, 1, 1);
+  closure_layout->addWidget(closure_y_in_, 1, 2);
+  closure_layout->addWidget(closure_z_in_, 1, 3);
+  closure_layout->addWidget(new QLabel("Envelop"), 2, 0);
+  closure_layout->addWidget(envelop_closure_x_in_, 2, 1);
+  closure_layout->addWidget(envelop_closure_y_in_, 2, 2);
+  closure_layout->addWidget(envelop_closure_z_in_, 2, 3);
+  auto * apply_closure = new QPushButton("Apply Both Closure Centers");
   apply_closure->setToolTip(
     "Apply to subsequent FINAL grasps while the robot is IDLE; no immediate motion");
   connect(apply_closure, &QPushButton::clicked, this, [this]() {
-    std::ostringstream cmd;
-    cmd << std::fixed << std::setprecision(6)
-        << "set_closure_center_offsets "
+    std::ostringstream normal_cmd;
+    normal_cmd << std::fixed << std::setprecision(6)
+        << "set_closure_center_offsets normal "
         << closure_x_in_->value() / 1000.0 << " "
         << closure_y_in_->value() / 1000.0 << " "
         << closure_z_in_->value() / 1000.0;
-    publishCmd(cmd.str());
-    status_label_->setText("Closure-center offset requested for next grasp");
+    publishCmd(normal_cmd.str());
+    std::ostringstream envelop_cmd;
+    envelop_cmd << std::fixed << std::setprecision(6)
+        << "set_closure_center_offsets envelop "
+        << envelop_closure_x_in_->value() / 1000.0 << " "
+        << envelop_closure_y_in_->value() / 1000.0 << " "
+        << envelop_closure_z_in_->value() / 1000.0;
+    publishCmd(envelop_cmd.str());
+    status_label_->setText("NORMAL and ENVELOP closure centers requested");
   });
-  closure_layout->addWidget(apply_closure, 2, 0, 1, 2);
+  closure_layout->addWidget(apply_closure, 3, 0, 1, 3);
   auto * reset_closure = new QPushButton("Reset to Defaults");
   connect(reset_closure, &QPushButton::clicked, this, [this, apply_closure]() {
     closure_x_in_->setValue(0.0);
-    closure_y_in_->setValue(0.0);
+    closure_y_in_->setValue(5.0);
     closure_z_in_->setValue(0.0);
+    envelop_closure_x_in_->setValue(0.0);
+    envelop_closure_y_in_->setValue(5.0);
+    envelop_closure_z_in_->setValue(0.0);
     apply_closure->click();
     status_label_->setText("Closure-center offset reset to defaults");
   });
-  closure_layout->addWidget(reset_closure, 2, 2);
+  closure_layout->addWidget(reset_closure, 3, 3);
 
   auto * teach_closure = new QPushButton("Measure Closure Offset Suggestion");
   teach_closure->setStyleSheet(
@@ -497,13 +518,13 @@ UR10ePanel::UR10ePanel(QWidget * parent)
         "Measuring guarded suggestion... current offsets remain unchanged");
     }
   });
-  closure_layout->addWidget(teach_closure, 3, 0, 1, 3);
+  closure_layout->addWidget(teach_closure, 4, 0, 1, 4);
   auto * teach_note = new QLabel(
     "Diagnostic only. Raw goal XYZ does not include FINAL depth/Z adjustments, "
     "so suggestions are never applied automatically. Check TEACH_CLOSURE log.");
   teach_note->setWordWrap(true);
   teach_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
-  closure_layout->addWidget(teach_note, 4, 0, 1, 3);
+  closure_layout->addWidget(teach_note, 5, 0, 1, 4);
 
   // Runtime gripper grasp mode. This publishes through the same /ui_command
   // path as the other grasp settings; the motion node accepts it only in IDLE.
@@ -540,7 +561,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * mode_final_layout = new QGridLayout(mode_final_group);
   auto * normal_depth = make_offset_input(0.0);
   auto * normal_z = make_offset_input(0.0);
-  auto * envelop_depth = make_offset_input(24.0);
+  auto * envelop_depth = make_offset_input(17.0);
   auto * envelop_z = make_offset_input(5.0);
   mode_final_layout->addWidget(new QLabel("Mode"), 0, 0);
   mode_final_layout->addWidget(new QLabel("Depth"), 0, 1);
@@ -570,7 +591,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     [normal_depth, normal_z, envelop_depth, envelop_z, apply_mode_final]() {
       normal_depth->setValue(0.0);
       normal_z->setValue(0.0);
-      envelop_depth->setValue(24.0);
+      envelop_depth->setValue(17.0);
       envelop_z->setValue(5.0);
       apply_mode_final->click();
     });
@@ -689,6 +710,51 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   tabs->addTab(heat_tab, "Heat");
   tabs->addTab(gripper_joints_tab, "Grip Joints");
   tabs->addTab(settings_tab, "Settings");
+
+  auto * vision_information_group = new QGroupBox("Vision Inference");
+  auto * vision_information_layout = new QVBoxLayout(vision_information_group);
+  vision_inference_info_label_ = new QLabel(
+    "YOLO confidence: waiting for vision\nMaximum detections: waiting for vision");
+  vision_inference_info_label_->setWordWrap(true);
+  vision_inference_info_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  vision_inference_info_label_->setStyleSheet(
+    "font-family: monospace; font-size: 10pt; color: #263238; "
+    "background: #eceff1; padding: 8px; border-radius: 4px;");
+  vision_information_layout->addWidget(vision_inference_info_label_);
+
+  auto * inference_controls = new QGridLayout();
+  inference_controls->addWidget(new QLabel("Confidence"), 0, 0);
+  vision_confidence_spin_ = new QDoubleSpinBox();
+  vision_confidence_spin_->setRange(0.01, 1.0);
+  vision_confidence_spin_->setDecimals(2);
+  vision_confidence_spin_->setSingleStep(0.05);
+  vision_confidence_spin_->setValue(0.10);
+  vision_confidence_spin_->setToolTip("Minimum accepted YOLO confidence");
+  inference_controls->addWidget(vision_confidence_spin_, 0, 1);
+
+  inference_controls->addWidget(new QLabel("Maximum detections"), 1, 0);
+  vision_max_detections_spin_ = new QSpinBox();
+  vision_max_detections_spin_->setRange(1, 100);
+  vision_max_detections_spin_->setValue(3);
+  vision_max_detections_spin_->setToolTip(
+    "Maximum detections returned per inference frame");
+  inference_controls->addWidget(vision_max_detections_spin_, 1, 1);
+
+  auto * apply_inference_btn = new QPushButton("Apply Live");
+  apply_inference_btn->setStyleSheet(
+    "background-color: #00695c; color: white; font-weight: bold;");
+  apply_inference_btn->setToolTip(
+    "Apply both values to the currently running vision worker without restarting");
+  connect(apply_inference_btn, &QPushButton::clicked, this, [this]() {
+      std::ostringstream cmd;
+      cmd << "camera_inference conf=" << vision_confidence_spin_->value()
+          << " max_det=" << vision_max_detections_spin_->value();
+      publishCmd(cmd.str());
+      status_label_->setText("Applying live YOLO detection settings…");
+    });
+  inference_controls->addWidget(apply_inference_btn, 2, 0, 1, 2);
+  vision_information_layout->addLayout(inference_controls);
+  camera_tab_layout->addWidget(vision_information_group);
   settings_tab_layout->addWidget(final_offsets_group);
   settings_tab_layout->addWidget(closure_group);
   settings_tab_layout->addWidget(grasp_mode_group);
@@ -863,18 +929,60 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   motion_layout->addWidget(multi_goal_label, 5, 0);
   motion_layout->addWidget(multi_goal_count_spin_, 5, 1);
 
+  auto * auto_harvest_group = new QGroupBox("Automatic Harvest");
+  auto * auto_harvest_layout = new QGridLayout(auto_harvest_group);
+  auto * auto_goal_label = new QLabel("Goals to complete");
+  auto_goal_count_spin_ = new QSpinBox();
+  auto_goal_count_spin_->setRange(1, 10);
+  auto_goal_count_spin_->setValue(3);
+  auto_goal_count_spin_->setToolTip(
+    "Automatic harvest cycles to complete before stopping (default 3)");
+  auto * auto_harvest_btn = new QPushButton("Start Auto Harvest");
+  auto_harvest_btn->setStyleSheet(
+    "background-color: #2e7d32; color: white; font-weight: bold; "
+    "font-size: 11pt; padding: 8px;");
+  auto_harvest_btn->setToolTip(
+    "Subscribe for one stable date. If none is visible, scan the LiDAR arc, "
+    "stop on detection, reacquire while stationary, and run the full harvest cycle. "
+    "Repeats until the selected number of cycles completes. Emergency Stop aborts it.");
+  connect(
+    auto_harvest_btn, &QPushButton::clicked,
+    this, &UR10ePanel::onAutoHarvest);
+  auto_harvest_layout->addWidget(auto_goal_label, 0, 0);
+  auto_harvest_layout->addWidget(auto_goal_count_spin_, 0, 1);
+  auto_harvest_layout->addWidget(auto_harvest_btn, 1, 0, 1, 2);
+  motion_layout->addWidget(auto_harvest_group, 6, 0, 1, 2);
+
+  require_final_reacquire_cb_ = new QCheckBox("Require final-position reacquire");
+  require_final_reacquire_cb_->setChecked(false);
+  require_final_reacquire_cb_->setStyleSheet(
+    "font-weight: bold; font-size: 10pt; padding: 4px;");
+  require_final_reacquire_cb_->setToolTip(
+    "Applies to manual, queued, and automatic harvesting. At the approach pose, "
+    "require a fresh stationary date position before final insertion and grasp; "
+    "abort that goal if reacquisition fails.");
+  connect(
+    require_final_reacquire_cb_, &QCheckBox::stateChanged,
+    this, [this](int state) {
+      const bool enabled = state == Qt::Checked;
+      publishCmd(enabled ? "set_final_reacquire true" : "set_final_reacquire false");
+      status_label_->setText(
+        enabled ? "Final-position reacquire REQUIRED" : "Final-position reacquire OFF");
+    });
+  motion_layout->addWidget(require_final_reacquire_cb_, 7, 0, 1, 2);
+
   calib_result_label_ = new QLabel("—");
   calib_result_label_->setWordWrap(true);
   calib_result_label_->setStyleSheet(
     "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;");
-  motion_layout->addWidget(calib_result_label_, 6, 0, 1, 2);
+  motion_layout->addWidget(calib_result_label_, 8, 0, 1, 2);
 
   debug_preview_cb_ = new QCheckBox("Debug Plan Preview");
   debug_preview_cb_->setChecked(true);
   debug_preview_cb_->setStyleSheet("font-weight: bold; font-size: 10pt; padding: 4px;");
   debug_preview_cb_->setToolTip("Show full plan in RViz before executing");
   connect(debug_preview_cb_, &QCheckBox::stateChanged, this, &UR10ePanel::onDebugPreviewChanged);
-  motion_layout->addWidget(debug_preview_cb_, 7, 0, 1, 2);
+  motion_layout->addWidget(debug_preview_cb_, 9, 0, 1, 2);
 
   reachability_cloud_cb_ = new QCheckBox("Reachability Cloud");
   reachability_cloud_cb_->setChecked(false);
@@ -884,14 +992,14 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(
     reachability_cloud_cb_, &QCheckBox::stateChanged,
     this, &UR10ePanel::onReachabilityCloudChanged);
-  motion_layout->addWidget(reachability_cloud_cb_, 8, 0, 1, 2);
+  motion_layout->addWidget(reachability_cloud_cb_, 10, 0, 1, 2);
 
   zone_overlay_btn_ = new QPushButton("Zone Overlay: OFF");
   zone_overlay_btn_->setCheckable(true);
   zone_overlay_btn_->setStyleSheet("background-color: #607d8b; color: white; font-weight: bold;");
   zone_overlay_btn_->setToolTip("Show/hide date side-classification zones on the vision display");
   connect(zone_overlay_btn_, &QPushButton::clicked, this, &UR10ePanel::onZoneOverlayToggle);
-  motion_layout->addWidget(zone_overlay_btn_, 9, 0, 1, 2);
+  motion_layout->addWidget(zone_overlay_btn_, 11, 0, 1, 2);
 
   plan_confirm_btn_ = new QPushButton("Confirm Plan");
   plan_confirm_btn_->setStyleSheet(
@@ -899,7 +1007,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_confirm_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanConfirm);
   plan_confirm_btn_->setVisible(false);
-  motion_layout->addWidget(plan_confirm_btn_, 10, 0);
+  motion_layout->addWidget(plan_confirm_btn_, 12, 0);
 
   plan_cancel_btn_ = new QPushButton("Cancel Plan");
   plan_cancel_btn_->setStyleSheet(
@@ -907,7 +1015,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "font-size: 11pt; padding: 8px;");
   connect(plan_cancel_btn_, &QPushButton::clicked, this, &UR10ePanel::onPlanCancel);
   plan_cancel_btn_->setVisible(false);
-  motion_layout->addWidget(plan_cancel_btn_, 10, 1);
+  motion_layout->addWidget(plan_cancel_btn_, 12, 1);
 
   motion_tab_layout->addWidget(motion_group);
 
@@ -2238,6 +2346,26 @@ void UR10ePanel::onSubscribeMulti()
   const int count = multi_goal_count_spin_ ? multi_goal_count_spin_->value() : 3;
   publishCmd("subscribe_multi " + std::to_string(count));
 }
+void UR10ePanel::onAutoHarvest()
+{
+  const int count = auto_goal_count_spin_ ? auto_goal_count_spin_->value() : 3;
+  const auto reply = QMessageBox::warning(
+    this,
+    "Start Automatic Harvest",
+    QString(
+      "Run up to %1 complete automatic harvest cycles?\n\n"
+      "The robot will subscribe for a date, perform a LiDAR search when none "
+      "is visible, stop and reacquire a detected date, then execute approach, "
+      "grasp, reverse, drop-off and return without per-goal confirmation.\n\n"
+      "Keep the workspace clear and use EMERGENCY STOP to abort.").arg(count),
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (reply == QMessageBox::Yes) {
+    publishCmd("auto_harvest " + std::to_string(count));
+    status_label_->setText(
+      QString("Auto harvest requested: %1 goals").arg(count));
+  }
+}
 void UR10ePanel::onUpdateVoxel() { publishCmd("update_voxel"); }
 void UR10ePanel::onExit()
 {
@@ -2885,6 +3013,27 @@ void UR10ePanel::updateDisplay()
   }
   if (camera_status_label_ && !camera_status_text_.empty()) {
     camera_status_label_->setText(QString::fromStdString(camera_status_text_));
+  }
+  if (vision_inference_info_label_ && !camera_status_text_.empty()) {
+    const std::string confidence = lineValue(camera_status_text_, "YOLO confidence:");
+    const std::string max_detections = lineValue(camera_status_text_, "Maximum detections:");
+    vision_inference_info_label_->setText(QString::fromStdString(
+      "YOLO confidence: " + (confidence.empty() ? "—" : confidence) + "\n" +
+      "Maximum detections: " + (max_detections.empty() ? "—" : max_detections)));
+    try {
+      if (!confidence.empty() && vision_confidence_spin_ &&
+        !vision_confidence_spin_->hasFocus())
+      {
+        vision_confidence_spin_->setValue(std::stod(confidence));
+      }
+      if (!max_detections.empty() && vision_max_detections_spin_ &&
+        !vision_max_detections_spin_->hasFocus())
+      {
+        vision_max_detections_spin_->setValue(std::stoi(max_detections));
+      }
+    } catch (const std::exception &) {
+      // Keep the last valid controls if an older vision node publishes no values.
+    }
   }
 
   // Motion phase badge
