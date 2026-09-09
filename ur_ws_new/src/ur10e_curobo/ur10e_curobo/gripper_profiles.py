@@ -32,10 +32,16 @@ LAB_NORMAL_OPEN_POSITION = [
     0.3770, 0.1710, 2.0320, -0.4400,
 ]
 
+# Measured from /gripper/joint_states on 2026-09-08 with the hand confirmed
+# fully and accurately closed (median of 997 samples over 5s, 0.10deg jitter).
+# The previous values were captured before the fingers were fully shut, so the
+# hand routinely closed 5-6deg PAST its own "closed" target -- which is what
+# produced the "calibrated close not fully reached" warning on every grasp and
+# made the position-based contact test meaningless.
 LAB_NORMAL_CLOSED_POSITION = [
-    0.3300, -0.0720, 2.0370, -0.1780,
-    -1.0770, 0.0510, 1.9880, -0.0310,
-    0.4080, 0.1450, 2.1680, -0.1540,
+    0.3473, -0.0367, 1.9897, -0.0663,
+    -1.0978, 0.0401, 2.0769, -0.0663,
+    0.3944, 0.1047, 2.1101, -0.0419,
 ]
 
 # Measured physical postures for the enveloping three-finger grasp. These are

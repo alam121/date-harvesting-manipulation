@@ -294,10 +294,22 @@ class DeltoGripperController:
                 abs(self.actual_joint_effort[idx]
                     - self.close_baseline_effort[idx])
                 for idx in finger_indices)
-            span = abs(self.closed_position[joint_idx] - self.open_position[joint_idx])
-            remaining_fraction = (
-                abs(self.closed_position[joint_idx]
-                    - self.actual_joint_position[joint_idx]) / max(span, 1e-6))
+            # Signed along the closing direction: how much closing travel is
+            # LEFT. Positive means the finger stopped short of the closed
+            # posture (something is in the way -- the contact signal); negative
+            # means it closed past it, which is the opposite situation and must
+            # not look like a grasp. The previous abs() collapsed those two
+            # cases into the same number, so a finger that overshot an
+            # under-calibrated "closed" pose reported a large "remaining" value
+            # exactly as if a date were blocking it.
+            span_signed = (
+                self.closed_position[joint_idx] - self.open_position[joint_idx])
+            if abs(span_signed) < 1e-6:
+                remaining_fraction = 0.0
+            else:
+                remaining_fraction = (
+                    (self.closed_position[joint_idx]
+                     - self.actual_joint_position[joint_idx]) / span_signed)
             current_deltas.append(current_delta)
             remaining.append(remaining_fraction)
             contacts.append(
