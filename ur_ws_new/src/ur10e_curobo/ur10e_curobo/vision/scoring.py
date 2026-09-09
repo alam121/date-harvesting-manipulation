@@ -22,14 +22,22 @@ def estimate_fruit_radius(target: Dict[str, Any], fx: Optional[float] = None) ->
     Estimate fruit radius from bounding box and depth using camera geometry.
 
     Args:
-        target: dict with "bb" (x1,y1,x2,y2), "Zc" (depth in meters)
-        fx: camera focal length in pixels (optional, uses default if None)
+        target: dict with "bb" (x1,y1,x2,y2), "Zc" (depth in meters) and, for
+            targets built by _extract_target_3d, "fx" (the live focal length)
+        fx: camera focal length in pixels; overrides target["fx"] when given
 
     Returns:
         Estimated radius in meters, clamped to [FRUIT_RADIUS_MIN, FRUIT_RADIUS_MAX]
     """
     if fx is None:
-        fx = 700.0  # typical ZED camera focal length
+        # Prefer the focal length recorded on the target by _extract_target_3d.
+        # The old unconditional 700.0 fallback was silently wrong: no call site
+        # passed fx, and the real value is ~1230 at QHDPLUS, so every radius came
+        # out ~1.8x too large. That value is published on /fruit_radius for the
+        # adaptive gripper and sizes the collision spheres below.
+        fx = target.get("fx")
+    if not fx or fx <= 0.0:
+        return FRUIT_RADIUS_DEFAULT
 
     bb = target.get("bb")
     Zc = target.get("Zc", 0.5)

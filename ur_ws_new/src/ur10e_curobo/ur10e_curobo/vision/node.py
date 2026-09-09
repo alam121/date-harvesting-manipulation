@@ -33,6 +33,7 @@ from .config import (
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
     FRUIT_CAMERA_Z_MIN, FRUIT_CAMERA_Z_MAX,
+    FRUIT_SURFACE_TO_CENTER_FRACTION,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
     SHOW_FINGER_CONTACTS, FINGERTIP_CONTACT_RADIUS_M,
     FINGER_CONTACT_RADIAL_FRACTION, FINGER_CONTACT_ROTATION_SAMPLES,
@@ -61,7 +62,10 @@ DEBUG_DEPTH_SAMPLING = True
 # Periodic loop/render timing is useful for profiling but too noisy for normal
 # field operation. Enable temporarily when benchmarking perception performance.
 DEBUG_PERFORMANCE = False
-from .scoring import compute_fruit_score, compute_collision_free_direction
+from .scoring import (
+    compute_fruit_score, compute_collision_free_direction,
+    estimate_fruit_radius,
+)
 from .contact_points import estimate_three_finger_contacts
 from .yolo_thread import YoloThread
 from .visualization import VisionVisualizer
@@ -164,6 +168,13 @@ class VisionNode:
         self._mini_pts_lock = Lock()
         self._mini_pts_buffer_size: int = 7       # keep last 7 Mini depth frames
         self._latest_zed_one_ts: float = 0.0      # wall-clock time of last ZED One grab
+        # ROS time of the same grab. TF is looked up at THIS stamp rather
+        # than at 'latest', because detections are consumed one or more
+        # frames after the image they came from (YOLO runs in its own
+        # thread and results are deliberately deferred a frame when the
+        # GPU is busy). Transforming an old image with a current TF turns
+        # pipeline latency into position error whenever the arm moves.
+        self._latest_image_stamp = None           # rclpy Time of last grab
 
         # ZED X One image from ROS topic (used when --use_lidar)
         self._latest_ros_image: Optional[np.ndarray] = None
@@ -1007,6 +1018,7 @@ class VisionNode:
                         break
                     t_now = time()
                 self._latest_zed_one_ts = t_now
+                self._latest_image_stamp = self.node.get_clock().now()
                 if not use_zedx_mini_only:
                     _grab_times.append(t_now)
                     if len(_grab_times) >= 2:
@@ -1089,13 +1101,11 @@ class VisionNode:
                 # Refresh per-frame TF cache — one lookup per frame instead of
                 # one per detection (was 8+ tf_buffer.transform calls at ~20ms each).
                 try:
-                    self._cached_tf_base = _tf_stamped_to_Rt(
-                        self.tf_buffer.lookup_transform("base_link", self.cam_frame, rclpyTime()))
+                    self._cached_tf_base = self._lookup_tf_at_image("base_link")
                 except Exception:
                     pass  # keep previous cached value
                 try:
-                    self._cached_tf_grip = _tf_stamped_to_Rt(
-                        self.tf_buffer.lookup_transform("gripper_tip", self.cam_frame, rclpyTime()))
+                    self._cached_tf_grip = self._lookup_tf_at_image("gripper_tip")
                 except Exception:
                     pass
 
@@ -1598,6 +1608,38 @@ class VisionNode:
         self._publish_camera_status()
         return zed
 
+    def _image_stamp_msg(self):
+        """Stamp of the image currently being processed, for TF and headers.
+
+        Falls back to zero time ("latest available") before the first grab.
+        """
+        stamp = self._latest_image_stamp
+        return stamp.to_msg() if stamp is not None else rclpyTime().to_msg()
+
+    def _lookup_tf_at_image(self, target_frame: str):
+        """cam_frame -> target_frame at the current image's acquisition time.
+
+        Falls back to the latest available transform when the buffer cannot
+        resolve the image stamp (startup, a TF gap, or a stamp already aged out
+        of the cache). The fallback is the old behaviour, so a miss is never
+        worse than before -- it is just no longer the default.
+        """
+        stamp = self._latest_image_stamp
+        if stamp is not None:
+            try:
+                return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
+                    target_frame, self.cam_frame, stamp,
+                    timeout=rclpyDuration(seconds=0.01)))
+            except Exception:
+                _now = time()
+                if _now - getattr(self, "_last_tf_stamp_warn_t", 0.0) > 5.0:
+                    self._last_tf_stamp_warn_t = _now
+                    self.node.get_logger().warn(
+                        f"[TF] no {target_frame}<-{self.cam_frame} at image stamp; "
+                        "using latest (adds pipeline latency to position error)")
+        return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
+            target_frame, self.cam_frame, rclpyTime()))
+
     def _publish_camera_status(self) -> None:
         pub = getattr(self, "_camera_status_pub", None)
         if pub is None:
@@ -1721,7 +1763,7 @@ class VisionNode:
         if trunk_cam_pub is not None:
             cam_msg = PointStamped()
             cam_msg.header.frame_id = self.cam_frame
-            cam_msg.header.stamp = rclpyTime().to_msg()
+            cam_msg.header.stamp = self._image_stamp_msg()
             cam_msg.point.x = float(_trunk_xyz_cam[0])
             cam_msg.point.y = float(_trunk_xyz_cam[1])
             cam_msg.point.z = float(_trunk_xyz_cam[2])
@@ -1732,7 +1774,7 @@ class VisionNode:
                 _xyz_b = _R_b @ _trunk_xyz_cam + _t_b
                 pt_base = PointStamped()
                 pt_base.header.frame_id = "base_link"
-                pt_base.header.stamp = rclpyTime().to_msg()
+                pt_base.header.stamp = self._image_stamp_msg()
                 pt_base.point.x = float(_xyz_b[0])
                 pt_base.point.y = float(_xyz_b[1])
                 if X_FORWARD_Y_LATERAL:
@@ -1743,7 +1785,7 @@ class VisionNode:
             else:
                 point_msg = PointStamped()
                 point_msg.header.frame_id = self.cam_frame
-                point_msg.header.stamp = rclpyTime().to_msg()
+                point_msg.header.stamp = self._image_stamp_msg()
                 point_msg.point.x = _trunk_xyz_cam[0]
                 point_msg.point.y = _trunk_xyz_cam[1]
                 point_msg.point.z = _trunk_xyz_cam[2]
@@ -2048,15 +2090,20 @@ class VisionNode:
                 _p5, _p50, _p95, _near, _far,
                 _out_near, int(_out.shape[0]), _out_p5, _out_p50)
 
-            # X,Y: reproject from the front-depth pixels, not the full mask
-            # centroid. This prevents bunch/background mask leakage from pulling
-            # the goal inside the bunch when the date is directly in front.
-            u_c = float(np.median(uv_front[:, 0]))
-            v_c = float(np.median(uv_front[:, 1]))
-            fx_ = intrinsics["fx"]; fy_ = intrinsics["fy"]
-            cx_ = intrinsics["cx"]; cy_ = intrinsics["cy"]
-            Xc = (u_c - cx_) * Zc / fx_
-            Yc = (v_c - cy_) * Zc / fy_
+            # X,Y from the front-depth points themselves. Same point set as
+            # uv_front, so this keeps the original intent -- median over the
+            # front layer only, so bunch/background mask leakage cannot pull the
+            # goal inside the bunch when the date is directly in front.
+            #
+            # These points are already exact camera-frame coordinates, so taking
+            # their median directly is both cheaper and correct. Back-projecting
+            # median(uv_front) through the pinhole model was not: uv_front comes
+            # from project_lidar_to_image, which projects WITH the distortion
+            # coefficients (cv2.projectPoints), while the pinhole inverse below
+            # ignored them. That round-trip injected the full radial distortion
+            # error at the fruit's image position -- a few mm near the edges.
+            Xc = float(np.median(pts_front[:, 0]))
+            Yc = float(np.median(pts_front[:, 1]))
 
             if DEBUG_DEPTH_SAMPLING:
                 _now = time()
@@ -2261,10 +2308,26 @@ class VisionNode:
             else:
                 obj_confidence = getattr(obj, "confidence", 50.0) / 100.0
 
+        # ── Surface → centre ─────────────────────────────────────────────────
+        # Every branch above measured the front surface facing the camera, but
+        # the grasp goal must be the fruit CENTRE. Push back along the camera ray
+        # by a fraction of the estimated radius. Applied after the depth-range
+        # validation above so that check keeps testing the measured surface.
+        # Radius is estimated here (not from the returned dict) because the dict
+        # is built further down; the inputs it needs are bb, Zc and fx.
+        _fruit_radius = estimate_fruit_radius(
+            {"bb": (x1, y1, x2, y2), "Zc": Zc}, fx=intrinsics["fx"])
+        if FRUIT_SURFACE_TO_CENTER_FRACTION > 0.0:
+            _ray = np.array([Xc, Yc, Zc], dtype=np.float64)
+            _ray_n = float(np.linalg.norm(_ray))
+            if _ray_n > 1e-6:
+                _push = FRUIT_SURFACE_TO_CENTER_FRACTION * _fruit_radius
+                Xc, Yc, Zc = (_ray + _push * (_ray / _ray_n)).tolist()
+
         # Transform to base_link
         point_msg = PointStamped()
         point_msg.header.frame_id = self.cam_frame
-        point_msg.header.stamp = rclpyTime().to_msg()
+        point_msg.header.stamp = self._image_stamp_msg()
         point_msg.point.x = Xc
         point_msg.point.y = Yc
         point_msg.point.z = Zc
@@ -2320,6 +2383,9 @@ class VisionNode:
             return {
                 "Xc": Xc, "Yc": Yc, "Zc": Zc,
                 "bb": (x1, y1, x2, y2),
+                # Live focal length, so estimate_fruit_radius() never has to
+                # guess it. Every call site used to omit fx and silently get 700.
+                "fx": float(intrinsics["fx"]),
                 "img_width": display_resolution.width,
                 "img_height": display_resolution.height,
                 "mask_resized": mask_resized,
@@ -3198,8 +3264,7 @@ class VisionNode:
                 self._latest_goal_update_time = time()
 
             # Publish estimated fruit radius for adaptive gripper
-            from .scoring import estimate_fruit_radius
-            radius = estimate_fruit_radius(t_best)
+            radius = estimate_fruit_radius(t_best, fx=intrinsics["fx"])
             radius_msg = Float32()
             radius_msg.data = float(radius)
             self.radius_pub.publish(radius_msg)

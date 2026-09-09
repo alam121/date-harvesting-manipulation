@@ -59,10 +59,38 @@ SWITCH_THRESHOLD = 0.02  # low threshold — switch quickly to closer fruit
 # Best fruit tracking
 BEST_REUSE_THRESH = 0.08  # 8 cm positional tolerance in base_link
 
-# Collision avoidance parameters
-FRUIT_RADIUS_DEFAULT = 0.035  # default radius of a date fruit (3.5cm)
-FRUIT_RADIUS_MIN = 0.020      # minimum fruit radius (2cm)
-FRUIT_RADIUS_MAX = 0.060      # maximum fruit radius (6cm)
+# Collision avoidance parameters.
+#
+# NOTE: these are RADII, not diameters. The previous values (min 20mm radius =
+# 40mm diameter) were larger than a real date, so estimate_fruit_radius() clamped
+# every fruit to the floor and the estimate carried no information. They were
+# also masking the hardcoded fx=700 in that function, which inflated every radius
+# by fx_real/700 (~1.8x at QHDPLUS) -- the clamp hid the error.
+# Set for the harvested cultivar: 20-25mm diameter, i.e. 10.0-12.5mm radius
+# (confirmed 2026-09-09).
+#
+# MIN sits below the real range on purpose. A partially occluded date has a
+# smaller visible bbox and so estimates small; clamping it up to 8mm under-states
+# the radius, which under-states the surface->centre push below. That is the safe
+# failure direction -- the goal stops short of the centre, still inside the
+# fruit, rather than being driven out the back of it.
+#
+# MAX is the important guard. It is NOT "the largest date", it is the cap on how
+# wrong a bad bounding box is allowed to make us. Two merged detections or a
+# bbox that swallowed part of the bunch would otherwise estimate a huge radius,
+# and FRUIT_SURFACE_TO_CENTER_FRACTION would push the goal that much past the
+# surface. At 18mm the worst-case push is 12.6mm; at the old 60mm it was 42mm.
+FRUIT_RADIUS_DEFAULT = 0.011  # default radius of a date fruit (22mm diameter)
+FRUIT_RADIUS_MIN = 0.008      # floor: 16mm diameter (occluded/partial detections)
+FRUIT_RADIUS_MAX = 0.018      # ceiling: 36mm diameter (caps bad-bbox over-push)
+
+# Grasp goals must name the fruit CENTRE, but every depth backend measures the
+# front surface facing the camera. For a sphere of radius r the median depth of
+# the visible cap sits ~0.71*r in front of the centre, so the goal was
+# consistently that far short. Push the measured point back along the camera ray
+# by this fraction of the estimated radius. The trunk already gets the equivalent
+# correction (see _publish_trunk_position). Set to 0.0 to disable.
+FRUIT_SURFACE_TO_CENTER_FRACTION = 0.7
 APPROACH_CHECK_DIST = 0.20    # how far back to check for collisions (20cm)
 NUM_CANDIDATE_DIRS = 12       # number of directions to sample
 
@@ -101,6 +129,7 @@ CLASS_ZONE_LOW_RIGHT_THRESH = 0.68
 
 # Z limit in base_link frame
 Z_MAX = 1.50
+Z_STD_IDEAL = 0.005   # ideal depth std (m)
 
 # Camera frame name. The active calibration profile is selected by the launcher
 # via UR10E_CAMERA_PROFILE / UR10E_CAMERA_MODE. Explicit frame env vars remain
@@ -165,9 +194,21 @@ ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED On
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
 ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
 ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
-# Fruit-only acceptance window. This is intentionally narrower than the camera
-# depth range so nearby red gripper fingertips cannot become harvesting goals.
-FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.20"))
+# Fruit acceptance window. This used to sit at 0.20 -- 5cm above the sensor
+# floor -- purely so the gripper's red fingertips could not be detected as ripe
+# dates. The fingertips were recoloured on 2026-09-09, so that reason is gone and
+# the window now matches the ZED X Mini's usable depth range exactly: anything
+# the sensor can measure is eligible.
+#
+# This matters beyond a few extra centimetres. Hand-eye translation is ~16cm, so
+# at the moment of grasp the camera sits roughly 20-30cm from the fruit -- right
+# on the old boundary. At 0.20 the target was rejected exactly when the arm was
+# closest to it, which is why the final approach was dead-reckoned from a frozen
+# pose and why reacquire never had anything fresh to work with.
+#
+# Keep in step with ZEDMINI_DEPTH_Z_MIN: points below that are filtered out of
+# the cloud upstream anyway, so a lower value here would have no effect.
+FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.15"))
 FRUIT_CAMERA_Z_MAX = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MAX", "0.70"))
 if not 0.0 < FRUIT_CAMERA_Z_MIN < FRUIT_CAMERA_Z_MAX:
     raise ValueError(
