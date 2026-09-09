@@ -249,6 +249,11 @@ class UR10eCuroboMoveIt(Node):
         self.goal_sort_ascending = True
 
         self.latest_goal_pose = None        # [x, y, z, qw, qx, qy, qz]
+        # Identity of the PERCEPTION SAMPLE behind latest_goal_pose. The vision
+        # node deliberately preserves the goal header stamp across its 50 Hz
+        # republish timer, so a change here means a genuinely new measurement,
+        # whereas latest_goal_time below ticks on every repeat.
+        self.latest_goal_sample_ns = 0
         self.latest_goal_time = 0.0         # timestamp of last valid pos
         self.latest_fruit_radius = None     # estimated fruit radius from vision (meters)
         self.all_fruit_poses = []           # list of [x,y,z] for ALL visible fruits (not just best)
@@ -1977,6 +1982,11 @@ class UR10eCuroboMoveIt(Node):
         completed = 0
         search_round = 0
         self.stop_requested = False
+        # Cleared only here, when a batch is deliberately started. Any stop
+        # (emergency stop topic, GUI stop, keyboard) latches this; plan_and_
+        # execute's _check_stop consumes stop_requested itself, so without a
+        # latch this loop would see False again and continue to the next goal.
+        self._auto_harvest_abort = False
         self._auto_harvest_active = True
         original_preview = bool(self.cfg.planner.debug_plan_preview)
         # The RViz button confirmation authorizes this bounded automatic batch.
@@ -1992,6 +2002,7 @@ class UR10eCuroboMoveIt(Node):
                 completed < target_count
                 and getattr(self, 'running', True)
                 and not getattr(self, 'stop_requested', False)
+                and not getattr(self, '_auto_harvest_abort', False)
             ):
                 search_round += 1
                 self.goal_poses.clear()
@@ -2014,7 +2025,8 @@ class UR10eCuroboMoveIt(Node):
                         stop_when_goal_found=True,
                         return_home=True,
                     )
-                    if getattr(self, 'stop_requested', False):
+                    if (getattr(self, 'stop_requested', False)
+                            or getattr(self, '_auto_harvest_abort', False)):
                         break
                     if not found_during_scan:
                         self._destroy_auto_goal_subscription()
@@ -2051,24 +2063,73 @@ class UR10eCuroboMoveIt(Node):
                 if not self.goal_poses:
                     continue
 
-                # Execute exactly one selected target. plan_and_execute reports
-                # completed cycles separately from internal corridor retries.
-                while len(self.goal_poses) > 1:
-                    self.goal_poses.pop(-1)
+                # Queue several targets from this one detection pass when
+                # batching is on. plan_and_execute() already loops over the whole
+                # queue, and with goals still queued its smart-return path can
+                # plan straight from DROP-OFF to the next approach and skip the
+                # trip HOME entirely -- impossible before, because the queue was
+                # always emptied down to a single goal here. Each goal is still
+                # reacquired individually before its approach, so batching
+                # changes the ordering of work, not per-grasp accuracy.
+                _batch = bool(getattr(
+                    self.cfg.planner, "auto_harvest_batch_goals", False))
+                _remaining = target_count - completed
+                if _batch and _remaining > 1:
+                    _want = max(1, min(
+                        int(getattr(self.cfg.planner, "auto_harvest_max_batch", 3)),
+                        _remaining))
+                    if _want > 1:
+                        # subscribe_multi_goals() CLEARS the queue first and only
+                        # fills it synchronously when /vision/all_fruit_poses is
+                        # already populated; otherwise it falls through to an async
+                        # subscription and returns with nothing queued. Keep the
+                        # goal we already have so a batch miss degrades to the old
+                        # single-goal behaviour instead of losing the target.
+                        _fallback = list(self.goal_poses.snapshot()) if hasattr(
+                            self.goal_poses, "snapshot") else [g for g in self.goal_poses]
+                        try:
+                            goals_mod.subscribe_multi_goals(self, max_goals=_want)
+                        except Exception as exc:
+                            self.get_logger().warn(
+                                f"[AUTO_HARVEST] Batch capture raised ({exc})")
+                        if not self.goal_poses and _fallback:
+                            self._destroy_auto_goal_subscription()
+                            for g in _fallback[:1]:
+                                self.goal_poses.append(g)
+                            self.get_logger().info(
+                                "[AUTO_HARVEST] Batch capture returned nothing; "
+                                "continuing with the single detected goal")
+                    while len(self.goal_poses) > _want:
+                        self.goal_poses.pop(-1)
+                else:
+                    while len(self.goal_poses) > 1:
+                        self.goal_poses.pop(-1)
+
+                _queued = len(self.goal_poses)
                 self.get_logger().info(
-                    f"[AUTO_HARVEST] Executing goal {completed + 1}/{target_count}")
+                    f"[AUTO_HARVEST] Executing {_queued} goal(s), "
+                    f"{completed + 1}-{completed + _queued}/{target_count}")
                 # Never reuse the result of a previous execution attempt.
                 self._last_completed_harvest_cycles = 0
                 self._prep_and_execute()
+                # plan_and_execute increments this once per COMPLETED cycle, so a
+                # batch can finish several; count them all rather than assuming 1.
                 finished_now = int(getattr(
                     self, "_last_completed_harvest_cycles", 0))
                 if finished_now > 0:
-                    completed += 1
+                    completed += finished_now
                     self.get_logger().info(
-                        f"[AUTO_HARVEST] PROGRESS completed={completed}/{target_count}")
+                        f"[AUTO_HARVEST] PROGRESS completed={completed}/{target_count}"
+                        + (f" (+{finished_now} this batch)" if finished_now > 1 else ""))
                 else:
                     self.get_logger().warn(
                         "[AUTO_HARVEST] Goal did not complete; returning to discovery")
+
+                if getattr(self, '_auto_harvest_abort', False):
+                    self.get_logger().warn(
+                        "[AUTO_HARVEST] Stop requested during execution; "
+                        "aborting batch (no further goals will be started)")
+                    break
 
                 if getattr(self, "motion_phase", "IDLE") == "ERROR":
                     self.get_logger().error(
@@ -2577,6 +2638,8 @@ class UR10eCuroboMoveIt(Node):
             msg.pose.orientation.z,
         ]
         self.latest_goal_time = _time.time()
+        self.latest_goal_sample_ns = (
+            msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec)
 
         if self.goal_seed_xy is None:
             return

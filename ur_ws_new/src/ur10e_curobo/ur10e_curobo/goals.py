@@ -94,8 +94,8 @@ class ThreadSafeGoalList:
 from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import (
-    LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, VOXEL_CONFIG,
-    X_FORWARD_Y_LATERAL,
+    LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, PLAN_CFG_SCAN_PREFLIGHT,
+    VOXEL_CONFIG, X_FORWARD_Y_LATERAL,
 )
 from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
@@ -433,7 +433,14 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
         inward = rotated(-math.radians(bounded_axis_deg))
         valid = True
         direction_source = "selected_date_axis"
-        node.get_logger().debug(
+        # Promoted from debug. This axis steers the entire corridor choice, and a
+        # near-round date gives an almost arbitrary ellipse major axis: observed
+        # a ~55deg swing on a stationary fruit that flipped FROM_RIGHT_10 into
+        # FROM_LEFT_45 (branch_cost 22deg -> 67deg, straight 6cm approach -> a
+        # curved 18.6cm one, final TCP 24mm above the date) and missed. Without
+        # these numbers in the log there is no way to tell a good axis from a
+        # flipped one after the fact.
+        node.get_logger().info(
             f"[APPROACH_AXIS_SOURCE] class={class_label} "
             f"axis={axis_angle_deg:+.1f}deg applied={bounded_axis_deg:+.1f}deg "
             f"confidence={axis_confidence:.2f} stable={axis_stable} "
@@ -1045,6 +1052,18 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     states = []
     _use_cartesian_ik = (label == "FINAL" or require_cartesian) and _N_CART > 0
     if _use_cartesian_ik and _cur_ee is not None and not getattr(node, "_cuda_faulted", False):
+        # Hold the YOLO inference lock across this IK burst. plan_and_send()
+        # already does this for plan_single -- YOLO TRT and cuRobo kernels
+        # contending on the shared Jetson GPU is both slower and the documented
+        # source of device-side asserts -- but this path solved unlocked, so the
+        # per-waypoint chain (plus its branch retries) raced vision inference at
+        # ~7Hz. This is FINAL's planner and the straight approach entry's, and
+        # FINAL alone measured ~940ms per cycle. Released before the publish and
+        # wait below, so vision is never starved while the arm is moving.
+        _yolo_dm = getattr(node, 'yolo_thread', None)
+        _yolo_dm_lock = getattr(_yolo_dm, 'inference_lock', None)
+        if _yolo_dm_lock:
+            _yolo_dm_lock.acquire()
         try:
             _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             _start_quat = list(_cur_ee[3:]) if len(_cur_ee) > 3 else [1.0, 0.0, 0.0, 0.0]
@@ -1168,6 +1187,9 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                         f"{len(_wp_js)} waypoints, {len(states)} states")
         except Exception as _ce:
             node.get_logger().warn(f"[DIRECT] {label}: Cartesian IK path failed: {_ce}")
+        finally:
+            if _yolo_dm_lock:
+                _yolo_dm_lock.release()
 
     if not _states_built:
         if require_cartesian:
@@ -1391,8 +1413,19 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
         return False, "NO_IK_STATE"
     _yolo = getattr(node, 'yolo_thread', None)
     _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    # Split the cost: time spent waiting for the YOLO lock vs time actually
+    # inside cuRobo, and per solve. The chain runs 1 + (waypoint_count + 1)
+    # solves; a single solve_single() was measured at ~22ms on this hardware,
+    # so ~90ms is expected, while the field logs show ~900ms with vision ALREADY
+    # paused. That rules out GPU contention and points at the CUDA graph not
+    # being reused for this call shape. These numbers say which it is, and must
+    # be answered before any batching refactor -- batching 4 fast solves saves
+    # little, batching 4 slow non-graphed solves saves a lot.
+    _pf_lock_t0 = time.time()
     if _yolo_lock:
         _yolo_lock.acquire()
+    _pf_lock_ms = (time.time() - _pf_lock_t0) * 1000.0
+    _pf_solve_ms = []
     try:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1415,6 +1448,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             # nudge would have rescued, but never accepts a worse branch than
             # the manual loop would have, and the continuity/branch-switch
             # checks below still run on whatever this returns.
+            _solve_t0 = time.time()
             pos = torch.tensor([pose[:3]], dtype=torch.float32, device=dev)
             quat = torch.tensor([pose[3:]], dtype=torch.float32, device=dev)
             retract_t = torch.tensor([seed], dtype=torch.float32, device=dev)
@@ -1424,21 +1458,34 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             result = node.motion_gen.ik_solver.solve_single(
                 goal_pose, seed_config=seed_t, retract_config=retract_t)
             if not result.success.item():
+                _pf_solve_ms.append((time.time() - _solve_t0) * 1000.0)
                 return None
-            return nearest_joint_config(
+            _out = nearest_joint_config(
                 seed, result.js_solution.position.squeeze().cpu().tolist())
+            _pf_solve_ms.append((time.time() - _solve_t0) * 1000.0)
+            return _out
 
         approach_js = solve(approach_pose, start_js)
         if approach_js is None:
             return False, "APPROACH_IK"
-        approach_delta = max(
-            abs(a - b) for a, b in zip(approach_js, start_js))
+        _approach_deltas = [
+            abs(a - b) for a, b in zip(approach_js, start_js)]
+        approach_delta = max(_approach_deltas)
+        _worst_joint = _approach_deltas.index(approach_delta)
         chain_max_delta = approach_delta
         max_approach_delta = math.radians(float(getattr(
             node.cfg.planner,
             "corridor_preflight_approach_max_joint_delta_deg", 75.0)))
         if approach_delta > max_approach_delta:
-            return False, "APPROACH_BRANCH_SWITCH"
+            # Report the magnitude, not just the verdict. How far over the limit
+            # decides the remedy: a few degrees over means a nearby staging
+            # posture makes this corridor reachable, whereas a near-180deg flip
+            # means the arm is simply on the wrong side and no amount of
+            # corridor retrying will help.
+            return False, (
+                f"APPROACH_BRANCH_SWITCH(j{_worst_joint}="
+                f"{math.degrees(approach_delta):.0f}deg"
+                f">{math.degrees(max_approach_delta):.0f}deg)")
 
         previous = approach_js
         for index in range(1, waypoint_count + 2):
@@ -1450,9 +1497,14 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             candidate = solve([*xyz, *final_pose[3:]], previous)
             if candidate is None:
                 return False, f"FINAL_WAYPOINT_{index}"
-            if max(abs(a - b) for a, b in zip(
-                    candidate, previous)) > math.radians(30.0):
-                return False, f"FINAL_BRANCH_SWITCH_{index}"
+            _step_deltas = [
+                abs(a - b) for a, b in zip(candidate, previous)]
+            _step_max = max(_step_deltas)
+            if _step_max > math.radians(30.0):
+                return False, (
+                    f"FINAL_BRANCH_SWITCH_{index}"
+                    f"(j{_step_deltas.index(_step_max)}="
+                    f"{math.degrees(_step_max):.0f}deg>30deg)")
             chain_max_delta = max(
                 chain_max_delta,
                 max(abs(a - b) for a, b in zip(candidate, previous)))
@@ -1466,6 +1518,9 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
         node.get_logger().warn(f"[CORRIDOR_PREFLIGHT] IK exception: {exc}")
         return False, "IK_EXCEPTION"
     finally:
+        # Publish the breakdown on every exit path, including rejections.
+        node._corridor_preflight_lock_ms = _pf_lock_ms
+        node._corridor_preflight_solve_ms = list(_pf_solve_ms)
         if _yolo_lock:
             _yolo_lock.release()
 
@@ -2800,8 +2855,70 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
 
     _last_progress_log = 0.0   # throttle per-frame progress to once/sec
 
+    # Perception sample in effect when reacquire started. Vision is PAUSED
+    # during the approach, so node.latest_goal_pose still holds the very sample
+    # that produced the seed. Matching against it "succeeds" instantly with
+    # drift=(0,0,0) and adds no information -- observed in the field as
+    # "ACCEPTED (full 3D) after 0.0s | drift=(0,-0,0)mm". Refuse to match until
+    # vision has published a genuinely new sample. If none arrives we time out
+    # and fall back to the seed, which is the correct outcome: reacquire has
+    # nothing to say, and must not pretend otherwise.
+    _entry_sample_ns = int(getattr(node, "latest_goal_sample_ns", 0) or 0)
+    _fresh_seen = False
+    _fresh_gate_expired = False
+    # Bound on how long the freshness gate may hold us up.
+    _fresh_wait_s = min(0.6, max(0.0, float(timeout) * 0.4))
+
     _grace_extended = False
-    while time.time() - start < timeout:
+    # Absolute ceiling. `timeout` is extended by the grace period below, so it is
+    # not by itself a guarantee of progress. This one is never extended:
+    # reacquire is an optimisation and must never be able to stall a harvest.
+    _hard_deadline = start + float(timeout) + 2.0
+    while time.time() - start < timeout and time.time() < _hard_deadline:
+        # Grace period: if we have at least one reading and are about to time
+        # out, extend by 1s to wait for the next one.
+        #
+        # This check MUST run before the `continue` paths below. It used to sit
+        # after them, so it was only ever evaluated on an iteration where a new
+        # distinct matching pose arrived -- which is exactly the thing that is
+        # not happening when we are stuck at stable=1. Observed in the field:
+        # "TIMEOUT after 0.9s | stable=1/2" with the fruit 4mm from the seed,
+        # the grace never having fired.
+        if (not _grace_extended and stable_count >= 1
+                and time.time() - start >= timeout - 0.05):
+            timeout += 1.0
+            _grace_extended = True
+            if _verbose_reacq:
+                node.get_logger().info(
+                    f"[REACQ] Grace +1s: stable={stable_count}/{stable_needed} "
+                    "— waiting for one more reading")
+
+        # Freshness gate, BOUNDED. Its job is to stop us instantly matching the
+        # very sample that produced the seed (vision is paused during approach,
+        # so latest_goal_pose still holds it) -- not to block indefinitely. In
+        # "reacquire" mode the vision node runs YOLO on every 3rd frame only and
+        # has just come back from a pause, so a genuinely new sample can take a
+        # while. After _fresh_wait_s, proceed with whatever is published and say
+        # so, rather than burning the whole budget waiting.
+        if (not _fresh_seen
+                and int(getattr(node, "latest_goal_sample_ns", 0) or 0)
+                != _entry_sample_ns):
+            _fresh_seen = True
+            if _verbose_reacq:
+                node.get_logger().info(
+                    f"[REACQ] fresh perception sample after "
+                    f"{time.time() - start - DEPTH_SETTLE_S:.2f}s")
+        if not _fresh_seen:
+            if time.time() - start < _fresh_wait_s:
+                time.sleep(0.005)
+                continue
+            if not _fresh_gate_expired:
+                _fresh_gate_expired = True
+                node.get_logger().warn(
+                    f"[REACQ] no new perception sample within "
+                    f"{_fresh_wait_s:.1f}s (vision throttles to every 3rd frame "
+                    "in reacquire mode); matching against the latest available")
+
         # Check best fruit first, then fall back to all visible fruits.
         # This allows reacquire to find the target even when it isn't best-ranked
         # (e.g. another fruit is closer during the approach phase).
@@ -2934,9 +3051,13 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
             dy = (y - matched_seed[1]) * 1000
             dz = (z - matched_seed[2]) * 1000
             drift_xy = math.hypot(dx, dy)
+            # With stable_needed=1 there is only one reading, so no Z spread
+            # exists to report. Print n/a rather than "nan".
+            _zstd_txt = (
+                "n/a" if z_std != z_std else f"{z_std*1000:.1f}mm")
             _accept_msg = (
                 f"[REACQ] ACCEPTED ({match_type}) after {time.time()-start-DEPTH_SETTLE_S:.1f}s | "
-                f"count={stable_count} Z_std={z_std*1000:.1f}mm | "
+                f"count={stable_count} Z_std={_zstd_txt} | "
                 f"[{x:.3f},{y:.3f},{z:.3f}] | seed=[{matched_seed[0]:.3f},{matched_seed[1]:.3f},{matched_seed[2]:.3f}] | "
                 f"drift=({dx:.0f},{dy:.0f},{dz:.0f})mm XY={drift_xy:.0f}mm"
             )
@@ -2946,14 +3067,6 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 node.get_logger().info(_accept_msg)
             return (x, y, z)
 
-        # Grace period: if we have stable=1 and are about to time out, extend by 1s
-        if (not _grace_extended and stable_count >= 1
-                and time.time() - start >= timeout - 0.05):
-            timeout += 1.0
-            _grace_extended = True
-            if _verbose_reacq:
-                node.get_logger().info(
-                    f"[REACQ] Grace +1s: stable={stable_count}/{stable_needed} — waiting for one more reading")
         time.sleep(0.001)
 
     # Timeout — soft-accept if we have ≥3 stable readings with good Z
@@ -3492,6 +3605,42 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
     prev_dot = None
     d_prev = None
     fruit_dir = getattr(node, "fruit_direction", None)
+
+    # Only trust the vision direction if it actually belongs to THIS goal.
+    # /datefruit_direction carries the axis of whatever fruit vision currently
+    # considers best, and _direction_cb stores it as a bare vector with no
+    # association to a position -- so when several goals are queued from one
+    # detection pass, goals 2..N would silently reuse goal 1's axis and pick a
+    # corridor from the wrong fruit's orientation (observed: three goals 18cm
+    # apart all approached with inward=[-0.002,-1.000,0.000], and a misleading
+    # direction_match=1.000 because the stale axis trivially matches itself).
+    # date_tip_point is the per-fruit 3D position published with that axis, so
+    # reuse the association test the tool-axis aiming already applies. Failing
+    # it falls through to the camera-ray direction below, which is derived from
+    # this goal's own geometry.
+    if fruit_dir is not None and bool(getattr(
+            node.cfg.planner, "corridor_axis_require_goal_match", True)):
+        _tip = getattr(node, "date_tip_point", None)
+        _tip_age = time.time() - float(getattr(node, "date_tip_time", 0.0) or 0.0)
+        # Deliberately tighter than tool_axis_tip_max_goal_distance_m (80mm):
+        # that limit answers "is the tip close enough to aim with", whereas this
+        # answers "is this the SAME fruit". subscribe_multi_goals treats
+        # detections >=5cm apart as separate fruits, so use the same standard --
+        # at 80mm a neighbouring date 54mm away would still lend its axis.
+        _max_gap = float(getattr(
+            node.cfg.planner, "corridor_axis_max_goal_distance_m", 0.05))
+        _max_age = float(getattr(
+            node.cfg.planner, "corridor_axis_max_age_s", 2.0))
+        _gap = math.dist(list(_tip), [x, y, z]) if _tip is not None else float("inf")
+        if _tip is None or _gap > _max_gap or _tip_age > _max_age:
+            _why = ("no tip" if _tip is None
+                    else (f"tip {_gap*1000:.0f}mm from goal (limit {_max_gap*1000:.0f}mm)"
+                          if _gap > _max_gap else f"tip {_tip_age:.1f}s old"))
+            node.get_logger().info(
+                f"[CORRIDOR_AXIS] vision axis not associated with this goal "
+                f"({_why}); using goal-local camera-ray direction instead")
+            fruit_dir = None
+
     if fruit_dir is not None:
         d_dir = np.array(fruit_dir, dtype=float)
         n_dir = np.linalg.norm(d_dir)
@@ -3619,6 +3768,11 @@ def plan_and_execute(node):
             node.get_logger().warn("STOP requested — aborting immediately.")
             publish_stop_trajectory(node)
             node.goal_poses.clear()
+            # Latch before consuming: clearing these two flags is what let an
+            # AUTO-HARVEST batch resume after a stop, because the outer loop
+            # re-reads stop_requested and sees False. The latch survives until a
+            # new batch is deliberately started.
+            node._auto_harvest_abort = True
             node.stop_requested = False
             node._stop_was_requested = False
             unlock_target(node)
@@ -3659,6 +3813,7 @@ def plan_and_execute(node):
             node._slip_retry_approach = None
             node._slip_retry_fruit_radius = None
         x,y,z = goal[:3]
+
         _tip_anchored_final_grasp = None
         _tip_anchor = None
         _tip_candidate = getattr(node, "date_tip_point", None)
@@ -3685,6 +3840,26 @@ def plan_and_execute(node):
         _frozen_retry_tip = (
             getattr(node, "_corridor_retry_tip_anchor", None)
             if _same_corridor_goal else None)
+        # Age of the frozen snapshot, measured from the VISION timestamp of the
+        # reading that was frozen -- so it counts both how stale that reading
+        # already was and how long corridor retrying has taken since. Missing
+        # timestamp (0.0) yields a huge age and is therefore rejected, which is
+        # the safe direction: fall back to the calibrated corridor grasp.
+        _frozen_tip_max_age = float(getattr(
+            node.cfg.planner, "tool_axis_tip_frozen_max_age_s", 2.0))
+        _frozen_tip_age = time.time() - float(
+            getattr(node, "_corridor_retry_tip_time", 0.0) or 0.0)
+        _frozen_tip_fresh = (
+            _frozen_retry_tip is not None
+            and _frozen_tip_age <= _frozen_tip_max_age)
+        if (_frozen_retry_tip is not None and not _frozen_tip_fresh):
+            node.get_logger().warn(
+                f"[TOOL_AXIS_AIM] frozen snapshot {_frozen_tip_age:.1f}s old "
+                f"(limit {_frozen_tip_max_age:.1f}s); discarding it and "
+                "aiming at the detected date centre instead")
+            _frozen_retry_tip = None
+            node._corridor_retry_tip_anchor = None
+            node._corridor_retry_tip_time = 0.0
         node._active_tool_axis_result = "NO_TIP"
         node._active_tool_axis_reason = "NO_TIP_AVAILABLE"
         node._active_tool_axis_tip_age_s = (
@@ -3705,10 +3880,21 @@ def plan_and_execute(node):
             _tip_anchor = np.asarray(_tip_candidate, dtype=float)
             node._active_tool_axis_result = "DATE_TIP_ACCEPTED"
             node._active_tool_axis_reason = "STABLE"
-        elif _tip_aim_enabled and _frozen_retry_tip is not None:
+        elif (_tip_aim_enabled and _frozen_retry_tip is not None
+              and math.dist(list(_frozen_retry_tip), [x, y, z])
+              <= _tip_max_goal_distance):
             # Corridor preflight retries intentionally keep the same frozen
             # perception snapshot. Do not call that snapshot stale and claim a
             # calibrated fallback while subsequently restoring and using it.
+            #
+            # The distance guard above is NOT optional, even though this is the
+            # "same goal" path: the branch used to restore the snapshot
+            # unconditionally, so a tip sitting well off the goal was accepted
+            # and pulled the grasp point with it. Observed in a batch run: a tip
+            # 46.5mm off moved goal 1's grasp 42.8mm, landing 13.5mm from goal 2
+            # -- two queued goals (52.6mm apart, so legitimately distinct) ended
+            # up grasping the same date. Aim correction must never exceed what
+            # keeps goals separable.
             _tip_anchor = np.asarray(_frozen_retry_tip, dtype=float)
             _tip_goal_match = math.dist(_tip_anchor.tolist(), [x, y, z])
             node._active_tool_axis_result = "DATE_TIP_FROZEN_RETRY"
@@ -3746,18 +3932,31 @@ def plan_and_execute(node):
             node._corridor_roll_disabled = set()
             node._corridor_retry_goal = list(goal[:3])
             node._corridor_retry_tip_anchor = None
+            node._corridor_retry_tip_time = 0.0
+            node._corridor_preflight_cache = {}
+            node._corridor_preflight_cache_start = None
             node._corridor_tip_fallback_active = False
             node._corridor_forced_label = None
             node._corridor_pair_eval = None
         if _tip_anchor is not None:
             node._corridor_retry_tip_anchor = _tip_anchor.tolist()
-        elif _same_corridor_goal:
-            _saved_tip_anchor = getattr(
-                node, "_corridor_retry_tip_anchor", None)
-            if _saved_tip_anchor is not None:
-                _tip_anchor = np.asarray(_saved_tip_anchor, dtype=float)
-                _tip_goal_match = math.dist(
-                    _tip_anchor.tolist(), [x, y, z])
+            # Stamp the snapshot with the vision time of the reading behind it,
+            # so later retries can tell how old it has become.
+            node._corridor_retry_tip_time = float(
+                getattr(node, "date_tip_time", 0.0) or 0.0)
+        elif _same_corridor_goal and _frozen_retry_tip is not None:
+            # Silent restore path. This used to resurrect the snapshot with no
+            # distance OR age check -- even right after the chain above logged
+            # "fallback=CALIBRATED_CORRIDOR", which made that message untrue.
+            # Apply the same two gates the FROZEN_RETRY branch applies.
+            _saved_match = math.dist(list(_frozen_retry_tip), [x, y, z])
+            if _saved_match <= _tip_max_goal_distance:
+                _tip_anchor = np.asarray(_frozen_retry_tip, dtype=float)
+                _tip_goal_match = _saved_match
+                node.get_logger().info(
+                    "[TOOL_AXIS_AIM] restored frozen snapshot "
+                    f"({_frozen_tip_age:.1f}s old, "
+                    f"goal_match={_saved_match * 1000.0:.1f}mm)")
         if bool(getattr(node, "_corridor_tip_fallback_active", False)):
             _tip_anchor = None
             node.get_logger().debug(
@@ -4065,7 +4264,7 @@ def plan_and_execute(node):
                         timeout=float(getattr(
                             node.cfg.planner, "reacquire_timeout_s", 1.0)),
                         radius=0.03,
-                        z_tolerance=0.002,
+                        z_tolerance=0.010,  # see the after-approach call site
                         depth_settle_s=float(getattr(
                             node.cfg.planner, "reacquire_depth_settle_s", 0.10)),
                         stable_needed=int(getattr(
@@ -4655,19 +4854,76 @@ def plan_and_execute(node):
             _pf_final = [*_pf_tcp, *orientation]
             _pf_start = _valid_joint_positions()
             _pf_ik_t0 = time.time()
-            _pf_ok, _pf_reason = _preflight_approach_final_chain(
-                node, _pf_start, approach, _pf_final,
-                waypoint_count=max(1, int(getattr(
-                    node.cfg.planner, "direct_final_cart_waypoints", 2))))
+            # The preflight result is a pure function of (start joints, approach
+            # pose, final pose) -- the arm does not move between corridor tests.
+            # The mirror-polarity evaluation tests A, then its mirror B, then
+            # re-selects A, and used to re-solve A from scratch: measured in the
+            # field as FROM_RIGHT_10 costing 1035ms and then 869ms again for a
+            # byte-identical input and an identical branch_cost=20.1deg result.
+            # Memoised per goal; the cache is dropped when the goal changes.
+            _pf_cache = getattr(node, "_corridor_preflight_cache", None)
+            if _pf_cache is None:
+                _pf_cache = {}
+                node._corridor_preflight_cache = _pf_cache
+            # Start joints are NOT part of the key. Rounding them into a key
+            # does not work on real hardware: the reported joint values jitter
+            # in the low digits even while the arm is stationary, so every
+            # lookup missed. Corridor evaluation is explicitly "without robot
+            # motion", so instead hold the start pose the cache was built
+            # against and invalidate wholesale if the arm has actually moved.
+            _pf_cache_start = getattr(node, "_corridor_preflight_cache_start", None)
+            if (_pf_cache_start is None
+                    or len(_pf_cache_start) != len(_pf_start)
+                    or max(abs(a - b) for a, b in
+                           zip(_pf_cache_start, _pf_start)) > 0.002):
+                _pf_cache.clear()
+                node._corridor_preflight_cache_start = list(_pf_start)
+            _pf_key = (
+                str(_active_corridor),
+                tuple(round(float(v), 5) for v in approach),
+                tuple(round(float(v), 5) for v in _pf_final),
+            )
+            _pf_hit = _pf_cache.get(_pf_key)
+            if _pf_hit is not None:
+                _pf_ok, _pf_reason, _pf_hit_js, _pf_hit_cost = _pf_hit
+                # Restore the two side effects the solver would have set, or the
+                # caller would execute a stale/absent IK branch.
+                node._corridor_preflight_approach_js = (
+                    list(_pf_hit_js) if _pf_hit_js is not None else None)
+                node._corridor_preflight_cost_deg = _pf_hit_cost
+                _pf_reason = f"{_pf_reason}|CACHED"
+            else:
+                _pf_ok, _pf_reason = _preflight_approach_final_chain(
+                    node, _pf_start, approach, _pf_final,
+                    waypoint_count=max(1, int(getattr(
+                        node.cfg.planner, "direct_final_cart_waypoints", 2))))
+                _pf_cached_js = getattr(
+                    node, "_corridor_preflight_approach_js", None)
+                _pf_cache[_pf_key] = (
+                    _pf_ok, _pf_reason,
+                    list(_pf_cached_js) if _pf_cached_js is not None else None,
+                    float(getattr(
+                        node, "_corridor_preflight_cost_deg", float("inf"))),
+                )
             _pf_ik_ms = (time.time() - _pf_ik_t0) * 1000.0
             _pose_compute_ms_str = (
                 f"{_pose_compute_ms:.0f}" if _pose_compute_ms is not None else "NA")
-            node.get_logger().debug(
+            # Per-corridor PASS/REJECT with reason and branch cost. This is the
+            # line that answers "would corridors 3..9 fail the same way", so
+            # promote it to info when corridor logging is enabled instead of
+            # leaving it at debug where it is invisible in field logs.
+            _pf_log = (
+                node.get_logger().info
+                if getattr(node.cfg.planner, "log_corridor_candidates", False)
+                else node.get_logger().debug)
+            _pf_log(
                 f"[CORRIDOR_PREFLIGHT] candidate={_active_corridor} "
                 f"result={'PASS' if _pf_ok else 'REJECT'} reason={_pf_reason} "
                 f"branch_cost={getattr(node, '_corridor_preflight_cost_deg', float('inf')):.1f}deg "
                 f"pose_compute_ms={_pose_compute_ms_str} "
                 f"ik_preflight_ms={_pf_ik_ms:.0f} "
+                f"lock_wait_ms={getattr(node, '_corridor_preflight_lock_ms', 0.0):.0f} "
+                f"solves_ms={[round(v) for v in getattr(node, '_corridor_preflight_solve_ms', [])]} "
                 "stage=BEFORE_CONFIRM motion=NONE")
 
             # A fitted ellipse provides an undirected major axis: LEFT and
@@ -4703,8 +4959,13 @@ def plan_and_execute(node):
                         f"result={'PASS' if _pf_ok else 'REJECT'}; "
                         f"testing_mirror={_mirror} motion=NONE")
                     node.goal_poses.insert(0, goal)
-                    _vision_resume()
-                    unlock_target(node)
+                    # Keep the lock and leave vision paused, exactly as the
+                    # bounded corridor-retry paths below do. The arm does not
+                    # move for a mirror test and no fresh detection is consumed,
+                    # so resuming vision only to re-pause it next iteration adds
+                    # a handshake per hop and puts YOLO/ZED depth back on the
+                    # GPU while cuRobo is solving.
+                    node._corridor_retry_keep_lock = True
                     continue
                 if (not _pair.get("done", False)
                         and _active_corridor == _pair.get("mirror_label")):
@@ -4730,8 +4991,9 @@ def plan_and_execute(node):
                             f"{_mirror_cost:.1f}deg selected={_selected}; "
                             "reloading selected branch motion=NONE")
                         node.goal_poses.insert(0, goal)
-                        _vision_resume()
-                        unlock_target(node)
+                        # Same convention as above: reloading the already
+                        # selected branch involves no robot motion.
+                        node._corridor_retry_keep_lock = True
                         continue
                     else:
                         # Both failed; fall through to the existing bounded
@@ -5381,7 +5643,12 @@ def plan_and_execute(node):
                 timeout=float(getattr(
                     node.cfg.planner, "reacquire_timeout_s", 1.0)),
                 radius=0.03,          # 3cm — tighter than default 4cm
-                z_tolerance=0.002,    # 2mm
+                # 10mm, not 2mm. The old gate sat below this function's own
+                # noise floor: it accepts Z_STABLE_THRESH=12mm of scatter when
+                # calling a reading "stable", then demanded 2mm agreement with
+                # the seed. Field logs showed the date at dz=4mm and dz=8mm from
+                # the seed -- good measurements, both outside a 2mm gate.
+                z_tolerance=0.010,
                 depth_settle_s=float(getattr(
                     node.cfg.planner, "reacquire_depth_settle_s", 0.10)),
                 stable_needed=int(getattr(
@@ -6406,15 +6673,29 @@ def plan_and_execute(node):
                     next_orient = minimize_rotation_orientation(cur_quat, next_quat)
                     next_approach = [nax, nay, naz, *next_orient]
 
-                    # Test plan (don't execute yet, just check feasibility)
-                    plan_cfg = PLAN_CFG_DEFAULT
+                    # Test plan (don't execute yet, just check feasibility).
+                    # The resulting trajectory is ALWAYS discarded: this asks only
+                    # "could the arm get near the next goal without going HOME
+                    # first", and the real approach the main loop plans afterwards
+                    # goes to a different pose (corridor selection, tool-axis
+                    # aiming and the staging offset all still to be applied). So
+                    # use the cheap reachability config rather than the polished
+                    # one -- PLAN_CFG_SCAN_PREFLIGHT drops the finetune smoothing
+                    # pass, which is the expensive part and is pure waste for a
+                    # yes/no answer. Hold the YOLO lock for it as every other
+                    # cuRobo call on this shared GPU does.
+                    plan_cfg = PLAN_CFG_SCAN_PREFLIGHT
                     lock = getattr(node, '_planning_lock', None)
+                    _yolo_t = getattr(node, 'yolo_thread', None)
+                    _yolo_l = getattr(_yolo_t, 'inference_lock', None)
+                    if _yolo_l: _yolo_l.acquire()
                     if lock: lock.acquire()
                     try:
                         test_res = node.motion_gen.plan_single(
                             next_start, Pose.from_list(next_approach), plan_cfg)
                     finally:
                         if lock: lock.release()
+                        if _yolo_l: _yolo_l.release()
 
                     if test_res.success:
                         node.get_logger().info(
@@ -6510,6 +6791,7 @@ def plan_and_execute(node):
                 "total_s": round(float(_cycle_total), 3),
                 "status": "COMPLETED",
             })
+
         node._last_completed_harvest_cycles += 1
 
         # Release target lock and reset tracking state for next goal

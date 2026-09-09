@@ -521,6 +521,16 @@ class Planner:
     goal_recovery_stage_marker_first: bool = True      # when marker/current orientations differ, try requested marker-orientation standoff first
     safe_zone_path_margin_m: float = 0.01              # keep manual Cartesian TCP samples this far inside the safe-zone box
     dynamic_goal_ordering: bool = False                # False: run the queue strictly in insertion order; True: choose next queued goal by current IK reachability
+    # AUTO-HARVEST batching. The loop used to discover ONE goal, execute it, and
+    # re-discover from scratch every cycle -- paying the discovery/settle wait each
+    # time, and leaving the goal queue empty so the "more goals queued" smart-return
+    # path (which skips the trip HOME when the next approach is directly reachable)
+    # could never trigger. Batching queues several targets from one detection pass
+    # instead. The per-goal reacquire still runs before each approach, so targets
+    # are refreshed as the bunch shifts after a pick -- the batch fixes the ORDER
+    # of work, not the accuracy of any individual grasp.
+    auto_harvest_batch_goals: bool = True
+    auto_harvest_max_batch: int = 3                    # targets queued per discovery pass
     goal_reachability_skip_delta_deg: float = 100.0    # postpone/skip queued goals above this nearest-IK delta
     goal_recovery_max_ik_delta_deg: float = 100.0      # do not grind staging/posture recovery above this nearest-IK delta
     shortest_ik_plan_max_delta_deg: float = 80.0       # fail fast when nearest IK branch is too far for short-goal planning
@@ -558,8 +568,25 @@ class Planner:
     # Sphere-surface clearance, not physical caliper distance. A modeled 41.8mm
     # has produced a real UR clamping stop, so all trajectories must stay above 45mm.
     clamp_safety_threshold_mm: float = 45.0
-    very_low_preflight_min_clearance_mm: float = 50.0
-    very_low_preflight_early_accept_mm: float = 50.0
+    # Lowered 50.0 -> 45.0 (2026-09-09). A VERY_LOW goal was aborted outright at
+    # best=48.3mm of 33 branches: above the 45mm clamp floor, but under the old
+    # 50mm preflight bar, so no grasp was attempted at all.
+    # This is now equal to clamp_safety_threshold_mm, i.e. no preflight margin
+    # above the trajectory-level guard -- a branch admitted at 45-46mm here can
+    # still be rejected later by the per-waypoint clamp check in motions.py.
+    # very_low_preflight_early_accept_mm stays at 50.0 on purpose: the search
+    # still stops early on a >=50mm branch and still prefers the safest branch
+    # within very_low_clearance_window_mm, so this relaxes the FLOOR, not the
+    # preference.
+    very_low_preflight_min_clearance_mm: float = 45.0
+    # Short-circuit the branch search at this clearance. Effective value is
+    # max(min_clearance, this). At 50.0 with a 45.0 floor, a goal whose best
+    # branch is e.g. 48.3mm never early-accepts, so the search runs to
+    # exhaustion over every pitch x wrist x seed before picking a winner --
+    # measured as a 12s stall between plan confirmation and APPROACH_ALIGNMENT.
+    # 48.0 stops on the first branch comfortably above the floor while still
+    # preferring high clearance and never going below very_low_preflight_min.
+    very_low_preflight_early_accept_mm: float = 48.0
     very_low_preflight_preferred_pitch_deg: float = 0.0   # straight-on approach tried first
     very_low_preflight_second_pitch_deg: float = -30.0
     very_low_preflight_preferred_wrist_deg: float = 0.0
@@ -707,16 +734,58 @@ class Planner:
     # IK per goal. Only treat polarity as ambiguous when the two direction_match
     # scores are within this margin of each other.
     corridor_polarity_margin: float = 0.10
-    log_corridor_candidates: bool = False
+    # Max single-joint change from the current state that a corridor's approach
+    # IK may require. Above this the solution is a wrist/elbow flip, which would
+    # swing the arm through the canopy -- rejected as APPROACH_BRANCH_SWITCH.
+    # Previously only a getattr default in goals.py, so it could not be seen or
+    # tuned. Value unchanged; raise it only with very good reason.
+    corridor_preflight_approach_max_joint_delta_deg: float = 75.0
+    # Diagnostic run (2026-09-09): emit the ranked corridor list AND promote the
+    # per-corridor [CORRIDOR_PREFLIGHT] PASS/REJECT line (reason + branch_cost)
+    # from debug to info. Set back to False once the corridor question is
+    # settled -- it is several lines per goal.
+    log_corridor_candidates: bool = True
     tool_axis_tip_aim_enabled: bool = True
     tool_axis_tip_max_age_s: float = 0.50
     # The detected tip is naturally displaced from the fruit centroid.  Keep
     # the proven 80 mm association gate; 15 mm rejected valid date tips and
     # forced a corridor-only grasp that contacted with one finger first.
     tool_axis_tip_max_goal_distance_m: float = 0.08
+    # Corridor selection uses the vision date axis (/datefruit_direction), which
+    # is published for whatever fruit vision currently rates best and is stored
+    # without any link to a position. With several goals queued from one
+    # detection pass that let goals 2..N inherit goal 1's axis. Require the axis
+    # to be associated with the goal being approached -- same tip-to-goal test
+    # the tool-axis aiming uses -- and fall back to the goal's own camera-ray
+    # direction when it isn't. False restores the old unconditional behaviour.
+    corridor_axis_require_goal_match: bool = True
+    corridor_axis_max_age_s: float = 2.0
+    # Matches subscribe_multi_goals' DISTINCT_DIST: detections >=5cm apart are
+    # already treated as separate fruits, so an axis whose tip sits further than
+    # this from the goal belongs to a different date. Tighter on purpose than
+    # tool_axis_tip_max_goal_distance_m, which answers a different question
+    # ("close enough to aim with", not "same fruit").
+    corridor_axis_max_goal_distance_m: float = 0.05
+    # Max age of a FROZEN_RETRY tip snapshot. Corridor preflight retries reuse
+    # the tip captured on the first attempt so corridors are compared against a
+    # fixed target -- but that snapshot had no expiry, so a tip from many
+    # seconds and several retries ago still moved the grasp point. Observed:
+    # "[CORRIDOR_AXIS] ... (tip 2.5s old); using goal-local camera-ray direction"
+    # immediately followed by "[TOOL_AXIS_AIM] source=FROZEN_RETRY
+    # goal_match=21.7mm" -- the same tip rejected as stale for corridor choice
+    # and used anyway for aiming. Age is measured from the vision timestamp of
+    # the frozen reading, so it counts both how old the reading was when frozen
+    # and how long retrying has taken since.
+    tool_axis_tip_frozen_max_age_s: float = 2.0
     tool_axis_tip_require_safe_candidate: bool = False
     tool_axis_tip_max_swing_deg: float = 45.0
-    tool_axis_tip_fallback_after_corridors: int = 2  # then retry from detected centre
+    # Corridors to try before abandoning tip-aligned search and retrying from the
+    # detected date centre. The preflight budget is 9, but at 2 the search gave
+    # up after two rejections and fell through to a STRAIGHT approach 44deg off
+    # the date axis, which closed on nothing. Raised to 5 so the ranked list is
+    # actually worked down. Revert to 2 if the extra IK time is not paying for
+    # itself -- each rejected corridor costs one preflight chain.
+    tool_axis_tip_fallback_after_corridors: int = 5  # then retry from detected centre
 
 #---------------------------------------------------------------------------------------------------------
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
@@ -790,11 +859,21 @@ class Planner:
     pre_dropoff_y_offset: float = 0.25  # legacy alias for pre_dropoff_depth_offset
 
     # === REACQUIRE ===
-    reacquire_after_approach: bool = False  # stable subscribed seed is used for normal grasps
-    reacquire_timeout_s: float = 1.0        # high-FPS vision: fail back to seed quickly
+    reacquire_after_approach: bool = True   # re-detect fruit position after reaching approach standoff
+    # 1.5s, not 1.0s. Reacquire was ~1.1s of a 22.3s harvest cycle, so latency
+    # here is not the constraint -- and both field runs timed out at 0.9s with
+    # the date already measured well inside tolerance.
+    reacquire_timeout_s: float = 1.5
     require_reacquire_before_grasp: bool = False  # allow stable-seed fallback when close-view reacquisition times out
     reacquire_depth_settle_s: float = 0.10  # brief depth/RGB synchronization settle
-    reacquire_stable_frames: int = 2        # two consistent high-FPS measurements
+    # One distinct published measurement is enough. Vision's own
+    # MIN_FRAMES_TO_SHOW=2 already requires a fruit to appear in two consecutive
+    # frames under the same ID before it is published at all, so demanding two
+    # further distinct samples here double-counts the same confirmation. Field
+    # runs consistently reached stable=1/2 and were rejected while the date sat
+    # 4-8mm from the seed. Raise again once vision publishes stable tracks at a
+    # steady rate (per-track association + filtering).
+    reacquire_stable_frames: int = 1
     slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
     subscribe_goal_min_settle_s: float = 0.25  # ignore first depth samples after Subscribe
@@ -843,7 +922,13 @@ class Gripper:
     close_feedback_trim_max_correction_rad: float = 0.1745  # 10 degrees
     close_feedback_trim_settle_s: float = 0.25
     holding_force_enabled: bool = True
-    holding_force_command: int = 50  # DG-3F-M units: 0.1 N (50 = 5 N)
+    # Squeeze applied to the three primary closing motors (M4/M7/M12) after the
+    # position close finishes -- this is what actually holds the date, since the
+    # close itself is position-controlled to the empty-closed posture and simply
+    # stops where the fruit blocks it. At 50 (5 N) dates were closing to size and
+    # then slipping. Raised to 70 (7 N); range is 0-200 (0-20 N), and too much
+    # risks crushing the fruit, so step up rather than jumping to the ceiling.
+    holding_force_command: int = 70  # DG-3F-M units: 0.1 N (70 = 7 N)
     holding_force_settle_s: float = 0.15
     holding_release_settle_s: float = 0.05
     opening_steps: int = 6
@@ -851,15 +936,33 @@ class Gripper:
     open_settle_s: float = 0.10
     open_hold_repeats: int = 3
     open_hold_interval_s: float = 0.04
-    # Non-tactile contact validation learned from the four labelled closures
-    # captured on 2026-08-30. Current values are amperes from JointState.effort.
-    # Position obstruction is measured on the largest-travel motor in each
-    # environment-specific calibrated finger posture.
+    # Non-tactile contact validation. Re-measured 2026-09-08 on the lab hand
+    # against the corrected closed posture and the signed remaining_fraction
+    # (empty close now reads ~0.00 instead of 0.15-0.43, so the position signal
+    # finally means something). Directly measured, empty vs holding one date:
+    #
+    #             remaining_fraction        max current (mA)
+    #   finger1    0.000 -> +0.155           96 -> 111
+    #   finger2    0.000 -> -0.037          150 -> 150
+    #   finger3    0.000 -> +0.206           41 ->  82
+    #
+    # POSITION is the usable signal and these are the midpoints of it. Finger 2
+    # did not contact that date at all -- it closed PAST the empty posture, hence
+    # negative -- so its bar stays high rather than being tuned to noise.
+    #
+    # CURRENT is deliberately permissive. Finger 1 moved only 15 mA on a 96 mA
+    # idle (~15%, inside noise) and finger 2 moved 0 mA, so the old 220/120/220
+    # thresholds were unreachable while finger 2's 120 sat BELOW its 150 mA
+    # empty-hold and so read as gripping while holding nothing. Contact requires
+    # current AND position, so these are set below the empty values to stop the
+    # current term vetoing a real grasp; position carries the decision. Revisit
+    # once the hold force change (5 N -> 7 N) is running, which should widen the
+    # current separation and make a real current threshold worth setting.
     nontactile_contact_validation: bool = True
     nontactile_current_delta_a: List[float] = field(
-        default_factory=lambda: [0.220, 0.120, 0.220])
+        default_factory=lambda: [0.020, 0.020, 0.020])
     nontactile_remaining_fraction: List[float] = field(
-        default_factory=lambda: [0.75, 0.55, 0.75])
+        default_factory=lambda: [0.08, 0.50, 0.10])
     nontactile_min_contact_fingers: int = 2
     nontactile_feedback_max_age_s: float = 0.30
 

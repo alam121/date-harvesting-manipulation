@@ -282,6 +282,14 @@ class StateManager:
             return
         self._node.get_logger().warn("Emergency stop!")
         self._stop_requested = True
+        # Latch a separate abort flag for batch runs. stop_requested is CONSUMED
+        # by the first handler that sees it (plan_and_execute's _check_stop
+        # clears both flags after halting), so by the time control returns to the
+        # AUTO-HARVEST loop the flag reads False again and the loop would happily
+        # discover the next goal and carry on -- an emergency stop would abort
+        # only the current goal, not the run. This latch is cleared solely when a
+        # new batch is deliberately started.
+        self._node._auto_harvest_abort = True
         # Immediately publish stop trajectory to halt the robot
         try:
             from ..motions import publish_stop_trajectory
@@ -384,7 +392,27 @@ class StateManager:
             max_spread = math.radians(float(getattr(
                 self._config.cfg.planner,
                 "approach_date_axis_max_spread_deg", 8.0)))
-            self.fruit_major_axis_angle = sum(recent) / len(recent)
+            # Unwrapping exists so the MEAN is computed correctly across the
+            # +/-90deg seam, but the unwrapped values were exported as-is and
+            # nothing ever wrapped them back. They ratchet: each new sample is
+            # unwrapped about the drifting mean, so the mean walks out of the
+            # valid axial range and never returns. Observed in the field as
+            # "axis=+209.7deg" -- meaningless for an undirected major axis --
+            # which np.clip(angle, -45, +45) in the corridor code then saturated
+            # to exactly +45deg, pinning the approach to the extreme corridor.
+            # It read as stable because the drifted samples agree with EACH
+            # OTHER, so the spread gate never fired.
+            _mean_unwrapped = sum(recent) / len(recent)
+            _mean_wrapped = (
+                (_mean_unwrapped + math.pi / 2.0) % math.pi - math.pi / 2.0)
+            # Re-anchor the stored history by the same whole-pi shift. Spread is
+            # a difference so it is unchanged, but the values stay bounded
+            # instead of growing without limit.
+            _shift = _mean_wrapped - _mean_unwrapped
+            if _shift:
+                for _i in range(len(history)):
+                    history[_i] += _shift
+            self.fruit_major_axis_angle = _mean_wrapped
             self.fruit_major_axis_samples = len(recent)
             self.fruit_major_axis_spread_deg = math.degrees(spread)
             self.fruit_major_axis_stable = (
