@@ -95,7 +95,7 @@ from .motions import execute_single_pose as _exec
 from .motions import publish_stop_trajectory
 from .config import (
     LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, PLAN_CFG_SCAN_PREFLIGHT,
-    VOXEL_CONFIG, X_FORWARD_Y_LATERAL,
+    X_FORWARD_Y_LATERAL,
 )
 from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
@@ -1426,6 +1426,8 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
         _yolo_lock.acquire()
     _pf_lock_ms = (time.time() - _pf_lock_t0) * 1000.0
     _pf_solve_ms = []
+    _pf_split_ms = []   # (prep, call, sync) ms per solve
+    _pf_cpu_ms = []     # thread CPU ms inside the call
     try:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1449,20 +1451,58 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             # the manual loop would have, and the continuity/branch-switch
             # checks below still run on whatever this returns.
             _solve_t0 = time.time()
+            _prep_t0 = _solve_t0
             pos = torch.tensor([pose[:3]], dtype=torch.float32, device=dev)
             quat = torch.tensor([pose[3:]], dtype=torch.float32, device=dev)
             retract_t = torch.tensor([seed], dtype=torch.float32, device=dev)
             goal_pose = Pose(position=pos, quaternion=quat)
             seed_t = torch.tensor(
                 [seed], dtype=torch.float32, device=dev).unsqueeze(0)
+            # Split the cost three ways. A standalone benchmark of this exact
+            # call -- production collision world, a real VERY_LOW pose, both
+            # call shapes, even with the vision stack running -- measures 14ms,
+            # while the field measures ~250ms. So the time is NOT in the solver,
+            # and lumping it into one number cannot say where it is:
+            #   prep  = tensor/Pose construction (pure CPU, holds the GIL)
+            #   call  = solve_single itself (async GPU launch)
+            #   sync  = .item()/.cpu() -- where the thread blocks, and where any
+            #           contention or descheduling in this busy multi-threaded
+            #           node actually shows up
+            # Wall clock AND this thread's CPU time across the call. A
+            # standalone benchmark of this exact call measures 14ms -- with the
+            # production world, a real VERY_LOW pose, both call shapes, an
+            # update_world() after warmup, and even with the vision stack
+            # running. Production measures 144-396ms for the same line. The only
+            # difference left is that production runs it inside a busy
+            # multi-threaded ROS node, so the question is whether the thread is
+            # BUSY for those 250ms or merely not scheduled:
+            #   cpu ~= wall  -> the solve genuinely costs that much here
+            #   cpu <<  wall -> the thread is blocked/descheduled (GIL, executor
+            #                   contention) and cuRobo is not the problem
+            _call_t0 = time.time()
+            _call_c0 = time.thread_time()
             result = node.motion_gen.ik_solver.solve_single(
                 goal_pose, seed_config=seed_t, retract_config=retract_t)
+            _call_cpu_ms = (time.thread_time() - _call_c0) * 1000.0
+            _sync_t0 = time.time()
             if not result.success.item():
-                _pf_solve_ms.append((time.time() - _solve_t0) * 1000.0)
+                _now = time.time()
+                _pf_solve_ms.append((_now - _solve_t0) * 1000.0)
+                _pf_split_ms.append((
+                    (_call_t0 - _prep_t0) * 1000.0,
+                    (_sync_t0 - _call_t0) * 1000.0,
+                    (_now - _sync_t0) * 1000.0))
+                _pf_cpu_ms.append(_call_cpu_ms)
                 return None
             _out = nearest_joint_config(
                 seed, result.js_solution.position.squeeze().cpu().tolist())
-            _pf_solve_ms.append((time.time() - _solve_t0) * 1000.0)
+            _now = time.time()
+            _pf_solve_ms.append((_now - _solve_t0) * 1000.0)
+            _pf_split_ms.append((
+                (_call_t0 - _prep_t0) * 1000.0,
+                (_sync_t0 - _call_t0) * 1000.0,
+                (_now - _sync_t0) * 1000.0))
+            _pf_cpu_ms.append(_call_cpu_ms)
             return _out
 
         approach_js = solve(approach_pose, start_js)
@@ -1521,6 +1561,8 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
         # Publish the breakdown on every exit path, including rejections.
         node._corridor_preflight_lock_ms = _pf_lock_ms
         node._corridor_preflight_solve_ms = list(_pf_solve_ms)
+        node._corridor_preflight_split_ms = list(_pf_split_ms)
+        node._corridor_preflight_cpu_ms = list(_pf_cpu_ms)
         if _yolo_lock:
             _yolo_lock.release()
 
@@ -2198,42 +2240,6 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             node.stored_trajectory_states.extend(states)
         return True
 
-    # 1b) Verify trajectory against latest depth data before execution
-    if (VOXEL_CONFIG.get("verify_before_execute", True) and
-        hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None):
-
-        # Use provided goal_xyz for exclusion zone (more reliable than extracting from Pose)
-        goal_position = goal_xyz
-
-        max_attempts = VOXEL_CONFIG.get("max_replan_attempts", 2)
-        for attempt in range(max_attempts):
-            is_safe, collision_idx = node.voxel_obstacles.verify_trajectory_collision(
-                states,
-                exclude_position=goal_position,  # Skip collision check near target
-            )
-
-            if is_safe:
-                break
-
-            node.get_logger().warn(
-                f"Collision detected at waypoint {collision_idx}/{len(states)} for {label} "
-                f"(attempt {attempt + 1}/{max_attempts})"
-            )
-
-            # Replan with updated obstacles (snapshot already taken in verify)
-            if lock: lock.acquire()
-            try:
-                res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
-            finally:
-                if lock: lock.release()
-            if not res.success:
-                node.get_logger().error(f"Replan failed for {label}")
-                return False
-            states = interpolated_positions(res)
-        else:
-            # All replan attempts failed
-            node.get_logger().error(f"Collision persists after {max_attempts} replans for {label}")
-            return False
 
     # 1c) Path-length sanity check using subsampled single-waypoint FK (batch=1, planner-safe)
     def _sampled_path_len(waypoints, step=20):
@@ -4924,6 +4930,8 @@ def plan_and_execute(node):
                 f"ik_preflight_ms={_pf_ik_ms:.0f} "
                 f"lock_wait_ms={getattr(node, '_corridor_preflight_lock_ms', 0.0):.0f} "
                 f"solves_ms={[round(v) for v in getattr(node, '_corridor_preflight_solve_ms', [])]} "
+                f"split_prep/call/sync={[tuple(round(x) for x in t) for t in getattr(node, '_corridor_preflight_split_ms', [])]} "
+                f"call_cpu_ms={[round(v) for v in getattr(node, '_corridor_preflight_cpu_ms', [])]} "
                 "stage=BEFORE_CONFIRM motion=NONE")
 
             # A fitted ellipse provides an undirected major axis: LEFT and
@@ -5196,11 +5204,6 @@ def plan_and_execute(node):
         if not skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
             node.motion_phase = "APPROACH"
-            # Clear depth-camera voxels — stale noise from previous pick blocks approach paths.
-            if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None:
-                try: node.voxel_obstacles.clear()
-                except Exception: pass
-
             _preflight_candidate = None
             if is_very_low_center and not is_side_approach:
                 _preflight_start = _valid_joint_positions()
@@ -6497,8 +6500,6 @@ def plan_and_execute(node):
                 f"(retry {node._slip_retry_count}/{_MAX_SLIP_RETRIES}) — "
                 "retrying from reverse position")
             unlock_target(node)
-            if hasattr(node, 'voxel_obstacles') and node.voxel_obstacles:
-                node.voxel_obstacles.clear()
             # Re-insert original x,y,z — approach was computed for this seed and will be reused
             _retry_goal = [x, y, z] + list(goal[3:])
             node.goal_poses.append(_retry_goal)

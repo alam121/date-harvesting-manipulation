@@ -351,24 +351,6 @@ WORLD_CONFIG = {
     }
 }
 
-# Voxel grid configuration for depth-based obstacle avoidance
-VOXEL_CONFIG = {
-    "dims": [1.5, 1.5, 1.5],           # 1.5m cube workspace
-    "pose": (
-        [0.5, 0.3, 0.8, 1, 0, 0, 0]
-        if X_FORWARD_Y_LATERAL
-        else [0.3, -0.5, 0.8, 1, 0, 0, 0]
-    ),
-    "voxel_size": 0.02,                # 2cm resolution
-    "max_esdf_distance": 0.3,          # Max distance to compute ESDF
-    # Collision verification parameters
-    "collision_safety_margin": 0.03,   # 3cm safety buffer around robot
-    "collision_check_interval": 5,     # Check every Nth waypoint for speed
-    "max_replan_attempts": 2,          # Max replans if collision detected
-    "verify_before_execute": False,     # Enable/disable pre-execution verification
-    "target_exclusion_radius": 0.08,   # 8cm radius around target to skip collision check
-}
-
 PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
 
 # For joint-space planning (plan_single_js): no graph search needed since start/goal joints

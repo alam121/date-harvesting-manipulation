@@ -1522,8 +1522,6 @@ class UR10eCuroboMoveIt(Node):
             goals_mod.subscribe_multi_goals(self, max_goals=max_goals)
             self.goal_capture_active = False
             self.get_logger().info(f"Subscribe multi: collecting up to {max_goals} goals in 10s")
-        elif cmd == "update_voxel":
-            self._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._set_current_as_home()
         elif cmd == "set_dropoff_current":
@@ -2238,33 +2236,6 @@ class UR10eCuroboMoveIt(Node):
                 pub("DIAGNOSIS: Hand-eye OK — T_CAM_ZEDMINI or ZED Mini depth is unstable.")
             else:
                 pub("DIAGNOSIS: POOR on both — check trunk visibility, ZED Mini depth, and both calibrations.")
-
-    def _update_voxel_snapshot(self):
-        """Update voxel obstacles from latest depth data (triggered by 'u' key).
-        VoxelObstacleManager subscribes to /zed_depth_pointcloud and caches points
-        in _latest_points. snapshot() reads from that cache."""
-        if not hasattr(self, 'voxel_obstacles') or self.voxel_obstacles is None:
-            self.get_logger().warn("No voxel obstacle manager available.")
-            return
-        vo = self.voxel_obstacles
-        if vo._latest_points is None:
-            try:
-                sub_count = vo._depth_sub.get_publisher_count()
-            except Exception:
-                sub_count = -1
-            self.get_logger().warn(
-                "No depth data available yet for voxel update. "
-                f"/zed_depth_pointcloud publishers={sub_count}. "
-                "Start/restart the vision node and wait for the initial depth-cloud burst."
-            )
-            return
-        try:
-            if vo.snapshot():
-                self.get_logger().info("Voxel obstacles updated from latest depth.")
-            else:
-                self.get_logger().warn("Voxel snapshot returned False.")
-        except Exception as e:
-            self.get_logger().warn(f"Voxel update failed: {e}")
 
     def _set_current_as_home(self):
         """Set the active HOME joint preset to the latest measured joint state."""
@@ -3512,10 +3483,6 @@ class UR10eCuroboMoveIt(Node):
     @property
     def obstacles(self):
         return self._motion_mgr.obstacles
-
-    @property
-    def voxel_obstacles(self):
-        return self._motion_mgr.voxel_obstacles
 
     @property
     def static_obstacles(self):
