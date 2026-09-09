@@ -33,9 +33,22 @@ signal.signal(signal.SIGTERM, _handle_signal)  # kill
 # benchmarks at 14ms in an idle process. A shorter interval hands the GIL back
 # sooner; the cost is slightly more context switching.
 #
+# Measured on this node, per corridor-preflight solve (wall vs thread CPU):
+#   5ms  (python default)  call 182-244ms, cpu 22-28ms   ik_preflight 953ms
+#   0.5ms                  call  82-164ms, cpu 16-25ms   ik_preflight 717-744ms
+#   0.1ms (current)        call  61-79ms,  cpu 17-20ms   ik_preflight 289-305ms
+#
+# 3.2x on the preflight, and the variance collapsed too: the spread went from
+# 82/316/137/147ms to 79/83/68/71ms, because the outliers were handoff stalls
+# rather than slow solves. Cycle time 23.6s -> 19.0s. Still ~3.7x starved
+# against the 14ms this call benchmarks at in an idle process; closing that
+# last gap needs planning moved off the ROS executor, not a smaller interval.
+#
 # Tune or disable with UR10E_GIL_SWITCH_INTERVAL (seconds; <=0 leaves the
-# default in place).
-_GIL_SWITCH_INTERVAL = float(os.environ.get("UR10E_GIL_SWITCH_INTERVAL", "0.0005"))
+# default in place). Lower is not free: the interpreter checks for thread
+# switches that much more often, which taxes every other Python thread in the
+# node, so back off to 0.0002 if callbacks or the GUI start to feel sluggish.
+_GIL_SWITCH_INTERVAL = float(os.environ.get("UR10E_GIL_SWITCH_INTERVAL", "0.0001"))
 if _GIL_SWITCH_INTERVAL > 0:
     sys.setswitchinterval(_GIL_SWITCH_INTERVAL)
 

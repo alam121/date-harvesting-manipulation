@@ -112,7 +112,13 @@ SHOW_REJECTED = True
 SKIP_DRAW = False
 SHOW_CLASSIFICATION_ZONES = False
 SHOW_GAP_DEBUG = False
-SHOW_FINGER_CONTACTS = True
+# Three predicted fingertip patches (3 coloured dots joined by a triangle) drawn
+# on the selected date. Diagnostic only -- it never altered gripper commands.
+# Disabled 2026-09-09: visual clutter, and the flag also gates the
+# estimate_three_finger_contacts() computation in _process_best_target (24
+# rotation samples per frame for the best target), so switching it off saves
+# that work in the vision node too.
+SHOW_FINGER_CONTACTS = False
 
 # Selected-date three-finger contact visualisation.  These values affect only
 # the predicted overlay/quality score; they do not alter gripper commands.

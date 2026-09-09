@@ -26,6 +26,9 @@ class StateManager:
 
         # Joint state (thread-safe access)
         self._state_lock = threading.Lock()
+        # (names, position indices, velocity indices) cache for the 500Hz
+        # /joint_states callback; rebuilt only if the name list changes.
+        self._js_index_cache = None
         self._current_joint_positions: Optional[List[float]] = None
         self._current_joint_velocities: Optional[List[float]] = None
 
@@ -251,16 +254,38 @@ class StateManager:
     # ============ Callbacks ============
 
     def _joint_state_cb(self, msg: ROSJointState) -> None:
-        """Update joint positions and velocities from /joint_states."""
-        jm = dict(zip(msg.name, msg.position))
-        vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        """Update joint positions and velocities from /joint_states.
 
+        This is the hottest Python path in the node: the UR driver publishes at
+        500Hz and the gripper publishes to this topic too. It used to build two
+        dicts and two comprehensions per message, and all of that needs the GIL
+        -- which is what starves the planning thread (measured: 25ms of solver
+        CPU stretched over 230ms of wall clock). The joint name list is
+        identical every message, so resolve the index mapping once and reuse it.
+
+        Semantics are unchanged: positions cover only the joints actually
+        present, in joint_order order; velocities always span joint_order,
+        with 0.0 where the message does not supply one.
+        """
+        names = tuple(msg.name)
+        cached = self._js_index_cache
+        if cached is None or cached[0] != names:
+            order = self._config.joint_order
+            cached = (
+                names,
+                [names.index(j) for j in order if j in names],
+                [names.index(j) if j in names else -1 for j in order],
+            )
+            self._js_index_cache = cached
+        _, pos_idx, vel_idx = cached
+
+        pos = msg.position
+        vel = msg.velocity
+        n_vel = len(vel)
         with self._state_lock:
-            self._current_joint_positions = [
-                jm[j] for j in self._config.joint_order if j in jm
-            ]
+            self._current_joint_positions = [pos[i] for i in pos_idx]
             self._current_joint_velocities = [
-                vm.get(j, 0.0) for j in self._config.joint_order
+                vel[i] if 0 <= i < n_vel else 0.0 for i in vel_idx
             ]
 
     def _robot_running_cb(self, msg: Bool) -> None:
