@@ -6,7 +6,7 @@ from curobo.types.robot import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import (PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_GRAPH,
-                     PLAN_CFG_JS_NO_FINETUNE, VOXEL_CONFIG)
+                     PLAN_CFG_JS_NO_FINETUNE)
 from .utils import build_trajectory, wait_until_xyz
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 
@@ -193,42 +193,6 @@ def execute_single_pose(node, pose: list, motion_type: str = "default",
 
     states = interpolated_positions(res)
     curobo_dt = get_curobo_dt(res)
-
-    # Verify trajectory against latest depth data before execution
-    if (VOXEL_CONFIG.get("verify_before_execute", True) and
-        hasattr(node, 'voxel_obstacles') and node.voxel_obstacles is not None):
-
-        # Extract goal position for exclusion zone (we WANT to reach the target)
-        goal_position = pose[:3]  # [x, y, z] from input pose
-
-        max_attempts = VOXEL_CONFIG.get("max_replan_attempts", 2)
-        for attempt in range(max_attempts):
-            is_safe, collision_idx = node.voxel_obstacles.verify_trajectory_collision(
-                states,
-                exclude_position=goal_position,  # Skip collision check near target
-            )
-
-            if is_safe:
-                break
-
-            node.get_logger().warn(
-                f"Collision detected at waypoint {collision_idx}/{len(states)} "
-                f"(attempt {attempt + 1}/{max_attempts})"
-            )
-
-            # Replan with updated obstacles
-            if lock: lock.acquire()
-            try:
-                res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
-            finally:
-                if lock: lock.release()
-            if not res.success:
-                node.get_logger().error("Replan failed after collision detection")
-                return False
-            states = interpolated_positions(res)
-        else:
-            node.get_logger().error(f"Collision persists after {max_attempts} replans")
-            return False
 
     planner = node.cfg.planner
     speed_map = {
@@ -1811,15 +1775,6 @@ def nearest_joint_config(current: List[float], target: List[float]) -> List[floa
     return out
 
 
-def _clear_voxels(node):
-    """Clear voxel obstacle world so depth-camera noise doesn't block return paths."""
-    vo = getattr(node, 'voxel_obstacles', None)
-    if vo is not None:
-        try:
-            vo.clear()
-        except Exception:
-            pass
-
 
 def _exit_safe_zone(node, why):
     """Keep safe-zone walls active.
@@ -1922,7 +1877,6 @@ def move_to_nearest_good_posture(node, *, label: str = "GOAL_RECOVERY",
 
 
 def move_to_home_position(node):
-    _clear_voxels(node)
     _exit_safe_zone(node, "HOME")
     target = node.home_joints
     if node.current_joint_positions is not None:
@@ -1931,7 +1885,6 @@ def move_to_home_position(node):
 
 
 def move_to_dropoff_position(node):
-    _clear_voxels(node)
     _exit_safe_zone(node, "DROP-OFF")
     target = node.dropoff_joints
     if node.current_joint_positions is not None:

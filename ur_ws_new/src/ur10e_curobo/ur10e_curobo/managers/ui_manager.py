@@ -148,8 +148,6 @@ class UIManager:
             self._state.plan_confirm_event.set()
         elif cmd.startswith("set_debug_preview "):
             self._handle_set_debug_preview(cmd)
-        elif cmd == "update_voxel":
-            self._node._update_voxel_snapshot()
         elif cmd == "set_home_current":
             self._node._set_current_as_home()
         elif cmd == "set_dropoff_current":

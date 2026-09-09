@@ -18,7 +18,6 @@ from curobo.util_file import get_assets_path, get_robot_configs_path, join_path,
 
 from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES, ENVIRONMENT
 from ..dynamic_obstacle import DynamicObstacleManager
-from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
 from .. import fk as fk_mod
 from ..vision.calibration_profiles import load_camera_profile
@@ -42,7 +41,6 @@ class MotionExecutor:
 
         # Obstacles
         self.obstacles: Optional[DynamicObstacleManager] = None
-        self.voxel_obstacles: Optional[VoxelObstacleManager] = None
         self.static_obstacles: List = []
 
         # Publishers
@@ -140,13 +138,6 @@ class MotionExecutor:
         self.obstacles.add_sphere("dyn_sphere", radius=0.1)
         self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
 
-        if vision_enabled:
-            # Voxel collision data is published by the vision node.
-            self.voxel_obstacles = VoxelObstacleManager(
-                node=self._node,
-                motion_gen=self.motion_gen
-            )
-
         # Teleop subscription
         self._node.create_subscription(
             Twist,
@@ -159,12 +150,6 @@ class MotionExecutor:
         self._node.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
         self._node.create_timer(1.0, self._publish_static_obstacles)
         self._node.create_timer(1.0, self._publish_golfcart_pallet_marker)
-
-        if vision_enabled:
-            # Take the initial snapshot once the depth stream is available.
-            self._initial_voxel_timer = self._node.create_timer(
-                2.0, self._initial_voxel_snapshot
-            )
 
         self._node.get_logger().info("MotionExecutor initialized")
 
@@ -512,16 +497,6 @@ class MotionExecutor:
             self._node.get_logger().warn(f"Trajectory publish exception: {e}")
             return
 
-    def _initial_voxel_snapshot(self) -> None:
-        """Take initial voxel snapshot once depth data arrives, then cancel timer."""
-        vo = self.voxel_obstacles
-        if vo._latest_points is not None:
-            try:
-                vo.snapshot()
-                self._node.get_logger().info("Initial voxel snapshot taken from depth data.")
-            except Exception as e:
-                self._node.get_logger().warn(f"Initial voxel snapshot failed: {e}")
-            self._initial_voxel_timer.cancel()
 
     def _safe_zone_wall_cuboids(self, lo, hi):
         """Four VERTICAL (lateral) panels fencing the box's back/front/sides — the blind
