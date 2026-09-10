@@ -48,12 +48,82 @@ class DeltoROSDriver(Node):
         self.declare_parameter('slaveID', 1)
         self.declare_parameter('dummy', False)
         self.declare_parameter('grasp_force', 50)
+        # Motor-current -> contact-channel mapping, per finger. Defaults are the
+        # values that were hardcoded in estimate_force(), so behaviour is
+        # unchanged until someone deliberately measures better ones.
+        #
+        # force_baseline is the NO-LOAD current of each finger's sensed motor.
+        # It was one shared -17.5 for all three, but the three motors do not
+        # idle at the same current (different units, different gravity loading
+        # by pose), and the value drifts with temperature. Measure per finger
+        # with the hand open and unloaded, read /gripper/joint_states effort
+        # x1000 for indices 3/7/11, and set them here.
+        # force_baseline accepts 3 values (one per finger, applied to all four of
+        # that finger's motors) or 12 (one per motor, the accurate form).
+        #
+        # MEASURED 2026-09-10 on this gripper: 667 samples over 8s, hand open and
+        # unloaded, median per motor (stdev ~1.1mA on every channel).
+        #
+        # The previous default was a single -17.5 shared by all three fingers,
+        # and it was simply wrong for this hardware: every motor actually idles
+        # near ZERO. raw = current - (-17.5) was therefore always ~+23, so
+        # /gripper/force read 7.35/7.05/7.95 N with the hand idle and open, and
+        # the deadband could never engage because nothing was ever within 0.3 of
+        # -17.5. DeltoGripperController re-baselines at closing time, which is
+        # why contact detection worked at all -- it subtracted the bogus offset
+        # back out -- but the published channel was meaningless in absolute
+        # terms and had poor resolution.
+        #
+        # These are pose-dependent (gravity loads the fingers differently). They
+        # were measured at the parked pose; re-measure at the grasp pose if you
+        # want better. Procedure: hand open and unloaded, average
+        # /gripper/joint_states effort x1000 per motor.
+        self.declare_parameter(
+            'force_baseline',
+            [4.0, 2.0, 10.0, 5.0, 2.0, 0.0, 4.0, 6.0, 0.0, 1.0, 8.0, 2.0])
+        # Which motor's current becomes each finger's contact channel.
+        #
+        #   "fixed"          -- read force_motor_indices, the long-standing
+        #                       behaviour: the 4th motor of each finger.
+        #   "max_per_finger" -- take whichever of that finger's four motors is
+        #                       furthest from its baseline, matching what the
+        #                       contact tracker in delto_gripper_controller
+        #                       already does (it maxes over range(f*4, f*4+4)).
+        #
+        # The fixed form assumed one motor per finger carries the load. That held
+        # for the OLD gripper, whose driving joint was a single index per finger.
+        # The NEW gripper drives two joints per finger (2-3, 6-7, 10-11), so the
+        # load can land on either -- observed 2026-09-10: finger 2 pulled a
+        # 132mA delta and stopped 8.9deg short of its calibrated close while its
+        # force channel read exactly 0.00N, because index 7 was idle and index 6
+        # carried the load. That mislabelled a real grasp as WEAK.
+        #
+        # Switched to max_per_finger 2026-09-10 after three consecutive runs in
+        # which finger 2 drew the highest current of all three (122-161mA) and
+        # stopped 9-12deg short of its calibrated close, while its force channel
+        # read ~0 and the grasp was labelled WEAK. Index 7 was idle; the load was
+        # on another of that finger's motors.
+        #
+        # NOTE: max_per_finger reports a LARGER magnitude than "fixed", and
+        # DeltoGripperController.force_threshold (4.0) was tuned against the old
+        # signal. Set this back to 'fixed' if closures start stopping early.
+        self.declare_parameter('force_motor_mode', 'max_per_finger')
+        self.declare_parameter('force_motor_indices', [3, 7, 11])
+        self.declare_parameter('force_scale', 0.3)
+        # ~3 sigma of the measured 1.1mA per-channel noise floor, so an idle
+        # hand reads a clean 0.0 instead of jittering. Was 0.3, which was sized
+        # against the old (wrong) -17.5 baseline and never engaged anyway.
+        self.declare_parameter('force_deadband', 3.5)
 
         self.joint_state_list = [0.0]*12
         self.current_joint_state = [0.0]*12
         self.current_joint_velocity = [0.0]*12
         self.current_joint_effort = [0.0]*12
         self.raw_current_state = [0]*12
+        # When the values above were actually read off the gripper. joint_states
+        # is published at publish_rate but refreshed at feedback_read_rate, so
+        # stamping "now" at publish time claimed data was fresher than it was.
+        self._joint_state_stamp = None
         self.target_joint_state = [0.0]*12
         self.fixed_joint_state = [0]*12
 
@@ -302,11 +372,32 @@ class DeltoROSDriver(Node):
             # self.get_logger().error("(read_joint_callback) Connection lost")
             return
         try:
-            position_tmp = self.get_position()
-            self.current_joint_state = [float(self._deg2rad(x)) for x in position_tmp]
-            self.raw_current_state = self.delto_client.get_current_raw()
-            self.current_joint_effort = [float(x * 0.001) for x in self.raw_current_state]
-            self.current_joint_velocity = [float(x) for x in self.delto_client.get_velocity()]
+            if self.is_dummy:
+                # Preserve the dummy path exactly: get_position() echoes the
+                # commanded state back, which get_state() cannot do.
+                position_tmp = self.get_position()
+                self.current_joint_state = [
+                    float(self._deg2rad(x)) for x in position_tmp]
+                self.raw_current_state = self.delto_client.get_current_raw()
+                self.current_joint_effort = [
+                    float(x * 0.001) for x in self.raw_current_state]
+                self.current_joint_velocity = [
+                    float(x) for x in self.delto_client.get_velocity()]
+            else:
+                # One Modbus round trip for all three, instead of three. Beyond
+                # the 3x saving, position/current/velocity now come from the
+                # SAME instant -- previously current was one round trip newer
+                # than the position it was reported with, which matters when
+                # deriving contact from motor current.
+                position_deg, raw_current, velocity = (
+                    self.delto_client.get_state())
+                self.current_joint_state = [
+                    float(self._deg2rad(x)) for x in position_deg]
+                self.raw_current_state = raw_current
+                self.current_joint_effort = [
+                    float(x * 0.001) for x in raw_current]
+                self.current_joint_velocity = [float(v) for v in velocity]
+            self._joint_state_stamp = self.get_clock().now()
         except Exception as e:
             self.get_logger().error("Failed to read joint state: {0}".format(e))
             self.is_connected = False
@@ -328,7 +419,15 @@ class DeltoROSDriver(Node):
     def joint_state_publisher(self):
 
         joint_state_msg = JointState()
-        joint_state_msg.header.stamp = self.get_clock().now().to_msg()
+        # Stamp when the data was READ, not when this timer happened to fire.
+        # publish_rate (100Hz) is 5x feedback_read_rate (20Hz), so most messages
+        # repeat the previous sample; stamping "now" made every repeat claim to
+        # be a fresh measurement, and any consumer differentiating position or
+        # timing a contact onset was working from that false rate.
+        joint_state_msg.header.stamp = (
+            self._joint_state_stamp.to_msg()
+            if self._joint_state_stamp is not None
+            else self.get_clock().now().to_msg())
 
         joint_state_msg.name = ['F1M1', 'F1M2', 'F1M3', 'F1M4',
                                 'F2M1', 'F2M2', 'F2M3', 'F2M4',
@@ -596,14 +695,33 @@ class DeltoROSDriver(Node):
         """ Convert unsigned 16-bit integer to signed 16-bit integer """
         return value if value < 32768 else value - 65536
 
-    def estimate_force(self, current):
-        baseline = -17.5   # measured
-        k = 0.3            # bigger scale for better resolution
+    def estimate_force(self, current, finger=0, motor=None):
+        """Motor current -> contact channel for one finger.
+
+        Not a calibrated force in N: force_scale is a display gain, not a
+        transfer function to Newtons. See publish_force_data's docstring.
+
+        `current - baseline` removes that finger's no-load current, so the
+        result is deviation from unloaded and the deadband sits around zero
+        load. DeltoGripperController additionally captures its own live
+        baseline and thresholds on change from it, which absorbs whatever
+        offset error remains here -- so a wrong baseline degrades resolution
+        rather than breaking contact detection.
+        """
+        baselines = self.get_parameter('force_baseline').value
+        if motor is not None and len(baselines) >= 12:
+            baseline = float(baselines[motor])          # per-motor calibration
+        elif finger < len(baselines):
+            baseline = float(baselines[finger])         # per-finger
+        else:
+            baseline = float(baselines[0])
+        k = float(self.get_parameter('force_scale').value)
+        deadband = float(self.get_parameter('force_deadband').value)
 
         raw = current - baseline
 
         # Clamp very small noise
-        if abs(raw) < 0.3:
+        if abs(raw) < deadband:
             raw = 0.0
 
         return round(k * raw, 3)
@@ -627,9 +745,24 @@ class DeltoROSDriver(Node):
                 self.raw_current_state = list(raw_current)
                 self.current_joint_effort = [float(x * 0.001) for x in raw_current]
 
-            # Extract only 4th (index 3), 8th (index 7), and 12th (index 11)
-            selected_currents = [raw_current[i] for i in [3, 7, 11]]
-            estimated_forces = [self.estimate_force(c) for c in selected_currents]
+            mode = str(self.get_parameter('force_motor_mode').value).strip().lower()
+            if mode == 'max_per_finger':
+                # Whichever of this finger's four motors is furthest from its
+                # baseline -- the load can sit on any of them.
+                estimated_forces = []
+                for finger in range(3):
+                    vals = [
+                        self.estimate_force(raw_current[i], finger=finger, motor=i)
+                        for i in range(finger * 4, finger * 4 + 4)
+                        if i < len(raw_current)]
+                    estimated_forces.append(max(vals, key=abs) if vals else 0.0)
+            else:
+                indices = [int(v) for v in
+                           self.get_parameter('force_motor_indices').value]
+                estimated_forces = [
+                    self.estimate_force(raw_current[idx], finger=i, motor=idx)
+                    for i, idx in enumerate(indices)
+                    if 0 <= idx < len(raw_current)]
 
             # Publish as a Float32MultiArray ROS message
             force_msg = Float32MultiArray()

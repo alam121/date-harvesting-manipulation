@@ -137,6 +137,50 @@ class Communication:
         values = response.registers
         return [value if value < 32768 else value - 65536 for value in values]
 
+    def get_state(self):
+        """Read position, current and velocity in ONE Modbus transaction.
+
+        The three blocks are contiguous on the DG-3F-M (position 6..17,
+        current 26..37, velocity 46..57), so a single read of 52 registers
+        covers all of them -- well inside Modbus's 125-register limit. The
+        unused gaps at 18..25 and 38..45 are read and discarded.
+
+        This replaces three separate round trips per feedback tick. The point is
+        not only the 3x saving: the three quantities are now sampled at the SAME
+        instant. Read separately, the current was one round trip newer than the
+        position it was attributed to, which is exactly the inconsistency that
+        matters when deriving contact from motor current.
+
+        Returns (position_deg, current_raw, velocity_rad_s), each MOTOR_NUM long.
+        """
+        n = Delto3F.MOTOR_NUM.value
+        if self.dummy:
+            return [0.0] * n, [0] * n, [0.0] * n
+
+        first = self.current_position_register
+        count = (self.velocity_register + n) - first
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=first, count=count, slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid state response: {response}")
+        regs = response.registers
+        if len(regs) < count:
+            raise RuntimeError(
+                f"short state response: got {len(regs)} registers, want {count}")
+
+        def _signed(block):
+            return [v if v < 32768 else v - 65536 for v in block]
+
+        def _slice(reg_addr):
+            off = reg_addr - first
+            return _signed(regs[off:off + n])
+
+        position = [v / 10.0 for v in _slice(self.current_position_register)]
+        current = _slice(self.current_register)
+        velocity = [v * (math.pi / 30.0) for v in _slice(self.velocity_register)]
+        return position, current, velocity
+
     def get_current_raw(self):
         return self._read_signed_input_registers(
             self.current_register,

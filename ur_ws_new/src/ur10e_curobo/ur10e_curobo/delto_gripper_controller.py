@@ -98,14 +98,30 @@ class DeltoGripperController:
         import threading
         def capture_initial_baseline():
             time.sleep(1.0)  # Wait for force data to start flowing
-            if self.force_data != [0.0, 0.0, 0.0]:
+            # Detect ARRIVAL via last_force_stamp, not by sniffing for a
+            # non-zero value. The old test was `force_data != [0, 0, 0]`, which
+            # conflated "no message received" with "received, and every channel
+            # is legitimately zero".
+            #
+            # That distinction used to be academic: the driver's force baseline
+            # was a wrong -17.5 for every motor, so an idle hand published a
+            # constant ~7N offset and the check passed by accident. With the
+            # baselines measured properly (2026-09-10) an idle, unloaded hand
+            # now publishes exactly [0.0, 0.0, 0.0] -- the correct reading --
+            # and this warned "No force data received" on every startup.
+            if self.last_force_stamp > 0.0:
                 self.baseline_force = self.force_data.copy()
-                self.node.get_logger().debug(
-                    f"Gripper initialized (baseline=[{self.baseline_force[0]:.2f}, "
-                    f"{self.baseline_force[1]:.2f}, {self.baseline_force[2]:.2f}]N)"
+                self.node.get_logger().info(
+                    f"Gripper force baseline captured: "
+                    f"[{self.baseline_force[0]:.2f}, {self.baseline_force[1]:.2f}, "
+                    f"{self.baseline_force[2]:.2f}]N "
+                    "(near zero is expected and correct: the driver already "
+                    "subtracts each motor's measured idle current)"
                 )
             else:
-                self.node.get_logger().warn("⚠️ No force data received - baseline will be set on first close")
+                self.node.get_logger().warn(
+                    "⚠️ No force data received on /gripper/force within 1s - "
+                    "baseline will be set on first close")
         threading.Thread(target=capture_initial_baseline, daemon=True).start()
 
     def configure_grasp_mode(self, mode: str):
