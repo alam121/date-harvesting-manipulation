@@ -545,8 +545,8 @@
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_new_outdoor_rpy" value="-0.202440 0.016049 -0.497189"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_xyz" value="-0.117001 -0.028902 0.072682"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_rpy" value="-0.114225 0.001975 -1.122874"/>
-    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_xyz" value="-0.115038 -0.075192 0.082343"/>
-    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_rpy" value="-0.183795 0.002590 -0.791661"/>
+    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_xyz" value="-0.115138 -0.075365 0.080713"/>
+    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_rpy" value="-0.187840 -0.004377 -0.796829"/>
     <origin
       xyz="${hand_eye_zed_mini_left_camera_frame_new_lab_xyz if robot_profile == 'new' and environment == 'lab' else hand_eye_zed_mini_left_camera_frame_new_outdoor_xyz if robot_profile == 'new' else hand_eye_zed_mini_left_camera_frame_old_lab_xyz if environment == 'lab' else hand_eye_zed_mini_left_camera_frame_old_outdoor_xyz}"
       rpy="${hand_eye_zed_mini_left_camera_frame_new_lab_rpy if robot_profile == 'new' and environment == 'lab' else hand_eye_zed_mini_left_camera_frame_new_outdoor_rpy if robot_profile == 'new' else hand_eye_zed_mini_left_camera_frame_old_lab_rpy if environment == 'lab' else hand_eye_zed_mini_left_camera_frame_old_outdoor_rpy}"/>

@@ -8,6 +8,39 @@ echo risc | sudo -S systemctl restart zed_x_daemon
 echo risc | sudo -S systemctl restart nvargus-daemon
 sleep 8
 
+# ── Clock sanity (must run BEFORE any ROS node starts) ────────────────────
+# This unit has no battery-backed RTC, so an offline boot comes up at the epoch
+# (1970). A wrong-but-stable clock is harmless here: every ROS node runs on this
+# one machine and shares it, so TF stays self-consistent. What is NOT harmless is
+# a clock that STEPS while nodes are running -- every buffered transform becomes
+# decades stale, stamped TF lookups start failing, and the vision node silently
+# falls back to "latest", which quietly turns pipeline latency into position
+# error. systemd-timesyncd always steps, never slews.
+#
+# fake-hwclock (installed 2026-09-10) normally restores the clock at boot, and
+# chrony is configured "makestep 1 3" so it steps only in the first 3 updates
+# after startup and slews from then on -- a mid-session WiFi reconnect nudges
+# instead of jumping. This block is the belt-and-braces check in case
+# fake-hwclock did not run: pull the clock forward while nothing is running.
+if [ "$(date +%Y)" -lt 2025 ]; then
+    _ref=/etc/fake-hwclock.data
+    if [ -s "$_ref" ]; then
+        echo "Clock is unset (no RTC battery). Restoring from $_ref ..."
+        echo risc | sudo -S date -u -s "$(cat "$_ref")" >/dev/null 2>&1
+    fi
+fi
+if [ "$(date +%Y)" -lt 2025 ]; then
+    echo ""
+    echo "*** WARNING: system clock is still unset ($(date))."
+    echo "*** Logs, screenshots and any calibration saved this session will be"
+    echo "*** stamped 1970, and connecting to a network mid-run will step the"
+    echo "*** clock and invalidate the TF buffer."
+    echo "*** Set it before launching:  sudo timedatectl set-time 'YYYY-MM-DD HH:MM:SS'"
+    echo ""
+else
+    echo "Clock OK: $(date)"
+fi
+
 # Set ROS domain ID
 export ROS_DOMAIN_ID=6
 echo "ROS_DOMAIN_ID set to 6"

@@ -970,6 +970,25 @@ def main():
     rpy = Rotation.from_matrix(R_cam2gripper).as_euler("xyz")  # radians
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # This Jetson has no battery-backed RTC, so an offline boot starts at the
+    # epoch and stays there until something sets the clock. Two outdoor
+    # calibrations were written that way (calibrated_at 1970-01-01 03:09:10 and
+    # 03:24:20 -- 9 and 24 minutes past epoch, +03), which left two profiles
+    # with no way to tell which was newer or which the robot was actually
+    # flying. The geometry in those files was fine; the provenance was not.
+    #
+    # Refuse to write rather than produce another untraceable file. The
+    # calibration itself is unaffected by the wrong clock -- it only uses TF
+    # within one session -- so the operator loses nothing by setting the clock
+    # and re-saving.
+    if datetime.now().year < 2025:
+        raise RuntimeError(
+            f"System clock reads {timestamp} -- it is unset (no RTC battery on "
+            "this unit). Refusing to write an untraceable calibration.\n"
+            "Fix the clock first, e.g.:\n"
+            "  sudo timedatectl set-time '2026-01-01 12:00:00'   # or connect to a network\n"
+            "then re-run. The solve above is valid; only the timestamp is bad.")
+
     result = {
         "hand_eye_calibration": {
             "parent_frame": EE_FRAME,
