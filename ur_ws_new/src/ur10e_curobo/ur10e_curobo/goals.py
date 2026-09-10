@@ -658,17 +658,18 @@ def goal_is_in_robot_workspace(node, xyz):
     f_max = float(getattr(planner, "goal_workspace_forward_max_m", 1.60))
     l_min = float(getattr(planner, "goal_workspace_lateral_min_m", -0.80))
     l_max = float(getattr(planner, "goal_workspace_lateral_max_m", 0.90))
-    z_min = float(getattr(planner, "goal_workspace_z_min_m", 0.02))
     z_max = float(getattr(planner, "goal_workspace_z_max_m", 1.40))
     valid = (
         f_min <= forward <= f_max
         and l_min <= lateral <= l_max
-        and z_min <= z <= z_max
+        # Dates below base_link are valid in the harvesting workspace. Keep an
+        # upper-Z guard, but do not reject a goal solely because Z is negative.
+        and z <= z_max
     )
     reason = (
         f"forward={forward:.3f}m [{f_min:.2f},{f_max:.2f}], "
         f"lateral={lateral:.3f}m [{l_min:.2f},{l_max:.2f}], "
-        f"z={z:.3f}m [{z_min:.2f},{z_max:.2f}]"
+        f"z={z:.3f}m [no lower limit,{z_max:.2f}]"
     )
     return valid, reason
 
@@ -2794,7 +2795,7 @@ def execute_partial_reverse(node, clearance_m: float = 0.35,
     return endpoint_reached
 
 
-def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None, restore_mode="full"):
+def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None, restore_mode="full", planner_busy=False):
     """Fast reacquire across multiple candidate seeds.
 
     Checks vision against all candidates. Returns first stable match.
@@ -2807,10 +2808,16 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
         depth_settle_s: how long to wait for depth to stabilise (reduce for small nudges)
         restore_mode: vision mode to restore on exit ("full" or "paused").
                       Pass "paused" for slip check so YOLO stays off during dropoff planning.
+        planner_busy: True if cuRobo may be planning concurrently, in which case
+                      vision keeps throttling YOLO to every 3rd frame to leave it
+                      GPU headroom. False (default) when the arm is stopped and
+                      nothing is planning, so YOLO runs every frame and reacquire
+                      gets ~3x the samples inside the same timeout. Only the slip
+                      check needs True: _bg_preplan_dropoff is still running then.
     """
     # Switch vision to lightweight mode: no heatmap, no trunk, no viz
     if hasattr(node, 'set_vision_mode'):
-        node.set_vision_mode("reacquire")
+        node.set_vision_mode("reacquire" if planner_busy else "reacquire_fast")
 
     try:
         return _reacquire_goal_pose_impl(
@@ -2822,6 +2829,57 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
             node.set_vision_mode(restore_mode)
             if restore_mode == "paused":
                 time.sleep(0.12)  # wait for any in-flight YOLO inference to finish
+
+
+def _reacquire_candidate_quality(node, candidate):
+    """Quality for the fruit at `candidate`, or None if unknown.
+
+    /vision/all_fruit_quality is published in the same score-sorted order as
+    /vision/all_fruit_poses, but the two arrive as separate messages and
+    node.latest_goal_pose comes from a third topic on its own timer. Rather
+    than trust index alignment, match by position: find the nearest published
+    fruit and use its quality. Returns None when nothing is close enough,
+    which callers must treat as "unknown", not "bad".
+    """
+    quality = getattr(node, "all_fruit_quality", None)
+    poses = getattr(node, "all_fruit_poses", None)
+    if not quality or not poses:
+        return None
+    best_i, best_d = None, float("inf")
+    for i, p in enumerate(poses):
+        if i >= len(quality):
+            break
+        d = math.dist(candidate, p)
+        if d < best_d:
+            best_i, best_d = i, d
+    # 2cm: same fruit seen by both topics, not a neighbour.
+    if best_i is None or best_d > 0.02:
+        return None
+    return quality[best_i]
+
+
+def _reacquire_quality_ok(node, candidate):
+    """(ok, reason). Unknown quality passes -- never block on missing data."""
+    planner = node.cfg.planner
+    if not bool(getattr(planner, "reacquire_quality_gate", True)):
+        return True, ""
+    q = _reacquire_candidate_quality(node, candidate)
+    if q is None:
+        return True, ""
+    vis_ratio, z_std, confidence, _score, edge_margin = q
+    min_vis = float(getattr(planner, "reacquire_min_vis_ratio", 0.25))
+    max_std = float(getattr(planner, "reacquire_max_z_std_m", 0.025))
+    min_conf = float(getattr(planner, "reacquire_min_confidence", 0.20))
+    min_edge = float(getattr(planner, "reacquire_min_edge_margin", 0.0))
+    if vis_ratio < min_vis:
+        return False, f"vis_ratio {vis_ratio:.2f}<{min_vis:.2f}"
+    if z_std > max_std:
+        return False, f"z_std {z_std*1000:.0f}mm>{max_std*1000:.0f}mm"
+    if confidence < min_conf:
+        return False, f"conf {confidence:.2f}<{min_conf:.2f}"
+    if edge_margin < min_edge:
+        return False, f"bbox clipped (edge {edge_margin:.3f}<{min_edge:.3f})"
+    return True, ""
 
 
 def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
@@ -2869,7 +2927,15 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
     # vision has published a genuinely new sample. If none arrives we time out
     # and fall back to the seed, which is the correct outcome: reacquire has
     # nothing to say, and must not pretend otherwise.
+    # Watch BOTH the goal stamp and the all-fruit-poses counter. The goal topic
+    # alone was never a workable signal here: it is published only from
+    # _process_best_target, which the vision node skips in reacquire mode, so it
+    # is silent for the entire duration of this function and this gate always
+    # expired -- burning its full _fresh_wait_s every cycle and then matching
+    # "the latest available" anyway, which is exactly what it existed to prevent.
+    # all_fruits_seq increments on every processed frame in every mode.
     _entry_sample_ns = int(getattr(node, "latest_goal_sample_ns", 0) or 0)
+    _entry_fruits_seq = int(getattr(node, "all_fruits_seq", 0) or 0)
     _fresh_seen = False
     _fresh_gate_expired = False
     # Bound on how long the freshness gate may hold us up.
@@ -2902,13 +2968,15 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
         # Freshness gate, BOUNDED. Its job is to stop us instantly matching the
         # very sample that produced the seed (vision is paused during approach,
         # so latest_goal_pose still holds it) -- not to block indefinitely. In
-        # "reacquire" mode the vision node runs YOLO on every 3rd frame only and
+        # throttled "reacquire" mode the vision node runs YOLO every 3rd frame and
         # has just come back from a pause, so a genuinely new sample can take a
         # while. After _fresh_wait_s, proceed with whatever is published and say
         # so, rather than burning the whole budget waiting.
         if (not _fresh_seen
-                and int(getattr(node, "latest_goal_sample_ns", 0) or 0)
-                != _entry_sample_ns):
+                and (int(getattr(node, "latest_goal_sample_ns", 0) or 0)
+                     != _entry_sample_ns
+                     or int(getattr(node, "all_fruits_seq", 0) or 0)
+                     != _entry_fruits_seq)):
             _fresh_seen = True
             if _verbose_reacq:
                 node.get_logger().info(
@@ -2922,14 +2990,29 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
                 _fresh_gate_expired = True
                 node.get_logger().warn(
                     f"[REACQ] no new perception sample within "
-                    f"{_fresh_wait_s:.1f}s (vision throttles to every 3rd frame "
-                    "in reacquire mode); matching against the latest available")
+                    f"{_fresh_wait_s:.1f}s (no detections, or vision throttled); "
+                    "matching against the latest available")
 
         # Check best fruit first, then fall back to all visible fruits.
         # This allows reacquire to find the target even when it isn't best-ranked
         # (e.g. another fruit is closer during the approach phase).
+        #
+        # BUT only if latest_goal_pose has actually refreshed since we entered.
+        # In reacquire mode the vision node skips _process_best_target, so
+        # /external_goal_pose is never republished, and the publish timer drops
+        # the goal after 0.25s of staleness. latest_goal_pose therefore still
+        # holds the very sample that produced the seed. Listing it first meant
+        # reacquire matched the seed against itself and "succeeded" with
+        # drift=(0,0,0)mm, learning nothing -- the exact outcome the freshness
+        # gate above was written to prevent. Making the gate work was not enough
+        # while the stale value stayed in the candidate list.
+        #
+        # all_fruit_poses is published every processed frame in every mode, so
+        # it carries the genuinely new measurements.
         pose = None
-        if node.latest_goal_pose:
+        _goal_pose_is_fresh = (
+            int(getattr(node, "latest_goal_sample_ns", 0) or 0) != _entry_sample_ns)
+        if node.latest_goal_pose and _goal_pose_is_fresh:
             pose = node.latest_goal_pose[:3]
 
         # If best fruit doesn't match any seed, scan all visible fruits
@@ -2947,6 +3030,21 @@ def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5,
         _closest_miss_d = float('inf')
         for candidate in candidate_poses:
             if candidate is None:
+                continue
+            # Quality gate first: a detection can sit well inside the match
+            # radius and still be junk (half the date out of frame, depth
+            # scattered across the bunch behind it). Accepting it moves the
+            # grasp goal onto a bad measurement, which is worse than timing out
+            # and keeping the seed.
+            _q_ok, _q_reason = _reacquire_quality_ok(node, candidate)
+            if not _q_ok:
+                _now_q = time.time()
+                if (not hasattr(_reacquire_goal_pose_impl, "_last_q_log")
+                        or _now_q - _reacquire_goal_pose_impl._last_q_log > 1.0):
+                    _reacquire_goal_pose_impl._last_q_log = _now_q
+                    node.get_logger().info(
+                        f"[REACQ] rejected on quality: {_q_reason} "
+                        f"at [{candidate[0]:.3f},{candidate[1]:.3f},{candidate[2]:.3f}]")
                 continue
             cx, cy, cz = candidate
             for s in seeds:
@@ -3184,7 +3282,7 @@ def subscribe_to_goal_pose(node):
         _workspace_ok, _workspace_reason = goal_is_in_robot_workspace(node, new_xyz)
         if not _workspace_ok:
             _warn_rejected_goal_throttled(node, new_xyz, _workspace_reason)
-            #return
+            return
 
         # ---- ALWAYS STORE LATEST GOAL POSE ----
         node.latest_goal_pose = [*new_xyz, *new_quat]
@@ -6474,6 +6572,9 @@ def plan_and_execute(node):
                 depth_settle_s=2.0,
                 stable_needed=3,
                 restore_mode="paused",
+                # _bg_preplan_dropoff (started right after the grasp, joined
+                # below) may still be planning on the GPU. Keep YOLO throttled.
+                planner_busy=True,
             )
             _slip_detected = _slip_reacq is not None
             node.get_logger().info(

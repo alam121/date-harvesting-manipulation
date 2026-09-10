@@ -220,13 +220,39 @@ class UR10eCuroboMoveIt(Node):
         # Subscribe to all visible fruit positions, score-sorted by vision.
         # Reacquire searches all entries; goal multi queues the top entries.
         # Format: flat [x0,y0,z0, x1,y1,z1, ...] in base_link frame.
+        # Monotonic count of perception samples that arrive REGARDLESS of mode.
+        # /external_goal_pose cannot serve this: it is published from
+        # latest_goal_msg, set only inside _process_best_target, which the
+        # vision node skips in reacquire mode -- and the publish timer drops the
+        # goal entirely after 0.25s of staleness. So during a reacquire the goal
+        # topic is silent by construction, and anything watching it for freshness
+        # waits forever. /vision/all_fruit_poses is published every processed
+        # frame in every mode, and is the list reacquire actually searches.
+        self.all_fruits_seq = 0
+
         def _all_fruits_cb(msg):
             data = msg.data
             self.all_fruit_poses = [
                 [data[i], data[i+1], data[i+2]]
                 for i in range(0, len(data) - 2, 3)
             ]
+            self.all_fruits_seq += 1
         self.create_subscription(Float32MultiArray, '/vision/all_fruit_poses', _all_fruits_cb, 10)
+
+        # Detection quality for the same fruits, same order, 5 floats each:
+        # [vis_ratio, z_std, confidence, score, edge_margin_norm]. Reacquire
+        # uses this to refuse a positionally-plausible but low-quality match
+        # instead of accepting anything inside the match radius.
+        self.all_fruit_quality = []
+
+        def _all_fruit_quality_cb(msg):
+            data = msg.data
+            self.all_fruit_quality = [
+                list(data[i:i + 5]) for i in range(0, len(data) - 4, 5)
+            ]
+        self.create_subscription(
+            Float32MultiArray, '/vision/all_fruit_quality',
+            _all_fruit_quality_cb, 10)
 
         # timers
         self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers

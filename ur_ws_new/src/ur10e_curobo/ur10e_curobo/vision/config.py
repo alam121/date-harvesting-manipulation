@@ -120,6 +120,17 @@ SHOW_GAP_DEBUG = False
 # that work in the vision node too.
 SHOW_FINGER_CONTACTS = False
 
+# On-screen overlay for the ACTUAL detected red fingertips: the line/triangle
+# joining them, the convex hull, the yellow R1/R2/R3 markers and the FIT/NOT_FIT
+# text. Display only -- disabled 2026-09-10 as visual clutter.
+#
+# This gates DRAWING ONLY, not the detection behind it. The red-fingertip
+# detection still runs and still publishes /vision/fingertip_verification, which
+# goals.py depends on: after the final move it resumes vision for
+# final_visual_verification_s and reads latest_fingertip_verification for
+# phase-5 centre logging. Gating the computation too would silently break that.
+SHOW_FINGERTIP_VERIFICATION_OVERLAY = False
+
 # Selected-date three-finger contact visualisation.  These values affect only
 # the predicted overlay/quality score; they do not alter gripper commands.
 FINGERTIP_CONTACT_RADIUS_M = 0.006
@@ -198,7 +209,7 @@ T_CAM_LIDAR = [
 ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN to pin
 ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED One (15 max at QHDPLUS)
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
-ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
+ZEDMINI_DEPTH_Z_MIN = 0.18   # minimum valid ZED Mini depth (m)
 ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 # Fruit acceptance window. This used to sit at 0.20 -- 5cm above the sensor
 # floor -- purely so the gripper's red fingertips could not be detected as ripe
@@ -214,11 +225,25 @@ ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 #
 # Keep in step with ZEDMINI_DEPTH_Z_MIN: points below that are filtered out of
 # the cloud upstream anyway, so a lower value here would have no effect.
-FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.15"))
+# Raised 0.15 -> 0.18 on 2026-09-10 to follow ZEDMINI_DEPTH_Z_MIN, which was
+# raised to narrow the ZED's disparity search (a depth-speed win). The two had
+# drifted apart, leaving the bottom 3cm of this window unable to contain data
+# and the comment above untrue. Still well under the 0.20 that caused the
+# original problem described above, so the reasoning there is preserved.
+FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.18"))
 FRUIT_CAMERA_Z_MAX = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MAX", "0.70"))
 if not 0.0 < FRUIT_CAMERA_Z_MIN < FRUIT_CAMERA_Z_MAX:
     raise ValueError(
         "Expected 0 < UR10E_FRUIT_CAMERA_Z_MIN < UR10E_FRUIT_CAMERA_Z_MAX"
+    )
+# The invariant the comment above states, enforced rather than trusted: a fruit
+# window whose floor sits below the sensor's own minimum has a dead band.
+if FRUIT_CAMERA_Z_MIN < ZEDMINI_DEPTH_Z_MIN:
+    raise ValueError(
+        f"FRUIT_CAMERA_Z_MIN ({FRUIT_CAMERA_Z_MIN:.3f}) is below "
+        f"ZEDMINI_DEPTH_Z_MIN ({ZEDMINI_DEPTH_Z_MIN:.3f}); the depth backend "
+        "cannot return points in that band, so the window has a dead bottom. "
+        "Raise FRUIT_CAMERA_Z_MIN or lower ZEDMINI_DEPTH_Z_MIN."
     )
 ZEDMINI_MAX_POINTS = 20000   # subsample dense depth cloud to this many points (match LiDAR density)
 # Camera←ZedMini extrinsic (4×4, transforms points FROM ZED Mini left-cam frame

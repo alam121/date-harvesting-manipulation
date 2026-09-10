@@ -11,6 +11,7 @@ from .config import (
     SHOW_CLASSIFICATION_ZONES, CLASS_ZONE_MID_LEFT_THRESH, CLASS_ZONE_MID_RIGHT_THRESH,
     CLASS_ZONE_LOW_LEFT_THRESH, CLASS_ZONE_LOW_RIGHT_THRESH, APPROACH_CHECK_DIST,
     SHOW_GAP_DEBUG, SHOW_FINGER_CONTACTS,
+    SHOW_FINGERTIP_VERIFICATION_OVERLAY,
 )
 from .math_utils import project_point_to_image
 from .scoring import estimate_fruit_radius
@@ -31,6 +32,7 @@ class VisionVisualizer:
         self.display_scale = display_scale
         self.show_classification_zones = SHOW_CLASSIFICATION_ZONES
         self.show_gap_debug = SHOW_GAP_DEBUG
+        self.show_fingertip_overlay = SHOW_FINGERTIP_VERIFICATION_OVERLAY
         # Full harvesting needs an unobstructed view of the fruit.  Raw-YOLO
         # playback keeps the original class/confidence rendering.
         self.clean_harvest_overlay = clean_harvest_overlay
@@ -565,23 +567,24 @@ class VisionVisualizer:
             color = (0, 255, 255, 255) if possible_fit else (0, 165, 255, 255)
             p1i = tuple(np.round(p1).astype(int))
             p2i = tuple(np.round(p2).astype(int))
-            cv2.line(image, p1i, p2i, color, self._thick(3), cv2.LINE_AA)
-            for index, point in enumerate((p1i, p2i), 1):
-                cv2.circle(image, point, self._radius(9), (255, 255, 0, 255),
-                           self._thick(3), cv2.LINE_AA)
+            if self.show_fingertip_overlay:
+                cv2.line(image, p1i, p2i, color, self._thick(3), cv2.LINE_AA)
+                for index, point in enumerate((p1i, p2i), 1):
+                    cv2.circle(image, point, self._radius(9), (255, 255, 0, 255),
+                               self._thick(3), cv2.LINE_AA)
+                    if not self.clean_harvest_overlay:
+                        cv2.putText(image, f"R{index}", (point[0] + 5, point[1] - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                                    (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
                 if not self.clean_harvest_overlay:
-                    cv2.putText(image, f"R{index}", (point[0] + 5, point[1] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
-                                (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
-            if not self.clean_harvest_overlay:
-                cv2.putText(image, self.last_fingertip_verification,
-                            (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                            self._font(0.58), color, self._thick(2), cv2.LINE_AA)
+                    cv2.putText(image, self.last_fingertip_verification,
+                                (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                                self._font(0.58), color, self._thick(2), cv2.LINE_AA)
             return
 
         if len(points) != 3:
             self.last_fingertip_verification = f"NEED_2_TIPS detected={len(points)}"
-            if not self.clean_harvest_overlay:
+            if self.show_fingertip_overlay and not self.clean_harvest_overlay:
                 cv2.putText(
                     image, self.last_fingertip_verification,
                     (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
@@ -617,20 +620,21 @@ class VisionVisualizer:
             f"dx={dx:+.1f}px dy={dy:+.1f}px")
 
         color = (0, 255, 0, 255) if fit else (0, 165, 255, 255)
-        cv2.polylines(image, [hull.astype(np.int32).reshape(-1, 1, 2)],
-                      True, color, self._thick(3), cv2.LINE_AA)
-        for index, point in enumerate(points, 1):
-            center = (int(round(point[0])), int(round(point[1])))
-            cv2.circle(image, center, self._radius(9), (255, 255, 0, 255),
-                       self._thick(3), cv2.LINE_AA)
+        if self.show_fingertip_overlay:
+            cv2.polylines(image, [hull.astype(np.int32).reshape(-1, 1, 2)],
+                          True, color, self._thick(3), cv2.LINE_AA)
+            for index, point in enumerate(points, 1):
+                center = (int(round(point[0])), int(round(point[1])))
+                cv2.circle(image, center, self._radius(9), (255, 255, 0, 255),
+                           self._thick(3), cv2.LINE_AA)
+                if not self.clean_harvest_overlay:
+                    cv2.putText(image, f"R{index}", (center[0] + 5, center[1] - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
+                                (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
             if not self.clean_harvest_overlay:
-                cv2.putText(image, f"R{index}", (center[0] + 5, center[1] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, self._font(0.45),
-                            (255, 255, 0, 255), self._thick(1), cv2.LINE_AA)
-        if not self.clean_harvest_overlay:
-            cv2.putText(image, self.last_fingertip_verification,
-                        (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
-                        self._font(0.58), color, self._thick(2), cv2.LINE_AA)
+                cv2.putText(image, self.last_fingertip_verification,
+                            (max(5, x1), max(24, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                            self._font(0.58), color, self._thick(2), cv2.LINE_AA)
 
     def _draw_approach_arrows(
         self,

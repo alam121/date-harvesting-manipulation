@@ -856,6 +856,26 @@ class Planner:
     # 4-8mm from the seed. Raise again once vision publishes stable tracks at a
     # steady rate (per-track association + filtering).
     reacquire_stable_frames: int = 1
+    # Reacquire detection-quality gate. Until this existed, reacquire matched on
+    # position proximity alone -- any detection inside the match radius was
+    # accepted however bad it was, because the quality topics
+    # (depth_diagnostics / fruit_score / bbox_norm) are published inside
+    # _process_best_target, which the vision node SKIPS in reacquire mode.
+    # Quality now arrives on /vision/all_fruit_quality, which is published in
+    # reacquire mode too.
+    #
+    # Defaults are deliberately permissive: a rejected candidate costs a
+    # reacquire (falling back to the seed, i.e. today's behaviour), so start by
+    # only excluding clearly bad detections and tighten from field logs. Every
+    # rejection is logged with the failing metric.
+    reacquire_quality_gate: bool = True
+    reacquire_min_vis_ratio: float = 0.25     # fraction of mask with valid depth
+    reacquire_max_z_std_m: float = 0.025      # depth scatter across the fruit
+    reacquire_min_confidence: float = 0.20    # YOLO confidence
+    # 0.0 means the bbox touches the frame border, i.e. the date is cut off --
+    # the close-range failure mode, and it also corrupts the bbox-derived radius
+    # that feeds the surface->centre push.
+    reacquire_min_edge_margin: float = 0.0
     slip_check_reacquire: bool = False      # query depth after grasp to detect fruit slip
     regrip_after_slip: bool = False         # attempt regrip correction when grip is weak after slip
     subscribe_goal_min_settle_s: float = 0.25  # ignore first depth samples after Subscribe

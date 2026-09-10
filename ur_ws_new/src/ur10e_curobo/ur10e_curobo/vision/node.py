@@ -279,6 +279,15 @@ class VisionNode:
             Float32MultiArray, "/vision/depth_diagnostics", 10)
         self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
+        # Per-fruit detection quality, in the SAME score-sorted order as
+        # /vision/all_fruit_poses, 5 floats per fruit. Published in reacquire
+        # modes too, unlike the quality topics inside _process_best_target
+        # (depth_diagnostics / fruit_score / bbox_norm), which are skipped there.
+        # Without this, reacquire matched on position proximity alone: any
+        # detection landing within the match radius was accepted regardless of
+        # how bad it was.
+        self.all_fruit_quality_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/all_fruit_quality", 10)
         # Large camera frames must never back-pressure perception. A depth-1,
         # best-effort stream lets RViz consume the newest image and drops stale
         # frames when rendering cannot keep up.
@@ -353,7 +362,7 @@ class VisionNode:
         # Main node publishes to /vision/mode to switch modes on the fly.
         def _mode_cb(msg):
             mode = msg.data.strip()
-            if mode in ("full", "reacquire", "paused"):
+            if mode in ("full", "reacquire", "reacquire_fast", "paused"):
                 self.detection_mode = mode
         self.node.create_subscription(StdString, "/vision/mode", _mode_cb, 10)
         # Report the effective detection state back to the motion node. Used for a
@@ -1018,7 +1027,25 @@ class VisionNode:
                         break
                     t_now = time()
                 self._latest_zed_one_ts = t_now
-                self._latest_image_stamp = self.node.get_clock().now()
+                # Stamp this frame with when it was CAPTURED, not when the loop
+                # got round to it. _lookup_tf_at_image() exists precisely so a
+                # detection is transformed with the arm pose from the moment of
+                # the photo; handing it "now" fed it the very staleness it was
+                # written to remove.
+                #
+                # The gap is not hypothetical in mini-only mode: t_now is
+                # recorded in the capture thread right after grab() returns, and
+                # the packet then crosses a depth-1 queue whose depth-request
+                # handshake can hold it for up to 200ms (see _wait_deadline
+                # above). At 0.3 m/s tool speed every 10ms of stamp error is
+                # ~3mm of position error.
+                #
+                # Residual: the sensor->grab-return latency inside the SDK is
+                # still counted as zero. zed.get_timestamp(TIME_REFERENCE.IMAGE)
+                # would remove that too, but it has to be read on the capture
+                # thread and carried in the packet; t_now removes the large,
+                # variable term, which is the one that matters.
+                self._latest_image_stamp = self._ros_time_from_wall(t_now)
                 if not use_zedx_mini_only:
                     _grab_times.append(t_now)
                     if len(_grab_times) >= 2:
@@ -1048,11 +1075,21 @@ class VisionNode:
                     print("buffer", image_left_ocv.shape, "zed", image_left_ocv.shape)
                     self._printed_zed_buffer_shape = True
                 # "paused" mode: no inference at all (arm is moving, GPU needed for cuRobo).
-                # "reacquire" mode: every 3rd frame only.
+                # "reacquire" mode: every 3rd frame (planner busy).
+                # "reacquire_fast": every frame (arm stopped, GPU free).
                 # "full" mode: every frame.
                 _mode = self.detection_mode
                 _paused = _mode == "paused"
-                _reacquire = _mode == "reacquire"
+                _reacquire = _mode in ("reacquire", "reacquire_fast")
+                # YOLO submission throttle while reacquiring. The every-3rd-frame
+                # version exists to leave GPU headroom for cuRobo, and at the
+                # slip-check site that is real: _bg_preplan_dropoff is still
+                # planning while that reacquire runs. At the approach sites it
+                # protects nothing -- the arm is stopped and no preplan thread
+                # exists yet -- and it starves reacquire of exactly the samples
+                # it needs, which is why "[REACQ] no new perception sample" fires.
+                # The caller picks, via reacquire_goal_pose(planner_busy=...).
+                _reacq_skip_n = 1 if _mode == "reacquire_fast" else 3
                 if _paused:
                     # Keep the display live during robot motion, but skip stale
                     # detections/depth/heatmap work so cuRobo keeps the GPU.
@@ -1070,7 +1107,8 @@ class VisionNode:
                     if self._vision_paused_acked:
                         self.yolo_thread.paused = False
                         self._vision_paused_acked = False
-                    self._reacquire_frame_skip = (self._reacquire_frame_skip + 1) % 3
+                    self._reacquire_frame_skip = (
+                        (self._reacquire_frame_skip + 1) % _reacq_skip_n)
                     _waiting_for_depth = (
                         use_zedx_mini_only and
                         self.yolo_thread.dets_ready.is_set())
@@ -1325,14 +1363,57 @@ class VisionNode:
                     key=lambda _t: float(_t.get("score", 0.0)),
                     reverse=True,
                 )
+                # Quality per fruit, same order, 5 floats each:
+                #   vis_ratio, z_std, confidence, score, edge_margin_norm
+                # edge_margin_norm is how far the bbox sits from the nearest
+                # image border, as a fraction of the half-min image dimension.
+                # 0.0 means the box is clipped by the frame -- the direct signal
+                # for "the date is not fully visible", which is the failure mode
+                # at close range as the off-axis camera converges on the fruit.
+                _qual_flat = []
                 for _t in _targets_by_score:
                     _pb = _t.get("pt_base")
-                    if _pb is not None:
-                        _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
-                if _all_flat:
-                    _af_msg = Float32MultiArray()
-                    _af_msg.data = _all_flat
-                    self.all_fruits_pub.publish(_af_msg)
+                    if _pb is None:
+                        continue
+                    _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
+                    _bb = _t.get("bb")
+                    _iw = float(_t.get("img_width", 0) or 0)
+                    _ih = float(_t.get("img_height", 0) or 0)
+                    if _bb is not None and _iw > 0 and _ih > 0:
+                        _bx1, _by1, _bx2, _by2 = (float(v) for v in _bb)
+                        _edge_px = min(_bx1, _by1, _iw - _bx2, _ih - _by2)
+                        _half = max(1.0, min(_iw, _ih) / 2.0)
+                        _edge_norm = max(0.0, min(1.0, _edge_px / _half))
+                    else:
+                        _edge_norm = 1.0   # unknown -> do not penalise
+                    _qual_flat.extend([
+                        float(_t.get("vis_ratio", 0.0)),
+                        float(_t.get("z_std", 0.0)),
+                        float(_t.get("confidence", 0.0)),
+                        float(_t.get("score", 0.0)),
+                        float(_edge_norm),
+                    ])
+                # Publish EVERY processed frame, including when nothing was
+                # detected. Suppressing the message on "no detections" left
+                # every consumer holding the last non-empty list indefinitely,
+                # with no way to distinguish "nothing is visible" from "vision
+                # has not looked yet".
+                #
+                # That is what made reacquire report drift=(0,0,0)mm: the frozen
+                # list still contained the very detection that produced the
+                # seed, so reacquire matched the seed against itself and
+                # "succeeded" having learned nothing. An empty publish makes it
+                # time out honestly and fall back to the seed instead, which is
+                # the correct outcome when there is nothing to see.
+                #
+                # goal-multi guards with `if visible:` and reacquire iterates,
+                # so an empty list is safe for both consumers.
+                _af_msg = Float32MultiArray()
+                _af_msg.data = _all_flat
+                self.all_fruits_pub.publish(_af_msg)
+                _aq_msg = Float32MultiArray()
+                _aq_msg.data = _qual_flat
+                self.all_fruit_quality_pub.publish(_aq_msg)
 
                 if best_idx is None:
                     # No valid target exists in this frame.  Stop publishing the
@@ -1585,10 +1666,24 @@ class VisionNode:
                  if use_zedx_mini_only else "ZED stereo depth")
             )
             apply_zed_stereo_settings(zed)
-            if not bool(getattr(self.args, "raw_yolo_view", False)):
+            # Positional tracking is the SDK's visual odometry: once enabled it
+            # runs on every grab. Nothing here consumes it -- there is no
+            # get_position()/sl.Pose call anywhere in the package, and the arm
+            # pose comes from TF, which is exact. It was previously enabled in
+            # BOTH modes, so mini-only paid for a camera trajectory it computed
+            # and threw away every frame, on an arm-mounted camera watching a
+            # wind-blown palm (the input VO is worst at).
+            #
+            # It is NOT dead in the stereo path: enable_object_detection() below
+            # sets enable_tracking=True, and the SDK requires positional tracking
+            # for that. So gate it on exactly the object-detection condition
+            # rather than removing it -- keep these two ifs in step.
+            _use_object_detection = (
+                not use_zedx_mini_only
+                and not bool(getattr(self.args, "raw_yolo_view", False)))
+            if _use_object_detection:
                 zed.enable_positional_tracking(sl.PositionalTrackingParameters())
-            if not use_zedx_mini_only and not bool(
-                    getattr(self.args, "raw_yolo_view", False)):
+            if _use_object_detection:
                 obj_param = sl.ObjectDetectionParameters()
                 obj_param.detection_model = sl.OBJECT_DETECTION_MODEL.CUSTOM_BOX_OBJECTS
                 obj_param.enable_tracking = True
@@ -1607,6 +1702,31 @@ class VisionNode:
         Thread(target=self.yolo_thread.run, daemon=True).start()
         self._publish_camera_status()
         return zed
+
+    def _ros_time_from_wall(self, t_wall: float):
+        """rclpy Time for a time.time() reading, on the node clock's time base.
+
+        time.time() and the ROS system clock are both Unix epoch seconds, so
+        this is a straight conversion. Split whole seconds from the fraction
+        before scaling: t_wall is ~1.8e9, and float64 cannot carry nanosecond
+        resolution at that magnitude, while the sub-second remainder is well
+        under 1.0 and converts with room to spare.
+
+        clock_type is taken from the node clock so the returned Time can be
+        compared against it inside tf2 (mixing ROS_TIME and SYSTEM_TIME raises).
+        Assumes use_sim_time is false, which it must be -- this node opens
+        physical ZED cameras.
+        """
+        try:
+            _sec = int(t_wall)
+            _nsec = int(round((t_wall - _sec) * 1e9))
+            if _nsec >= 1_000_000_000:      # rounding can carry into the second
+                _sec += 1
+                _nsec -= 1_000_000_000
+            return rclpyTime(seconds=_sec, nanoseconds=_nsec,
+                             clock_type=self.node.get_clock().clock_type)
+        except Exception:
+            return self.node.get_clock().now()
 
     def _image_stamp_msg(self):
         """Stamp of the image currently being processed, for TF and headers.
@@ -2050,12 +2170,45 @@ class VisionNode:
                         "using nearest central foreground layer")
 
             # Depth: use ZED Mini pts (in ZED One frame) for Z only.
-            # Use all in-mask points within FRUIT_DEPTH_RANGE of the nearest valid point.
-            # Background is always farther so ~10 cm cap excludes it.
-            FRUIT_DEPTH_RANGE = 0.10
+            # Keep in-mask points within a window of the nearest valid point;
+            # anything past it is background bleeding through the mask.
+            #
+            # This window was a flat 0.10 -- about 9x the depth extent of the
+            # object it is meant to isolate. A date of this cultivar is 20-25mm
+            # across, so its visible cap spans only ~11mm plus a few mm of
+            # neural-depth noise.
+            #
+            # 452 field frames (~/.ros/log, 2026-09-10) say the flat cap caught
+            # the gross case and nothing else. 13% of frames carry points
+            # 1.5-2.2m behind the date -- sky/canopy seen through the mask --
+            # and every one of those was correctly excluded. But on the 392
+            # frames where the cap excluded nothing at all:
+            #
+            #   in-mask spread (p95-p5)   median   9mm  <- healthy: cap + noise
+            #                             p90     26mm
+            #                             max     49mm  (52/392 span 25-49mm)
+            #
+            # On those wide frames the median sits ~21mm behind p5 where the
+            # sphere geometry says it should sit ~8mm (0.707*r), i.e. Zc reads
+            # roughly 10-15mm too far back. That is larger than the
+            # surface->centre correction applied further down, so the window was
+            # the dominant error term, not the correction it was masking.
+            #
+            # Size the window to the fruit instead. estimate_fruit_radius()
+            # clamps to [8mm, 18mm] (see FRUIT_RADIUS_MIN/MAX), so the window
+            # stays inside [25mm, 54mm] and a merged or oversized bbox cannot
+            # reopen it. z_min_anchor is the measured front surface, which is a
+            # good enough provisional depth to size the radius from.
             zs  = pts[:, 2]
             z_min_anchor = float(np.percentile(zs, 5))
-            in_fruit = zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)
+            _r_provisional = estimate_fruit_radius(
+                {"bb": (x1, y1, x2, y2), "Zc": z_min_anchor},
+                fx=intrinsics["fx"])
+            # ~r of visible cap + headroom for neural-depth noise. The floor
+            # keeps small or partially occluded dates from getting a window so
+            # tight that the real cap falls outside it.
+            fruit_depth_range = max(0.025, 3.0 * _r_provisional)
+            in_fruit = zs <= (z_min_anchor + fruit_depth_range)
             if in_fruit.sum() >= 10:
                 pts_front = pts[in_fruit]
                 uv_front = uv_in_mask[in_fruit]
@@ -2073,22 +2226,32 @@ class VisionNode:
             _p5, _p50, _p95 = (
                 float(p) for p in np.percentile(zs, [5, 50, 95]))
             _near = int(np.count_nonzero(
-                zs <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
+                zs <= (z_min_anchor + fruit_depth_range)))
             _far = int(zs.shape[0] - _near)
-            _out = pts_bbox[~in_mask]
-            _out_near = (
-                int(np.count_nonzero(
-                    _out[:, 2] <= (z_min_anchor + FRUIT_DEPTH_RANGE)))
-                if _out.shape[0] else 0)
-            _out_p5 = (
-                float(np.percentile(_out[:, 2], 5))
-                if _out.shape[0] else -1.0)
-            _out_p50 = (
-                float(np.percentile(_out[:, 2], 50))
-                if _out.shape[0] else -1.0)
+            # Points inside the bbox but OUTSIDE the mask. Answers "is the
+            # date's depth landing next to the mask rather than on it?" -- a
+            # question worth having when alignment is suspect, but it is pure
+            # diagnostics and it used to run on every detection of every frame.
+            # DEBUG_DEPTH_SAMPLING throttled only the printing, not this. The
+            # -1 placeholders match the fallback tuple built further down.
+            if DEBUG_DEPTH_SAMPLING:
+                _out = pts_bbox[~in_mask]
+                _out_near = (
+                    int(np.count_nonzero(
+                        _out[:, 2] <= (z_min_anchor + fruit_depth_range)))
+                    if _out.shape[0] else 0)
+                _out_p5 = (
+                    float(np.percentile(_out[:, 2], 5))
+                    if _out.shape[0] else -1.0)
+                _out_p50 = (
+                    float(np.percentile(_out[:, 2], 50))
+                    if _out.shape[0] else -1.0)
+                _out_count = int(_out.shape[0])
+            else:
+                _out_near, _out_count, _out_p5, _out_p50 = -1, -1, -1.0, -1.0
             depth_diag = (
                 _p5, _p50, _p95, _near, _far,
-                _out_near, int(_out.shape[0]), _out_p5, _out_p50)
+                _out_near, _out_count, _out_p5, _out_p50)
 
             # X,Y from the front-depth points themselves. Same point set as
             # uv_front, so this keeps the original intent -- median over the
@@ -2123,8 +2286,9 @@ class VisionNode:
                     self.node.get_logger().info(
                         f"[DEPTH_DBG] bbox=({x1},{y1},{x2},{y2}) in_mask={int(zs.shape[0])}pts "
                         f"z(m) p5/p50/p95={_p5:.3f}/{_p50:.3f}/{_p95:.3f} "
-                        f"near(<=p5+10cm)={_near} far={_far} -> Zc={Zc:.3f} | "
-                        f"near_but_OUTSIDE_mask={_out_near}/{int(_out.shape[0])}"
+                        f"win={fruit_depth_range*1000:.0f}mm(r={_r_provisional*1000:.1f}mm) "
+                        f"near={_near} far={_far} -> Zc={Zc:.3f} | "
+                        f"near_but_OUTSIDE_mask={_out_near}/{_out_count}"
                         f" | cam=[{Xc:.3f},{Yc:.3f},{Zc:.3f}]{_base_str}")
 
             if not np.isfinite(Zc):
@@ -2228,31 +2392,40 @@ class VisionNode:
             # pixels just outside the mask are consistently nearer than the
             # selected in-mask surface, RGB/depth alignment may be excluding the
             # true date layer. Do not alter the commanded goal yet.
-            _ring = (
-                cv2.dilate(mask_bool.astype(np.uint8),
-                           np.ones((21, 21), np.uint8), iterations=1) > 0
-            ) & (~mask_bool)
-            _ring_valid = (
-                _ring & np.isfinite(roi_xyz[:, :, 2]) &
-                (roi_xyz[:, :, 2] > 0.0)
-            )
-            _outside_z = roi_xyz[:, :, 2][_ring_valid]
-            _outside_near = (
-                int(np.count_nonzero(_outside_z <= Zc - 0.005))
-                if _outside_z.size else 0)
-            _outside_p5 = (
-                float(np.percentile(_outside_z, 5))
-                if _outside_z.size else -1.0)
-            _outside_p50 = (
-                float(np.percentile(_outside_z, 50))
-                if _outside_z.size else -1.0)
+            # The 21x21 dilate is the expensive part and this whole block is
+            # diagnostics -- its own comment says it must not alter the goal.
+            # It ran per detection per frame regardless of whether anyone was
+            # reading it; gate it like the ZED Mini path above.
+            if DEBUG_DEPTH_SAMPLING:
+                _ring = (
+                    cv2.dilate(mask_bool.astype(np.uint8),
+                               np.ones((21, 21), np.uint8), iterations=1) > 0
+                ) & (~mask_bool)
+                _ring_valid = (
+                    _ring & np.isfinite(roi_xyz[:, :, 2]) &
+                    (roi_xyz[:, :, 2] > 0.0)
+                )
+                _outside_z = roi_xyz[:, :, 2][_ring_valid]
+                _outside_near = (
+                    int(np.count_nonzero(_outside_z <= Zc - 0.005))
+                    if _outside_z.size else 0)
+                _outside_p5 = (
+                    float(np.percentile(_outside_z, 5))
+                    if _outside_z.size else -1.0)
+                _outside_p50 = (
+                    float(np.percentile(_outside_z, 50))
+                    if _outside_z.size else -1.0)
+                _outside_count = int(_outside_z.size)
+            else:
+                _outside_near, _outside_count = -1, -1
+                _outside_p5, _outside_p50 = -1.0, -1.0
             _p5, _p50, _p95 = (
                 float(p) for p in np.percentile(zs, [5, 50, 95]))
             _near = int(np.count_nonzero(zs <= Zc + 0.10))
             _far = int(zs.shape[0] - _near)
             depth_diag = (
                 _p5, _p50, _p95, _near, _far,
-                _outside_near, int(_outside_z.size),
+                _outside_near, _outside_count,
                 _outside_p5, _outside_p50,
             )
 
