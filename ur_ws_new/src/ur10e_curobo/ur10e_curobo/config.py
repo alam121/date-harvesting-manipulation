@@ -968,7 +968,11 @@ class Planner:
                                         # treat the program as always "running" so wait_until_xyz doesn't stall
     debug_plan_preview: bool = True    # show full plan and wait for confirmation before executing
     log_cycle_start: bool = False      # verbose per-goal start/decision metadata
-    log_phase_timings: bool = False    # per-phase timing lines; cycle summary always includes timings
+    # Default True from 2026-09-13. The per-phase lines are what showed that the
+    # reacquire freshness gate was burning its full 0.6s (now 0.13s with
+    # approach streaming) and are how the remaining cost gets attributed. Set
+    # False again if the console gets too noisy for field use.
+    log_phase_timings: bool = True     # per-phase timing lines; cycle summary always includes timings
     log_path_publish: bool = False     # RViz path marker publish messages
     concise_console_logs: bool = True  # operator view; warnings/errors and cycle results remain visible
     log_gripper_force_profile: bool = False  # enable only while collecting force calibration data
