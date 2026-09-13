@@ -91,6 +91,22 @@ class ConfigManager:
         self._node.declare_parameter("planner.ramp_points", self.cfg.planner.ramp_points)
         self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
         self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
+        # In-flight FINAL correction. Declared so apply can be toggled on the
+        # running robot: the last ~7cm was dead-reckoned, and this is the switch
+        # that closes it. Keep in step with param_map in _on_parameter_change --
+        # declaring alone is not enough, a change only reaches cfg via that map.
+        self._node.declare_parameter(
+            "planner.final_inflight_observe", self.cfg.planner.final_inflight_observe)
+        self._node.declare_parameter(
+            "planner.final_inflight_apply", self.cfg.planner.final_inflight_apply)
+        self._node.declare_parameter(
+            "planner.final_inflight_min_delta_m", self.cfg.planner.final_inflight_min_delta_m)
+        self._node.declare_parameter(
+            "planner.final_inflight_max_delta_m", self.cfg.planner.final_inflight_max_delta_m)
+        self._node.declare_parameter(
+            "planner.final_inflight_max_updates", self.cfg.planner.final_inflight_max_updates)
+        self._node.declare_parameter(
+            "planner.final_inflight_min_interval_s", self.cfg.planner.final_inflight_min_interval_s)
         self._node.declare_parameter("planner.max_traj_velocity", self.cfg.planner.max_traj_velocity)
         self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
         self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
@@ -534,6 +550,13 @@ class ConfigManager:
             "planner.subscribe_goal_stable_tol": (self.cfg.planner, "subscribe_goal_stable_tol", float),
             "planner.subscribe_goal_median_window": (self.cfg.planner, "subscribe_goal_median_window", int),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
+            # In-flight FINAL correction (see _declare_parameters)
+            "planner.final_inflight_observe": (self.cfg.planner, "final_inflight_observe", bool),
+            "planner.final_inflight_apply": (self.cfg.planner, "final_inflight_apply", bool),
+            "planner.final_inflight_min_delta_m": (self.cfg.planner, "final_inflight_min_delta_m", float),
+            "planner.final_inflight_max_delta_m": (self.cfg.planner, "final_inflight_max_delta_m", float),
+            "planner.final_inflight_max_updates": (self.cfg.planner, "final_inflight_max_updates", int),
+            "planner.final_inflight_min_interval_s": (self.cfg.planner, "final_inflight_min_interval_s", float),
             "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
             "planner.pre_dropoff_depth_offset": (self.cfg.planner, "pre_dropoff_depth_offset", float),
             "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),
