@@ -180,12 +180,30 @@ _LAB_GRASP_OFFSETS = {
 }
 
 _OUTDOOR_GRASP_OFFSETS = {
+    # low/mid CENTER depth offsets: -0.010 -> +0.020 on 2026-09-13, found
+    # empirically on the rig after the LEFT and RIGHT fingertips were replaced
+    # with longer ones (the CENTER tip is unchanged, small, and does not reach
+    # the fruit).
+    #
+    # Applied as _center_final_y = y - offset, and targets sit at y ~ -0.93, so
+    # a larger positive value drives the TCP FURTHER from the base, i.e. deeper
+    # toward the fruit. That is the OPPOSITE of what simple geometry predicts:
+    # longer fingers should need the TCP to stop shorter, not deeper. So these
+    # tips do something other than extend the pinch point straight out. Treat
+    # the value as MEASURED, not derived, and re-measure if the tips change.
+    #
+    # Briefly 0.0, which was followed by a CLOSED_NOTHING; +0.020 is what works.
+    #
+    # NOTE low_side_final_depth_offset stays 0.0, so SIDE-classified targets get
+    # no fingertip correction at all. Every target tested on 2026-09-13 was
+    # CENTER, so this is untested rather than known-good -- if side grasps start
+    # missing short, that is the first thing to look at.
     "low_side_final_depth_offset": 0.0,
     "low_left_final_z_offset": 0.020,
     "low_right_final_z_offset": 0.010,
-    "low_center_final_depth_offset": -0.010,
+    "low_center_final_depth_offset": 0.020,
     "low_center_final_z_offset": 0.0,
-    "mid_center_final_depth_offset": -0.010,
+    "mid_center_final_depth_offset": 0.020,
     "mid_center_final_z_offset": 0.0,
     "mid_center_slip_final_z_offset": 0.020,
     "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
