@@ -6273,6 +6273,25 @@ def plan_and_execute(node):
             _inflight_stop.set()
             if _inflight_thread is not None:
                 _inflight_thread.join(timeout=0.5)
+                # Freeze the last crop BEFORE re-pausing vision. This is the
+                # model input for a ready-to-close judgement: the date between
+                # the fingertips at the moment the arm has finished closing in
+                # and is about to grip. Taken here it is a few hundred ms old;
+                # the recorder otherwise saves whatever survives until the
+                # outcome fires, which is after the close AND the reverse --
+                # measured at 2.9s stale, by which time the gripper has moved
+                # and the image no longer describes the decision.
+                try:
+                    _cc = getattr(node, "_latest_grasp_crop", None)
+                    node._grasp_crop_at_close = (
+                        _cc.copy() if _cc is not None else None)
+                    node._grasp_crop_at_close_meta = list(
+                        getattr(node, "_latest_grasp_crop_meta", None) or [])
+                    node._grasp_crop_at_close_age = round(
+                        time.time() - float(getattr(
+                            node, "_latest_grasp_crop_t", 0.0)), 3)
+                except Exception:
+                    node._grasp_crop_at_close = None
                 # Restore the pause the rest of the sequence expects.
                 node.set_vision_mode("paused")
                 node.wait_for_vision_paused(timeout=0.30)

@@ -117,16 +117,28 @@ def record_episode(node, outcome: str, end: str) -> Optional[str]:
     episode["grasp_crop_age_s"] = _jsonable(_safe(
         lambda: round(time.time() - float(node._latest_grasp_crop_t), 3)))
 
+    episode["grasp_crop_at_close_meta"] = _jsonable(
+        getattr(node, "_grasp_crop_at_close_meta", None))
+    episode["grasp_crop_at_close_age_s"] = _jsonable(
+        getattr(node, "_grasp_crop_at_close_age", None))
+
     saved = []
-    _crop = getattr(node, "_latest_grasp_crop", None)
-    if _crop is not None:
+    # crop_close is the MODEL INPUT: frozen at the end of the FINAL move, just
+    # before the gripper closes. crop is whatever was latest at outcome time,
+    # which is after the close and the reverse -- kept for context, not for
+    # training a close/don't-close decision.
+    for _img, _name in (
+            (getattr(node, "_grasp_crop_at_close", None), "crop_close.jpg"),
+            (getattr(node, "_latest_grasp_crop", None), "crop.jpg")):
+        if _img is None:
+            continue
         try:
             import cv2
-            cv2.imwrite(os.path.join(path, "crop.jpg"), _crop,
+            cv2.imwrite(os.path.join(path, _name), _img,
                         [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-            saved.append("crop.jpg")
+            saved.append(_name)
         except Exception as exc:
-            node.get_logger().warn(f"[EPISODE] crop not saved: {exc}")
+            node.get_logger().warn(f"[EPISODE] {_name} not saved: {exc}")
 
     for name in ("_grasp_pair_before_frame", "_grasp_pair_after_frame"):
         frame = getattr(node, name, None)
