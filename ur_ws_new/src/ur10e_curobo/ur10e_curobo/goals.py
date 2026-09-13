@@ -1321,7 +1321,13 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     # Wait target: only use FK of the truncated endpoint when THIS trajectory was
     # truncated.  Using the node flag (_approach_truncated) instead caused the flag
     # to leak from a previous APPROACH into a later FINAL call, mis-directing the wait.
-    _wait_xyz = target_pose_list[:3]
+    # A LIST, deliberately, and published on the node. wait_until_xyz reads
+    # `math.dist(cur[:3], target_xyz)` fresh on every loop iteration, so
+    # mutating this list in place retargets the move already in flight without
+    # touching that function. _final_inflight_apply uses it.
+    _wait_xyz = list(target_pose_list[:3])
+    if _is_final:
+        node._final_live_wait_xyz = _wait_xyz
     if _this_traj_truncated:
         _fk_end = forward_kinematics(node, states[-1])
         if _fk_end:
@@ -2831,6 +2837,79 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
                 time.sleep(0.12)  # wait for any in-flight YOLO inference to finish
 
 
+def _apply_final_inflight_correction(node, delta, report):
+    """Retarget the FINAL move already in flight. Returns True if published.
+
+    Regenerates the remaining straight leg from where the arm IS now to the
+    corrected TCP pose and publishes it, replacing the active trajectory, then
+    mutates the live wait target in place so wait_until_xyz follows.
+
+    Nothing here stops the arm. The correction is bounded by the caller to
+    [min_delta, max_delta], so the new straight line stays close to the one the
+    corridor preflight already cleared.
+    """
+    planner = node.cfg.planner
+    tcp = getattr(node, "_final_live_wait_xyz", None)
+    quat = getattr(node, "_final_live_quat", None)
+    if tcp is None or quat is None:
+        return False
+    js = node.current_joint_positions
+    if js is None:
+        return False
+    cur = node.get_end_effector_pose()
+    if not cur or len(cur) < 7:
+        return False
+
+    corrected = [float(tcp[i]) + float(delta[i]) for i in range(3)]
+    ok, why = goal_is_in_robot_workspace(node, corrected)
+    if not ok:
+        node.get_logger().warn(f"[FINAL_INFLIGHT] retarget outside workspace: {why}")
+        return False
+
+    # Remaining distance decides how long the new leg should take, so the
+    # correction does not change the approach speed near the fruit.
+    _remaining = math.dist(cur[:3], corrected)
+    _dt = float(min(max(planner.base_dt / max(
+        planner.speed_scale * planner.speed_final, 1e-6),
+        planner.min_dt), planner.max_dt))
+    _dur = max(0.25, _remaining / max(0.024, 1e-6))   # ~2.4cm/s, the FINAL rate
+
+    states = straight_cartesian_entry_states(
+        node, list(js), list(cur[:3]), list(cur[3:7]),
+        [*corrected, *quat], _dt, label="FINAL_RETARGET", duration_s=_dur)
+    if not states:
+        node.get_logger().warn(
+            "[FINAL_INFLIGHT] retarget IK failed; keeping the original path")
+        return False
+
+    # Same clearance gate the original FINAL had to pass.
+    _clamp_mm, _cut, _dest = _log_forearm_flange_clearance(
+        node, states, "FINAL_RETARGET", log_result=False)
+    _thr = float(getattr(planner, "clamp_safety_threshold_mm", 35.0))
+    if _clamp_mm < _thr:
+        node.get_logger().warn(
+            f"[FINAL_INFLIGHT] retarget clearance {_clamp_mm:.1f}mm < {_thr:.0f}mm; "
+            "keeping the original path")
+        return False
+
+    traj = build_trajectory(
+        node.joint_order, states, vel=min(0.05 * 0.5, 0.15), dt=_dt,
+        stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity * 0.5,
+        max_acc=planner.max_joint_acceleration * 0.3,
+        ramp_points=0, include_acc=False)
+    node.trajectory_pub.publish(traj)
+    # In place: wait_until_xyz is holding a reference to this same list.
+    tcp[0], tcp[1], tcp[2] = corrected
+    report["applied"] += 1
+    node.get_logger().info(
+        f"[FINAL_INFLIGHT] retargeted "
+        f"{math.dist([0,0,0], delta)*1000:.1f}mm -> "
+        f"[{corrected[0]:.3f},{corrected[1]:.3f},{corrected[2]:.3f}] "
+        f"({_remaining*1000:.0f}mm remaining, clearance {_clamp_mm:.0f}mm)")
+    return True
+
+
 def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     """Watch vision during the FINAL move. Observation-only.
 
@@ -2878,11 +2957,32 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         if best_d > max_d:
             report["above_max"] += 1
             continue
-        # A usable correction. Record the newest one; APPLY consumes it.
+        # A usable correction.
         report["usable"] += 1
         report["latest"] = best
         report["latest_d"] = best_d
         report["latest_t"] = time.time() - t0
+
+        if not bool(getattr(planner, "final_inflight_apply", False)):
+            continue
+        # Bounded: a capped number of retargets, spaced out, and the running
+        # total held under max_d so repeated small nudges cannot walk the goal
+        # somewhere the corridor preflight never cleared.
+        if report["applied"] >= int(getattr(
+                planner, "final_inflight_max_updates", 2)):
+            continue
+        if (time.time() - report["last_apply_t"]
+                < float(getattr(planner, "final_inflight_min_interval_s", 0.25))):
+            continue
+        delta = [best[i] - target_xyz[i] for i in range(3)]
+        if math.dist([0.0, 0.0, 0.0], delta) + report["applied_total"] > max_d:
+            report["above_max"] += 1
+            continue
+        if _apply_final_inflight_correction(node, delta, report):
+            report["last_apply_t"] = time.time()
+            report["applied_total"] += math.dist([0.0, 0.0, 0.0], delta)
+            # Corrections are measured against the goal we are now driving to.
+            target_xyz = [target_xyz[i] + delta[i] for i in range(3)]
 
 
 def _reacquire_candidate_quality(node, candidate):
@@ -6116,11 +6216,13 @@ def plan_and_execute(node):
             "frames": 0, "matched": 0, "rejected": 0, "no_candidate": 0,
             "below_min": 0, "above_max": 0, "usable": 0,
             "latest": None, "latest_d": 0.0, "latest_t": 0.0,
-            "last_reject": "",
+            "last_reject": "", "applied": 0, "applied_total": 0.0,
+            "last_apply_t": 0.0,
         }
         _inflight_stop = threading.Event()
         _inflight_thread = None
         if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
+            node._final_live_quat = list(final_target[3:7])
             node.set_vision_mode("reacquire_fast")
             # Compare against the FRUIT goal (x,y,z), not final_target.
             # final_target is the TCP pose, which sits ~28mm from the fruit by
@@ -6156,6 +6258,8 @@ def plan_and_execute(node):
                     f"rejected_quality={_r['rejected']} "
                     f"below_min={_r['below_min']} above_max={_r['above_max']} "
                     f"usable={_r['usable']}{_latest} "
+                    f"applied={_r['applied']} "
+                    f"applied_total={_r['applied_total']*1000:.1f}mm "
                     f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
                     + (f" last_reject={_r['last_reject']}"
                        if _r["last_reject"] else ""))
