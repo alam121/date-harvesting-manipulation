@@ -6422,12 +6422,23 @@ def plan_and_execute(node):
 
         _measured_final = node.get_end_effector_pose()
         if _measured_final:
+            # Report against the goal the arm was actually driving to. An
+            # in-flight retarget moves it, and printing the original target here
+            # showed an error that is really the size of the correction -- seen
+            # as "error=5.2mm" on a move the endpoint check (which does use the
+            # retargeted goal) passed at 3.2mm. Two references in adjacent lines
+            # reads like a near-miss when nothing is wrong.
+            _reached_ref = getattr(node, "_final_retarget_xyz", None) or final_target[:3]
+            _retarget_note = (
+                f" retargeted_from=[{final_target[0]:.3f},"
+                f"{final_target[1]:.3f},{final_target[2]:.3f}]"
+                if getattr(node, "_final_retarget_xyz", None) else "")
             _final_error_mm = math.dist(
-                _measured_final[:3], final_target[:3]) * 1000.0
+                _measured_final[:3], _reached_ref) * 1000.0
             node.get_logger().info(
-                f"[FINAL_REACHED] target=[{final_target[0]:.3f},{final_target[1]:.3f},{final_target[2]:.3f}] "
+                f"[FINAL_REACHED] target=[{_reached_ref[0]:.3f},{_reached_ref[1]:.3f},{_reached_ref[2]:.3f}] "
                 f"actual=[{_measured_final[0]:.3f},{_measured_final[1]:.3f},{_measured_final[2]:.3f}] "
-                f"error={_final_error_mm:.1f}mm")
+                f"error={_final_error_mm:.1f}mm{_retarget_note}")
         else:
             node.get_logger().warn(
                 "[FINAL_REACHED] Actual TCP unavailable before gripper close")

@@ -473,9 +473,13 @@ class Planner:
     global_speed_multiplier: float = 5.0
 
     # Motion-specific speed factors (multiplied by global_speed_multiplier)
-    speed_home: float = 0.11        # faster return; effective scale=0.55 with global=5
-    speed_dropoff: float = 0.18     # faster carrying move; effective scale=0.90
-    speed_predropoff: float = 0.2  # for pre-dropoff reverse
+    # 0.11 -> 0.35 on 2026-09-13. dt = base_dt/(global*speed), clamped to
+    # [min_dt, max_dt] = [10ms, 80ms]. HOME was running at 36.4ms; 0.35 gives
+    # 11.4ms, close to the floor the staged approach already runs at safely.
+    # 0.40 would sit exactly on min_dt if more is wanted.
+    speed_home: float = 0.35        # effective scale=1.75 with global=5 -> dt 11.4ms
+    speed_dropoff: float = 0.35     # was 0.18 (dt 22.2ms) -> dt 11.4ms
+    speed_predropoff: float = 0.35 # was 0.2 (dt 20ms) -> dt 11.4ms; also drives REVERSE
     # Only FINAL is genuinely near the fruit and needs to be slow. Everything
     # before it is gross motion well outside the fruit corridor.
     #
@@ -494,7 +498,12 @@ class Planner:
     # of how fast the staging leg runs. Previously this leg was 41 samples at
     # 50ms = ~2.05s; keeping it close to that preserves the careful entry while
     # the approach to it got faster.
-    approach_entry_duration_s: float = 1.5
+    # 1.5 -> 0.9. This leg is the last 80mm of the APPROACH and ends at the
+    # standoff, ~7cm short of the fruit -- not at it. It was held slow when that
+    # standoff measurement was the last word on where the date was. The FINAL is
+    # now closed-loop and retargets in flight, so the careful part has moved
+    # downstream and this leg does not need to carry it.
+    approach_entry_duration_s: float = 0.9
 
     # Final base-frame guard for vision goals. A stable but physically impossible
     # background-depth estimate must never enter the motion queue.

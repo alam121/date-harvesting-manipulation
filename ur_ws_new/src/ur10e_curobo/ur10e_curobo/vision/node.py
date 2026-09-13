@@ -1440,8 +1440,17 @@ class VisionNode:
                         _ih, _iw = image_left_ocv.shape[:2]
                         _mw = max(8, _bx2 - _bx1)
                         _mh = max(8, _by2 - _by1)
-                        _cx1 = max(0, _bx1 - _mw); _cy1 = max(0, _by1 - _mh)
-                        _cx2 = min(_iw, _bx2 + _mw); _cy2 = min(_ih, _by2 + _mh)
+                        # Slide the window instead of shrinking it when it
+                        # hits a border. A VERY_LOW date sits near the bottom of
+                        # the frame, so the naive clamp returned 213 of the 318
+                        # requested rows and cut the lower gripper off. Sliding
+                        # keeps the crop a consistent size for training and
+                        # recovers the context on the opposite side.
+                        _cw = min(_iw, (_bx2 - _bx1) + 2 * _mw)
+                        _ch = min(_ih, (_by2 - _by1) + 2 * _mh)
+                        _cx1 = int(min(max(0, _bx1 - _mw), _iw - _cw))
+                        _cy1 = int(min(max(0, _by1 - _mh), _ih - _ch))
+                        _cx2 = _cx1 + _cw; _cy2 = _cy1 + _ch
                         if _cx2 > _cx1 + 8 and _cy2 > _cy1 + 8:
                             _crop = image_left_ocv[_cy1:_cy2, _cx1:_cx2]
                             if _crop.ndim == 3 and _crop.shape[2] == 4:
