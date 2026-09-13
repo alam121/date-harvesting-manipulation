@@ -2477,6 +2477,18 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
     node.trajectory_pub.publish(traj)
 
+    # Planning is finished and the arm is now executing, so the GPU is free.
+    # Stream vision through the approach travel; reacquire then reads a
+    # measurement that is already fresh on arrival instead of parking the arm
+    # while it waits for one. lock_target() was called before the pause, so
+    # vision stays on this target and cannot drift to a different "best".
+    if (label.startswith("APPROACH")
+            and bool(getattr(node.cfg.planner, "approach_vision_streaming", False))
+            and hasattr(node, "set_vision_mode")):
+        node.set_vision_mode("reacquire_fast")
+        node.get_logger().info(
+            "[APPROACH_VISION] streaming during travel (GPU free; planning done)")
+
     if callable(_record_motion):
         _record_motion(
             stage="EXECUTE", label=label, motion_type=motion_type,

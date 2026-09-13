@@ -807,6 +807,22 @@ class Planner:
     #
     # APPLY additionally retargets the move in flight. Keep it False until the
     # OBSERVE logs show the detection is trustworthy that close in.
+    # Stream vision during the APPROACH move so a fresh measurement is already
+    # available when the arm arrives, instead of parking at the standoff for
+    # 0.75-1.6s while reacquire waits for one.
+    #
+    # Vision is paused before the approach to free the GPU for cuRobo -- but
+    # that pause is for the PLANNING, and it currently persists through the
+    # execution too, where nothing is planning. Same reasoning that removed the
+    # pause from the FINAL leg, and the same evidence: measuring while moving
+    # works (FINAL_INFLIGHT saw 10-13 frames per move, 100% matched).
+    #
+    # Only enabled after the trajectory is published, so planning keeps the GPU
+    # to itself. Two differences from the FINAL leg make this less certain:
+    # the approach runs faster (speed_alignment 4.0 vs speed_final 0.06), and
+    # the vision node deliberately discards detections when the camera moves
+    # >5mm, so measurements arrive without temporal smoothing.
+    approach_vision_streaming: bool = False
     final_inflight_observe: bool = True
     final_inflight_apply: bool = False
     # Ignore corrections below this (noise) and above this (a different date, or

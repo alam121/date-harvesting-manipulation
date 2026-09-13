@@ -96,6 +96,8 @@ class ConfigManager:
         # that closes it. Keep in step with param_map in _on_parameter_change --
         # declaring alone is not enough, a change only reaches cfg via that map.
         self._node.declare_parameter(
+            "planner.approach_vision_streaming", self.cfg.planner.approach_vision_streaming)
+        self._node.declare_parameter(
             "planner.final_inflight_observe", self.cfg.planner.final_inflight_observe)
         self._node.declare_parameter(
             "planner.final_inflight_apply", self.cfg.planner.final_inflight_apply)
@@ -551,6 +553,7 @@ class ConfigManager:
             "planner.subscribe_goal_median_window": (self.cfg.planner, "subscribe_goal_median_window", int),
             "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
             # In-flight FINAL correction (see _declare_parameters)
+            "planner.approach_vision_streaming": (self.cfg.planner, "approach_vision_streaming", bool),
             "planner.final_inflight_observe": (self.cfg.planner, "final_inflight_observe", bool),
             "planner.final_inflight_apply": (self.cfg.planner, "final_inflight_apply", bool),
             "planner.final_inflight_min_delta_m": (self.cfg.planner, "final_inflight_min_delta_m", float),
