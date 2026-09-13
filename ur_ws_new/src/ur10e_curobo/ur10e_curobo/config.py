@@ -194,11 +194,12 @@ _OUTDOOR_GRASP_OFFSETS = {
     #
     # Briefly 0.0, which was followed by a CLOSED_NOTHING; +0.020 is what works.
     #
-    # NOTE low_side_final_depth_offset stays 0.0, so SIDE-classified targets get
-    # no fingertip correction at all. Every target tested on 2026-09-13 was
-    # CENTER, so this is untested rather than known-good -- if side grasps start
-    # missing short, that is the first thing to look at.
-    "low_side_final_depth_offset": 0.0,
+    # low_side_final_depth_offset matches the centre value: the longer LEFT and
+    # RIGHT fingertips are a property of the hardware, not of the approach
+    # direction, so every FINAL depth correction moves together. It was left at
+    # 0.0 while only CENTER targets were being tested; side targets were then
+    # the only ones with no fingertip correction at all.
+    "low_side_final_depth_offset": 0.020,
     "low_left_final_z_offset": 0.020,
     "low_right_final_z_offset": 0.010,
     "low_center_final_depth_offset": 0.020,
