@@ -360,6 +360,14 @@ def on_grasp_outcome(node, outcome: str, end: str):
         pass
     if hasattr(node, "grasp_history"):
         node.grasp_history.append({"outcome": outcome, "end": end})
+
+    # Persist the episode. Best-effort: a recording failure must never affect
+    # the grasp sequence.
+    try:
+        from .grasp_episode_recorder import record_episode
+        record_episode(node, outcome, end)
+    except Exception as _exc:
+        node.get_logger().warn(f"[EPISODE] not recorded: {_exc}")
     if hasattr(node, "visualizer"):
         node.visualizer.update_outcome(outcome)
 

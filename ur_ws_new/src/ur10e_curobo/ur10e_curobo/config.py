@@ -925,7 +925,14 @@ class Planner:
     # 1.5s, not 1.0s. Reacquire was ~1.1s of a 22.3s harvest cycle, so latency
     # here is not the constraint -- and both field runs timed out at 0.9s with
     # the date already measured well inside tolerance.
-    reacquire_timeout_s: float = 1.5
+    # 1.5 -> 0.6 on 2026-09-13. Successes and failures cost very differently:
+    # with approach streaming feeding it, a successful reacquire completes in
+    # 0.2-0.5s (measured 0.20, 0.36, 0.50), while a failure burns the entire
+    # budget before giving up (measured 1.54, 1.55). 0.6s costs nothing on the
+    # successes and saves ~0.9s on every failure -- which on VERY_LOW targets,
+    # where the camera sees past the date to fruit higher in the bunch, is most
+    # of them.
+    reacquire_timeout_s: float = 0.6
     require_reacquire_before_grasp: bool = False  # allow stable-seed fallback when close-view reacquisition times out
     reacquire_depth_settle_s: float = 0.10  # brief depth/RGB synchronization settle
     # One distinct published measurement is enough. Vision's own
@@ -972,6 +979,15 @@ class Planner:
     # reacquire freshness gate was burning its full 0.6s (now 0.13s with
     # approach streaming) and are how the remaining cost gets attributed. Set
     # False again if the console gets too noisy for field use.
+    # One record per grasp attempt for later model training: the frames already
+    # captured around the reverse, plus goal, arm pose, gripper currents,
+    # contact evidence and the outcome label. No model, no inference, no effect
+    # on behaviour -- see grasp_episode_recorder.
+    #
+    # On by default because the alternative is discovering after a field week
+    # that none of it was kept. ~1-2MB per grasp.
+    grasp_episode_recording: bool = True
+    grasp_episode_dir: str = "~/harvest_logs/episodes"
     log_phase_timings: bool = True     # per-phase timing lines; cycle summary always includes timings
     log_path_publish: bool = False     # RViz path marker publish messages
     concise_console_logs: bool = True  # operator view; warnings/errors and cycle results remain visible

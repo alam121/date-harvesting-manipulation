@@ -6276,6 +6276,7 @@ def plan_and_execute(node):
                 # Restore the pause the rest of the sequence expects.
                 node.set_vision_mode("paused")
                 node.wait_for_vision_paused(timeout=0.30)
+                node._last_inflight_report = dict(_inflight_report)
                 _r = _inflight_report
                 _latest = (
                     f" nearest_usable={_r['latest_d']*1000:.1f}mm"
@@ -6695,6 +6696,8 @@ def plan_and_execute(node):
                 _grasp_pair_before_frame = node.capture_grasp_pair_frame(
                     _grasp_pair_attempt_id, "before_reverse",
                     timeout=_grasp_pair_timeout)
+                # kept on the node so the episode recorder can persist it
+                node._grasp_pair_before_frame = _grasp_pair_before_frame
             except Exception as _e:
                 node.get_logger().warn(
                     f"[GRASP_PAIR] {_grasp_pair_attempt_id} before_reverse failed: {_e}")
@@ -6725,6 +6728,8 @@ def plan_and_execute(node):
                 _grasp_pair_after_frame = node.capture_grasp_pair_frame(
                     _grasp_pair_attempt_id, "after_reverse",
                     timeout=_grasp_pair_timeout)
+                # kept on the node so the episode recorder can persist it
+                node._grasp_pair_after_frame = _grasp_pair_after_frame
             except Exception as _e:
                 node.get_logger().warn(
                     f"[GRASP_PAIR] {_grasp_pair_attempt_id} "
