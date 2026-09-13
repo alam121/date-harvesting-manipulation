@@ -254,6 +254,32 @@ class UR10eCuroboMoveIt(Node):
             Float32MultiArray, '/vision/all_fruit_quality',
             _all_fruit_quality_cb, 10)
 
+        # Gripper-relative crop around the selected date, for episode recording.
+        # Cached only; nothing in the motion path reads it.
+        self._latest_grasp_crop = None
+        self._latest_grasp_crop_t = 0.0
+        self._latest_grasp_crop_meta = None
+
+        def _grasp_crop_cb(msg):
+            try:
+                # _get_camera_bridge() constructs CvBridge lazily; safe here
+                # because this callback cannot fire until the node is spinning,
+                # well after __init__ sets _camera_bridge = None.
+                self._latest_grasp_crop = self._get_camera_bridge().imgmsg_to_cv2(
+                    msg, desired_encoding="bgr8")
+                self._latest_grasp_crop_t = time.time()
+            except Exception:
+                pass
+
+        def _grasp_crop_meta_cb(msg):
+            self._latest_grasp_crop_meta = list(msg.data)
+
+        self.create_subscription(
+            Image, '/vision/grasp_crop', _grasp_crop_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            Float32MultiArray, '/vision/grasp_crop_meta',
+            _grasp_crop_meta_cb, 10)
+
         # timers
         self.create_timer(0.1, lambda: markers_mod.track_robot_path(self)) #Track & update RViz path markers
         self.create_timer(0.02, self._classifier_tick) #Tick classifier loop (gripper ML logic)

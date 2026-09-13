@@ -288,6 +288,18 @@ class VisionNode:
         # how bad it was.
         self.all_fruit_quality_pub = self.node.create_publisher(
             Float32MultiArray, "/vision/all_fruit_quality", 10)
+        # Crop around the selected date, wide enough to include the fingertips.
+        # Published in EVERY mode, unlike /fruit_image_bbox_norm which lives in
+        # _process_best_target and so is silent exactly when the arm is closing
+        # in. The motion node caches the latest and the episode recorder saves
+        # it, so training data shows the date RELATIVE TO THE GRIPPER rather
+        # than as an absolute position -- which is the point: it sidesteps the
+        # hand-eye chain instead of inheriting its error.
+        self.grasp_crop_pub = self.node.create_publisher(
+            ROSImage, "/vision/grasp_crop", 10)
+        self.grasp_crop_meta_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/grasp_crop_meta", 10)
+        self._last_grasp_crop_t = 0.0
         # Large camera frames must never back-pressure perception. A depth-1,
         # best-effort stream lets RViz consume the newest image and drops stale
         # frames when rendering cannot keep up.
@@ -1414,6 +1426,49 @@ class VisionNode:
                 _aq_msg = Float32MultiArray()
                 _aq_msg.data = _qual_flat
                 self.all_fruit_quality_pub.publish(_aq_msg)
+
+                # Crop around the selected date for episode recording. The
+                # margin is generous on purpose: the fingertips must be in frame
+                # for the crop to say anything about gripper-relative geometry.
+                # Throttled -- the recorder only needs the one at grasp time.
+                _now_crop = time()
+                if (best_idx is not None and 0 <= best_idx < len(targets)
+                        and _now_crop - self._last_grasp_crop_t > 0.2):
+                    try:
+                        _bx1, _by1, _bx2, _by2 = (
+                            int(v) for v in targets[best_idx]["bb"])
+                        _ih, _iw = image_left_ocv.shape[:2]
+                        _mw = max(8, _bx2 - _bx1)
+                        _mh = max(8, _by2 - _by1)
+                        _cx1 = max(0, _bx1 - _mw); _cy1 = max(0, _by1 - _mh)
+                        _cx2 = min(_iw, _bx2 + _mw); _cy2 = min(_ih, _by2 + _mh)
+                        if _cx2 > _cx1 + 8 and _cy2 > _cy1 + 8:
+                            _crop = image_left_ocv[_cy1:_cy2, _cx1:_cx2]
+                            if _crop.ndim == 3 and _crop.shape[2] == 4:
+                                _crop = cv2.cvtColor(_crop, cv2.COLOR_BGRA2BGR)
+                            _cm = self.cv_bridge.cv2_to_imgmsg(
+                                np.ascontiguousarray(_crop), encoding="bgr8")
+                            _cm.header.stamp = self._image_stamp_msg()
+                            _cm.header.frame_id = self.cam_frame
+                            self.grasp_crop_pub.publish(_cm)
+                            # date bbox INSIDE the crop, then the crop origin and
+                            # full image size, so a label can be reconstructed
+                            # either way round.
+                            _mm = Float32MultiArray()
+                            _mm.data = [
+                                float(_bx1 - _cx1), float(_by1 - _cy1),
+                                float(_bx2 - _cx1), float(_by2 - _cy1),
+                                float(_cx1), float(_cy1),
+                                float(_iw), float(_ih),
+                            ]
+                            self.grasp_crop_meta_pub.publish(_mm)
+                            self._last_grasp_crop_t = _now_crop
+                    except Exception as _ce:
+                        _now_w = time()
+                        if _now_w - getattr(self, "_last_crop_warn_t", 0.0) > 5.0:
+                            self._last_crop_warn_t = _now_w
+                            self.node.get_logger().warn(
+                                f"[GRASP_CROP] not published: {_ce}")
 
                 if best_idx is None:
                     # No valid target exists in this frame.  Stop publishing the

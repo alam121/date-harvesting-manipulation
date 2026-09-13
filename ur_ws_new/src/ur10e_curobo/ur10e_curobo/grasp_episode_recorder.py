@@ -108,7 +108,26 @@ def record_episode(node, outcome: str, end: str) -> Optional[str]:
         "all_fruit_quality": _jsonable(getattr(node, "all_fruit_quality", None)),
     }
 
+    # The crop is the one that matters for a learned grasp-state model: it
+    # shows the date WITH the fingertips, so a model reasons about
+    # gripper-relative geometry instead of absolute position -- which is how it
+    # sidesteps the hand-eye chain rather than inheriting its error.
+    episode["grasp_crop_meta"] = _jsonable(
+        getattr(node, "_latest_grasp_crop_meta", None))
+    episode["grasp_crop_age_s"] = _jsonable(_safe(
+        lambda: round(time.time() - float(node._latest_grasp_crop_t), 3)))
+
     saved = []
+    _crop = getattr(node, "_latest_grasp_crop", None)
+    if _crop is not None:
+        try:
+            import cv2
+            cv2.imwrite(os.path.join(path, "crop.jpg"), _crop,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            saved.append("crop.jpg")
+        except Exception as exc:
+            node.get_logger().warn(f"[EPISODE] crop not saved: {exc}")
+
     for name in ("_grasp_pair_before_frame", "_grasp_pair_after_frame"):
         frame = getattr(node, name, None)
         if frame is None:
