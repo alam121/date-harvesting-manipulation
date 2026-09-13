@@ -1328,10 +1328,15 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     _wait_xyz = list(target_pose_list[:3])
     if _is_final:
         node._final_live_wait_xyz = _wait_xyz
+        node._final_retarget_xyz = None
     if _this_traj_truncated:
         _fk_end = forward_kinematics(node, states[-1])
         if _fk_end:
-            _wait_xyz = [_fk_end.x, _fk_end.y, _fk_end.z]
+            # In place: node._final_live_wait_xyz holds a reference to this
+            # same list, and rebinding here would orphan it -- the retarget
+            # would then mutate a list nothing reads.
+            _wait_xyz[0], _wait_xyz[1], _wait_xyz[2] = (
+                _fk_end.x, _fk_end.y, _fk_end.z)
 
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
@@ -1362,7 +1367,18 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             node.stored_trajectory_states.extend(states)
         return True
     if cur_pose:
-        final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose_list[:3])))
+        # Measure against the goal the arm was actually driving to. An in-flight
+        # retarget moves it, and comparing to the ORIGINAL target then reports
+        # the size of the correction as endpoint error: observed 2026-09-13 as
+        # "endpoint error=8.2mm exceeds 4.0mm -- treating as failure" after two
+        # correct retargets totalling 11.1mm, which sent a good grasp back to
+        # HOME to retry another corridor.
+        #
+        # Accuracy is still enforced to 4mm, just against the right point. The
+        # retarget is quality-gated and capped at 25mm, so this cannot excuse an
+        # arbitrary miss.
+        _endpoint_ref = getattr(node, "_final_retarget_xyz", None) or target_pose_list[:3]
+        final_dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(cur_pose[:3], _endpoint_ref)))
         if _is_final and final_dist > _endpoint_tol:
             if callable(_record_motion):
                 _record_motion(
@@ -2913,6 +2929,8 @@ def _apply_final_inflight_correction(node, delta, report):
     node.trajectory_pub.publish(traj)
     # In place: wait_until_xyz is holding a reference to this same list.
     tcp[0], tcp[1], tcp[2] = corrected
+    # And the endpoint check must judge against this, not the original target.
+    node._final_retarget_xyz = list(corrected)
     report["applied"] += 1
     node.get_logger().info(
         f"[FINAL_INFLIGHT] retargeted "
