@@ -167,12 +167,26 @@ _OLD_OUTDOOR_JOINTS = {
 # now -- tune one side independently as real per-environment grasp data
 # comes in; only the keys you change take effect.
 _LAB_GRASP_OFFSETS = {
-    "low_side_final_depth_offset": 0.0,
+    # FINAL depth offsets -> +0.020 on 2026-09-13. The LEFT and RIGHT
+    # fingertips were replaced with longer ones (the CENTER tip is unchanged,
+    # small, and does not reach the fruit), and +0.020 is what was found to
+    # work on the rig. This is the profile actually in use
+    # (UR10E_ENVIRONMENT=lab), so it is where the measurement belongs.
+    #
+    # Applied as _center_final_y = y - offset with targets at y ~ -0.9, so a
+    # larger positive value drives the TCP further from the base, i.e. deeper
+    # toward the fruit. That is the opposite of what simple geometry predicts
+    # for longer fingers, so treat it as MEASURED, not derived, and re-measure
+    # if the tips change again.
+    #
+    # All three move together: fingertip length is a property of the gripper,
+    # not of the approach direction.
+    "low_side_final_depth_offset": 0.020,
     "low_left_final_z_offset": 0.020,
     "low_right_final_z_offset": 0.010,
-    "low_center_final_depth_offset": -0.010,
+    "low_center_final_depth_offset": 0.020,
     "low_center_final_z_offset": 0.0,
-    "mid_center_final_depth_offset": -0.010,
+    "mid_center_final_depth_offset": 0.020,
     "mid_center_final_z_offset": 0.0,
     "mid_center_slip_final_z_offset": 0.020,
     "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
