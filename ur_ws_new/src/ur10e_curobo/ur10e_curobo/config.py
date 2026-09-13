@@ -836,9 +836,15 @@ class Planner:
     # the approach runs faster (speed_alignment 4.0 vs speed_final 0.06), and
     # the vision node deliberately discards detections when the camera moves
     # >5mm, so measurements arrive without temporal smoothing.
-    approach_vision_streaming: bool = False
+    approach_vision_streaming: bool = True
     final_inflight_observe: bool = True
-    final_inflight_apply: bool = False
+    # Default True from 2026-09-13. Both bounds and behaviour are now evidenced:
+    # a run with usable=9 / nearest 8.6mm had nothing to apply because the
+    # runtime parameter had been lost to a restart, for the third time. The
+    # 25mm cap was also exercised for real -- on a VERY_LOW target it refused
+    # all 15 high-quality detections because they were a different date 17cm
+    # higher, which is exactly what it is there to stop.
+    final_inflight_apply: bool = True
     # Ignore corrections below this (noise) and above this (a different date, or
     # a bad measurement). The upper bound is the safety property: the corrected
     # straight line stays close enough to the original that it cannot wander
