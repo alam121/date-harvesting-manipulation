@@ -209,7 +209,14 @@ T_CAM_LIDAR = [
 ZEDMINI_SERIAL = 0        # 0 = auto-detect (first available stereo ZED); set SN to pin
 ZEDMINI_DEPTH_FPS = 15    # grab rate for the depth camera — must match ZED One (15 max at QHDPLUS)
 ZEDMINI_RGBD_FPS = 30     # grab rate when ZED X Mini is used for both RGB + depth (mini-only mode; no ZED One pacing)
-ZEDMINI_DEPTH_Z_MIN = 0.18   # minimum valid ZED Mini depth (m)
+# Lowered back 0.18 -> 0.15 on 2026-09-10. It was raised to 0.18 to narrow the
+# disparity search (a depth-speed win), but that is the sensor floor: the camera
+# returns NOTHING closer than this, so it decides how near the arm can get and
+# still see the date. Field runs showed the target rejected at close range while
+# vision reported other dates 12-16cm further back, reacquire timing out to the
+# seed on 3 of 4 cycles, and FINAL_INFLIGHT finding nothing usable on those same
+# three. 0.15 is the distance the ZED X Mini is accurate to.
+ZEDMINI_DEPTH_Z_MIN = 0.15   # minimum valid ZED Mini depth (m)
 ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 # Fruit acceptance window. This used to sit at 0.20 -- 5cm above the sensor
 # floor -- purely so the gripper's red fingertips could not be detected as ripe
@@ -225,12 +232,12 @@ ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 #
 # Keep in step with ZEDMINI_DEPTH_Z_MIN: points below that are filtered out of
 # the cloud upstream anyway, so a lower value here would have no effect.
-# Raised 0.15 -> 0.18 on 2026-09-10 to follow ZEDMINI_DEPTH_Z_MIN, which was
-# raised to narrow the ZED's disparity search (a depth-speed win). The two had
-# drifted apart, leaving the bottom 3cm of this window unable to contain data
-# and the comment above untrue. Still well under the 0.20 that caused the
-# original problem described above, so the reasoning there is preserved.
-FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.18"))
+# Back to 0.15 with ZEDMINI_DEPTH_Z_MIN, 2026-09-10. Briefly 0.18; that
+# reproduced the exact failure the paragraph above describes -- the target
+# rejected precisely when the arm was closest to it. NOTE the "20-30cm at grasp"
+# figure above is WRONG: the dates come nearer than 18cm, which is why 0.18
+# blocked them. Do not raise either value without re-measuring that distance.
+FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.15"))
 FRUIT_CAMERA_Z_MAX = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MAX", "0.70"))
 if not 0.0 < FRUIT_CAMERA_Z_MIN < FRUIT_CAMERA_Z_MAX:
     raise ValueError(

@@ -2299,6 +2299,20 @@ class VisionNode:
                     f"Fruit depth {Zc:.2f}m outside "
                     f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
                 )
+                # Surface this one. A date rejected here never reaches
+                # /vision/all_fruit_poses, so downstream it is indistinguishable
+                # from "YOLO saw nothing" -- both show as no_candidate in
+                # FINAL_INFLIGHT and as a reacquire timeout. Those have
+                # completely different fixes: this one is the window being too
+                # tight, the other is a detection problem. Throttled to 1/s.
+                _now_rej = time()
+                if _now_rej - getattr(self, "_last_zrange_warn_t", 0.0) > 1.0:
+                    self._last_zrange_warn_t = _now_rej
+                    self.node.get_logger().warn(
+                        f"[DEPTH_RANGE_REJECT] date at {Zc:.3f}m is outside "
+                        f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m "
+                        f"({'TOO CLOSE' if Zc < FRUIT_CAMERA_Z_MIN else 'too far'})"
+                        " -- detected but discarded")
                 return None
 
             # Heatmap + vis_ratio — use EDT depth map so vis_ratio matches stereo mode.

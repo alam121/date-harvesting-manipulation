@@ -2831,6 +2831,60 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
                 time.sleep(0.12)  # wait for any in-flight YOLO inference to finish
 
 
+def _final_inflight_monitor(node, target_xyz, stop_evt, report):
+    """Watch vision during the FINAL move. Observation-only.
+
+    Runs on its own thread while the arm covers the last few centimetres. Polls
+    the same quality-gated candidate list reacquire uses, and records how far
+    the best match sits from the target the arm is currently driving to, plus
+    how far through the move that happened.
+
+    This is the measurement nobody has: the camera has never been on during the
+    FINAL leg, so it is unknown whether the date stays detectable as the
+    off-axis camera converges on it and the fingers enter frame. `report`
+    accumulates the answer; nothing here commands motion or alters the target.
+    """
+    planner = node.cfg.planner
+    min_d = float(getattr(planner, "final_inflight_min_delta_m", 0.002))
+    max_d = float(getattr(planner, "final_inflight_max_delta_m", 0.025))
+    t0 = time.time()
+    seen_seq = -1
+    while not stop_evt.is_set():
+        time.sleep(0.05)
+        seq = int(getattr(node, "all_fruits_seq", 0) or 0)
+        if seq == seen_seq:
+            continue
+        seen_seq = seq
+        report["frames"] += 1
+        best, best_d = None, float("inf")
+        for cand in (getattr(node, "all_fruit_poses", None) or []):
+            if len(cand) < 3:
+                continue
+            ok, why = _reacquire_quality_ok(node, cand)
+            if not ok:
+                report["rejected"] += 1
+                report["last_reject"] = why
+                continue
+            d = math.dist(cand[:3], target_xyz[:3])
+            if d < best_d:
+                best, best_d = list(cand[:3]), d
+        if best is None:
+            report["no_candidate"] += 1
+            continue
+        report["matched"] += 1
+        if best_d < min_d:
+            report["below_min"] += 1
+            continue
+        if best_d > max_d:
+            report["above_max"] += 1
+            continue
+        # A usable correction. Record the newest one; APPLY consumes it.
+        report["usable"] += 1
+        report["latest"] = best
+        report["latest_d"] = best_d
+        report["latest_t"] = time.time() - t0
+
+
 def _reacquire_candidate_quality(node, candidate):
     """Quality for the fruit at `candidate`, or None if unknown.
 
@@ -6049,10 +6103,62 @@ def plan_and_execute(node):
                 f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}] "
                 f"forward_delta={_forward_delta_mm:+.0f}mm")
         node.motion_phase = "FINAL"
-        # Vision is already "paused" from _vision_pause() — keep it that way for final move.
+        # Vision was historically kept "paused" through the FINAL move, on the
+        # grounds that cuRobo needs the GPU. It does not: by this point planning
+        # is finished and the arm is replaying a trajectory computed a moment
+        # ago, so nothing is competing. That pause is the reason the last ~7cm
+        # is dead-reckoned.
+        #
+        # With observe enabled, vision runs through the leg and records what it
+        # sees. It does NOT change the target -- see _final_inflight_monitor.
         _t_final = time.time()
-        final_ok = _direct_ik_move(node, final_target, label="FINAL",
-                                   motion_type="final", store_trajectory=True)
+        _inflight_report = {
+            "frames": 0, "matched": 0, "rejected": 0, "no_candidate": 0,
+            "below_min": 0, "above_max": 0, "usable": 0,
+            "latest": None, "latest_d": 0.0, "latest_t": 0.0,
+            "last_reject": "",
+        }
+        _inflight_stop = threading.Event()
+        _inflight_thread = None
+        if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
+            node.set_vision_mode("reacquire_fast")
+            # Compare against the FRUIT goal (x,y,z), not final_target.
+            # final_target is the TCP pose, which sits ~28mm from the fruit by
+            # design (grasp depth/z offsets plus the closure-centre correction).
+            # Measuring fruit detections against it made every candidate read
+            # as >25mm off, so the first run reported above_max=10 usable=0 --
+            # an artefact of the wrong reference, not a real miss.
+            _inflight_thread = threading.Thread(
+                target=_final_inflight_monitor,
+                args=(node, [float(x), float(y), float(z)], _inflight_stop,
+                      _inflight_report),
+                daemon=True)
+            _inflight_thread.start()
+        try:
+            final_ok = _direct_ik_move(node, final_target, label="FINAL",
+                                       motion_type="final", store_trajectory=True)
+        finally:
+            _inflight_stop.set()
+            if _inflight_thread is not None:
+                _inflight_thread.join(timeout=0.5)
+                # Restore the pause the rest of the sequence expects.
+                node.set_vision_mode("paused")
+                node.wait_for_vision_paused(timeout=0.30)
+                _r = _inflight_report
+                _latest = (
+                    f" nearest_usable={_r['latest_d']*1000:.1f}mm"
+                    f"@{_r['latest_t']:.2f}s"
+                    if _r["latest"] is not None else " nearest_usable=NONE")
+                node.get_logger().info(
+                    "[FINAL_INFLIGHT] "
+                    f"frames={_r['frames']} matched={_r['matched']} "
+                    f"no_candidate={_r['no_candidate']} "
+                    f"rejected_quality={_r['rejected']} "
+                    f"below_min={_r['below_min']} above_max={_r['above_max']} "
+                    f"usable={_r['usable']}{_latest} "
+                    f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
+                    + (f" last_reject={_r['last_reject']}"
+                       if _r["last_reject"] else ""))
         if not final_ok and _phase4_yaw_applied:
             node.get_logger().warn(
                 "[PHASE4_YAW] candidate execution IK/path failed; retrying "
