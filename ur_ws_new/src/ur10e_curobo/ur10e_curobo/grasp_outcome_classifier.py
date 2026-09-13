@@ -8,23 +8,55 @@ import time
 # NOTE: Calibrate these values by running with DEBUG_FORCES=True
 #       and observing the force readings for each scenario
 # ============================================================
-DEBUG_FORCES = False  # Enable temporarily only for force-template calibration
+DEBUG_FORCES = False  # Calibration done 2026-09-13; see the block below. The
+                      # templates below still assume a three-finger grip --
+                      # PROPER=[5.0,5.5,5.0] wants the CENTRE channel highest,
+                      # which this gripper can never produce, so a perfect
+                      # two-finger grip scores nearest to OPEN. Re-measure and
+                      # replace all six, then set this back to False.
 
 # ---- Templates (tune for your dates) ----
 # Forces are POSITIVE for Delto gripper (motor current based)
-OPEN           = [2.25, 2.55, 3.15]   # fingers open, no contact (baseline)
-CLOSED_NOTHING = [2.55, 2.85, 3.15]   # closed on air (slight increase)
-WEAK_L         = [3.5, 4.0, 3.5]      # weak grip, left finger light contact
-WEAK_R         = [3.5, 4.0, 4.5]      # weak grip, right finger light contact
-WEAK_C         = [3.0, 5.0, 3.5]      # weak grip, center finger contact
-PROPER         = [5.0, 5.5, 5.0]      # solid 3-finger grip on date
+# Re-measured 2026-09-13. Channel order is [RIGHT, CENTER, LEFT].
+#
+# READ THIS BEFORE "FIXING" THE ORDERING: magnitude ANTI-CORRELATES with grip
+# quality on this gripper. Closing on air runs the fingers to their limit where
+# they STALL, drawing maximum current. A date stops them early, before they
+# stall, so a good grip draws LESS. Measured:
+#
+#     empty close   [59.10, 1.50, 45.90]   remaining [0.10, 0.10, 0.05]
+#     empty close   [57.30, 1.80, 48.00]
+#     good grip     [48.90, 5.10, 42.00]   remaining [0.26, 0.49, 0.13]
+#
+# The old values had PROPER ABOVE CLOSED_NOTHING, i.e. the relationship
+# backwards, and were on a ~2-5 scale from when the driver used a wrong -17.5
+# per-motor baseline. With the baselines actually measured the channel reads in
+# tens, so every old number was obsolete twice over.
+#
+# The CENTER channel stays near zero because that fingertip is small and never
+# reaches the fruit; it is the only channel that RISES on a grip (1.7 -> 5.1).
+#
+# These are the FALLBACK path. classify_outcome prefers contact evidence
+# (current delta + remaining travel) whenever it is available, and that is the
+# signal to trust -- it separated empty from gripping cleanly every time.
+OPEN           = [0.00,  0.00, 0.00]   # measured: 161 samples, zero variance
+CLOSED_NOTHING = [58.20, 1.70, 47.00]  # measured: mean of two empty closes
+WEAK           = [53.50, 3.40, 44.50]  # NOT MEASURED -- interpolated midpoint.
+                                       # Physically a weak grip stops only
+                                       # slightly early, so it should sit
+                                       # between PROPER and CLOSED_NOTHING.
+                                       # Replace with a real slipping-grip
+                                       # sample when one is captured.
+PROPER         = [48.90, 5.10, 42.00]  # measured: ONE sample only -- widen with
+                                       # more good grasps before relying on it
 
 TEMPLATES: List[Tuple[str, List[float]]] = [
     ("OPEN", OPEN),
     ("CLOSED_NOTHING", CLOSED_NOTHING),
-    ("WEAK", WEAK_L),
-    ("WEAK", WEAK_R),
-    ("WEAK", WEAK_C),
+    # The three WEAK_L/R/C variants encoded which finger made light contact on a
+    # three-finger grip. Meaningless here: the centre finger never contacts, so
+    # the pattern is always right+left. Collapsed to one.
+    ("WEAK", WEAK),
     ("PROPER", PROPER),
 ]
 STAGE = {"OPEN": 0, "CLOSED_NOTHING": 1, "WEAK": 2, "PROPER": 3}
@@ -139,13 +171,46 @@ class GraspOutcomeClassifier:
         elif evidence and evidence.get('valid') and evidence.get('grasp_detected'):
             contact_count = int(evidence.get('contact_count', 0))
             label = "GRABBED"
-            end_name = "PROPER" if contact_count >= 3 else "WEAK"
-        elif end_stage < self.max_stage_seen:
-            label = "SLIPPED"
-        elif end_stage >= STAGE["WEAK"]:
-            label = "GRABBED"
+            # Was hardcoded 3. The CENTER finger's tip is small and never
+            # reaches the fruit, so contact_count caps at 2 and this returned
+            # WEAK for every grasp, however good -- which is why regrips fired
+            # on solid grips and no tuning could be judged from the label.
+            # min_contacts comes from the evidence dict and is already capped
+            # to the number of load-bearing fingers.
+            _need = int(evidence.get('min_contacts', 3) or 3)
+            end_name = "PROPER" if contact_count >= _need else "WEAK"
         else:
-            label = "NO_GRAB"
+            # NO CONTACT EVIDENCE. Previously this guessed from force templates.
+            # It must not: measured 2026-09-13, the force signature cannot
+            # discriminate a grasp on this gripper.
+            #
+            #   good grasp  [48.90, 5.10, 42.00]   centre blocked, 166mA
+            #   good grasp  [56.40, 0.00, 54.60]   centre free,     11mA
+            #   good grasp  [58.50, 0.00, 55.20]   centre free,      7mA
+            #   empty close [59.10, 1.50, 45.90]
+            #   empty close [57.30, 1.80, 48.00]
+            #
+            # The good grasps are 15-17 apart from each other but only 8-11 from
+            # an empty close, so grips 2 and 3 match CLOSED_NOTHING. That is not
+            # noise: the signature is BIMODAL, depending on whether the date
+            # happens to sit against the small centre fingertip. Two different
+            # physical geometries, one template -- unfixable by re-calibration.
+            #
+            # Magnitude also anti-correlates with quality (see the template
+            # block above), so "more force" is not "better grip" here either.
+            #
+            # Slip-by-stage went with it: max_stage_seen is accumulated from the
+            # same classify_triplet() matching, so a close that rises through
+            # ~[30,0,30] and settles at ~[57,0,55] reads as PROPER-then-
+            # CLOSED_NOTHING and would report a SLIP that never happened.
+            #
+            # Contact evidence (current delta + remaining travel) separated all
+            # six closes cleanly and is what _finalize uses above. If it is
+            # missing, say so rather than inventing an answer.
+            label = "UNKNOWN"
+            end_name = "UNKNOWN"
+            print("[grasp] no contact evidence; outcome UNKNOWN "
+                  "(force templates cannot discriminate on this gripper)")
 
         if self.on_outcome:
             self.on_outcome(label, end_name)

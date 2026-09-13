@@ -773,6 +773,31 @@ class Planner:
     final_overshoot_threshold: float = 0.004    # m; correct only if TCP passes target by >4mm
     final_overshoot_max_backoff: float = 0.012  # m; max one-shot pullback before closing
     final_endpoint_tolerance: float = 0.004     # m; require FINAL TCP within 4mm before closing
+
+    # === IN-FLIGHT FINAL CORRECTION ===
+    # The FINAL move (~7cm, ~2.9s) is dead-reckoned: vision is paused for it, so
+    # the arm drives to a position measured at the standoff and never looks
+    # again. Reacquire at the standoff now corrects 5-8mm, which is a lower
+    # bound on what the seed was carrying; nobody knows what accumulates over
+    # the last 7cm because the camera has never been on during it.
+    #
+    # OBSERVE runs vision through the FINAL move and logs what it sees, changing
+    # nothing. That answers the open question -- is the date still detectable as
+    # the off-axis camera converges and the fingers enter frame? -- at zero cost
+    # and without adding a stop.
+    #
+    # APPLY additionally retargets the move in flight. Keep it False until the
+    # OBSERVE logs show the detection is trustworthy that close in.
+    final_inflight_observe: bool = True
+    final_inflight_apply: bool = False
+    # Ignore corrections below this (noise) and above this (a different date, or
+    # a bad measurement). The upper bound is the safety property: the corrected
+    # straight line stays close enough to the original that it cannot wander
+    # into something the original path was already checked against.
+    final_inflight_min_delta_m: float = 0.002
+    final_inflight_max_delta_m: float = 0.025
+    final_inflight_max_updates: int = 2      # cap retargets per FINAL move
+    final_inflight_min_interval_s: float = 0.25
     final_visual_verification_s: float = 0.4    # observation-only camera window at FINAL before close
     phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves
@@ -965,6 +990,20 @@ class Gripper:
         default_factory=lambda: [0.020, 0.020, 0.020])
     nontactile_remaining_fraction: List[float] = field(
         default_factory=lambda: [0.08, 0.50, 0.10])
+    # Fingers that physically bear load, by index into the 3-finger arrays:
+    #   0 = RIGHT  (motors M1-M4,  tracked M4)
+    #   1 = CENTER (motors M5-M8,  tracked M7)
+    #   2 = LEFT   (motors M9-M12, tracked M12)
+    #
+    # The CENTER fingertip is small and does not reach the fruit, so that finger
+    # never registers contact. Everything downstream assumed three contributing
+    # fingers and so could not represent a healthy grasp:
+    #   - grasp_outcome_classifier hardcoded `PROPER if contact_count >= 3`,
+    #     which capped at 2 and labelled every good grasp WEAK
+    #   - nontactile_min_contact_fingers=2 "of 3" was really "2 of 2", so one
+    #     marginal outer finger gave contacts=1/3 -> EMPTY_CLOSE -> NO_GRAB
+    # Set back to [0, 1, 2] if a full-length centre fingertip is refitted.
+    active_fingers: List[int] = field(default_factory=lambda: [0, 2])
     nontactile_min_contact_fingers: int = 2
     nontactile_feedback_max_age_s: float = 0.30
 

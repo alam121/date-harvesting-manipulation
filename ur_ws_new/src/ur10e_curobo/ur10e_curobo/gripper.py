@@ -342,6 +342,22 @@ def on_grasp_outcome(node, outcome: str, end: str):
         f"[grasp] outcome={outcome} end={end} slip={node.slip_detection} "
         f"miss={node.grab_miss} weak={node.weak_grab}"
     )
+    # Absolute force triplet, template-ready. grasp_outcome_classifier's
+    # DEBUG_FORCES prints this with print(), i.e. to the node's stdout, which
+    # is not where the operator is reading. Mirror it through the ROS logger so
+    # template re-calibration can be done from the normal log view.
+    # Order is [RIGHT, CENTER, LEFT]; CENTER reads ~0 on this gripper because
+    # its fingertip is small and does not reach the fruit.
+    try:
+        _f = getattr(getattr(node, "classifier", None), "last_forces", None)
+        if _f is not None and len(_f) >= 3:
+            node.get_logger().info(
+                f"[grasp] FORCES (R,C,L) = "
+                f"[{_f[0]:.2f}, {_f[1]:.2f}, {_f[2]:.2f}]   "
+                f"<- paste into grasp_outcome_classifier.py as the "
+                f"{end if outcome != 'NO_GRAB' else 'CLOSED_NOTHING'} template")
+    except Exception:
+        pass
     if hasattr(node, "grasp_history"):
         node.grasp_history.append({"outcome": outcome, "end": end})
     if hasattr(node, "visualizer"):

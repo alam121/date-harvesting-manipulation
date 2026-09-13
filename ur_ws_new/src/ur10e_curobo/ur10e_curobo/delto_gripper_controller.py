@@ -332,9 +332,18 @@ class DeltoGripperController:
                 current_delta >= float(current_thresholds[finger])
                 and remaining_fraction >= float(remaining_thresholds[finger]))
 
+        # Only load-bearing fingers can register contact. Counting a finger
+        # whose tip cannot reach the fruit silently raises the bar: "2 of 3"
+        # becomes "2 of 2", leaving no margin, and a single marginal outer
+        # finger reads as EMPTY_CLOSE.
+        active = [int(i) for i in getattr(cfg, 'active_fingers', [0, 1, 2])
+                  if 0 <= int(i) < len(contacts)]
+        if not active:
+            active = list(range(len(contacts)))
         min_contacts = int(getattr(
             cfg, 'nontactile_min_contact_fingers', self.min_fingers_for_stop))
-        count = sum(contacts)
+        min_contacts = min(min_contacts, len(active))
+        count = sum(1 for i in active if contacts[i])
         return {
             'valid': True,
             'reason': 'CONTACT' if count >= min_contacts else 'EMPTY_CLOSE',
@@ -344,6 +353,7 @@ class DeltoGripperController:
             'current_delta_a': current_deltas,
             'remaining_fraction': remaining,
             'tracking_joints': tracking_joints,
+            'active_fingers': active,
             'grasp_detected': count >= min_contacts,
         }
 

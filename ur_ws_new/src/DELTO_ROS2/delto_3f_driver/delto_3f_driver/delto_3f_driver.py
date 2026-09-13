@@ -107,7 +107,25 @@ class DeltoROSDriver(Node):
         # NOTE: max_per_finger reports a LARGER magnitude than "fixed", and
         # DeltoGripperController.force_threshold (4.0) was tuned against the old
         # signal. Set this back to 'fixed' if closures start stopping early.
-        self.declare_parameter('force_motor_mode', 'max_per_finger')
+        # REVERTED to 'fixed' 2026-09-10 after max_per_finger caused a false
+        # contact confirmation on an EMPTY close: goals.py computes
+        # _force_confirmed = sum(d > 1.5 for d in deltas) >= 2 and skips the
+        # regrip when it fires. baseline_force is re-captured at each close, so
+        # the delta measures open->closed change -- and driving the fingers
+        # through their travel draws current even with nothing in the hand.
+        # 'fixed' read one motor that was often idle; max_per_finger reads
+        # whichever of the four works hardest, which is never zero, so empty
+        # closes cleared 1.5. Observed: contacts=0/3, current_delta=[7,9,11]mA,
+        # outcome=NO_GRAB -- and the regrip was skipped on
+        # deltas=[3.00,1.80,3.30].
+        #
+        # The per-motor baselines below are unaffected and stay: baseline_force
+        # is re-captured per close, so it cancels out of the delta either way.
+        #
+        # The real fix is for _force_confirmed to use the contact tracker
+        # (contacts/current_delta from joint_states), which correctly reported
+        # 0/3 on that close, rather than this channel. Until then, 'fixed'.
+        self.declare_parameter('force_motor_mode', 'fixed')
         self.declare_parameter('force_motor_indices', [3, 7, 11])
         self.declare_parameter('force_scale', 0.3)
         # ~3 sigma of the measured 1.1mA per-channel noise floor, so an idle
