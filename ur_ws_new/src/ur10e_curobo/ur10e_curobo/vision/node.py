@@ -20,7 +20,7 @@ from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
 from std_msgs.msg import Float32, Float32MultiArray, String as StdString
-from sensor_msgs.msg import PointCloud2, Image as ROSImage
+from sensor_msgs.msg import PointCloud2, Image as ROSImage, CameraInfo
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
@@ -719,6 +719,39 @@ class VisionNode:
         display_resolution = sl.Resolution(disp_w, disp_h)
         image_left_ocv = np.full((disp_h, disp_w, 4), [245, 239, 239, 255], np.uint8)
         image_scale = [disp_w / cam_w, disp_h / cam_h]
+
+        # Publish the DISPLAY-resolution intrinsics. Nothing outside this node
+        # could project into the images it publishes: the ZED intrinsics are
+        # read here and never leave, so /vision/raw, /vision/display and
+        # /vision/grasp_crop were unprojectable by any consumer. Scaled by
+        # image_scale because images are retrieved at display resolution while
+        # the SDK reports intrinsics at camera resolution -- the raw values
+        # would be silently wrong for every published image.
+        _ci = CameraInfo()
+        _ci.width = int(disp_w)
+        _ci.height = int(disp_h)
+        _ci.k = [fx * image_scale[0], 0.0, cx * image_scale[0],
+                 0.0, fy * image_scale[1], cy * image_scale[1],
+                 0.0, 0.0, 1.0]
+        _ci.p = [fx * image_scale[0], 0.0, cx * image_scale[0], 0.0,
+                 0.0, fy * image_scale[1], cy * image_scale[1], 0.0,
+                 0.0, 0.0, 1.0, 0.0]
+        _ci.distortion_model = "plumb_bob"
+        _ci.d = [float(v) for v in (list(disto)[:5] if disto is not None else [0.0] * 5)]
+        self._camera_info_msg = _ci
+        self._camera_info_pub = self.node.create_publisher(
+            CameraInfo, "/vision/camera_info", 10)
+
+        def _publish_camera_info():
+            self._camera_info_msg.header.stamp = self._image_stamp_msg()
+            self._camera_info_msg.header.frame_id = self.cam_frame
+            self._camera_info_pub.publish(self._camera_info_msg)
+
+        self.node.create_timer(1.0, _publish_camera_info)
+        self.node.get_logger().info(
+            f"[CAMERA_INFO] display {disp_w}x{disp_h} "
+            f"fx={fx * image_scale[0]:.1f} fy={fy * image_scale[1]:.1f} "
+            f"cx={cx * image_scale[0]:.1f} cy={cy * image_scale[1]:.1f}")
         display_scale = 0.5
         image_left = sl.Mat()
         runtime_params = sl.RuntimeParameters()
