@@ -609,15 +609,20 @@ def execute_pose_shortest(node, pose: list, label: str = "MOVE",
         
 # Publishes /joint_trajectory_controller/joint_trajectory.
 def _wait_for_joint_target(node, target_joints, timeout: float = 15.0, tol: float = 0.05) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline and getattr(node, 'running', True):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and getattr(node, 'running', True):
         if getattr(node, 'stop_requested', False):
             return False
         current = node.current_joint_positions
-        if current is not None:
-            max_err = max(abs(c - t) for c, t in zip(current, target_joints))
-            if max_err < tol:
-                return True
+        velocity = node.current_joint_velocities
+        received = getattr(getattr(node, '_state_mgr', None), '_joint_state_received_at', None)
+        fresh = received is None or time.monotonic() - received <= 0.25
+        position_ok = (current is not None and len(current) == len(target_joints)
+                       and all(math.isfinite(c) and abs(c-t) < tol for c,t in zip(current,target_joints)))
+        stopped = (velocity is not None and len(velocity) == len(target_joints)
+                   and all(math.isfinite(v) and abs(v) <= 0.01 for v in velocity))
+        if fresh and position_ok and stopped:
+            return True
         time.sleep(0.05)
     return False
 
@@ -1743,12 +1748,9 @@ def plan_execute_js(
     # 8. Wait for the robot, then blend to avoid abrupt stop
     # ------------------------------
     target_joints = states[-1]
-    fk = forward_kinematics(node, target_joints)
-    if fk:
-        wait_until_xyz(node, [fk.x, fk.y, fk.z])
-    # Secondary joint-space check: if EE arrived instantly (different IK branch),
-    # wait until joints actually converge to the target configuration.
-    reached = _wait_for_joint_target(node, target_joints)
+    end_time = traj.points[-1].time_from_start
+    duration_s = end_time.sec + end_time.nanosec / 1e9
+    reached = _wait_for_joint_target(node, target_joints, timeout=max(15.0, duration_s+2.0))
     blend_motion(node)
     if not reached:
         node.get_logger().warn(f"Joint-space move to {label} did not reach target")
@@ -2005,48 +2007,42 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
 
 
 def execute_preplan(node, traj, states, label: str) -> bool:
-    """Publish a pre-planned JointTrajectory and wait for completion.
-    Drop-in replacement for the publish+wait portion of plan_execute_js."""
-    if not traj or not traj.points:
-        node.get_logger().warn(f"[PREPLAN] {label}: empty trajectory, skipping")
+    """Revalidate and retime a cached plan from the actual stationary start."""
+    if not traj or not traj.points or not states or node.stop_requested:
         return False
     current = node.current_joint_positions
-    if current is None or not states:
-        node.get_logger().warn(f"[PREPLAN] {label}: missing current/start joint state")
+    velocity = node.current_joint_velocities
+    if (current is None or len(current) != len(states[0]) or not velocity
+            or not all(math.isfinite(v) and abs(v) <= 0.01 for v in velocity)):
         return False
-    start_error = max(abs(c - s) for c, s in zip(current, states[0]))
+    if not all(math.isfinite(c) for c in current):
+        return False
+    start_error = max(abs(c-s) for c,s in zip(current,states[0]))
     if start_error > 0.10:
-        node.get_logger().warn(
-            f"[PREPLAN] {label}: stale start state "
-            f"({math.degrees(start_error):.1f}deg mismatch); replanning required")
+        node.get_logger().warn(f"[PREPLAN] {label}: stale start; replanning required")
         return False
-    if not getattr(node.cfg.planner, "concise_console_logs", False):
-        node.get_logger().info(
-            f"[PREPLAN] {label}: publishing pre-planned trajectory "
-            f"({len(traj.points)} pts)")
+    states = _prepend_measured_start_bridge(states, current, label, max_step_deg=0.25)
+    with node._planning_lock:
+        if not _curobo_path_constraints_valid(node, states, label):
+            return False
+    initial_time = traj.points[0].time_from_start
+    dt = initial_time.sec + initial_time.nanosec / 1e9
+    traj = build_trajectory(node.joint_order, states, dt=dt,
+        stop_flag=lambda:node.stop_requested,
+        max_vel=node.cfg.planner.max_joint_velocity,
+        max_acc=node.cfg.planner.max_joint_acceleration)
+    latest = node.current_joint_positions
+    if (not traj.points or node.stop_requested or latest is None
+            or len(latest) != len(current)
+            or max(abs(a-b) for a,b in zip(latest,current)) > 0.004):
+        return False
     node.trajectory_pub.publish(traj)
-
-    target_joints = states[-1]
-    fk = forward_kinematics(node, target_joints)
-    if fk:
-        wait_until_xyz(node, [fk.x, fk.y, fk.z])
-
-    _joint_tol = 0.05
-    _deadline = time.time() + 15.0
-    converged = False
-    while time.time() < _deadline and getattr(node, 'running', True):
-        if getattr(node, 'stop_requested', False):
-            break
-        cur = node.current_joint_positions
-        if cur is not None:
-            if max(abs(c - t) for c, t in zip(cur, target_joints)) < _joint_tol:
-                converged = True
-                break
-        time.sleep(0.05)
-    blend_motion(node)
-    if not converged:
-        node.get_logger().warn(f"[PREPLAN] {label}: trajectory did not reach target")
-    return converged
+    end_time = traj.points[-1].time_from_start
+    duration_s = end_time.sec + end_time.nanosec / 1e9
+    reached = _wait_for_joint_target(node, states[-1], timeout=max(15.0,duration_s+2.0))
+    if reached:
+        blend_motion(node)
+    return reached
 
 
 def move_to_predropoff_position(node):

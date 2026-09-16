@@ -58,24 +58,30 @@ def _get_kin_model(node):
 
 
 def get_end_effector_pose(node) -> Optional[list]:
-    if node.current_joint_positions is None:
+    joints = node.current_joint_positions
+    if joints is None:
         node.get_logger().debug("Joint states not yet received.")
         return None
-    # Skip CUDA FK while planning is active to avoid corrupting CUDA graph capture
+    owner = getattr(node, '_fk_cache_owner', node)
     if _is_planning_active(node):
-        return getattr(node, '_last_ee_pose', None)
+        cached = getattr(owner, '_ee_pose_cache', None)
+        return list(cached[1]) if cached is not None and cached[0][1] == tuple(joints) else None
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        q = torch.tensor([node.current_joint_positions], dtype=torch.float32, device=device)
         with _fk_lock:
             kin = _get_kin_model(node)
+            key = (id(kin), tuple(joints))
+            cached = getattr(owner, '_ee_pose_cache', None)
+            if cached is not None and cached[0] == key:
+                return list(cached[1])
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            q = torch.tensor([joints], dtype=torch.float32, device=device)
             with torch.no_grad():
                 ee_pos, ee_quat, _, _, _, _, _ = kin.forward(q)
-            pos = ee_pos[0].cpu().tolist()
-            quat = ee_quat[0].cpu().tolist()
-        result = pos + quat
-        node._last_ee_pose = result  # cache for use during planning
-        return result
+            # One device-to-host transfer for the complete pose.
+            result = torch.cat((ee_pos[0], ee_quat[0])).cpu().tolist()
+            owner._ee_pose_cache = (key, tuple(result))
+            owner._last_ee_pose = list(result)
+            return result
     except Exception as e:
         node.get_logger().warn(f"FK failed: {e}")
         return None

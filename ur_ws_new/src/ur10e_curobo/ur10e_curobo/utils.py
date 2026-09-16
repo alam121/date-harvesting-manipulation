@@ -107,60 +107,66 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
                      stop_flag: Optional[Callable[[], bool]] = None,
                      max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8,
                      include_acc: bool = False) -> JointTrajectory:
-    """
-    Build a simple trajectory — positions + constant dt only.
-    cuRobo already handles velocity profiling in its interpolated plan.
+    """Build a uniformly retimed Hermite trajectory within derivative limits.
+
+    Exact cubic extrema (or Bernstein bounds for quintics) cover interpolation
+    between samples, including zero-velocity endpoints. The measured-state-to-first-point bridge must be
+    supplied by the caller; it cannot be validated without the measured state.
     """
     msg = JointTrajectory()
     msg.joint_names = joint_names
-
     states_list = list(states)
-    n_points = len(states_list)
-
-    if n_points == 0:
+    if not states_list:
         return msg
-
-    n_joints = len(joint_names)
-    states_arr = np.array(states_list, dtype=float)  # (n_points, n_joints)
-
-    # Start at t=dt (not 0) so the controller has one timestep to reach the first
-    # waypoint from its current actual position.  This prevents an instantaneous
-    # position jump when cuRobo reads joints, spends ~200 ms planning, then
-    # publishes a trajectory whose first point is time_from_start=0 ("be here NOW")
-    # while gravity has drifted the arm slightly during that planning window.
-    t = dt
-    for i, q in enumerate(states_list):
-        if stop_flag and stop_flag():
-            break
-        pt = JointTrajectoryPoint()
-        pt.positions = list(q)
-        if i == 0 or i == n_points - 1:
-            pt.velocities = [0.0] * n_joints
-            pt.accelerations = [0.0] * n_joints
+    if not all(math.isfinite(v) and v > 0 for v in (dt, max_vel, max_acc)):
+        raise ValueError("dt, max_vel and max_acc must be positive and finite")
+    q = np.asarray(states_list, dtype=float)
+    if q.shape != (len(states_list), len(joint_names)) or not joint_names or not np.isfinite(q).all():
+        raise ValueError("Trajectory must contain complete finite joint positions")
+    # Derivatives with respect to one unit sample interval, retimed together.
+    v = np.zeros_like(q)
+    a = np.zeros_like(q)
+    if len(q) > 2:
+        v[1:-1] = (q[2:] - q[:-2]) / 2.0
+        if include_acc:
+            a[1:-1] = q[2:] - 2.0*q[1:-1] + q[:-2]
+    if len(q) > 1:
+        if include_acc:
+            controls = np.stack((q[:-1], q[:-1]+v[:-1]/5,
+                q[:-1]+2*v[:-1]/5+a[:-1]/20,
+                q[1:]-2*v[1:]/5+a[1:]/20, q[1:]-v[1:]/5, q[1:]), axis=1)
+            degree = 5
+            speed_bound = float(np.max(np.abs(degree*np.diff(controls, axis=1))))
+            accel_bound = float(np.max(np.abs(degree*(degree-1)*np.diff(controls, n=2, axis=1))))
         else:
-            # Central-difference velocity: v_i = (q[i+1] - q[i-1]) / (2*dt)
-            v = (states_arr[i + 1] - states_arr[i - 1]) / (2.0 * dt)
-            # Scale the entire velocity vector proportionally instead of per-joint clipping.
-            # Per-joint clipping changes the velocity direction, making (pos, vel) inconsistent
-            # — the UR controller then computes huge implied accelerations → sanity check fail.
-            v_max_component = float(np.max(np.abs(v)))
-            if v_max_component > max_vel:
-                v = v * (max_vel / v_max_component)
-            pt.velocities = v.tolist()
-            # Accelerations only for analytically-consistent paths (S-curve).
-            # Do NOT set for cuRobo paths: cuRobo's ~10 rad/s² peaks get clipped
-            # to max_acc, making (pos, vel, acc) inconsistent → quintic spline jerk.
-            if include_acc:
-                a = (states_arr[i + 1] - 2.0 * states_arr[i] + states_arr[i - 1]) / (dt * dt)
-                a_max_component = float(np.max(np.abs(a)))
-                if a_max_component > max_acc:
-                    a = a * (max_acc / a_max_component)
-                pt.accelerations = a.tolist()
-        pt.time_from_start.sec = int(t)
-        pt.time_from_start.nanosec = int((t % 1.0) * 1e9)
+            # Exact cubic Hermite extrema avoid unnecessary slowing from the
+            # looser Bernstein hull. q(u)=q0+v0*u+c2*u²+c3*u³, 0<=u<=1.
+            delta = q[1:] - q[:-1]
+            c2 = 3*delta - 2*v[:-1] - v[1:]
+            c3 = -2*delta + v[:-1] + v[1:]
+            extremum = np.zeros_like(c2)
+            np.divide(-c2, 3*c3, out=extremum, where=np.abs(c3) > 1e-15)
+            extremum = np.clip(extremum, 0.0, 1.0)
+            interior_v = v[:-1] + 2*c2*extremum + 3*c3*extremum**2
+            speed_bound = max(float(np.max(np.abs(v))), float(np.max(np.abs(interior_v))))
+            accel_bound = max(float(np.max(np.abs(2*c2))),
+                              float(np.max(np.abs(2*c2+6*c3))))
+        dt = max(dt, speed_bound/max_vel, math.sqrt(accel_bound/max_acc))
+    # Round upward once so serialized intervals do not undershoot the bound.
+    step_ns = max(1, math.ceil(dt * 1e9))
+    dt = step_ns / 1e9
+    for i, positions in enumerate(q):
+        if stop_flag and stop_flag():
+            msg.points.clear()
+            return msg
+        pt = JointTrajectoryPoint()
+        pt.positions = positions.tolist()
+        pt.velocities = (v[i]/dt).tolist()
+        if include_acc:
+            pt.accelerations = (a[i]/(dt*dt)).tolist()
+        stamp_ns = (i+1)*step_ns
+        pt.time_from_start.sec, pt.time_from_start.nanosec = divmod(stamp_ns, 1_000_000_000)
         msg.points.append(pt)
-        t += dt
-
     return msg
 
 
@@ -175,9 +181,9 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     last_dist = None
     stall_start = None
     stalled = False
-    _at_tol_since = None
+    reached = False
     STALL_TIMEOUT = 2.0
-    _deadline = time.time() + timeout
+    _deadline = time.monotonic() + timeout
     _min_dist_seen = float('inf')
     _prog_was_off = False
 
@@ -193,18 +199,13 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
         else:
             _already_there = math.dist(_start_xyz, target_xyz) < tol * 2
             _departed = _already_there
-        _departure_deadline = time.time() + 15.0
+        _departure_deadline = time.monotonic() + 15.0
 
         while getattr(node, "running", True):
 
-            # Hard timeout — accept if arm got close enough, otherwise stall
-            if time.time() > _deadline:
-                if _min_dist_seen < tol * 2:
-                    node.get_logger().info(
-                        f"Timeout — closest was {_min_dist_seen*100:.1f}cm, accepting.")
-                    break
-                node.get_logger().warn(
-                    f"Timeout — arm never reached target (closest={_min_dist_seen*100:.1f}cm).")
+            # Completion requires the current pose, never a past closest approach.
+            if time.monotonic() > _deadline:
+                node.get_logger().warn("Timeout waiting for a settled target pose.")
                 stalled = True
                 break
 
@@ -212,7 +213,6 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
             if getattr(node, "stop_requested", False):
                 node.get_logger().warn("Stop requested during wait; holding.")
                 publish_stop_trajectory(node)
-                node.stop_requested = False
                 node._stop_was_requested = True
                 break
 
@@ -221,7 +221,7 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 if not _prog_was_off:
                     node.get_logger().info("Robot program OFF — waiting for restart.")
                     _prog_was_off = True
-                _departure_deadline = time.time() + 15.0
+                _departure_deadline = time.monotonic() + 15.0
                 stall_start = None
                 last_dist = None
                 time.sleep(0.5)
@@ -236,44 +236,46 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 node.get_logger().warn(f"FK error: {e}")
                 cur = None
 
-            if not cur or any(math.isnan(v) for v in cur[:3]):
+            state_mgr = getattr(node, '_state_mgr', None)
+            received_at = getattr(state_mgr, '_joint_state_received_at', None)
+            stale = received_at is not None and time.monotonic() - received_at > 0.25
+            if stale or not cur or any(not math.isfinite(v) for v in cur[:3]):
                 time.sleep(0.05)
                 continue
 
             dist = math.dist(cur[:3], target_xyz)
             _min_dist_seen = min(_min_dist_seen, dist)
 
+            # A short move can reach its goal without travelling 1 cm.
+            if dist < tol:
+                _departed = True
+
             # Departure check
             if not _departed and _start_xyz is not None:
                 if math.dist(cur[:3], _start_xyz) > 0.01:
                     _departed = True
-                elif time.time() > _departure_deadline:
+                elif time.monotonic() > _departure_deadline:
                     node.get_logger().warn("Arm has not moved 1cm in 15s — giving up.")
                     return False
             if not _departed:
                 time.sleep(0.05)
                 continue
 
-            # Arrival check
-            if dist < tol:
-                if target_quat and len(cur) >= 7:
-                    dot = abs(sum(a * b for a, b in zip(cur[3:7], target_quat[:4])))
-                    if dot < quat_tol:
-                        time.sleep(0.05)
-                        continue
-                vels = getattr(node, 'current_joint_velocities', None)
-                if vels and max(abs(v) for v in vels) > 0.01:
-                    if _at_tol_since is None:
-                        _at_tol_since = time.time()
-                    elif time.time() - _at_tol_since < 1.0:
-                        time.sleep(0.05)
-                        continue
-                if not getattr(node.cfg.planner, "concise_console_logs", False):
-                    node.get_logger().info(
-                        f"End-effector reached target. dist={dist*100:.1f}cm")
+            # Confirm measured position, orientation and stationary velocity.
+            # No extra fixed dwell after the feedback already confirms arrival.
+            orientation_ok = True
+            if target_quat is not None:
+                orientation_ok = False
+                if len(cur) >= 7:
+                    q, goal_q = cur[3:7], target_quat[:4]
+                    norm = math.sqrt(sum(v*v for v in q) * sum(v*v for v in goal_q))
+                    if math.isfinite(norm) and norm > 1e-12:
+                        orientation_ok = abs(sum(a*b for a, b in zip(q, goal_q))) / norm >= quat_tol
+            vels = getattr(node, 'current_joint_velocities', None)
+            stationary = bool(vels) and all(math.isfinite(v) and abs(v) <= 0.01 for v in vels)
+            if dist < tol and orientation_ok and stationary:
+                reached = True
                 break
-            else:
-                _at_tol_since = None
 
             # Stall detection must use actual robot motion as well as radial
             # progress. On a curved cuRobo path the TCP can move tangentially
@@ -290,8 +292,8 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 last_dist is not None and abs(dist - last_dist) < 0.001)
             if no_radial_progress and (robot_stationary or not velocity_known):
                 if stall_start is None:
-                    stall_start = time.time()
-                elif time.time() - stall_start > STALL_TIMEOUT:
+                    stall_start = time.monotonic()
+                elif time.monotonic() - stall_start > STALL_TIMEOUT:
                     node.get_logger().warn(
                         f"Robot not moving (dist={dist*100:.1f}cm from target, "
                         f"stalled {STALL_TIMEOUT}s) — declaring motion failed.")
@@ -310,7 +312,7 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     if stalled:
         node._goal_stall_count = getattr(node, '_goal_stall_count', 0) + 1
 
-    return not stalled
+    return reached
 
 def quat_to_rot_matrix(q):
     """

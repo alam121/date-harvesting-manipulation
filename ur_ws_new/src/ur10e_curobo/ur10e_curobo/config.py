@@ -64,9 +64,16 @@ _NEW_LAB_JOINTS = {
 }
 
 _OLD_LAB_JOINTS = {
+    # Re-taught on the rig 2026-09-14 by jogging the arm and reading
+    # /joint_states. TCP at this pose (base_link):
+    #   xyz  [0.29739, -1.01013, 0.34247]
+    #   quat [0.44906, 0.34690, 0.40271, -0.71821]  (x, y, z, w)
+    # Previous value, kept for reference in case the new one needs backing out:
+    #   [-1.4994238058673304, -0.7151940625957032, 1.7512252966510218,
+    #    -4.656813760797018, -1.7659905592547815, 1.1700091361999512]
     "home": [
-        -1.4994238058673304, -0.7151940625957032, 1.7512252966510218,
-        -4.656813760797018, -1.7659905592547815, 1.1700091361999512,
+        -1.3516314665423792, -0.6408413213542481, 1.5598562399493616,
+        -4.552072664300436, -1.8974092642413538, 1.0977357625961304,
     ],
     "dropoff": [
         -1.90818959871401, -1.079150215988495, 2.008786980305807,
@@ -758,6 +765,15 @@ class Planner:
     # IK per goal. Only treat polarity as ambiguous when the two direction_match
     # scores are within this margin of each other.
     corridor_polarity_margin: float = 0.10
+    # Polarity ambiguity is a question about ANGLES, so test it in degrees.
+    # The margin above compares cosines, and cosine is flat near 0deg: a mirror
+    # a full 20deg away from a 2.3deg match differs by only 0.074, inside the
+    # 0.10 margin, so any well-aimed corridor was declared "ambiguous" and the
+    # direction handed to branch cost. Seen 2026-09-14 12:00:09 -- axis -12.1deg
+    # picked FROM_RIGHT_10 (22.3deg error) over FROM_LEFT_10 (2.3deg) because it
+    # was 13deg cheaper in wrist travel. The score test only starts
+    # discriminating past 25.8deg, which is wider than the corridor spacing.
+    corridor_polarity_margin_deg: float = 10.0
     # Max single-joint change from the current state that a corridor's approach
     # IK may require. Above this the solution is a wrist/elbow flip, which would
     # swing the arm through the canopy -- rejected as APPROACH_BRANCH_SWITCH.
@@ -1161,6 +1177,281 @@ class LidarScan:
     ])
 
 @dataclass
+class Pollination:
+    """Flower-visit mode: arc-sweep for the best view, close in, hold.
+
+    Separate from the date harvest pipeline on purpose -- it uses a different
+    YOLO engine, does not grasp, and its "best pose" is chosen by apparent
+    flower size rather than by reachability or grasp scoring.
+    """
+    enabled: bool = True
+    # Swapped in for the sweep and swapped back afterwards. The vision process
+    # restarts on a model change, so this costs a few seconds each way.
+    flower_weights: str = "flwoer_model__1248_fp16.engine"
+    restore_weights_after: bool = True
+    # Arc sweep. Reuses the lidar_scan semicircle pose generator, so these
+    # mirror its knobs rather than introducing a second geometry.
+    # Narrowed 120 -> 80 and 7 poses -> 5. Across five real runs the winning
+    # pose was at 50, 50, 70, 30 and 110 deg -- clustered well below the 90deg
+    # the arc is centred on, so the upper half was mostly being swept for
+    # nothing. A tighter arc is also easier to reach: the far side of a wide arc
+    # around a distant flower is what kept failing IK.
+    #
+    # NOTE the span is centred on 90deg (straight ahead in base frame), so 80deg
+    # gives 50..130. That keeps four of the five observed winners and drops the
+    # 30deg end. If runs start failing to find a good view, widen this before
+    # touching anything else -- and see arc_centre_deg below.
+    arc_poses: int = 5
+    arc_deg: float = 80.0
+    # Fallback orbit radius, used when there is no flower fix to measure from.
+    arc_radius_m: float = 0.35
+    # Sweep at the distance the arm is ALREADY at from the flower, rather than
+    # letting lidar_scan's close-first candidates pull it in to 0.22m. Orbiting
+    # a flower at 22cm drives the arm through the surrounding leaves on every
+    # pose; the arm's current standoff is by definition a place it reached
+    # without hitting anything. The close-in to standoff_m happens afterwards,
+    # once the best viewing angle is known, so the approach is one short move
+    # along a known-good sightline instead of a full orbit inside the canopy.
+    arc_radius_from_current: bool = True
+    arc_radius_min_m: float = 0.25
+    arc_radius_max_m: float = 0.60
+    # Sweep at the height the arm STARTED at, not the flower's height.
+    # Centring the arc on the flower put the whole sweep plane up at z=0.849 --
+    # level with the flower and therefore level with the leaves around it, which
+    # the arm then drove through on every pose. The flower still defines the
+    # orbit centre in XY, so the sweep genuinely circles it; only the plane
+    # drops back to where the arm was already standing safely. Looking slightly
+    # up at the flower costs nothing: earlier runs detected it from ~40cm below
+    # at 12/12 frames.
+    arc_at_current_height: bool = True
+    # lidar_scan.speed_factor is 0.08 because a LiDAR sweep wants the arm slow
+    # enough to build a dense point cloud. Pollination records no LiDAR -- it
+    # stops at each pose to look -- so that slowness buys nothing and costs
+    # ~1.5s per arc leg. Move at a normal scan speed instead.
+    arc_speed_factor: float = 0.08
+    # Time to let the arm settle and vision produce fresh frames at each pose
+    # before the mask area is read.
+    # settle_s is NOT slack -- it is vision's recovery time. Every arc leg moves
+    # the camera far more than the 5mm threshold in vision/node.py, which wipes
+    # the tracker history and discards cached bboxes, so detection has to
+    # rebuild from a fresh YOLO pass. Vision publishes at ~5Hz, so 1.0s is about
+    # five frames of rebuild. Cutting it to 0.4s (two frames) produced area=0px
+    # and 0/6 frames at all seven poses -- detection looked dead.
+    settle_s: float = 0.9
+    samples_per_pose: int = 6
+    # Sample at the rate vision actually publishes. The old 0.08s polled a 5Hz
+    # topic at 12.5Hz, so most reads re-counted the same message and
+    # frames_with_flower overstated how many real frames had been seen.
+    sample_interval_s: float = 0.15
+    # A pose has to see something real to count as a candidate.
+    # Measured areas on the first real sweep were 21k-74k px, so 200 was far
+    # below anything real. Keep a floor that rejects speckle without coming
+    # near a genuine flower.
+    min_mask_area_px: float = 1000.0
+    # Confidence is NOT a usable gate for this model -- it is anti-correlated
+    # with everything that matters. Measured 2026-09-15 across one sweep:
+    #
+    #   pose     area    frames   conf
+    #   PREFIX   51224   12/12    0.06   <- best view, lowest confidence
+    #   ARC_2    26998    3/12    0.30   <- flakiest view, highest confidence
+    #   ARC_3    34802   12/12    0.09   <- rejected at 0.10, should have won
+    #
+    # At 0.10 this threw away the PREFIX detection (so the arc fell back to
+    # centring on the TCP) and rejected ARC_3, handing the visit to a smaller,
+    # less consistently seen flower. Gate on consistency instead: a detection
+    # present in most frames of a burst is real, whatever score it carries.
+    #
+    # Tried at 0.5, then 0.3, now off. 2026-09-15 16:44 settled it -- six poses
+    # held a flower in >=3 of 6 frames and only ONE cleared 0.3, the SMALLEST of
+    # them:
+    #
+    #   38149px 6/6 conf 0.23  rejected
+    #   30438px 6/6 conf 0.06  rejected  <- PREFIX, forcing a 25s search arc
+    #   30000px 6/6 conf 0.05  rejected
+    #   26585px 6/6 conf 0.06  rejected
+    #   17728px 6/6 conf 0.40  CANDIDATE <- chosen, <half the size of the best
+    #
+    # Choosing it fixed the flower 1.49m from base, which forced a 0.59m arc
+    # radius, cost an IK slot, and left the close-in needing 173deg of joint
+    # travel -- refused, so the arm never reached the flower.
+    #
+    # On this engine a 0.06 score held across every frame is a better detection
+    # than a 0.40 held across every frame: area is the signal, confidence is
+    # noise (correlation +0.34). The area and frame-count gates below already
+    # reject the junk on their own -- in that run the only false positives
+    # (0px, and 3476px at 3/6) failed on those two without confidence's help.
+    # Kept as a field, not deleted, so it can be re-enabled if the model is ever
+    # retrained to produce meaningful scores.
+    min_confidence: float = 0.0
+    # Fraction of the sample burst that must actually contain a flower.
+    min_frame_fraction: float = 0.5
+    # How close to get once the best pose is chosen, measured from the flower
+    # along the viewing ray.
+    #
+    # This is a TCP distance, and the nozzle sits forward of the TCP, so the
+    # physical gap is smaller than the number here. 0.15 measured 15.9cm at the
+    # TCP on 2026-09-15 and read as too close at the plant. A blower does not
+    # need to be intimate with the flower -- it throws pollen -- so back off and
+    # buy clearance. Raise further if the arm still crowds the bunch.
+    # Tip-to-flower distance. Was 0.25 when this number still meant TCP-to-
+    # flower (tip ~3cm off the bloom); once it became a true tip distance, 25cm
+    # put the gripper a long way out and the TCP 47cm back, which made the
+    # close-in a 43cm move the IK refused (79deg of joint travel).
+    standoff_m: float = 0.25
+    # Put the gripper IN FRONT of the flower, not below it.
+    #
+    # The sweep deliberately runs ~40cm under the flower to stay out of the
+    # canopy, so the viewing ray slants steeply upward. Backing off along that
+    # ray inherits the slant: on 2026-09-15 the gripper finished 27cm BELOW the
+    # flower, aimed up at it. For a nozzle that has to throw pollen at the
+    # flower, level and facing it is the pose that matters.
+    #
+    # So keep the azimuth the sweep chose -- that is the direction judged most
+    # visible -- but take the standoff horizontally and finish at the flower's
+    # own height.
+    approach_at_flower_height: bool = True
+    # Vertical trim on the final hold, relative to the measured flower centre.
+    # Negative sits lower. The flower position is a mask centroid, and the
+    # cluster reads slightly high relative to where the nozzle wants to be, so
+    # a small drop puts the gripper better. One knob -- make it more negative to
+    # sit lower still, 0.0 to hold exactly at the measured centre.
+    approach_z_offset_m: float = -0.04
+    # Point the gripper AT the flower at the final hold.
+    #
+    # The standoff inherits the winning arc pose's orientation, which was aimed
+    # at the arc centre from ~40cm below. Once the arm climbs to flower height
+    # that orientation no longer points at the flower, so the flower sits off to
+    # one side of the gripper instead of down its axis. Swing the tool's local
+    # Z onto the flower; capped, because a large orientation change near the
+    # plant risks an IK branch flip.
+    aim_tool_at_flower: bool = True
+    # Raised 25 -> 35 -> 45: runs needed 26deg, then 38deg, and were capped each
+    # time, leaving the gripper a few degrees off-axis. The cap exists to avoid
+    # IK branch flips, so it is loosened, not removed.
+    aim_max_deg: float = 45.0
+    # standoff_m is the distance from the GRIPPER TIP to the flower, not from
+    # the TCP. gripper_tip sits [0, 0, 0.221] in tool0 -- 22.1cm straight out
+    # along the pointing axis -- so a TCP-measured standoff was wildly wrong:
+    # at 15cm the tip was 7cm PAST the flower (which is why it read as too
+    # close), and at 25cm it was ~3cm off it. Looked up from TF at runtime;
+    # this is the fallback if the lookup fails.
+    gripper_tip_offset_m: float = 0.221
+    # Lateral trim on the final hold, in the TOOL frame, perpendicular to the
+    # pointing axis. Positive shifts the gripper along its local +X. Use this
+    # only for a bias that survives after the aim is confirmed uncapped --
+    # if [POLLINATION_AIM] reports the swing was CAPPED, raise aim_max_deg
+    # instead, because that is a pointing error and no positional trim fixes it.
+    approach_lateral_offset_m: float = 0.0
+    # Cheap pre-filter only -- IK is the real judge of reachability.
+    #
+    # This was 1.25, taken from the published UR10e figure rather than from this
+    # robot. The arm's own default_kinematics.yaml gives upper 0.612 + forearm
+    # 0.571 = 1.183m of extension from a shoulder 0.181m up, plus ~0.235m of
+    # wrist offsets -- and our targets are TCP poses with a further 0.221m of
+    # gripper beyond the flange. Straight-line distance from the base origin is
+    # therefore a poor proxy: it ignores the shoulder height and the wrist
+    # geometry entirely.
+    #
+    # At 1.25 it rejected three standoffs at 1.34-1.39m on 2026-09-15 18:19
+    # without ever asking IK, then fell through to the ray fallback and put the
+    # gripper 38cm below the flower. Widened so it only catches the clearly
+    # impossible; anything plausible now goes to IK, which answers properly.
+    max_reach_m: float = 1.45
+    # Allow the slanted viewing-ray standoff when no level one is reachable.
+    #
+    # Off by default: the ray inherits the sweep's upward slant, so for a flower
+    # the arm cannot reach it lands the gripper far BELOW the bloom and sprays
+    # at nothing. On 2026-09-15 18:19 a flower 1.58m from base (past the 1.30m
+    # arm) had every level standoff rejected at 1.34-1.39m, fell back to the
+    # ray, and finished 38cm under the flower after 8cm of travel.
+    #
+    # Holding at the arc pose and turning to face the flower is the better
+    # failure: the viewing angle was already good, and the nozzle at least
+    # points the right way.
+    allow_ray_fallback: bool = False
+    # Refuse to sweep when the start pose cannot see the flower.
+    #
+    # Without a pre-fix the arc falls back to circling the TCP, and those poses
+    # face a point the flower is not at: on 2026-09-15 six of seven poses saw
+    # area=0px, and the run then went and visited the one marginal 10952px /
+    # conf 0.05 detection it happened to catch. That is ~60s of motion near the
+    # plant to reach a worse answer than not running at all. Failing in one
+    # second with "aim the arm at the flower" is the more useful outcome.
+    # Set False to restore the old best-effort behaviour.
+    require_prefix_detection: bool = True
+    # When the start pose sees nothing, sweep the arm around its own position
+    # looking for the flower instead of giving up. This is the LiDAR-scan arc
+    # used as a SEARCH: it stops at the first pose with a confirmed, reachable
+    # sighting, then the real sweep re-centres on that flower. Turning an abort
+    # into a recovery is worth one extra arc, and the alternative was asking the
+    # operator to re-aim by hand every time.
+    search_when_not_visible: bool = True
+    # Wider than the scoring sweep on purpose -- this one is hunting, not
+    # ranking, so it should cover as much of the front as it can reach.
+    search_arc_deg: float = 180.0
+    search_poses: int = 7
+    # How far a sighting may sit from the arc centre and still count as "the
+    # flower we came for".
+    #
+    # The sweep orbits the flower PREFIX found, so a sighting far from that
+    # centre is not a better view of it -- it is either another bloom or, with
+    # only one flower on the rig, a bad depth reading of the same one. Either
+    # way it is not a position to drive to. Without this check the sweep simply
+    # took the biggest mask in frame: on 2026-09-15 16:50 ARC_7 reported a point
+    # 48cm from the centre (47cm of it vertical), won on area, and the arm drove
+    # 50cm below the flower -- while the re-fix from that same pose agreed with
+    # PREFIX to within 1.6cm and was discarded for being 3% smaller.
+    #
+    # 0.20m is generous next to a flower cluster but well inside the 0.48m
+    # error it would have caught.
+    max_center_drift_m: float = 0.20
+    # Stop the sweep at the first pose that holds the flower in EVERY frame.
+    #
+    # The original design swept all poses then drove back to the winner, on the
+    # grounds that a maximum is not knowable until every candidate is seen. True
+    # -- but the retrace is what keeps failing: 2026-09-15 17:16 found a clean
+    # 6-of-6 view at ARC_5, kept sweeping, and then died returning to it
+    # ("max joint change 348.5deg exceeds 75.0deg"), throwing away a good sweep.
+    #
+    # A pose that sees the flower in every frame of the burst is good enough to
+    # spray from, and stopping there means the arm is already where it needs to
+    # be -- no retrace to fail, and the sweep ends sooner. The standoff is still
+    # checked before accepting, so it cannot stop somewhere it cannot approach
+    # from.
+    stop_on_full_frames: bool = True
+    # ...and only when the view is also confident. Full frames alone can be a
+    # steady view of something marginal; a strong score on top of it means the
+    # model is sure as well as consistent. Both must hold to cut the sweep
+    # short, so an early stop is never a worse choice than finishing it.
+    #
+    # Deliberately far above min_confidence (0.0): that gate decides what counts
+    # as a flower at all, this one decides what is good enough to stop for.
+    stop_on_confidence: float = 0.4
+    # Extra hold at the flower AFTER the spray, on top of the ~9.7s the blower
+    # cycle already takes. Zero means leave as soon as the Arduino answers OK:
+    # the dispense is the reason to be there, and standing in the canopy after
+    # it adds nothing but time and exposure.
+    dwell_s: float = 0.0
+    # Pollen dispenser (Arduino + blower). Open-loop: grams are inferred from
+    # spray duration, never measured -- see pollen_dispenser.py.
+    # Bring-up done -- sweep, scoring, close-in and hold all verified on the
+    # rig over several runs, so the blower joins the sequence. It fires once the
+    # arm is holding at the flower, and the dwell absorbs the cycle: ~11.4s for
+    # 5g (7.7s of fixed firmware overhead plus 3.7s of blow) inside a 30s hold.
+    spray_enabled: bool = True
+    # Dose used by pollination and by the panel's "Spray Now" button. The
+    # separate "Spray 2 g" button is a fixed test shot and does not read this.
+    spray_grams: float = 2.0
+    spray_port: str = "/dev/ttyUSB0"
+    spray_baud: int = 9600
+    # A failed spray does not abort the visit: the arm is already at the plant,
+    # and retreating cleanly matters more than the dose.
+    spray_required: bool = False
+    approach_speed: float = 0.10
+    return_home_after: bool = True
+
+
+@dataclass
 class AppConfig:
     topics: Topics = field(default_factory=Topics)
     joints: JointsPreset = field(default_factory=JointsPreset)
@@ -1169,6 +1460,7 @@ class AppConfig:
     gripper: Gripper = field(default_factory=Gripper)
     grasp: Grasp = field(default_factory=Grasp)
     lidar_scan: LidarScan = field(default_factory=LidarScan)
+    pollination: Pollination = field(default_factory=Pollination)
 
     @staticmethod
     def from_env(cfg: "AppConfig") -> "AppConfig":

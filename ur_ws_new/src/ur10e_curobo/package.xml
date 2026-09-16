@@ -12,5 +12,8 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+  <!-- pollen dispenser serial link (pollen_dispenser.py). Optional at runtime:
+       a missing pyserial degrades pollination to a visit without spraying. -->
+  <exec_depend>python3-serial</exec_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

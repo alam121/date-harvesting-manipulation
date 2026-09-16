@@ -125,9 +125,20 @@ def _scan_basis_and_angles(node, center, cur, n: int, arc: float):
 
 
 def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = True,
-                            stop_check=None):
+                            stop_check=None, center_override=None):
+    """Build the arc. `center_override` puts the centre somewhere other than
+    the TCP -- pollination orbits the detected flower rather than the arm.
+
+    Default None keeps _scan_center's existing precedence untouched, so the
+    LiDAR scan behaves exactly as before.
+    """
     cfg = node.cfg.lidar_scan
-    center, ref_quat, source = _scan_center(node)
+    if center_override is not None:
+        # ref_quat stays None on purpose: the block below fills it from the
+        # current TCP, which is the same reference the normal path ends up with.
+        center, ref_quat, source = list(center_override[:3]), None, "caller override"
+    else:
+        center, ref_quat, source = _scan_center(node)
     if center is None:
         if log:
             node.get_logger().error("Lidar scan: no scan center available")

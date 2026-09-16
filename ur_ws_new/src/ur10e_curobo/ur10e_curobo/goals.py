@@ -92,7 +92,7 @@ class ThreadSafeGoalList:
         with self._lock:
             self._goals.sort(key=key, reverse=reverse)
 from .motions import execute_single_pose as _exec
-from .motions import publish_stop_trajectory
+from .motions import publish_stop_trajectory, _curobo_path_constraints_valid
 from .config import (
     LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, PLAN_CFG_SCAN_PREFLIGHT,
     X_FORWARD_Y_LATERAL,
@@ -238,6 +238,18 @@ def quat_rotate_vec(q, v):
     qv = [0.0, v[0], v[1], v[2]]
     qi = [q[0], -q[1], -q[2], -q[3]]
     return quat_multiply(quat_multiply(q, qv), qi)[1:]
+
+
+def active_closure_offset(node):
+    """Use one mode-specific physical closure calibration throughout a move."""
+    mode = str(getattr(node, "active_goal_grasp_mode", "NORMAL")).strip().upper()
+    name = ("envelop_closure_center_offset_tcp_m" if mode == "ENVELOP"
+            else "closure_center_offset_tcp_m")
+    offset = list(getattr(node.cfg.planner, name,
+                          node.cfg.planner.closure_center_offset_tcp_m))
+    if len(offset) != 3 or not all(math.isfinite(v) for v in offset):
+        raise ValueError(f"{name} must contain three finite values")
+    return offset
 
 
 def closure_center_corrected_tcp(desired_grasp_xyz, orientation_wxyz,
@@ -507,8 +519,9 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
     # but when the chosen heading matches the inward direction far better than
     # its mirror (e.g. 0.997 vs 0.814, a 31deg margin), the polarity is decided
     # and preflighting the mirror is ~1s of wasted IK per goal. Only treat it as
-    # a genuine pair when the two are within corridor_polarity_margin of each
-    # other, which is the case this pair evaluation exists to resolve.
+    # a genuine pair when the two headings are within
+    # corridor_polarity_margin_deg of each other, which is the case this pair
+    # evaluation exists to resolve.
     _mirror_label = None
     if isinstance(best.get("label"), str):
         if best["label"].startswith("FROM_LEFT_"):
@@ -517,16 +530,24 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
             _mirror_label = best["label"].replace("FROM_RIGHT_", "FROM_LEFT_", 1)
     _mirror_item = next(
         (item for item in evaluated if item["label"] == _mirror_label), None)
-    _polarity_margin = float(getattr(planner, "corridor_polarity_margin", 0.10))
+    # Compare headings in degrees, not in cosine. See the note on
+    # corridor_polarity_margin_deg in config.py: the cosine form treated a
+    # 20deg separation as a tie whenever the best match was good, which handed
+    # a well-determined direction to the branch-cost tie-breaker below.
+    _polarity_margin_deg = float(getattr(
+        planner, "corridor_polarity_margin_deg", 10.0))
     _polarity_ambiguous = bool(
         axis_valid and _mirror_item is not None
-        and (float(best["score"]) - float(_mirror_item["score"])) < _polarity_margin)
+        and (float(_mirror_item["error_deg"]) - float(best["error_deg"]))
+        < _polarity_margin_deg)
     if axis_valid and not _polarity_ambiguous and _mirror_item is not None:
         node.get_logger().debug(
             f"[CORRIDOR_POLARITY] decided: {best['label']} "
             f"match={float(best['score']):.3f} vs mirror {_mirror_label} "
             f"match={float(_mirror_item['score']):.3f} "
-            f"(margin>={_polarity_margin:.2f}); skipping mirror preflight")
+            f"({float(_mirror_item['error_deg']) - float(best['error_deg']):.1f}deg "
+            f"apart, margin>={_polarity_margin_deg:.0f}deg); "
+            "skipping mirror preflight")
     node._corridor_axis_polarity_ambiguous = _polarity_ambiguous
     node.get_logger().info(
         f"[APPROACH_SIDE_SELECTED] class={class_label} side={best['label']} "
@@ -888,6 +909,10 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     Bypasses trajectory optimization — goes straight to the IK solution."""
     _direct_t0 = time.perf_counter()
     _record_motion = getattr(node, "_record_motion_plan_event", None)
+    # Callers used to see a bare False and assume the corridor was unreachable.
+    # "The arm ended up in the wrong place" and "this pose has no IK solution"
+    # need opposite recoveries, so say which one happened.
+    node._final_fail_reason = None
     if node.current_joint_positions is None:
         for _ in range(20):
             time.sleep(0.05)
@@ -1250,7 +1275,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             max_acc=planner.max_joint_acceleration * 0.3,
                             ramp_points=0, include_acc=False)
     if node.stop_requested:
-        node.stop_requested = False; return False
+        return False
 
     # 5) Clamp check. Reject the complete motion when any sampled waypoint is
     # below the safety threshold. A truncated approach leaves the arm at an
@@ -1300,6 +1325,17 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         f"[PATH_LATERAL] {label}: max_deviation="
         f"{_lateral_deviation_m * 1000.0:.1f}mm "
         f"cartesian_required={require_cartesian}")
+    if require_cartesian and (len(cart_path) != len(states)
+            or _lateral_deviation_m > float(getattr(planner, "final_endpoint_tolerance", 0.004))):
+        node.get_logger().warn(f"[{label}] Cartesian path exceeds lateral tolerance")
+        return False
+    with node._planning_lock:
+        if not _curobo_path_constraints_valid(node, states, label):
+            return False
+    if node.stop_requested or not traj.points:
+        return False
+    _duration = traj.points[-1].time_from_start
+    _duration_s = _duration.sec + _duration.nanosec / 1e9
     node._planned_cartesian_path = cart_path  # keep PATH_DEV in sync with this motion
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
@@ -1344,9 +1380,21 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         float(getattr(planner, "final_endpoint_tolerance", 0.004))
         if _is_final else 0.008
     )
-    reached = wait_until_xyz(
-        node, _wait_xyz, tol=_endpoint_tol, timeout=8.0,
-        target_quat=target_quat)
+    while True:
+        with node._final_command_lock:
+            _wait_generation = node._final_retarget_generation
+        reached = wait_until_xyz(
+            node, _wait_xyz, tol=_endpoint_tol, timeout=max(8.0, _duration_s + 2.0),
+            target_quat=target_quat)
+        with node._final_command_lock:
+            if reached and _is_final and _wait_generation != node._final_retarget_generation:
+                continue  # A new command was accepted during this wait.
+            if _is_final and node._final_inflight_stop is not None:
+                node._final_inflight_stop.set()
+            break
+    if not reached:
+        node._final_fail_reason = "STOPPED" if node.stop_requested else "NOT_SETTLED"
+        return False
     blend_motion(node)
     _execution_ms = (time.perf_counter() - _direct_t0) * 1000.0
 
@@ -1354,6 +1402,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if not reached and getattr(node, '_goal_stall_count', 0) >= 2:
         node.get_logger().warn(
             f"[DIRECT] {label}: stall count={node._goal_stall_count} — aborting goal.")
+        node._final_fail_reason = "STALL_ABORT"
         return False
 
     # Reject stall-acceptance far from target — but skip this check when the trajectory
@@ -1390,10 +1439,12 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             node.get_logger().warn(
                 f"[DIRECT] {label}: endpoint error={final_dist*1000:.1f}mm "
                 f"exceeds {_endpoint_tol*1000:.1f}mm — treating as failure")
+            node._final_fail_reason = "ENDPOINT_ERROR"
             return False
         if final_dist > 0.015:
             node.get_logger().warn(
                 f"[DIRECT] {label}: stalled {final_dist*100:.1f}cm from target — treating as failure")
+            node._final_fail_reason = "STALLED_FAR"
             return False
 
     if store_trajectory:
@@ -2862,10 +2913,12 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
         if hasattr(node, 'set_vision_mode'):
             node.set_vision_mode(restore_mode)
             if restore_mode == "paused":
-                time.sleep(0.12)  # wait for any in-flight YOLO inference to finish
+                if not node.wait_for_vision_paused(timeout=2.0):
+                    node.get_logger().error("Vision pause was not acknowledged")
+                    node.stop_requested = True
 
 
-def _apply_final_inflight_correction(node, delta, report):
+def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     """Retarget the FINAL move already in flight. Returns True if published.
 
     Regenerates the remaining straight leg from where the arm IS now to the
@@ -2926,11 +2979,31 @@ def _apply_final_inflight_correction(node, delta, report):
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.3,
         ramp_points=0, include_acc=False)
-    node.trajectory_pub.publish(traj)
-    # In place: wait_until_xyz is holding a reference to this same list.
-    tcp[0], tcp[1], tcp[2] = corrected
-    # And the endpoint check must judge against this, not the original target.
-    node._final_retarget_xyz = list(corrected)
+    # Everything above (IK, clearance, trajectory build) takes long enough that
+    # the FINAL can finish or fail while it runs. Publishing after that point
+    # sends the arm somewhere nobody is waiting on -- observed 2026-09-14
+    # 11:52:55, a retarget published in the same second as the HOME command
+    # that followed the failed grasp. Last check before committing motion.
+    with node._final_command_lock:
+        if (node.stop_requested or not traj.points or stop_evt is None or stop_evt.is_set()
+                or node.motion_phase != "FINAL"):
+            return False
+        measured = node.current_joint_positions
+        if measured is None or max(abs(a-b) for a,b in zip(measured, states[0])) > 0.01:
+            return False  # The arm moved too far while this proposal was planned.
+        with node._planning_lock:
+            if not _curobo_path_constraints_valid(node, states, "FINAL_RETARGET"):
+                return False
+        measured = node.current_joint_positions
+        if (node.stop_requested or stop_evt.is_set() or measured is None
+                or len(measured) != len(states[0])
+                or max(abs(a-b) for a,b in zip(measured, states[0])) > 0.01):
+            return False
+        # Update the wait target before publishing, under completion ownership.
+        tcp[0], tcp[1], tcp[2] = corrected
+        node._final_retarget_generation += 1
+        node._final_retarget_xyz = list(corrected)
+        node.trajectory_pub.publish(traj)
     report["applied"] += 1
     node.get_logger().info(
         f"[FINAL_INFLIGHT] retargeted "
@@ -2957,7 +3030,7 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     min_d = float(getattr(planner, "final_inflight_min_delta_m", 0.002))
     max_d = float(getattr(planner, "final_inflight_max_delta_m", 0.025))
     t0 = time.time()
-    seen_seq = -1
+    seen_seq = int(getattr(node, "all_fruits_seq", 0) or 0)
     while not stop_evt.is_set():
         time.sleep(0.05)
         seq = int(getattr(node, "all_fruits_seq", 0) or 0)
@@ -2966,10 +3039,13 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         seen_seq = seq
         report["frames"] += 1
         best, best_d = None, float("inf")
-        for cand in (getattr(node, "all_fruit_poses", None) or []):
+        observation = getattr(node, "_fruit_observation", None)
+        if observation is None or not observation.fresh(node.get_clock().now().nanoseconds):
+            continue
+        for cand in observation.poses:
             if len(cand) < 3:
                 continue
-            ok, why = _reacquire_quality_ok(node, cand)
+            ok, why = _reacquire_quality_ok(node, cand, observation)
             if not ok:
                 report["rejected"] += 1
                 report["last_reject"] = why
@@ -3008,48 +3084,33 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         if math.dist([0.0, 0.0, 0.0], delta) + report["applied_total"] > max_d:
             report["above_max"] += 1
             continue
-        if _apply_final_inflight_correction(node, delta, report):
+        if _apply_final_inflight_correction(node, delta, report, stop_evt):
             report["last_apply_t"] = time.time()
             report["applied_total"] += math.dist([0.0, 0.0, 0.0], delta)
             # Corrections are measured against the goal we are now driving to.
             target_xyz = [target_xyz[i] + delta[i] for i in range(3)]
 
 
-def _reacquire_candidate_quality(node, candidate):
-    """Quality for the fruit at `candidate`, or None if unknown.
-
-    /vision/all_fruit_quality is published in the same score-sorted order as
-    /vision/all_fruit_poses, but the two arrive as separate messages and
-    node.latest_goal_pose comes from a third topic on its own timer. Rather
-    than trust index alignment, match by position: find the nearest published
-    fruit and use its quality. Returns None when nothing is close enough,
-    which callers must treat as "unknown", not "bad".
-    """
-    quality = getattr(node, "all_fruit_quality", None)
-    poses = getattr(node, "all_fruit_poses", None)
-    if not quality or not poses:
+def _reacquire_candidate_quality(node, candidate, observation=None):
+    """Read position and quality from the same immutable acquisition packet."""
+    observation = observation if observation is not None else getattr(node, "_fruit_observation", None)
+    if observation is None or not observation.poses:
         return None
-    best_i, best_d = None, float("inf")
-    for i, p in enumerate(poses):
-        if i >= len(quality):
-            break
-        d = math.dist(candidate, p)
-        if d < best_d:
-            best_i, best_d = i, d
-    # 2cm: same fruit seen by both topics, not a neighbour.
-    if best_i is None or best_d > 0.02:
-        return None
-    return quality[best_i]
+    distances = [math.dist(candidate, p) for p in observation.poses]
+    index = min(range(len(distances)), key=distances.__getitem__)
+    return observation.qualities[index] if distances[index] <= 0.02 else None
 
 
-def _reacquire_quality_ok(node, candidate):
-    """(ok, reason). Unknown quality passes -- never block on missing data."""
+def _reacquire_quality_ok(node, candidate, observation=None):
+    """(ok, reason). Quality must belong to the candidate observation."""
     planner = node.cfg.planner
     if not bool(getattr(planner, "reacquire_quality_gate", True)):
         return True, ""
-    q = _reacquire_candidate_quality(node, candidate)
+    q = _reacquire_candidate_quality(node, candidate, observation)
     if q is None:
-        return True, ""
+        return False, "missing observation quality"
+    if len(q) != 5 or not all(math.isfinite(v) for v in q):
+        return False, "invalid quality values"
     vis_ratio, z_std, confidence, _score, edge_margin = q
     min_vis = float(getattr(planner, "reacquire_min_vis_ratio", 0.25))
     max_std = float(getattr(planner, "reacquire_max_z_std_m", 0.025))
@@ -3067,323 +3128,65 @@ def _reacquire_quality_ok(node, candidate):
 
 
 def _reacquire_goal_pose_impl(node, seed_xyz, candidate_seeds=None, timeout=5.5, radius=0.04, z_tolerance=0.05, depth_settle_s=2.0, stable_needed=None):
-    import numpy as _np
-    _verbose_reacq = getattr(node.cfg.planner, "log_phase_timings", False)
-    # Build seed list: primary first, then candidates
-    seeds = [seed_xyz[:3]]
-    if candidate_seeds:
-        for c in candidate_seeds:
-            xyz = c[:3] if len(c) > 3 else c
-            if all(math.dist(xyz, s) > 0.03 for s in seeds):
-                seeds.append(list(xyz))
-
-    if stable_needed is None:
-        stable_needed = 5      # readings that must match before accepting
-    Z_STABLE_THRESH = 0.012    # max std of Z across stable readings (12 mm)
-
-    stable_count = 0
+    """Match fresh acquisitions in all three axes within a bounded deadline."""
+    seeds = [tuple(seed_xyz[:3])]
+    for candidate in candidate_seeds or []:
+        xyz = tuple(candidate[:3])
+        if all(math.dist(xyz, seed) > 0.03 for seed in seeds):
+            seeds.append(xyz)
+    stable_needed = max(1, int(stable_needed if stable_needed is not None else 5))
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    settle_end = min(deadline, time.monotonic() + max(0.0, depth_settle_s))
+    while time.monotonic() < settle_end:
+        if node.stop_requested or not node.running:
+            return None
+        time.sleep(min(0.01, max(0.0, settle_end - time.monotonic())))
+    # Receipt after settling is insufficient: acquisition itself must be new.
+    settled_ns = node.get_clock().now().nanoseconds
+    seen_stamp = settled_ns
+    history = []
     matched_seed = None
-    start = time.time()
-    prev_pose_tuple = None
-    recent_zs = []             # Z values of the last stable_needed matched readings
-
-    # Let depth settle before starting to match — ZED stereo depth needs a few
-    # frames to stabilize after the arm stops moving at the approach position.
-    DEPTH_SETTLE_S = depth_settle_s
-    search_s = max(timeout - DEPTH_SETTLE_S, 1.0)
-    if _verbose_reacq:
-        node.get_logger().info(
-            f"[REACQ] Settling {DEPTH_SETTLE_S:.1f}s | "
-            f"seeds={len(seeds)} primary=[{seeds[0][0]:.3f},{seeds[0][1]:.3f},{seeds[0][2]:.3f}] | "
-            f"search budget={search_s:.1f}s")
-    while time.time() - start < DEPTH_SETTLE_S:
-        time.sleep(0.05)
-    if _verbose_reacq:
-        node.get_logger().info(f"[REACQ] Settle done — searching ({search_s:.1f}s remaining)")
-
-    _last_progress_log = 0.0   # throttle per-frame progress to once/sec
-
-    # Perception sample in effect when reacquire started. Vision is PAUSED
-    # during the approach, so node.latest_goal_pose still holds the very sample
-    # that produced the seed. Matching against it "succeeds" instantly with
-    # drift=(0,0,0) and adds no information -- observed in the field as
-    # "ACCEPTED (full 3D) after 0.0s | drift=(0,-0,0)mm". Refuse to match until
-    # vision has published a genuinely new sample. If none arrives we time out
-    # and fall back to the seed, which is the correct outcome: reacquire has
-    # nothing to say, and must not pretend otherwise.
-    # Watch BOTH the goal stamp and the all-fruit-poses counter. The goal topic
-    # alone was never a workable signal here: it is published only from
-    # _process_best_target, which the vision node skips in reacquire mode, so it
-    # is silent for the entire duration of this function and this gate always
-    # expired -- burning its full _fresh_wait_s every cycle and then matching
-    # "the latest available" anyway, which is exactly what it existed to prevent.
-    # all_fruits_seq increments on every processed frame in every mode.
-    _entry_sample_ns = int(getattr(node, "latest_goal_sample_ns", 0) or 0)
-    _entry_fruits_seq = int(getattr(node, "all_fruits_seq", 0) or 0)
-    _fresh_seen = False
-    _fresh_gate_expired = False
-    # Bound on how long the freshness gate may hold us up.
-    _fresh_wait_s = min(0.6, max(0.0, float(timeout) * 0.4))
-
-    _grace_extended = False
-    # Absolute ceiling. `timeout` is extended by the grace period below, so it is
-    # not by itself a guarantee of progress. This one is never extended:
-    # reacquire is an optimisation and must never be able to stall a harvest.
-    _hard_deadline = start + float(timeout) + 2.0
-    while time.time() - start < timeout and time.time() < _hard_deadline:
-        # Grace period: if we have at least one reading and are about to time
-        # out, extend by 1s to wait for the next one.
-        #
-        # This check MUST run before the `continue` paths below. It used to sit
-        # after them, so it was only ever evaluated on an iteration where a new
-        # distinct matching pose arrived -- which is exactly the thing that is
-        # not happening when we are stuck at stable=1. Observed in the field:
-        # "TIMEOUT after 0.9s | stable=1/2" with the fruit 4mm from the seed,
-        # the grace never having fired.
-        if (not _grace_extended and stable_count >= 1
-                and time.time() - start >= timeout - 0.05):
-            timeout += 1.0
-            _grace_extended = True
-            if _verbose_reacq:
-                node.get_logger().info(
-                    f"[REACQ] Grace +1s: stable={stable_count}/{stable_needed} "
-                    "— waiting for one more reading")
-
-        # Freshness gate, BOUNDED. Its job is to stop us instantly matching the
-        # very sample that produced the seed (vision is paused during approach,
-        # so latest_goal_pose still holds it) -- not to block indefinitely. In
-        # throttled "reacquire" mode the vision node runs YOLO every 3rd frame and
-        # has just come back from a pause, so a genuinely new sample can take a
-        # while. After _fresh_wait_s, proceed with whatever is published and say
-        # so, rather than burning the whole budget waiting.
-        if (not _fresh_seen
-                and (int(getattr(node, "latest_goal_sample_ns", 0) or 0)
-                     != _entry_sample_ns
-                     or int(getattr(node, "all_fruits_seq", 0) or 0)
-                     != _entry_fruits_seq)):
-            _fresh_seen = True
-            if _verbose_reacq:
-                node.get_logger().info(
-                    f"[REACQ] fresh perception sample after "
-                    f"{time.time() - start - DEPTH_SETTLE_S:.2f}s")
-        if not _fresh_seen:
-            if time.time() - start < _fresh_wait_s:
-                time.sleep(0.005)
-                continue
-            if not _fresh_gate_expired:
-                _fresh_gate_expired = True
-                node.get_logger().warn(
-                    f"[REACQ] no new perception sample within "
-                    f"{_fresh_wait_s:.1f}s (no detections, or vision throttled); "
-                    "matching against the latest available")
-
-        # Check best fruit first, then fall back to all visible fruits.
-        # This allows reacquire to find the target even when it isn't best-ranked
-        # (e.g. another fruit is closer during the approach phase).
-        #
-        # BUT only if latest_goal_pose has actually refreshed since we entered.
-        # In reacquire mode the vision node skips _process_best_target, so
-        # /external_goal_pose is never republished, and the publish timer drops
-        # the goal after 0.25s of staleness. latest_goal_pose therefore still
-        # holds the very sample that produced the seed. Listing it first meant
-        # reacquire matched the seed against itself and "succeeded" with
-        # drift=(0,0,0)mm, learning nothing -- the exact outcome the freshness
-        # gate above was written to prevent. Making the gate work was not enough
-        # while the stale value stayed in the candidate list.
-        #
-        # all_fruit_poses is published every processed frame in every mode, so
-        # it carries the genuinely new measurements.
-        pose = None
-        _goal_pose_is_fresh = (
-            int(getattr(node, "latest_goal_sample_ns", 0) or 0) != _entry_sample_ns)
-        if node.latest_goal_pose and _goal_pose_is_fresh:
-            pose = node.latest_goal_pose[:3]
-
-        # If best fruit doesn't match any seed, scan all visible fruits
-        candidate_poses = [pose] if pose is not None else []
-        all_visible = getattr(node, 'all_fruit_poses', [])
-        for fp in all_visible:
-            if not any(fp == p for p in candidate_poses):
-                candidate_poses.append(fp)
-
-        best_seed = None
-        best_dist = float('inf')
-        pose = None
-        _used_xy_only = False
-        _closest_miss = None   # for diagnostics
-        _closest_miss_d = float('inf')
-        for candidate in candidate_poses:
-            if candidate is None:
-                continue
-            # Quality gate first: a detection can sit well inside the match
-            # radius and still be junk (half the date out of frame, depth
-            # scattered across the bunch behind it). Accepting it moves the
-            # grasp goal onto a bad measurement, which is worse than timing out
-            # and keeping the seed.
-            _q_ok, _q_reason = _reacquire_quality_ok(node, candidate)
-            if not _q_ok:
-                _now_q = time.time()
-                if (not hasattr(_reacquire_goal_pose_impl, "_last_q_log")
-                        or _now_q - _reacquire_goal_pose_impl._last_q_log > 1.0):
-                    _reacquire_goal_pose_impl._last_q_log = _now_q
-                    node.get_logger().info(
-                        f"[REACQ] rejected on quality: {_q_reason} "
-                        f"at [{candidate[0]:.3f},{candidate[1]:.3f},{candidate[2]:.3f}]")
-                continue
-            cx, cy, cz = candidate
-            for s in seeds:
-                d_xy = math.hypot(cx - s[0], cy - s[1])
-                d_z = abs(cz - s[2])
-                d = math.dist(candidate, s)
-                # XY-only match: only when we have enough readings AND they are
-                # genuinely noisy (high Z std). Do NOT open this gate early just
-                # because stable_count is low — that allows neighbouring fruits
-                # at 4-5cm to be accepted before we have evidence of depth noise.
-                depth_unstable = (
-                    len(recent_zs) >= stable_needed and
-                    float(_np.std(recent_zs)) > Z_STABLE_THRESH
-                )
-                xy_only_match = depth_unstable and d_xy <= 0.05
-                full_match = d_xy <= radius and d_z <= z_tolerance
-                # One-dim-close: if either dxy<2cm or dz<2cm the fruit is very close in that
-                # dimension — accept it but fall back to original seed xyz (safest position).
-                one_dim_close = (d_xy < 0.02 or d_z < 0.02) and (d_xy < radius or d_z < z_tolerance)
-                if (full_match or xy_only_match or one_dim_close) and d_xy < best_dist:
-                    best_dist = d_xy
-                    best_seed = s
-                    _used_xy_only = xy_only_match and not full_match
-                    _match_type = "one-dim-close" if (one_dim_close and not full_match and not xy_only_match) else ("XY-only" if _used_xy_only else "full")
-                    node.get_logger().debug(
-                        f"[REACQ] match: [{cx:.3f},{cy:.3f},{cz:.3f}] → seed [{s[0]:.3f},{s[1]:.3f},{s[2]:.3f}] "
-                        f"dxy={d_xy*100:.1f}cm dz={d_z*100:.1f}cm ({_match_type})")
-                    if one_dim_close and not full_match and not xy_only_match:
-                        # Use whichever dimension is close from candidate, keep seed for the other
-                        nx = cx if d_xy < 0.02 else s[0]
-                        ny = cy if d_xy < 0.02 else s[1]
-                        nz = cz if d_z < 0.02 else s[2]
-                        pose = [nx, ny, nz]
-                    elif _used_xy_only:
-                        # Use detected XY but keep seed Z — depth unreliable
-                        pose = [cx, cy, s[2]]
-                    else:
-                        pose = candidate
-                elif d < _closest_miss_d:
-                    _closest_miss_d = d
-                    _closest_miss = (candidate, s, d_xy, d_z)
-
-        if best_seed is None or pose is None:
-            # Log once per second so we can see why reacquire keeps missing
-            _now = time.time()
-            if (_verbose_reacq and
-                    (not hasattr(_reacquire_goal_pose_impl, '_last_miss_log') or
-                     _now - _reacquire_goal_pose_impl._last_miss_log > 1.0)):
-                _reacquire_goal_pose_impl._last_miss_log = _now
-                if _closest_miss is not None:
-                    _cm, _cs, _dxy, _dz = _closest_miss
-                    node.get_logger().warn(
-                        f"[REACQ] No match — closest candidate "
-                        f"[{_cm[0]:.3f},{_cm[1]:.3f},{_cm[2]:.3f}] "
-                        f"seed [{_cs[0]:.3f},{_cs[1]:.3f},{_cs[2]:.3f}] "
-                        f"d_xy={_dxy*100:.1f}cm d_z={_dz*100:.1f}cm "
-                        f"(limit: xy={radius*100:.0f}cm z={z_tolerance*100:.0f}cm)"
-                    )
-                else:
-                    node.get_logger().warn("[REACQ] No candidates visible at all")
-            time.sleep(0.001)
+    while time.monotonic() < deadline:
+        if node.stop_requested or not node.running:
+            return None
+        observation = getattr(node, "_fruit_observation", None)
+        now_ns = node.get_clock().now().nanoseconds
+        if (observation is None or observation.stamp_ns <= seen_stamp
+                or not observation.fresh(now_ns)):
+            time.sleep(0.005)
             continue
-
-        pose_tuple = tuple(pose)
-        if pose_tuple == prev_pose_tuple:
-            time.sleep(0.001)
+        seen_stamp = observation.stamp_ns
+        matches = []
+        for candidate in observation.poses:
+            ok, _ = _reacquire_quality_ok(node, candidate, observation)
+            if not ok:
+                continue
+            for seed in seeds:
+                dxy = math.hypot(candidate[0] - seed[0], candidate[1] - seed[1])
+                dz = abs(candidate[2] - seed[2])
+                if dxy <= radius and dz <= z_tolerance:
+                    matches.append((math.dist(candidate, seed), seed, candidate))
+        if not matches:
+            history.clear()
+            matched_seed = None
             continue
-        prev_pose_tuple = pose_tuple
-
-        x, y, z = pose
-
-        # Stability check: count how many distinct readings land near the seed.
-        # Depth noise is typically 5-20mm so a tight consecutive-delta gate (old 3mm)
-        # would reset on every noisy frame. Instead just count distinct detections.
-        if matched_seed != best_seed:
-            stable_count = 0
-            matched_seed = best_seed
-            recent_zs.clear()
-
-        stable_count += 1
-        recent_zs.append(z)
-        if len(recent_zs) > stable_needed:
-            recent_zs.pop(0)
-
-        z_std = float(_np.std(recent_zs)) if len(recent_zs) >= 2 else float('nan')
-
-        # Throttled progress log — once per second
-        _now = time.time()
-        if _verbose_reacq and _now - _last_progress_log >= 1.0:
-            _last_progress_log = _now
-            elapsed = _now - start - DEPTH_SETTLE_S
+        _, seed, pose = min(matches)
+        if seed != matched_seed:
+            history.clear()
+            matched_seed = seed
+        history.append(pose)
+        history = history[-stable_needed:]
+        if len(history) < stable_needed:
+            continue
+        # Check every axis; identical positions from distinct frames count.
+        means = tuple(sum(p[i] for p in history) / len(history) for i in range(3))
+        spread = [math.sqrt(sum((p[i] - means[i])**2 for p in history) / len(history))
+                  for i in range(3)]
+        if max(spread) <= 0.012:
             node.get_logger().info(
-                f"[REACQ] t={elapsed:.1f}s | stable={stable_count}/{stable_needed} "
-                f"Z_std={z_std*1000:.1f}mm | pos=[{x:.3f},{y:.3f},{z:.3f}] | "
-                f"visible={len(candidate_poses)} fruits")
-
-        if stable_count >= stable_needed:
-            if z_std > Z_STABLE_THRESH:
-                # Depth still fluctuating — keep collecting, don't reset count
-                if _verbose_reacq:
-                    node.get_logger().info(
-                        f"[REACQ] Waiting for depth: Z_std={z_std*1000:.1f}mm > {Z_STABLE_THRESH*1000:.0f}mm "
-                        f"(stable_count={stable_count})")
-                time.sleep(0.001)
-                continue
-            match_type = "XY-only (depth unstable)" if _used_xy_only else "full 3D"
-            dx = (x - matched_seed[0]) * 1000
-            dy = (y - matched_seed[1]) * 1000
-            dz = (z - matched_seed[2]) * 1000
-            drift_xy = math.hypot(dx, dy)
-            # With stable_needed=1 there is only one reading, so no Z spread
-            # exists to report. Print n/a rather than "nan".
-            _zstd_txt = (
-                "n/a" if z_std != z_std else f"{z_std*1000:.1f}mm")
-            _accept_msg = (
-                f"[REACQ] ACCEPTED ({match_type}) after {time.time()-start-DEPTH_SETTLE_S:.1f}s | "
-                f"count={stable_count} Z_std={_zstd_txt} | "
-                f"[{x:.3f},{y:.3f},{z:.3f}] | seed=[{matched_seed[0]:.3f},{matched_seed[1]:.3f},{matched_seed[2]:.3f}] | "
-                f"drift=({dx:.0f},{dy:.0f},{dz:.0f})mm XY={drift_xy:.0f}mm"
-            )
-            if drift_xy > 25:
-                node.get_logger().warn(_accept_msg + " ← LARGE DRIFT, verify correct fruit")
-            else:
-                node.get_logger().info(_accept_msg)
-            return (x, y, z)
-
-        time.sleep(0.001)
-
-    # Timeout — soft-accept if we have ≥3 stable readings with good Z
-    elapsed = time.time() - start - DEPTH_SETTLE_S
-    if stable_count >= 3 and matched_seed is not None and len(recent_zs) >= 2:
-        z_std = float(_np.std(recent_zs))
-        if z_std <= Z_STABLE_THRESH and prev_pose_tuple is not None:
-            x, y, z = prev_pose_tuple
-            dx = (x - matched_seed[0]) * 1000
-            dy = (y - matched_seed[1]) * 1000
-            dz = (z - matched_seed[2]) * 1000
-            drift_xy = math.hypot(dx, dy)
-            node.get_logger().warn(
-                f"[REACQ] SOFT-ACCEPT at timeout | stable={stable_count}/{stable_needed} "
-                f"Z_std={z_std*1000:.1f}mm | [{x:.3f},{y:.3f},{z:.3f}] | "
-                f"drift=({dx:.0f},{dy:.0f},{dz:.0f})mm XY={drift_xy:.0f}mm")
-            return (x, y, z)
-
-    # Hard timeout — nothing usable
-    if _closest_miss is not None:
-        _cm, _cs, _dxy, _dz = _closest_miss
-        node.get_logger().warn(
-            f"[REACQ] TIMEOUT after {elapsed:.1f}s | stable={stable_count}/{stable_needed} | "
-            f"closest was [{_cm[0]:.3f},{_cm[1]:.3f},{_cm[2]:.3f}] "
-            f"dxy={_dxy*100:.1f}cm dz={_dz*100:.1f}cm (need xy<{radius*100:.0f}cm z<{z_tolerance*100:.0f}cm)")
-    else:
-        node.get_logger().warn(
-            f"[REACQ] TIMEOUT after {elapsed:.1f}s | stable={stable_count}/{stable_needed} | "
-            f"no fruits visible in {len(seeds)} seed windows")
+                f"[REACQ] Accepted {len(history)} fresh observations at {means}")
+            return means
+    node.get_logger().info("[REACQ] No fresh stable match before deadline; retaining seed")
     return None
 
 
@@ -4037,17 +3840,16 @@ def plan_and_execute(node):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _yolo = getattr(node, 'yolo_thread', None)  # local inference_lock only (same process)
-    # Vision mode helpers — these publish to /vision/mode to control the separate vision process.
-    # _vision_pause() waits for the vision node to confirm it has paused and drained
-    # any in-flight YOLO inference (see wait_for_vision_paused). Without this handoff,
-    # YOLO TRT and cuRobo CUDA kernels overlap on the shared GPU and trigger
-    # device-side asserts. If no ack arrives (vision not running or ack dropped), fall
-    # back to a fixed 120ms delay: ROS2 topic latency (~20ms) + worst-case YOLO
-    # inference at 640px on Jetson (~50ms) + margin.
+    # Wait for a numbered drain acknowledgement; a timeout is not GPU idle.
     def _vision_pause():
         node.set_vision_mode("paused")
-        if not node.wait_for_vision_paused(timeout=0.30):
-            time.sleep(0.12)
+        if node.wait_for_vision_paused(timeout=2.0):
+            return True
+        node.get_logger().error("Vision pause was not acknowledged; stopping harvest")
+        node.motion_phase = "ERROR"
+        publish_stop_trajectory(node)
+        unlock_target(node)
+        return False
     def _vision_resume(): node.set_vision_mode("full")
 
     def _check_stop():
@@ -4330,7 +4132,8 @@ def plan_and_execute(node):
             # Lock vision onto this target (prevents switching to a different
             # "best" during approach), then free the GPU for cuRobo.
             lock_target(node, goal[:3])
-            _vision_pause()
+            if not _vision_pause():
+                break
 
         # Clear stored trajectory for partial reverse after grasp
         node.stored_trajectory_states = []
@@ -4978,9 +4781,7 @@ def plan_and_execute(node):
                     _tip_approach_closure = (
                         _tip_anchor
                         - (_tip_depth + _tip_standoff) * _center_insert_dir)
-                    _tip_offset_tcp = list(getattr(
-                        node.cfg.planner, "closure_center_offset_tcp_m",
-                        [-0.004553, 0.000100, -0.016223]))
+                    _tip_offset_tcp = active_closure_offset(node)
                     _tip_approach_tcp, _ = closure_center_corrected_tcp(
                         _tip_approach_closure, orientation, _tip_offset_tcp)
                     approach[:3] = list(_tip_approach_tcp)
@@ -5047,9 +4848,7 @@ def plan_and_execute(node):
                 _tip_approach_closure = (
                     _tip_anchor
                     - (_tip_depth + _tip_standoff) * _midhi_insert_dir)
-                _tip_offset_tcp = list(getattr(
-                    node.cfg.planner, "closure_center_offset_tcp_m",
-                    [-0.004553, 0.000100, -0.016223]))
+                _tip_offset_tcp = active_closure_offset(node)
                 _tip_approach_tcp, _ = closure_center_corrected_tcp(
                     _tip_approach_closure, orientation, _tip_offset_tcp)
                 ax, ay, az = _tip_approach_tcp
@@ -5134,9 +4933,7 @@ def plan_and_execute(node):
                 else [_pf_gx, _pf_gy, z + _pf_z])
             _pf_grasp, _, _, _, _ = _apply_mode_final_adjustment(
                 _pf_grasp, orientation)
-            _pf_closure_offset = list(getattr(
-                node.cfg.planner, "closure_center_offset_tcp_m",
-                [-0.004553, 0.000100, -0.016223]))
+            _pf_closure_offset = active_closure_offset(node)
             _pf_tcp, _ = closure_center_corrected_tcp(
                 _pf_grasp, orientation, _pf_closure_offset)
             _pf_final = [*_pf_tcp, *orientation]
@@ -5962,7 +5759,8 @@ def plan_and_execute(node):
                         f"[REACQ] Skipped — using original seed: "
                         f"[{x:.3f}, {y:.3f}, {z:.3f}]")
         # Pause YOLO again — final move and grasp need full GPU for IK.
-        _vision_pause()
+        if not _vision_pause():
+            break
         node._publish_goal_info()
         _timing["reacquire"] = time.time() - _t_reacq
         if _log_phase_timings:
@@ -5994,6 +5792,12 @@ def plan_and_execute(node):
                 f"[REACQ] Large drift (XY={_drift_xy:.0f}mm Z={_drift_z:.0f}mm) — reverting to original seed "
                 f"[{seed[0]:.3f},{seed[1]:.3f},{seed[2]:.3f}]")
             x, y, z = seed[0], seed[1], seed[2]
+
+        if (_tip_anchored_final_grasp is not None
+                and _do_reacq_after_approach and node.reacquire_result == "OK"):
+            _tip_anchored_final_grasp = [
+                float(_tip_anchored_final_grasp[i]) + value - seed[i]
+                for i, value in enumerate((x, y, z))]
 
         # 3. Final slow precise grasp — IK + direct joint interpolation (no cuRobo trajectory)
         # Reuse approach orientation — approach and final must be consistent to avoid wrist flips.
@@ -6105,9 +5909,7 @@ def plan_and_execute(node):
             f"tool_axis=[{_mode_axis[0]:+.3f},"
             f"{_mode_axis[1]:+.3f},{_mode_axis[2]:+.3f}] "
             f"closure_target=[{gx:.3f},{gy:.3f},{gz:.3f}]")
-        closure_offset_tcp = list(getattr(
-            node.cfg.planner, "closure_center_offset_tcp_m",
-            [-0.004553, -0.012559, -0.016223]))
+        closure_offset_tcp = active_closure_offset(node)
         _baseline_final_orientation = list(orientation)
         _baseline_tcp_xyz, _baseline_offset_base = closure_center_corrected_tcp(
             desired_grasp_xyz, _baseline_final_orientation, closure_offset_tcp)
@@ -6250,8 +6052,23 @@ def plan_and_execute(node):
             "last_apply_t": 0.0,
         }
         _inflight_stop = threading.Event()
+        node._final_inflight_stop = _inflight_stop
         _inflight_thread = None
+        _final_inplace_retried = False
         if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
+            # _direct_ik_move publishes its trajectory ~25 lines BEFORE it
+            # assigns node._final_live_wait_xyz, and this thread starts before
+            # _direct_ik_move is even called. That left a window (~1s of IK) in
+            # which the monitor read the PREVIOUS cycle's target and retargeted
+            # against it. Observed 2026-09-14 11:52:52: an "8.2mm" correction
+            # produced [0.203,-1.037,0.394] for a goal at [0.286,-1.059,0.375]
+            # -- 80mm off, because the base was a stale list. The arm drove
+            # there, the endpoint check measured 76.6mm against the real target
+            # and failed a grasp that was never given a chance.
+            # Clearing both here makes _apply_final_inflight_correction's
+            # `tcp is None` guard a no-op gate until the real target is live.
+            node._final_live_wait_xyz = None
+            node._final_retarget_xyz = None
             node._final_live_quat = list(final_target[3:7])
             node.set_vision_mode("reacquire_fast")
             # Compare against the FRUIT goal (x,y,z), not final_target.
@@ -6270,7 +6087,8 @@ def plan_and_execute(node):
             final_ok = _direct_ik_move(node, final_target, label="FINAL",
                                        motion_type="final", store_trajectory=True)
         finally:
-            _inflight_stop.set()
+            with node._final_command_lock:
+                _inflight_stop.set()
             if _inflight_thread is not None:
                 _inflight_thread.join(timeout=0.5)
                 # Freeze the last crop BEFORE re-pausing vision. This is the
@@ -6294,7 +6112,8 @@ def plan_and_execute(node):
                     node._grasp_crop_at_close = None
                 # Restore the pause the rest of the sequence expects.
                 node.set_vision_mode("paused")
-                node.wait_for_vision_paused(timeout=0.30)
+                if not node.wait_for_vision_paused(timeout=2.0):
+                    node.stop_requested = True
                 node._last_inflight_report = dict(_inflight_report)
                 _r = _inflight_report
                 _latest = (
@@ -6313,6 +6132,28 @@ def plan_and_execute(node):
                     f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
                     + (f" last_reject={_r['last_reject']}"
                        if _r["last_reject"] else ""))
+        # A FINAL that solved, planned and flew, but finished off-target, is not
+        # evidence against the corridor -- this one had CORRIDOR_PREFLIGHT=PASS,
+        # IK pos_err=0.0000 and PATH_LATERAL max_deviation=0.1mm. Excluding it
+        # and flying HOME to re-plan threw away ~11s and a perfectly good
+        # approach, and after 9 such failures the goal is abandoned outright.
+        # The arm is still centimetres from the fruit with a valid seed target,
+        # so re-fly the same leg from where it is. One attempt: if the second
+        # one also lands off-target the cause is not transient and the corridor
+        # logic below is the right answer.
+        if (not final_ok
+                and getattr(node, "_final_fail_reason", None) == "ENDPOINT_ERROR"
+                and not _final_inplace_retried
+                and not node.stop_requested):
+            _final_inplace_retried = True
+            node.get_logger().warn(
+                "[FINAL_RETRY] endpoint miss on a corridor that passed "
+                "preflight — re-flying the same leg from the current pose "
+                "instead of returning HOME")
+            final_ok = _direct_ik_move(
+                node, final_target, label="FINAL_RETRY",
+                motion_type="final", store_trajectory=True)
+
         if not final_ok and _phase4_yaw_applied:
             node.get_logger().warn(
                 "[PHASE4_YAW] candidate execution IK/path failed; retrying "
@@ -6472,7 +6313,8 @@ def plan_and_execute(node):
             node.latest_fingertip_verification_time = 0.0
             _vision_resume()
             time.sleep(_verify_s)
-            _vision_pause()
+            if not _vision_pause():
+                break
             _verification = getattr(node, "latest_fingertip_verification", None)
 
             # Phase 5 is deliberately observation-only. Convert the measured
@@ -6566,7 +6408,7 @@ def plan_and_execute(node):
         if _check_stop():
             break
         # Notify vision system about grasp attempt for fruit tracking
-        notify_grasp_attempt(node, final_target[:3])
+        notify_grasp_attempt(node, [x, y, z])
 
         # Evaluate grasp using force profile (when did contact start during closure)
         gc = node.gripper_controller

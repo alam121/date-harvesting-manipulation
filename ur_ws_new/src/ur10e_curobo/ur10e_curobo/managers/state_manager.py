@@ -26,7 +26,7 @@ class StateManager:
 
         # Joint state (thread-safe access)
         self._state_lock = threading.Lock()
-        # (names, position indices, velocity indices) cache for the 500Hz
+        # (names, arm joint indices) cache for the 500Hz
         # /joint_states callback; rebuilt only if the name list changes.
         self._js_index_cache = None
         self._current_joint_positions: Optional[List[float]] = None
@@ -263,30 +263,32 @@ class StateManager:
         CPU stretched over 230ms of wall clock). The joint name list is
         identical every message, so resolve the index mapping once and reuse it.
 
-        Semantics are unchanged: positions cover only the joints actually
-        present, in joint_order order; velocities always span joint_order,
-        with 0.0 where the message does not supply one.
+        Accept only complete, finite arm samples. Finger-only and partial
+        messages must not replace a valid arm state. Missing velocity is unknown.
         """
         names = tuple(msg.name)
         cached = self._js_index_cache
         if cached is None or cached[0] != names:
             order = self._config.joint_order
-            cached = (
-                names,
-                [names.index(j) for j in order if j in names],
-                [names.index(j) if j in names else -1 for j in order],
-            )
+            if not all(names.count(j) == 1 for j in order):
+                return
+            cached = (names, [names.index(j) for j in order])
             self._js_index_cache = cached
-        _, pos_idx, vel_idx = cached
-
-        pos = msg.position
-        vel = msg.velocity
-        n_vel = len(vel)
+        _, indices = cached
+        if any(i >= len(msg.position) for i in indices):
+            return
+        positions = [msg.position[i] for i in indices]
+        if not all(math.isfinite(v) for v in positions):
+            return
+        velocities = None
+        if all(i < len(msg.velocity) for i in indices):
+            values = [msg.velocity[i] for i in indices]
+            if all(math.isfinite(v) for v in values):
+                velocities = values
         with self._state_lock:
-            self._current_joint_positions = [pos[i] for i in pos_idx]
-            self._current_joint_velocities = [
-                vel[i] if 0 <= i < n_vel else 0.0 for i in vel_idx
-            ]
+            self._current_joint_positions = positions
+            self._current_joint_velocities = velocities
+            self._joint_state_received_at = time.monotonic()
 
     def _robot_running_cb(self, msg: Bool) -> None:
         """Track robot program running state."""
@@ -331,15 +333,24 @@ class StateManager:
         self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
 
     def _date_tip_cb(self, msg: PointStamped) -> None:
+        stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        age_s = (self._node.get_clock().now().nanoseconds - stamp_ns) / 1e9
+        if (msg.header.frame_id != "base_link" or not 0 <= age_s <= 0.5
+                or stamp_ns <= getattr(self, "_date_tip_sample_ns", 0)):
+            return
         point = (float(msg.point.x), float(msg.point.y), float(msg.point.z))
+        if not all(math.isfinite(v) for v in point):
+            return
+        self._date_tip_sample_ns = stamp_ns
         history = self._date_tip_history
+        if history and math.dist(history[-1], point) > 0.02:
+            history.clear()
         history.append(point)
         del history[:-5]
         mean = tuple(sum(p[i] for p in history) / len(history) for i in range(3))
-        spread = max(
-            math.dist(point_i, mean) for point_i in history) if history else float("inf")
+        spread = max(math.dist(point_i, mean) for point_i in history)
         self.date_tip_point = mean
-        self.date_tip_time = time.time()
+        self.date_tip_time = time.time() - age_s
         self.date_tip_stable = len(history) >= 3 and spread <= 0.012
 
     def _gap_info_cb(self, msg: Float32MultiArray) -> None:

@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <QSignalBlocker>
 #include <csignal>
 #include <ctime>
 #include <iomanip>
@@ -387,11 +388,14 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     input->setSuffix(" mm");
     return input;
   };
-  low_center_depth_in_ = make_offset_input(-10.0);
+  // Placeholders only: these match config.py's _LAB_GRASP_OFFSETS so the panel
+  // is not lying before the first /final_offsets_state message arrives, but the
+  // live values from the node overwrite them within ~1s (see updateDisplay).
+  low_center_depth_in_ = make_offset_input(20.0);
   low_center_z_in_ = make_offset_input(0.0);
-  mid_center_depth_in_ = make_offset_input(-10.0);
+  mid_center_depth_in_ = make_offset_input(20.0);
   mid_center_z_in_ = make_offset_input(0.0);
-  low_side_depth_in_ = make_offset_input(0.0);
+  low_side_depth_in_ = make_offset_input(20.0);
   low_left_z_in_ = make_offset_input(20.0);
   low_right_z_in_ = make_offset_input(10.0);
   final_offsets_layout->addWidget(new QLabel("Target"), 0, 0);
@@ -422,11 +426,12 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   reset_final_offsets->setToolTip(
     "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
   connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
-    low_center_depth_in_->setValue(-10.0);
+    // Keep in step with _LAB_GRASP_OFFSETS in ur10e_curobo/config.py.
+    low_center_depth_in_->setValue(20.0);
     low_center_z_in_->setValue(0.0);
-    mid_center_depth_in_->setValue(-10.0);
+    mid_center_depth_in_->setValue(20.0);
     mid_center_z_in_->setValue(0.0);
-    low_side_depth_in_->setValue(0.0);
+    low_side_depth_in_->setValue(20.0);
     low_left_z_in_->setValue(20.0);
     low_right_z_in_->setValue(10.0);
     onApplyFinalOffsets();
@@ -1251,6 +1256,56 @@ UR10ePanel::UR10ePanel(QWidget * parent)
 
   goal_tab_layout->addWidget(lidar_group);
 
+  // Pollination: a flower visit, not a harvest. Deliberately its own group and
+  // its own colour -- it swaps the YOLO engine and restarts vision, so it is
+  // not something to hit by accident while picking dates.
+  auto * pollination_group = new QGroupBox("Pollination");
+  auto * pollination_layout = new QVBoxLayout(pollination_group);
+  auto * pollinate_btn = new QPushButton("Pollinate");
+  pollinate_btn->setStyleSheet(
+    "background-color: #8e24aa; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 6px;");
+  pollinate_btn->setToolTip(
+    "Switch to the flower model, sweep the semicircle arc, and score each pose "
+    "by how large the flower's mask is.\n"
+    "Returns to the best view, closes in to the configured standoff, holds, "
+    "then restores the date model and goes home.\n"
+    "Arc, standoff and dwell are configured in config.py Pollination.");
+  connect(pollinate_btn, &QPushButton::clicked, this, &UR10ePanel::onPollinate);
+  pollination_layout->addWidget(pollinate_btn);
+
+  // Blower on its own, no arm motion. This is how you check wiring, servo
+  // angles and the serial link without spending a minute of pollination to
+  // reach the dispense. Amber rather than purple: it fires the blower where
+  // the arm is standing right now.
+  auto * spray_btn = new QPushButton("Spray Now (no arm motion)");
+  spray_btn->setStyleSheet(
+    "background-color: #ef6c00; color: white; font-weight: bold; "
+    "font-size: 10pt; padding: 6px;");
+  spray_btn->setToolTip(
+    "Run one pollen dispense cycle immediately, wherever the arm is.\n"
+    "Does not move the robot and does not switch the vision model.\n"
+    "Dose and serial port come from config.py Pollination "
+    "(spray_grams, spray_port).");
+  connect(spray_btn, &QPushButton::clicked, this, &UR10ePanel::onSprayNow);
+  pollination_layout->addWidget(spray_btn);
+
+  // Fixed small dose for repeat testing. The dose is in the label rather than
+  // read from config on purpose: this button's whole value is that it does the
+  // same thing every press, so it can be used as a reference shot.
+  auto * spray2g_btn = new QPushButton("Spray 2 g (test shot)");
+  spray2g_btn->setStyleSheet(
+    "background-color: #f9a825; color: black; font-weight: bold; "
+    "font-size: 10pt; padding: 6px;");
+  spray2g_btn->setToolTip(
+    "Dispense a fixed 2 g, wherever the arm is.\n"
+    "~2.0s blow, ~9.7s total cycle. Ignores spray_grams so it stays a\n"
+    "constant reference regardless of config.");
+  connect(spray2g_btn, &QPushButton::clicked, this, &UR10ePanel::onSpray2g);
+  pollination_layout->addWidget(spray2g_btn);
+
+  goal_tab_layout->addWidget(pollination_group);
+
   auto * camera_profile_group = new QGroupBox("Camera Profile");
   auto * camera_profile_layout = new QVBoxLayout(camera_profile_group);
   camera_profile_label_ = new QLabel(
@@ -1869,6 +1924,22 @@ void UR10ePanel::setupRos()
       have_joint_temps_ = true;
     });
 
+  final_offsets_sub_ = node_->create_subscription<std_msgs::msg::Float32MultiArray>(
+    "/final_offsets_state", 10,
+    [this](std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+      if (msg->data.size() < 7) {return;}
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      bool changed = !have_final_offsets_;
+      for (size_t i = 0; i < 7; i++) {
+        if (std::abs(static_cast<double>(msg->data[i]) - final_offsets_m_[i]) > 5e-5) {
+          changed = true;
+        }
+        final_offsets_m_[i] = msg->data[i];
+      }
+      have_final_offsets_ = true;
+      if (changed) {final_offsets_update_pending_ = true;}
+    });
+
   running_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
     "/io_and_status_controller/robot_program_running", 10,
     [this](std_msgs::msg::Bool::SharedPtr msg) {
@@ -2202,6 +2273,9 @@ void UR10ePanel::publishGoal(double x, double y, double z,
 }
 
 void UR10ePanel::onStop() { publishStop(); }
+void UR10ePanel::onPollinate() { publishCmd("pollinate"); }
+void UR10ePanel::onSprayNow() { publishCmd("spray"); }
+void UR10ePanel::onSpray2g() { publishCmd("spray 2"); }
 void UR10ePanel::onHome() { publishCmd("home"); }
 void UR10ePanel::onHomeLeft() { publishCmd("home_left"); }
 void UR10ePanel::onHomeRight() { publishCmd("home_right"); }
@@ -2994,6 +3068,18 @@ void UR10ePanel::updateDisplay()
       .arg(taught_closure_offsets_m_[1] * 1000.0, 0, 'f', 2)
       .arg(taught_closure_offsets_m_[2] * 1000.0, 0, 'f', 2));
     taught_closure_update_pending_ = false;
+  }
+
+  if (final_offsets_update_pending_) {
+    QDoubleSpinBox * boxes[7] = {
+      low_center_depth_in_, low_center_z_in_,
+      mid_center_depth_in_, mid_center_z_in_,
+      low_side_depth_in_, low_left_z_in_, low_right_z_in_};
+    for (int i = 0; i < 7; i++) {
+      QSignalBlocker blocker(boxes[i]);
+      boxes[i]->setValue(final_offsets_m_[i] * 1000.0);
+    }
+    final_offsets_update_pending_ = false;
   }
 
   if (!robot_config_text_.empty()) {

@@ -335,6 +335,7 @@ class MotionExecutor:
         facade.current_joint_positions = self._state.current_joint_positions
         facade.joint_order = self._config.joint_order
         facade.motion_gen = self.motion_gen
+        facade._fk_cache_owner = self._node
         facade.get_logger = self._node.get_logger
         facade._planning_lock = getattr(self._node, '_planning_lock', None)
         return facade

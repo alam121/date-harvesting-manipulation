@@ -60,6 +60,9 @@ class UR10eCuroboMoveIt(Node):
         # Thread-safety: lock held during plan_single / plan_single_js
         # FK checks this (non-blocking) to skip CUDA ops during graph capture
         self._planning_lock = threading.Lock()
+        self._final_command_lock = threading.RLock()
+        self._final_retarget_generation = 0
+        self._final_inflight_stop = None
         self._reachability_worker_lock = threading.Lock()
         self._reachability_worker_active = False
         self._reachability_clear_pending = True
@@ -142,6 +145,16 @@ class UR10eCuroboMoveIt(Node):
 
         self.create_subscription(Float32MultiArray, "/gripper/force", self._force_cb, 10)
 
+        # Pollination's view-quality signal. None until vision publishes, which
+        # is also how run_pollination detects that a model swap has finished.
+        self.latest_flower_visibility = None
+
+        def _flower_vis_cb(msg):
+            self.latest_flower_visibility = list(msg.data)
+
+        self.create_subscription(
+            Float32MultiArray, "/vision/flower_visibility", _flower_vis_cb, 10)
+
         # Cache latest heatmap 3D data from vision (for goal marker rendering)
         self._latest_heatmap_data = None
         self.create_subscription(
@@ -180,6 +193,28 @@ class UR10eCuroboMoveIt(Node):
             String, "/vision/fingertip_verification",
             self._fingertip_verification_cb, 10)
         self.calib_check_pub = self.create_publisher(String, "/calib_check_result", 10)
+
+        # Live FINAL grasp offsets, so the RViz panel can show what the robot is
+        # ACTUALLY using. The panel's spin boxes are hardcoded at construction
+        # (ur10e_panel.cpp) and never read anything back, so they displayed the
+        # old config defaults -- -10mm depth while the node was running +20mm --
+        # and pressing "Apply Final Offsets" silently pushed the stale numbers,
+        # reverting whatever had been tuned.
+        # Metres, in the same order set_final_offsets() expects.
+        self.final_offsets_pub = self.create_publisher(
+            Float32MultiArray, "/final_offsets_state", 10)
+
+        def _publish_final_offsets():
+            p = self.cfg.planner
+            msg = Float32MultiArray()
+            msg.data = [float(getattr(p, n, 0.0)) for n in (
+                "low_center_final_depth_offset", "low_center_final_z_offset",
+                "mid_center_final_depth_offset", "mid_center_final_z_offset",
+                "low_side_final_depth_offset", "low_left_final_z_offset",
+                "low_right_final_z_offset")]
+            self.final_offsets_pub.publish(msg)
+
+        self.create_timer(1.0, _publish_final_offsets)
         # Active robot type + environment for the RViz panel. Republished periodically so
         # the panel shows it regardless of who started first.
         self.robot_config_pub = self.create_publisher(String, "/robot_config_info", 10)
@@ -228,9 +263,30 @@ class UR10eCuroboMoveIt(Node):
         # topic is silent by construction, and anything watching it for freshness
         # waits forever. /vision/all_fruit_poses is published every processed
         # frame in every mode, and is the list reacquire actually searches.
+        from .observations import FruitObservation
+        self._fruit_observation = None
+
+        def _fruit_observation_cb(msg):
+            try:
+                observation = FruitObservation.decode(msg.data)
+            except (ValueError, KeyError, TypeError):
+                return
+            previous = self._fruit_observation
+            if previous is not None and observation.stamp_ns <= previous.stamp_ns:
+                return
+            # One immutable assignment: consumers retain their own snapshot.
+            self._fruit_observation = observation
+            self.all_fruit_poses = [list(p) for p in observation.poses]
+            self.all_fruit_quality = [list(q) for q in observation.qualities]
+            self.all_fruits_seq += 1
+
+        self.create_subscription(String, '/vision/fruit_observation',
+                                 _fruit_observation_cb, 10)
         self.all_fruits_seq = 0
 
         def _all_fruits_cb(msg):
+            if self._fruit_observation is not None:
+                return
             data = msg.data
             self.all_fruit_poses = [
                 [data[i], data[i+1], data[i+2]]
@@ -246,6 +302,8 @@ class UR10eCuroboMoveIt(Node):
         self.all_fruit_quality = []
 
         def _all_fruit_quality_cb(msg):
+            if self._fruit_observation is not None:
+                return
             data = msg.data
             self.all_fruit_quality = [
                 list(data[i:i + 5]) for i in range(0, len(data) - 4, 5)
@@ -434,18 +492,20 @@ class UR10eCuroboMoveIt(Node):
         }
     def set_vision_mode(self, mode: str):
         """Switch the vision node between 'full' (approach) and 'reacquire' modes."""
+        self._vision_pause_request = str(time.monotonic_ns()) if mode == "paused" else None
         if mode == "paused":
             # Arm the handshake before commanding pause so we only accept a fresh
             # "paused" ack that arrives after this request.
             self._vision_paused_event.clear()
         msg = String()
-        msg.data = mode
+        msg.data = mode + (":" + self._vision_pause_request if mode == "paused" else "")
         self._vision_mode_pub.publish(msg)
 
     def _vision_mode_state_cb(self, msg: String):
         """Handle the vision node's effective-state report (GPU handoff ack)."""
-        self._vision_mode_state = msg.data
-        if msg.data == "paused":
+        state, _, request_id = msg.data.partition(":")
+        self._vision_mode_state = state
+        if state == "paused" and request_id == getattr(self, "_vision_pause_request", None):
             self._vision_paused_event.set()
 
     def _fingertip_verification_cb(self, msg: String):
@@ -456,7 +516,7 @@ class UR10eCuroboMoveIt(Node):
     def wait_for_vision_paused(self, timeout: float = 0.30) -> bool:
         """Block until the vision node confirms it has paused and drained in-flight
         YOLO inference, freeing the GPU for cuRobo. Returns True on confirmation,
-        False on timeout (caller should then fall back to a fixed delay)."""
+        False on timeout. A timeout is not confirmation of GPU idleness."""
         ev = getattr(self, "_vision_paused_event", None)
         if ev is None:
             return False
@@ -1866,6 +1926,73 @@ class UR10eCuroboMoveIt(Node):
                         f"offset_tcp_mm=[{values[0]*1000:+.1f},"
                         f"{values[1]*1000:+.1f},{values[2]*1000:+.1f}] "
                         "effective=NEXT_GRASP")
+        elif cmd == "pollinate":
+            if getattr(self, "_pollination_thread", None) is not None and \
+                    self._pollination_thread.is_alive():
+                self.get_logger().warn("Pollination already running")
+            else:
+                from . import pollination as pollination_mod
+
+                def _run_pollination():
+                    try:
+                        pollination_mod.run_pollination(self)
+                    except Exception as exc:
+                        self.get_logger().error(f"Pollination failed: {exc}")
+
+                self._pollination_thread = threading.Thread(
+                    target=_run_pollination, daemon=True)
+                self._pollination_thread.start()
+                self.get_logger().info("Pollination started")
+        elif cmd == "spray" or cmd.startswith("spray "):
+            # Standalone dispense: no arm motion, no model swap. This is the
+            # bench test for the blower -- wiring, servo angles, serial link --
+            # without spending a minute of pollination to reach it.
+            #
+            # "spray" uses the configured dose; "spray <grams>" overrides it, so
+            # a small fixed test shot does not mean editing config and
+            # restarting.
+            if getattr(self, "_spray_thread", None) is not None and \
+                    self._spray_thread.is_alive():
+                self.get_logger().warn("Spray already running")
+            else:
+                from . import pollen_dispenser as _pd
+
+                _parts = cmd.split()
+                _override = None
+                if len(_parts) > 1:
+                    try:
+                        _override = float(_parts[1])
+                    except ValueError:
+                        self.get_logger().error(
+                            f"[SPRAY] bad dose '{_parts[1]}'; use: spray <grams>")
+                        return
+
+                def _run_spray(grams_override=_override):
+                    cfg = self.cfg.pollination
+                    grams = (grams_override if grams_override is not None
+                             else float(getattr(cfg, "spray_grams", 5.0)))
+                    port = str(getattr(cfg, "spray_port", "/dev/ttyUSB0"))
+                    try:
+                        secs = _pd.grams_to_seconds(grams)
+                        self.get_logger().warn(
+                            f"[SPRAY] dispensing ~{grams:.1f}g via {port} "
+                            f"({secs:.2f}s blow, "
+                            f"~{secs + _pd.FIRMWARE_OVERHEAD_S:.1f}s cycle) — "
+                            "arm is NOT moving")
+                    except ValueError as exc:
+                        self.get_logger().error(f"[SPRAY] bad dose: {exc}")
+                        return
+                    ok, detail = _pd.dispense(
+                        self.get_logger(), grams=grams, port=port,
+                        baud=int(getattr(cfg, "spray_baud", 9600)))
+                    if ok:
+                        self.get_logger().info(f"[SPRAY] done ({detail})")
+                    else:
+                        self.get_logger().error(f"[SPRAY] failed: {detail}")
+
+                self._spray_thread = threading.Thread(
+                    target=_run_spray, daemon=True)
+                self._spray_thread.start()
         elif cmd == "safe_zone_enable":
             getattr(self, "enable_safe_zone", lambda: None)()
         elif cmd == "safe_zone_disable":

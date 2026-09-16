@@ -403,8 +403,12 @@ class VisionVisualizer:
     def _draw_external_date_label(
         self, image, target, x1, y1, x2, y2, is_best, color,
     ) -> None:
-        """Place a compact label outside the date box, never over the fruit."""
-        text = "SELECTED" if is_best else "DATE"
+        """Place a compact label outside the detection box, never over it."""
+        # Fall back to DATE only when the engine gave us no class name, so a
+        # non-date model labels its own detections instead of inheriting the
+        # date pipeline's vocabulary.
+        _cls = str(target.get("class_name") or "").strip() or "DATE"
+        text = "SELECTED" if is_best else _cls
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = self._font(0.55)
         thickness = self._thick(2)

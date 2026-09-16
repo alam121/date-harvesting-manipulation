@@ -159,7 +159,12 @@ def report(goals, cam_poses) -> int:
     # spread is disqualifying on its own, even with plenty of translation.
     weak_rot = bool(valid) and r_spread < MIN_ROTATION_SPREAD_DEG
     weak_trans = bool(valid) and t_spread < MIN_TRANSLATION_SPREAD_MM
-    if weak_rot or weak_trans:
+    incomplete = (len(goals) < 3 or len(cam_poses) != len(goals)
+                  or len(valid) != len(goals))
+    if incomplete:
+        print("  INCONCLUSIVE — need at least three stations with paired camera TF.")
+        verdict = 2
+    elif weak_rot or weak_trans:
         print("  INCONCLUSIVE — the stations did not exercise the calibration.")
         if weak_rot:
             print(f"    rotation spread {r_spread:.0f}deg "

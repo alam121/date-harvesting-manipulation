@@ -239,6 +239,25 @@ ZEDMINI_DEPTH_Z_MAX = 7.0    # reject distant background behind nearby fruit
 # blocked them. Do not raise either value without re-measuring that distance.
 FRUIT_CAMERA_Z_MIN = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MIN", "0.15"))
 FRUIT_CAMERA_Z_MAX = float(os.getenv("UR10E_FRUIT_CAMERA_Z_MAX", "0.70"))
+
+# Pollination depth window, used automatically whenever the flower engine is
+# loaded (see VisionNode._fruit_z_range).
+#
+# The date window above is sized for fruit a grasp can reach. Pollination never
+# grasps: it orbits the flower at whatever radius the arc can manage -- 0.22m to
+# 0.59m on real runs -- and sprays from a standoff, so a flower at 0.9m is still
+# a perfectly good target. Applying the date window made arc poses report
+# area=0px purely for being too far, which reads as "detection stopped" when
+# the flower is plainly in frame.
+#
+# The floor stays at the sensor limit: below ZEDMINI_DEPTH_Z_MIN the depth
+# backend returns nothing, so accepting a smaller number would be fiction.
+FLOWER_CAMERA_Z_MIN = float(os.getenv("UR10E_FLOWER_CAMERA_Z_MIN", "0.15"))
+FLOWER_CAMERA_Z_MAX = float(os.getenv("UR10E_FLOWER_CAMERA_Z_MAX", "2.00"))
+if FLOWER_CAMERA_Z_MIN < ZEDMINI_DEPTH_Z_MIN:
+    raise ValueError(
+        f"FLOWER_CAMERA_Z_MIN ({FLOWER_CAMERA_Z_MIN:.3f}) is below "
+        f"ZEDMINI_DEPTH_Z_MIN ({ZEDMINI_DEPTH_Z_MIN:.3f})")
 if not 0.0 < FRUIT_CAMERA_Z_MIN < FRUIT_CAMERA_Z_MAX:
     raise ValueError(
         "Expected 0 < UR10E_FRUIT_CAMERA_Z_MIN < UR10E_FRUIT_CAMERA_Z_MAX"

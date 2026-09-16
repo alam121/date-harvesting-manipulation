@@ -289,25 +289,26 @@ class YoloThread:
                         f"dropped_30={dropped_interval}"
                     )
 
-            self.run_event.clear()
-            self.dets_ready.set()
-            self.idle_event.set()
+            with self.lock:
+                self.run_event.clear()
+                self.dets_ready.set()
+                self.idle_event.set()
 
         self.stopped.set()  # signal that the loop has fully exited
 
-    def set_image(self, image: np.ndarray, capture_time: Optional[float] = None) -> None:
-        """Set new image for inference. Dropped silently when paused."""
-        if self.paused or self.run_event.is_set():
-            self._dropped_frames += 1
-            return
+    def set_image(self, image: np.ndarray, capture_time: Optional[float] = None) -> bool:
+        """Queue an owned image and mark pending work busy before returning."""
         with self.lock:
-            # ZED reuses its SDK image buffer on the next grab. Own this frame
-            # so inference never observes a buffer being rewritten underneath it.
+            if self.paused or self.run_event.is_set():
+                self._dropped_frames += 1
+                return False
             self.image_net = image.copy()
             self._pending_frame_id = self._next_frame_id
             self._next_frame_id += 1
             self._pending_capture_time = capture_time if capture_time is not None else time()
+            self.idle_event.clear()
             self.run_event.set()
+            return True
 
     def _log_inference_time(self, dt: float) -> None:
         """Append inference time (ms) to CSV when UR10E_YOLO_TIMING_CSV is set.

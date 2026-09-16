@@ -106,6 +106,9 @@ private Q_SLOTS:
   void onPlanConfirm();
   void onPlanCancel();
   void onLidarScan();
+  void onPollinate();
+  void onSprayNow();
+  void onSpray2g();
   void onStabilityRecord();
   void onApplyFinalOffsets();
   void updateDisplay();
@@ -176,6 +179,7 @@ private:
     trajectory_command_sub_;
   rclcpp::Subscription<ur_msgs::msg::ToolDataMsg>::SharedPtr tool_data_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr joint_temp_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr final_offsets_sub_;
 
   // Data
   std::mutex data_mutex_;
@@ -191,6 +195,16 @@ private:
   bool have_tool_temp_ = false;
   double joint_temperatures_[6] = {};  // per-joint temperature (degC) from /joint_temperatures
   bool have_joint_temps_ = false;
+
+  // FINAL grasp offsets as the motion node currently has them (metres, in
+  // set_final_offsets order). The spin boxes used to be hardcoded at
+  // construction and never read anything back, so they showed stale config
+  // defaults and "Apply Final Offsets" pushed those stale numbers over live
+  // tuning. Mirror the node instead. Only a CHANGE arms the widget write, so a
+  // steady 1 Hz republish of unchanged values never fights the operator typing.
+  double final_offsets_m_[7] = {};
+  bool have_final_offsets_ = false;
+  bool final_offsets_update_pending_ = false;
   bool have_tracking_error_ = false;
   bool have_wrench_ = false;
   bool robot_running_ = false;

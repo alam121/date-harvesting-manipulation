@@ -1,6 +1,7 @@
 """Main VisionNode class for date fruit detection."""
 
 import math
+import json
 import os
 import queue
 import sys
@@ -33,6 +34,7 @@ from .config import (
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
     ZEDMINI_DEPTH_Z_MIN, ZEDMINI_DEPTH_Z_MAX, ZEDMINI_MAX_POINTS, T_CAM_ZEDMINI,
     FRUIT_CAMERA_Z_MIN, FRUIT_CAMERA_Z_MAX,
+    FLOWER_CAMERA_Z_MIN, FLOWER_CAMERA_Z_MAX,
     FRUIT_SURFACE_TO_CENTER_FRACTION,
     SHOW_CLASSIFICATION_ZONES, SHOW_GAP_DEBUG,
     SHOW_FINGER_CONTACTS, FINGERTIP_CONTACT_RADIUS_M,
@@ -278,6 +280,9 @@ class VisionNode:
         self.depth_diag_pub = self.node.create_publisher(
             Float32MultiArray, "/vision/depth_diagnostics", 10)
         self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
+        self.fruit_observation_pub = self.node.create_publisher(
+            StdString, "/vision/fruit_observation", 10)
+        self._fruit_observation_seq = 0
         self.all_fruits_pub = self.node.create_publisher(Float32MultiArray, "/vision/all_fruit_poses", 10)
         # Per-fruit detection quality, in the SAME score-sorted order as
         # /vision/all_fruit_poses, 5 floats per fruit. Published in reacquire
@@ -288,6 +293,13 @@ class VisionNode:
         # how bad it was.
         self.all_fruit_quality_pub = self.node.create_publisher(
             Float32MultiArray, "/vision/all_fruit_quality", 10)
+        # Pollination's view-quality signal, kept off /vision/all_fruit_quality
+        # so its fixed 5-floats-per-fruit layout stays intact for reacquire.
+        # [best_mask_area_px, n_detections, best_conf, bx, by, bz] in base_link;
+        # all zeros when nothing is visible, which is itself the answer the arc
+        # sweep needs at a pose where the flower is hidden.
+        self.flower_vis_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/flower_visibility", 10)
         # Crop around the selected date, wide enough to include the fingertips.
         # Published in EVERY mode, unlike /fruit_image_bbox_norm which lives in
         # _process_best_target and so is silent exactly when the arm is closing
@@ -372,10 +384,15 @@ class VisionNode:
 
         # Detection mode — "full" (approach) or "reacquire" (lightweight).
         # Main node publishes to /vision/mode to switch modes on the fly.
+        self._mode_state_lock = Lock()
+
         def _mode_cb(msg):
-            mode = msg.data.strip()
+            mode, _, request_id = msg.data.strip().partition(":")
             if mode in ("full", "reacquire", "reacquire_fast", "paused"):
-                self.detection_mode = mode
+                with self._mode_state_lock:
+                    self.detection_mode = mode
+                    self._pause_request_id = request_id if mode == "paused" else ""
+                    self._vision_paused_acked = False
         self.node.create_subscription(StdString, "/vision/mode", _mode_cb, 10)
         # Report the effective detection state back to the motion node. Used for a
         # deterministic GPU handoff: we publish "paused" only after in-flight YOLO
@@ -984,6 +1001,9 @@ class VisionNode:
             _capture_queue = queue.Queue(maxsize=1)
             _capture_depth_request = Event()
             _capture_thread = None
+            _inference_packet = None
+            _capture_gpu_lock = Lock()
+            _capture_depth_request.set()
             if use_zedx_mini_only:
                 def _capture_zedx_mini():
                     _cap_image = sl.Mat()
@@ -991,30 +1011,33 @@ class VisionNode:
                     _cap_times = deque(maxlen=30)
                     _cap_runtime = sl.RuntimeParameters()
                     while not self.exit_signal:
-                        _want_depth = (
-                            not bool(getattr(self.args, "raw_yolo_view", False))
-                            and _capture_depth_request.is_set())
-                        _cap_runtime.enable_depth = _want_depth
-                        if zed.grab(_cap_runtime) != sl.ERROR_CODE.SUCCESS:
-                            self.exit_signal = True
-                            break
-                        _cap_t = time()
-                        _cap_times.append(_cap_t)
-                        _cap_fps = 0.0
-                        if len(_cap_times) >= 2:
-                            _span = _cap_times[-1] - _cap_times[0]
-                            if _span > 0.0:
-                                _cap_fps = (len(_cap_times) - 1) / _span
-                        zed.retrieve_image(
-                            _cap_image, sl.VIEW.LEFT, sl.MEM.CPU,
-                            sl.Resolution(disp_w, disp_h))
-                        if _want_depth:
-                            zed.retrieve_measure(
-                                _cap_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
+                        with _capture_gpu_lock:
+                            _want_depth = (
+                                not bool(getattr(self.args, "raw_yolo_view", False))
+                                and self.detection_mode != "paused"
+                                and _capture_depth_request.is_set())
+                            _cap_runtime.enable_depth = _want_depth
+                            if zed.grab(_cap_runtime) != sl.ERROR_CODE.SUCCESS:
+                                self.exit_signal = True
+                                break
+                            # IMAGE is the acquisition timestamp, not grab completion.
+                            _cap_t = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds() / 1e9
+                            _cap_times.append(_cap_t)
+                            _cap_fps = 0.0
+                            if len(_cap_times) >= 2:
+                                _span = _cap_times[-1] - _cap_times[0]
+                                if _span > 0.0:
+                                    _cap_fps = (len(_cap_times) - 1) / _span
+                            zed.retrieve_image(
+                                _cap_image, sl.VIEW.LEFT, sl.MEM.CPU,
                                 sl.Resolution(disp_w, disp_h))
-                            _cap_pc = _cap_cloud.get_data()[:, :, :3].copy()
-                        else:
-                            _cap_pc = None
+                            if _want_depth:
+                                zed.retrieve_measure(
+                                    _cap_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
+                                    sl.Resolution(disp_w, disp_h))
+                                _cap_pc = _cap_cloud.get_data()[:, :, :3].copy()
+                            else:
+                                _cap_pc = None
                         _packet = (
                             _cap_t,
                             _cap_fps,
@@ -1142,16 +1165,25 @@ class VisionNode:
                     # then confirm to the motion node that the GPU is free.
                     if not self._vision_paused_acked:
                         self.yolo_thread.paused = True
-                        self.yolo_thread.wait_until_idle(timeout=0.5)
-                        self._publish_mode_state("paused")
-                        self._vision_paused_acked = True
+                        if not self.yolo_thread.wait_until_idle(timeout=0.5):
+                            continue
+                        if not _capture_gpu_lock.acquire(timeout=0.5):
+                            continue
+                        _capture_gpu_lock.release()
+                        with self._mode_state_lock:
+                            if self.detection_mode != "paused":
+                                continue
+                            self._vision_paused_acked = True
+                            self._publish_mode_state("paused")
                     current_dets = None
+                    _inference_packet = None
+                    self.yolo_thread.dets_ready.clear()
+                    _capture_depth_request.set()
                     _enqueue_raw_viz_frame()
                     continue
                 else:
-                    if self._vision_paused_acked:
-                        self.yolo_thread.paused = False
-                        self._vision_paused_acked = False
+                    self.yolo_thread.paused = False
+                    self._vision_paused_acked = False
                     self._reacquire_frame_skip = (
                         (self._reacquire_frame_skip + 1) % _reacq_skip_n)
                     _waiting_for_depth = (
@@ -1163,7 +1195,15 @@ class VisionNode:
                         # non-blocking and replaces stale pending RGB frames.
                         # Submit before depth/geometry work to overlap inference
                         # with CPU target extraction.
-                        self.yolo_thread.set_image(image_left_ocv, capture_time=t_now)
+                        if use_zedx_mini_only and not bool(getattr(self.args, "raw_yolo_view", False)):
+                            if _inference_packet is None:
+                                if _captured_pc_np is None:
+                                    _capture_depth_request.set()
+                                elif self.yolo_thread.set_image(image_left_ocv, capture_time=t_now):
+                                    # Retain exactly the RGB-D packet used by inference.
+                                    _inference_packet = (t_now, image_left_ocv, _captured_pc_np)
+                        else:
+                            self.yolo_thread.set_image(image_left_ocv, capture_time=t_now)
                 _t1 = time()
 
                 # Raw model inspection intentionally stops here. It uses only
@@ -1181,81 +1221,51 @@ class VisionNode:
                                 raw_timing=raw_result["timing"])
                     continue
 
-                # Refresh per-frame TF cache — one lookup per frame instead of
-                # one per detection (was 8+ tf_buffer.transform calls at ~20ms each).
-                try:
-                    self._cached_tf_base = self._lookup_tf_at_image("base_link")
-                except Exception:
-                    pass  # keep previous cached value
-                try:
-                    self._cached_tf_grip = self._lookup_tf_at_image("gripper_tip")
-                except Exception:
-                    pass
-
-                # Motion detection: when the camera has moved >5mm since the last
-                # frame, clear all temporal state so detections update immediately.
-                # This prevents stale bboxes, old heatmaps, and smoothing history
-                # from lagging behind after a robot repositioning move.
-                if self._cached_tf_base is not None:
-                    _cur_t = self._cached_tf_base[1]
-                    _prev_t = getattr(self, '_prev_cam_t', None)
-                    if _prev_t is not None and float(np.linalg.norm(_cur_t - _prev_t)) > 0.005:
-                        self.tracker.detection_history.clear()
-                        self.direction_history.clear()
-                        self.best_history.clear()
-                        self._cached_heatmaps.clear()
-                        self._contact_cache.clear()
-                        self.prev_heat_point = None
-                        self.prev_direction_base = None
-                        current_dets = None  # discard stale bboxes; wait for fresh YOLO
-                    self._prev_cam_t = _cur_t.copy()
-
-                # Use fresh YOLO dets when ready, otherwise reuse cached dets so
-                # the loop runs at camera fps rather than YOLO inference fps.
-                _cur_t_now = self._cached_tf_base[1] if self._cached_tf_base is not None else None
-                if self.yolo_thread.dets_ready.is_set():
-                    if use_zedx_mini_only and _captured_pc_np is None:
-                        # Hold this completed detection and ask the capture owner
-                        # for exactly one aligned depth packet. Do not start a
-                        # newer inference until the held result is consumed.
-                        _capture_depth_request.set()
-                        continue
-                    self.yolo_thread.dets_ready.clear()
-                    _depth_capture_pending = False
-                    current_dets = self.yolo_thread.get_detections()
-                    current_raw_viz = self.yolo_thread.get_raw_viz()
-                    _latest_yolo_timing = self.yolo_thread.get_latest_timing()
-                    fresh_detections = True
-                    trunk_boxes  = self.yolo_thread.get_trunk_boxes()
-                    # Record where the camera was when this result was accepted
-                    self._yolo_accepted_cam_t = _cur_t_now.copy() if _cur_t_now is not None else None
-                elif current_dets is None:
-                    # No YOLO result yet — publish raw frame so display stays live.
+                # Geometry and TF only run for a newly completed inference.
+                # RGB-only display frames do not need robot transforms.
+                if not self.yolo_thread.dets_ready.is_set():
                     _enqueue_raw_viz_frame()
                     continue
-                elif use_zedx_mini_only:
-                    # Geometry and goals update only for a fresh detection. RGB
-                    # acquisition continues independently at camera rate.
-                    continue
-                else:
-                    # Cumulative-drift check: discard cached dets if camera has drifted
-                    # since the last accepted YOLO result (handles slow/incremental moves
-                    # that never cross the per-frame 5 mm threshold).
-                    if (_cur_t_now is not None and self._yolo_accepted_cam_t is not None and
-                            float(np.linalg.norm(_cur_t_now - self._yolo_accepted_cam_t)) > _YOLO_STALE_DRIFT):
-                        current_dets = None
-                        # Camera has moved — publish raw frame so display stays live during motion.
-                        _enqueue_raw_viz_frame()
+                if use_zedx_mini_only:
+                    timing = self.yolo_thread.get_latest_timing() or {}
+                    if (_inference_packet is None
+                            or timing.get("capture_time") != _inference_packet[0]):
+                        self.yolo_thread.dets_ready.clear()
+                        _inference_packet = None
+                        _capture_depth_request.set()
                         continue
-                    if cached_processed_targets is not None:
-                        # No new YOLO observation: the target/depth result is
-                        # already cached. Previously we still retrieved and
-                        # traversed the full HD1080 XYZ map at camera FPS, then
-                        # discarded the duplicate processing result. Wait for
-                        # the next inference result instead. This preserves all
-                        # new-detection updates while freeing CPU/memory bandwidth.
-                        continue
+                    t_now, image_left_ocv, _captured_pc_np = _inference_packet
+                    _inference_packet = None
+                    _capture_depth_request.set()
+                    self._latest_image_stamp = self._ros_time_from_wall(t_now)
+                self.yolo_thread.dets_ready.clear()
+                _depth_capture_pending = False
+                current_dets = self.yolo_thread.get_detections()
+                current_raw_viz = self.yolo_thread.get_raw_viz()
+                _latest_yolo_timing = self.yolo_thread.get_latest_timing()
+                fresh_detections = True
+                trunk_boxes = self.yolo_thread.get_trunk_boxes()
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
+
+                # One base/gripper lookup pair for the exact accepted acquisition.
+                try:
+                    self._cached_tf_base = self._lookup_tf_at_image("base_link")
+                    self._cached_tf_grip = self._lookup_tf_at_image("gripper_tip")
+                except Exception:
+                    self._cached_tf_base = self._cached_tf_grip = None
+                    continue
+                _cur_t = self._cached_tf_base[1]
+                _prev_t = getattr(self, '_prev_cam_t', None)
+                if _prev_t is not None and float(np.linalg.norm(_cur_t - _prev_t)) > 0.005:
+                    self.tracker.detection_history.clear()
+                    self.direction_history.clear()
+                    self.best_history.clear()
+                    self._cached_heatmaps.clear()
+                    self._contact_cache.clear()
+                    self.prev_heat_point = None
+                    self.prev_direction_base = None
+                self._prev_cam_t = _cur_t.copy()
+                self._yolo_accepted_cam_t = _cur_t.copy()
 
                 pc_np_orig = None
                 _depth_t0 = time()
@@ -1312,10 +1322,12 @@ class VisionNode:
 
                 # Process detected objects
                 self._heatmap_frame_count += 1
-                # Heatmap is computed once per fruit (see target_key logic below);
-                # periodic clear removed — camera-movement clear (above) is the
-                # correct invalidation trigger when the robot repositions.
+                # Heatmaps are scoped to each accepted acquisition below.
                 _t2 = time()
+                self.tracker.begin_frame()
+                # Cached image-space tip geometry must not be restamped as new.
+                # Recompute on each accepted RGB-D acquisition.
+                self._cached_heatmaps.clear()
                 targets, rejected_targets, viz_only = self._process_objects(
                     current_dets if (use_mono_depth or use_zedx_mini_only) else objects,
                     pc_np, image_left_ocv, image_scale, display_resolution, intrinsics,
@@ -1418,7 +1430,7 @@ class VisionNode:
                 _qual_flat = []
                 for _t in _targets_by_score:
                     _pb = _t.get("pt_base")
-                    if _pb is None:
+                    if _pb is None or _pb.header.stamp != self._image_stamp_msg():
                         continue
                     _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
                     _bb = _t.get("bb")
@@ -1459,6 +1471,32 @@ class VisionNode:
                 _aq_msg = Float32MultiArray()
                 _aq_msg.data = _qual_flat
                 self.all_fruit_quality_pub.publish(_aq_msg)
+                self._fruit_observation_seq += 1
+                _obs_msg = StdString()
+                _obs_msg.data = json.dumps({
+                    "frame_id": "base_link",
+                    "stamp_ns": int(self._latest_image_stamp.nanoseconds),
+                    "sequence": self._fruit_observation_seq,
+                    "poses": [_all_flat[i:i+3] for i in range(0, len(_all_flat), 3)],
+                    "qualities": [_qual_flat[i:i+5] for i in range(0, len(_qual_flat), 5)],
+                })
+                self.fruit_observation_pub.publish(_obs_msg)
+
+                _fv_best, _fv_area = None, -1.0
+                for _t in _targets_by_score:
+                    _a = float(_t.get("mask_area_px", 0) or 0)
+                    if _a > _fv_area and _t.get("pt_base") is not None:
+                        _fv_best, _fv_area = _t, _a
+                _fv_msg = Float32MultiArray()
+                if _fv_best is None:
+                    _fv_msg.data = [0.0] * 6
+                else:
+                    _pb = _fv_best["pt_base"].point
+                    _fv_msg.data = [
+                        _fv_area, float(len(_targets_by_score)),
+                        float(_fv_best.get("confidence", 0.0)),
+                        float(_pb.x), float(_pb.y), float(_pb.z)]
+                self.flower_vis_pub.publish(_fv_msg)
 
                 # Crop around the selected date for episode recording. The
                 # margin is generous on purpose: the fingertips must be in frame
@@ -1496,13 +1534,42 @@ class VisionNode:
                             # date bbox INSIDE the crop, then the crop origin and
                             # full image size, so a label can be reconstructed
                             # either way round.
+                            # Fingertip pixels, projected from TF rather than
+                            # found by colour. The colour route is dead: the
+                            # red masks in visual_grasp_verifier and
+                            # visualization have matched nothing since the tips
+                            # were changed to white, silently, because both
+                            # return empty rather than error.
+                            #
+                            # F1/F2/F3_TIP hang off tool0 in ur_macro.xacro so
+                            # they share the camera's TF tree. They are STATIC
+                            # (nothing bridges /gripper/joint_states, and the
+                            # names differ anyway), i.e. the URDF default pose
+                            # -- fine for a closure region, and honest about it.
+                            # -1 means behind the camera or unavailable.
+                            _tips = []
+                            for _tf_name in ("F1_TIP", "F2_TIP", "F3_TIP"):
+                                try:
+                                    _tt = self.tf_buffer.lookup_transform(
+                                        self.cam_frame, _tf_name,
+                                        rclpyTime()).transform.translation
+                                    if _tt.z > 0.02:
+                                        _tu = (intrinsics["fx"] * _tt.x / _tt.z
+                                               + intrinsics["cx"]) * image_scale[0]
+                                        _tv = (intrinsics["fy"] * _tt.y / _tt.z
+                                               + intrinsics["cy"]) * image_scale[1]
+                                        _tips += [float(_tu - _cx1), float(_tv - _cy1)]
+                                    else:
+                                        _tips += [-1.0, -1.0]
+                                except Exception:
+                                    _tips += [-1.0, -1.0]
                             _mm = Float32MultiArray()
                             _mm.data = [
                                 float(_bx1 - _cx1), float(_by1 - _cy1),
                                 float(_bx2 - _cx1), float(_by2 - _cy1),
                                 float(_cx1), float(_cy1),
                                 float(_iw), float(_ih),
-                            ]
+                            ] + _tips
                             self.grasp_crop_meta_pub.publish(_mm)
                             self._last_grasp_crop_t = _now_crop
                     except Exception as _ce:
@@ -1828,10 +1895,30 @@ class VisionNode:
     def _image_stamp_msg(self):
         """Stamp of the image currently being processed, for TF and headers.
 
-        Falls back to zero time ("latest available") before the first grab.
+        Falls back to zero time before the first grab; localization rejects it.
         """
         stamp = self._latest_image_stamp
         return stamp.to_msg() if stamp is not None else rclpyTime().to_msg()
+
+    def _fruit_z_range(self):
+        """Valid camera-frame depth window, widened for the flower model.
+
+        The date window (FRUIT_CAMERA_Z_MIN..MAX) is sized for fruit reachable
+        by a grasp. Pollination never grasps -- it orbits a flower at whatever
+        radius the arc can reach and sprays from a standoff -- so a flower at
+        0.8m is perfectly usable while a date at 0.8m is not. Rejecting on the
+        date window made poses drop out of the sweep for being too far, which
+        is not a fault for this mode.
+
+        Detected from the loaded engine rather than a flag, so it is impossible
+        for the range and the model to disagree.
+        """
+        if getattr(self, "_is_flower_model", None) is None:
+            _w = str(getattr(self.args, "weights", "")).lower()
+            self._is_flower_model = ("flower" in _w or "flwoer" in _w)
+        if self._is_flower_model:
+            return FLOWER_CAMERA_Z_MIN, FLOWER_CAMERA_Z_MAX
+        return FRUIT_CAMERA_Z_MIN, FRUIT_CAMERA_Z_MAX
 
     def _lookup_tf_at_image(self, target_frame: str):
         """cam_frame -> target_frame at the current image's acquisition time.
@@ -1842,20 +1929,11 @@ class VisionNode:
         worse than before -- it is just no longer the default.
         """
         stamp = self._latest_image_stamp
-        if stamp is not None:
-            try:
-                return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
-                    target_frame, self.cam_frame, stamp,
-                    timeout=rclpyDuration(seconds=0.01)))
-            except Exception:
-                _now = time()
-                if _now - getattr(self, "_last_tf_stamp_warn_t", 0.0) > 5.0:
-                    self._last_tf_stamp_warn_t = _now
-                    self.node.get_logger().warn(
-                        f"[TF] no {target_frame}<-{self.cam_frame} at image stamp; "
-                        "using latest (adds pipeline latency to position error)")
+        if stamp is None:
+            raise RuntimeError("No image timestamp available for localization")
         return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
-            target_frame, self.cam_frame, rclpyTime()))
+            target_frame, self.cam_frame, stamp,
+            timeout=rclpyDuration(seconds=0.01)))
 
     def _publish_camera_status(self) -> None:
         pub = getattr(self, "_camera_status_pub", None)
@@ -1886,7 +1964,7 @@ class VisionNode:
         if pub is None:
             return
         msg = StdString()
-        msg.data = state
+        msg.data = state + (":" + self._pause_request_id if state == "paused" and getattr(self, "_pause_request_id", "") else "")
         pub.publish(msg)
 
     def _publish_depth_cloud(self, pc_np: np.ndarray, depth_pub,
@@ -2170,12 +2248,10 @@ class VisionNode:
             depth_std = float(np.std(pts_front[:, 2]))
             vis_ratio = min(1.0, in_mask_pts.shape[0] / max(1, int(0.1 * mask_bool.sum())))
             vis_quality = (vis_ratio ** 2) * np.exp(-(depth_std / 0.015) ** 2)
-            if (not np.isfinite(Zc)
-                    or not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX):
+            _zlo, _zhi = self._fruit_z_range()
+            if not np.isfinite(Zc) or not _zlo <= Zc <= _zhi:
                 mark_reject(
-                    f"Fruit depth {Zc:.2f}m outside "
-                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
-                )
+                    f"Fruit depth {Zc:.2f}m outside {_zlo:.2f}-{_zhi:.2f}m")
                 return None
 
             heatmap = t_best_point = t_best_dir2d = t_best_point_3d = scored_3d_pts = surface_normal = None
@@ -2391,11 +2467,10 @@ class VisionNode:
             if not np.isfinite(Zc):
                 mark_reject("Invalid fruit depth")
                 return None
-            if not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX:
+            _zlo, _zhi = self._fruit_z_range()
+            if not _zlo <= Zc <= _zhi:
                 mark_reject(
-                    f"Fruit depth {Zc:.2f}m outside "
-                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
-                )
+                    f"Fruit depth {Zc:.2f}m outside {_zlo:.2f}-{_zhi:.2f}m")
                 # Surface this one. A date rejected here never reaches
                 # /vision/all_fruit_poses, so downstream it is indistinguishable
                 # from "YOLO saw nothing" -- both show as no_candidate in
@@ -2543,11 +2618,10 @@ class VisionNode:
             if not np.isfinite(Zc):
                 mark_reject("Invalid fruit depth")
                 return None
-            if not FRUIT_CAMERA_Z_MIN <= Zc <= FRUIT_CAMERA_Z_MAX:
+            _zlo, _zhi = self._fruit_z_range()
+            if not _zlo <= Zc <= _zhi:
                 mark_reject(
-                    f"Fruit depth {Zc:.2f}m outside "
-                    f"{FRUIT_CAMERA_Z_MIN:.2f}-{FRUIT_CAMERA_Z_MAX:.2f}m"
-                )
+                    f"Fruit depth {Zc:.2f}m outside {_zlo:.2f}-{_zhi:.2f}m")
                 return None
 
             # Only compute heatmap for the previous best fruit (same as ZED Mini path).
@@ -2643,13 +2717,14 @@ class VisionNode:
             if not (0.0 <= obj_confidence <= 1.0):
                 obj_confidence = 0.5
 
-            fruit_id = hash((round(Xc, 2), round(Yc, 2), round(Zc, 2)))
+            _base_position = [pt_base.point.x, pt_base.point.y, pt_base.point.z]
+            fruit_id = self.tracker.associate_fruit(_base_position)
 
             if self.tracker.is_fruit_blacklisted(fruit_id):
                 mark_reject(f"Max attempts (3)")
                 return None
 
-            attempt_count = self.tracker.register_fruit(fruit_id, [Xc, Yc, Zc])
+            attempt_count = self.tracker.register_fruit(fruit_id, _base_position)
 
             # Every depth backend must provide diagnostics for the selected goal.
             # ZED Mini supplies full in-mask near/far counts above; LiDAR/stereo
@@ -2681,6 +2756,19 @@ class VisionNode:
                 "reason": "",
                 "pts_front": pts_front,
                 "z_std": depth_std,
+                # Apparent size in the image, in mask pixels. Pollination picks
+                # its viewing pose by maximising this: for a flower seen from an
+                # arc of angles, the pose with the largest mask is the one
+                # looking most squarely at it. Confidence saturates and is noisy
+                # frame to frame; mask area varies smoothly with view angle.
+                "mask_area_px": int(np.count_nonzero(mask_bool)),
+                # Real class name from the loaded engine. The overlay used to
+                # print a hardcoded "DATE" regardless of which model was running,
+                # so a pollination sweep on the flower engine still labelled
+                # everything DATE.
+                "class_name": str((getattr(
+                    getattr(self, "yolo_thread", None), "class_names", {})
+                    or {}).get(int(getattr(obj, "label", -1)), "")).upper(),
                 "vis_ratio": vis_ratio,
                 "vis_quality": vis_quality,
                 "confidence": obj_confidence,
@@ -3312,6 +3400,7 @@ class VisionNode:
     ) -> None:
         """Process the best target and publish goal."""
         t_best = targets[best_idx]
+        pt_base = t_best["pt_base"]
 
         # Predict three fingertip contact regions for the selected date only.
         # This is visual/diagnostic evidence; it does not change the goal pose or
@@ -3378,7 +3467,7 @@ class VisionNode:
                 _tip_base = _R_tf @ _tip_cam + _t_tf
                 _tip_msg = PointStamped()
                 _tip_msg.header.frame_id = "base_link"
-                _tip_msg.header.stamp = self.node.get_clock().now().to_msg()
+                _tip_msg.header.stamp = pt_base.header.stamp
                 _tip_msg.point.x = float(_tip_base[0])
                 _tip_msg.point.y = float(_tip_base[1])
                 _tip_msg.point.z = float(_tip_base[2])
@@ -3397,7 +3486,6 @@ class VisionNode:
             self.prev_heat_point = None
 
         # Compute approach direction
-        pt_base = t_best["pt_base"]
         dir_msg = None
         raw_pt = t_best.get("best_point2d")
 
@@ -3505,6 +3593,11 @@ class VisionNode:
             t_best["quat"] = (1.0, 0.0, 0.0, 0.0)
             t_best["approach_axis"] = np.array([1.0, 0.0, 0.0])
 
+        # A nearby different fruit must never inherit this target's filter.
+        _history_id = t_best.get("fruit_id")
+        if getattr(self, "_best_history_id", None) != _history_id:
+            self.best_history.clear()
+        self._best_history_id = _history_id
         # Smooth position
         pt_vec = np.array([pt_base.point.x, pt_base.point.y, pt_base.point.z], dtype=float)
 
@@ -3531,7 +3624,7 @@ class VisionNode:
             # This timestamp identifies a newly computed perception sample.
             # The 50 Hz publishing timer deliberately preserves it so consumers
             # can distinguish new samples from repeats of the same sample.
-            goal.header.stamp = self.node.get_clock().now().to_msg()
+            goal.header.stamp = pt_base.header.stamp
             goal.pose.position.x = float(pt_x)
             goal.pose.position.y = float(pt_y)
             goal.pose.position.z = float(pt_z)
