@@ -53,14 +53,14 @@ URDF_FILES = [
 ]
 
 # ── ChArUco board parameters ──────────────────────────────────────────
-# Calib.io ChArUco board: 17 x 24 physical squares.  ChArUco internal corners
-# are one fewer than the square count along each axis.
-BOARD_SQUARES_X = 17
-BOARD_SQUARES_Y = 24
+# Hand-eye ChArUco board: 9 x 14 physical squares. ChArUco internal corners
+# are one fewer than the square count along each axis (8 x 13 here).
+BOARD_SQUARES_X = 9
+BOARD_SQUARES_Y = 14
 BOARD_INNER_X = BOARD_SQUARES_X - 1
 BOARD_INNER_Y = BOARD_SQUARES_Y - 1
-SQUARE_SIZE = 0.030
-MARKER_SIZE = 0.022
+SQUARE_SIZE = 0.040
+MARKER_SIZE = 0.030
 ARUCO_DICTIONARY_ID = cv2.aruco.DICT_5X5_1000
 ARUCO_DICTIONARY_NAME = "DICT_5X5_1000"
 MIN_CHARUCO_CORNERS = 12
@@ -271,7 +271,7 @@ def main():
     if args.generate_board:
         if args.generate_board == "AUTO":
             filename = (
-                "charuco_7x24_30mm_22mm_dict5x5_100.png"
+                "charuco_9x14_40mm_30mm_dict5x5_1000.png"
                 if args.target == "charuco"
                 else "chessboard_8x11_29p75mm.png"
             )
