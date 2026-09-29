@@ -196,6 +196,7 @@ class VisionNode:
         self._refresh_reason = "camera refresh"
         self._raw_stream_enabled = bool(int(os.getenv("UR10E_RAW_IMAGE_STREAM", "0")))
         self._raw_stream_until = 0.0
+        self._nurec = None
 
         # Components
         self.tracker = FruitTracker()
@@ -530,6 +531,15 @@ class VisionNode:
                     f"YOLO settings applied live: confidence={confidence:.2f}, "
                     f"max_detections={max_detections}")
                 self._publish_camera_status()
+            elif cmd.startswith("nurec "):
+                mode = cmd.split()[1].lower()
+                if self._nurec is None:
+                    self.node.get_logger().warn("[NUREC] unavailable: requires ZED X Mini RGBD mode and valid calibration")
+                elif mode in ("on", "off"):
+                    self._nurec.enabled = mode == "on"
+                    self.node.get_logger().info(f"[NUREC] {mode.upper()}")
+                else:
+                    self.node.get_logger().warn("[NUREC] use 'nurec on' or 'nurec off'")
             elif cmd.startswith("raw_stream "):
                 parts = cmd.split()
                 mode = parts[1].lower() if len(parts) > 1 else ""
@@ -725,6 +735,19 @@ class VisionNode:
             fx, fy = float(left_cam.fx), float(left_cam.fy)
             cx, cy = float(left_cam.cx), float(left_cam.cy)
             disto  = left_cam.disto
+
+        if use_zedx_mini_only:
+            from .nurec import NuRecCapture
+            try:
+                self._nurec = NuRecCapture(
+                    self.node, camera_infos.camera_configuration.calibration_parameters,
+                    (cam_w, cam_h), self.cam_frame,
+                    width=getattr(self.args, 'nurec_width', 1280),
+                    hz=getattr(self.args, 'nurec_hz', 3.0),
+                    quality=getattr(self.args, 'nurec_jpeg_quality', 80))
+                self._nurec.enabled = bool(getattr(self.args, 'nurec_capture', False))
+            except Exception as exc:
+                self.node.get_logger().error(f"[NUREC] unavailable: {exc}")
 
         intrinsics = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
 
@@ -1027,6 +1050,7 @@ class VisionNode:
                 def _capture_zedx_mini():
                     _cap_image = sl.Mat()
                     _cap_cloud = sl.Mat()
+                    _nurec_left, _nurec_right = sl.Mat(), sl.Mat()
                     _cap_times = deque(maxlen=30)
                     _cap_runtime = sl.RuntimeParameters()
                     while not self.exit_signal:
@@ -1050,6 +1074,20 @@ class VisionNode:
                             zed.retrieve_image(
                                 _cap_image, sl.VIEW.LEFT, sl.MEM.CPU,
                                 sl.Resolution(disp_w, disp_h))
+                            if self._nurec is not None and self._nurec.due():
+                                try:
+                                    _nr = sl.Resolution(*self._nurec.size)
+                                    _left_ok = zed.retrieve_image(_nurec_left, sl.VIEW.LEFT, sl.MEM.CPU, _nr)
+                                    _right_ok = zed.retrieve_image(_nurec_right, sl.VIEW.RIGHT, sl.MEM.CPU, _nr)
+                                    if (_left_ok == sl.ERROR_CODE.SUCCESS
+                                            and _right_ok == sl.ERROR_CODE.SUCCESS):
+                                        self._nurec.submit(
+                                            _nurec_left.get_data(), _nurec_right.get_data(),
+                                            self._ros_time_from_wall(_cap_t).to_msg())
+                                    else:
+                                        self.node.get_logger().warn("[NUREC] stereo retrieve failed; pair dropped")
+                                except Exception as exc:
+                                    self.node.get_logger().warn(f"[NUREC] capture skipped: {exc}")
                             if _want_depth:
                                 zed.retrieve_measure(
                                     _cap_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
@@ -1732,6 +1770,8 @@ class VisionNode:
             if bool(getattr(self.args, "raw_yolo_view", False)):
                 cv2.destroyAllWindows()
             perception_thread.join(timeout=3.0)
+            if self._nurec is not None:
+                self._nurec.close()
             if self.yolo_thread is not None:
                 self.yolo_thread.stop()
                 self.yolo_thread.stopped.wait(timeout=5.0)

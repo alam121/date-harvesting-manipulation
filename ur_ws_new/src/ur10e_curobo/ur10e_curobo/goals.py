@@ -6407,9 +6407,15 @@ def plan_and_execute(node):
         if bool(getattr(node.cfg.planner, "demo_capture_enabled", False)):
             _vision_resume()
             try:
-                demo_capture.capture_correction(node)
+                _demo_saved = demo_capture.capture_correction(node)
             except Exception as _demo_exc:
+                _demo_saved = None
                 node.get_logger().warn(f"[DEMO] capture failed: {_demo_exc}")
+            if not _demo_saved or node.stop_requested:
+                node._auto_harvest_abort = True
+                node.stop_requested = True
+                node.get_logger().warn("[DEMO] attempt stopped without closing")
+                break
             if not _vision_pause():
                 break
 

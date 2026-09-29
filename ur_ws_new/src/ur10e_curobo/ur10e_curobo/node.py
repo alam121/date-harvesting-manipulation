@@ -322,10 +322,12 @@ class UR10eCuroboMoveIt(Node):
         # False discards it. None means "still jogging" -- the capture loop
         # waits on this transitioning away from None, so it must be reset
         # there, not here.
+        self._demo_capture_active = False
         self._demo_confirm = None
 
         def _demo_confirm_cb(msg):
-            self._demo_confirm = bool(msg.data)
+            if self._demo_capture_active:
+                self._demo_confirm = bool(msg.data)
 
         self.create_subscription(Bool, '/demo/confirm', _demo_confirm_cb, 10)
 
@@ -1543,6 +1545,16 @@ class UR10eCuroboMoveIt(Node):
             self._session_record_gripper_action("OPEN", "direct_open")
             gripper_mod.control_gripper(self, 'OPEN')
         elif cmd == "close":
+            if self._demo_capture_active:
+                if not getattr(self, "_demo_capture_ready", False):
+                    self.get_logger().warn("[DEMO] Wait for the fresh FINAL image before Close")
+                    return
+                if not self.robot_running:
+                    self.get_logger().warn("[DEMO] Restore the robot External Control program before Close")
+                    return
+                self._demo_confirm = True
+                self.get_logger().info("[DEMO] Close accepted; saving correction before grasp")
+                return
             self._session_record_gripper_action("CLOSE", "direct_close")
             gripper_mod.control_gripper(self, 'CLOSE')
         elif cmd.startswith("gripper_open_alpha "):
@@ -2068,6 +2080,13 @@ class UR10eCuroboMoveIt(Node):
             val = cmd.split()[1].lower()
             self.cfg.planner.debug_plan_preview = val in ("true", "1", "yes")
             self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
+        elif cmd.startswith("set_demo_capture "):
+            enabled = cmd.split()[1].lower() in ("true", "1", "yes", "on")
+            self.cfg.planner.demo_capture_enabled = enabled
+            if not enabled and self._demo_capture_active:
+                self._demo_confirm = False
+            self.get_logger().info(
+                f"[DEMO] {'ENABLED: hold at FINAL, then press Close' if enabled else 'DISABLED'}")
         elif cmd.startswith("set_final_reacquire "):
             val = cmd.split()[1].lower()
             enabled = val in ("true", "1", "yes", "on")
@@ -2492,6 +2511,8 @@ class UR10eCuroboMoveIt(Node):
 
         gripper = getattr(self, 'gripper_controller', None)
         msg_data = {
+            "demo_capture_enabled": bool(self.cfg.planner.demo_capture_enabled),
+            "demo_capture_active": bool(self._demo_capture_active),
             "goal_count": len(safe_goals),
             "goals": goal_summary,
             "goal_display": "\n".join(goal_display_lines),

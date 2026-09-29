@@ -1067,7 +1067,7 @@ class Planner:
     # OFF by default: a normal harvest must not stop and wait for a human.
     demo_capture_enabled: bool = False
     demo_capture_dir: str = "~/harvest_logs/demos"
-    demo_capture_timeout_s: float = 180.0
+    demo_capture_timeout_s: float = 0.0  # Wait for Close; positive values set a timeout.
     demo_capture_sample_hz: float = 10.0
     grasp_episode_recording: bool = True
     grasp_episode_dir: str = "~/harvest_logs/episodes"

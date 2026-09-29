@@ -241,3 +241,74 @@ For a fixed 4-pane layout (ur_bringup + main + teleop + vision):
 ```bash
 terminator -l ur10e
 ```
+
+## Record FINAL corrections in RViz
+
+On the `demo-recorder` branch, build `ur10e_curobo` and `rviz_ur10e_panel`
+with `colcon build --symlink-install --packages-select ur10e_curobo rviz_ur10e_panel`,
+then restart the control node and RViz (`launch_harvest`).
+
+1. Check **Demo: correct FINAL, then Close** in the RViz Motion tab.
+2. Start a harvest attempt normally. Wait for the `[DEMO] holding at FINAL` log;
+   the recorder first waits for a fresh crop and freezes it before you jog.
+3. Jog the pendant to the correct grasp pose. Keep the gripper open.
+4. Restore the robot's External Control program and press **Close** in RViz.
+   During the hold, Close accepts the correction; the harvest sequence saves it,
+   closes the gripper, and continues its normal reverse/drop-off/home workflow.
+5. Inspect `~/harvest_logs/demos/<timestamp>/`: `crop_before.jpg` is the training
+   input, `crop_after.jpg` is optional context, and `sample.json` contains the
+   before/after poses, translation correction in base/tool metres, and jog path.
+
+Demo mode waits indefinitely by default. Unchecking Demo during the hold discards
+and stops that attempt (including automatic harvest). Stop, missing fresh imagery,
+recording failure, or a configured positive `demo_capture_timeout_s` expiring also
+ends the attempt without automatically closing. Outside a demo hold, Close keeps
+its ordinary behavior. The checkbox reflects the running node and is off by default.
+
+Validate pendant-to-ROS handoff and fruit visibility with supervised cycles before
+collecting the dataset. The recorder requires a fresh crop but does not determine
+whether the fruit is actually visible in it. It does not switch robot control modes.
+
+## NuRec compressed stereo capture
+
+Available in `--use_zedx_mini_only` mode, **off by default**. After rebuilding
+`ur10e_curobo` and restarting the vision node, enable/disable it at runtime:
+
+```bash
+export ROS_DOMAIN_ID=6
+ros2 topic pub --once /camera_command std_msgs/msg/String "data: 'nurec on'"
+ros2 topic pub --once /camera_command std_msgs/msg/String "data: 'nurec off'"
+```
+
+Use the same ROS environment and Fast DDS profile as the harvest launcher.
+For startup capture, append `--nurec_capture` to the vision command.
+Optional arguments: `--nurec_width 1280 --nurec_hz 3 --nurec_jpeg_quality 80`.
+These settings produce 1280×720 from the current 1920×1080 camera mode.
+
+| Topic | Type |
+|---|---|
+| `/vision/nurec/left/image_rect/compressed` | `sensor_msgs/msg/CompressedImage` |
+| `/vision/nurec/right/image_rect/compressed` | `sensor_msgs/msg/CompressedImage` |
+| `/vision/nurec/left/camera_info` | `sensor_msgs/msg/CameraInfo` |
+| `/vision/nurec/right/camera_info` | `sensor_msgs/msg/CameraInfo` |
+
+Both rectified images come from the same SDK grab; all four messages share its
+acquisition stamp. Intrinsics match the published image dimensions, distortion
+is zero, and rectification rotation is identity. The right projection includes
+`P[3] = -fx * baseline_m`; recover the baseline as `-P[3] / P[0]`.
+The baseline comes from the SDK, using the camera's existing `UNIT.METER` setting
+([SDK baseline units](https://www.stereolabs.com/docs/api/python/classpyzed_1_1sl_1_1CalibrationParameters.html),
+[rectified calibration](https://www.stereolabs.com/docs/development/zed-sdk/modules/camera/camera-calibration)).
+The right image/info use the corresponding right camera frame name; this mode
+provides stereo geometry through CameraInfo and does not add a right-camera TF.
+
+Transport is reliable, volatile, keep-last 1. A separate JPEG/publishing worker
+uses a one-pair queue, replacing stale queued pairs instead of blocking the SDK
+capture thread. Disabled capture retrieves no additional images and publishes no
+pairs. This is a live stream, not a lossless local recorder: synchronize by stamp
+and discard incomplete pairs at the receiver. JPEG size and delivered frequency
+depend on the scene, CPU load, and network; 1 MB/s is a target, not a guarantee.
+Validate pair arrival and recovered scale on the remote recorder before a dataset run.
+
+Existing `/vision/raw` is independently gated by `raw_stream on`; publisher
+presence alone does not mean raw streaming has been enabled.

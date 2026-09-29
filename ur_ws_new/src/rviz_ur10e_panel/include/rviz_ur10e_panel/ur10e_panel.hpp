@@ -288,6 +288,9 @@ private:
   QSpinBox * multi_goal_count_spin_;
   QSpinBox * auto_goal_count_spin_;
   QCheckBox * require_final_reacquire_cb_;
+  QCheckBox * demo_capture_cb_ = nullptr;
+  bool demo_capture_enabled_ = false;
+  bool demo_capture_active_ = false;
   QDoubleSpinBox * low_center_depth_in_, * low_center_z_in_;
   QDoubleSpinBox * mid_center_depth_in_, * mid_center_z_in_;
   QDoubleSpinBox * low_side_depth_in_, * low_left_z_in_, * low_right_z_in_;

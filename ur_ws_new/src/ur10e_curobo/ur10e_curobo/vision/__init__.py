@@ -58,7 +58,14 @@ def main():
         "--raw_yolo_view", action="store_true",
         help="Display raw YOLO boxes/masks only; disable 3D processing and goal publishing"
     )
+    parser.add_argument('--nurec_capture', action='store_true',
+                        help='Publish compressed rectified stereo for NuRec (Mini RGBD only)')
+    parser.add_argument('--nurec_width', type=int, default=1280)
+    parser.add_argument('--nurec_hz', type=float, default=3.0)
+    parser.add_argument('--nurec_jpeg_quality', type=int, default=80)
     args = parser.parse_args()
+    if args.nurec_capture and not args.use_zedx_mini_only:
+        parser.error('--nurec_capture requires --use_zedx_mini_only')
 
     if args.video or (args.svo and args.raw_yolo_view):
         if not args.raw_yolo_view:

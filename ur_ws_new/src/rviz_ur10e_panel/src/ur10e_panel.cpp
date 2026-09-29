@@ -1022,6 +1022,19 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   plan_cancel_btn_->setVisible(false);
   motion_layout->addWidget(plan_cancel_btn_, 12, 1);
 
+  demo_capture_cb_ = new QCheckBox("Demo: correct FINAL, then Close");
+  demo_capture_cb_->setToolTip(
+    "Hold before grasping. Jog the pendant to the correct pose, restore ROS control, "
+    "then press Close to save the image and correction and continue harvesting. "
+    "Uncheck during a hold to discard and stop the attempt.");
+  connect(demo_capture_cb_, &QCheckBox::toggled, this, [this](bool enabled) {
+    publishCmd(enabled ? "set_demo_capture true" : "set_demo_capture false");
+    status_label_->setText(enabled
+      ? "Demo enabled: at FINAL, jog then press Close"
+      : "Demo disabled");
+  });
+  motion_layout->addWidget(demo_capture_cb_, 13, 0, 1, 2);
+
   motion_tab_layout->addWidget(motion_group);
 
   // Side-home moves — test/calibrate home_left/home_right per robot profile.
@@ -2008,6 +2021,8 @@ void UR10ePanel::setupRos()
       gripper_open_alpha_ = jsonNumberValue(data, "gripper_open_alpha", gripper_open_alpha_);
       gripper_open_alpha_ = std::max(-0.10, std::min(1.0, gripper_open_alpha_));
       gripper_fake_ = jsonBoolValue(data, "gripper_fake", gripper_fake_);
+      demo_capture_enabled_ = jsonBoolValue(data, "demo_capture_enabled", false);
+      demo_capture_active_ = jsonBoolValue(data, "demo_capture_active", false);
       gripper_disabled_ = jsonBoolValue(data, "gripper_disabled", gripper_disabled_);
       gripper_suction_ = jsonBoolValue(data, "gripper_suction", gripper_suction_);
       std::array<double, 3> taught_offsets{};
@@ -3173,6 +3188,15 @@ void UR10ePanel::updateDisplay()
     slip_count_label_->setText(QString::number(slip_count_));
     miss_count_label_->setText(QString::number(miss_count_));
     total_count_label_->setText(QString::number(grab_count_ + slip_count_ + miss_count_));
+  }
+
+  if (demo_capture_cb_) {
+    demo_capture_cb_->blockSignals(true);
+    demo_capture_cb_->setChecked(demo_capture_enabled_);
+    demo_capture_cb_->setText(demo_capture_active_
+      ? "Demo holding: jog, then press Close"
+      : "Demo: correct FINAL, then Close");
+    demo_capture_cb_->blockSignals(false);
   }
 
   // Robot state
