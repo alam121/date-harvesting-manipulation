@@ -14,7 +14,7 @@ from pathlib import Path
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
-from std_msgs.msg import Float32MultiArray, String, Float32
+from std_msgs.msg import Float32MultiArray, String, Float32, Bool
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from .config import AppConfig, ROBOT_PROFILE, ENVIRONMENT
@@ -317,6 +317,17 @@ class UR10eCuroboMoveIt(Node):
         self._latest_grasp_crop = None
         self._latest_grasp_crop_t = 0.0
         self._latest_grasp_crop_meta = None
+
+        # Operator verdict on a demo_capture hold: True keeps the correction,
+        # False discards it. None means "still jogging" -- the capture loop
+        # waits on this transitioning away from None, so it must be reset
+        # there, not here.
+        self._demo_confirm = None
+
+        def _demo_confirm_cb(msg):
+            self._demo_confirm = bool(msg.data)
+
+        self.create_subscription(Bool, '/demo/confirm', _demo_confirm_cb, 10)
 
         def _grasp_crop_cb(msg):
             try:

@@ -1063,6 +1063,12 @@ class Planner:
     #
     # On by default because the alternative is discovering after a field week
     # that none of it was kept. ~1-2MB per grasp.
+    # Operator-correction capture for the residual policy (demo_capture.py).
+    # OFF by default: a normal harvest must not stop and wait for a human.
+    demo_capture_enabled: bool = False
+    demo_capture_dir: str = "~/harvest_logs/demos"
+    demo_capture_timeout_s: float = 180.0
+    demo_capture_sample_hz: float = 10.0
     grasp_episode_recording: bool = True
     grasp_episode_dir: str = "~/harvest_logs/episodes"
     log_phase_timings: bool = True     # per-phase timing lines; cycle summary always includes timings

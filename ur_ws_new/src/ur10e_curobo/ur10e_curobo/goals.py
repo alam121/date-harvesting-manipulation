@@ -98,6 +98,7 @@ from .config import (
     X_FORWARD_Y_LATERAL,
 )
 from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head, log_retime
+from . import demo_capture
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt
 from .motions import move_to_dropoff_position, move_to_home_position
@@ -6397,6 +6398,20 @@ def plan_and_execute(node):
         else:
             node.get_logger().warn(
                 "[FINAL_REACHED] Actual TCP unavailable before gripper close")
+
+        # Operator-correction capture, before the observation window and before
+        # the gripper closes: the arm is standing exactly where the pipeline
+        # decided, which is the error this is here to measure. Vision is resumed
+        # first so the crop written alongside the correction is what the camera
+        # saw from the uncorrected pose. Off unless demo_capture_enabled.
+        if bool(getattr(node.cfg.planner, "demo_capture_enabled", False)):
+            _vision_resume()
+            try:
+                demo_capture.capture_correction(node)
+            except Exception as _demo_exc:
+                node.get_logger().warn(f"[DEMO] capture failed: {_demo_exc}")
+            if not _vision_pause():
+                break
 
         # Observation only: briefly resume live detection at the actual FINAL pose
         # so the vision overlay can verify the physical red fingertips around the
