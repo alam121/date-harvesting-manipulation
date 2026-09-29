@@ -7,7 +7,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import (PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_GRAPH,
                      PLAN_CFG_JS_NO_FINETUNE)
-from .utils import build_trajectory, wait_until_xyz
+from .utils import build_trajectory, wait_until_xyz, log_retime
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 
 
@@ -135,9 +135,17 @@ def _publish_cartesian_states(node, states, curobo_dt: float, target_pose,
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        # Same multiplier on acceleration. Measured 2026-09-16: with velocity
+        # scaled x5 and acceleration left at x1, build_trajectory's retime was
+        # decided entirely by the acceleration term and stretched every phase --
+        # reverse 1.7s -> 19.5s, dropoff 2.7s -> 11.6s, home 2.3s -> 10.5s.
         max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    _rt = getattr(build_trajectory, "last_retime", None)
+    if _rt:
+        node.get_logger().warn(f"[RETIME] {label}: {_rt}")
     if not traj.points:
         node.get_logger().warn(f"{label}: planned route produced an empty trajectory.")
         return False
@@ -216,9 +224,17 @@ def execute_single_pose(node, pose: list, motion_type: str = "default",
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        # Same multiplier on acceleration. Measured 2026-09-16: with velocity
+        # scaled x5 and acceleration left at x1, build_trajectory's retime was
+        # decided entirely by the acceleration term and stretched every phase --
+        # reverse 1.7s -> 19.5s, dropoff 2.7s -> 11.6s, home 2.3s -> 10.5s.
         max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    _rt = getattr(build_trajectory, "last_retime", None)
+    if _rt:
+        node.get_logger().warn(f"[RETIME] {motion_type}: {_rt}")
     if not traj.points:
         node.get_logger().warn("Single-pose plan produced an empty trajectory.")
         return False
@@ -694,9 +710,11 @@ def _execute_home_direct_fallback(node, target_joints, scale: float, *,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_home_direct_fallback")
     if not traj.points:
         return False
 
@@ -777,9 +795,11 @@ def _execute_verified_joint_interpolation(node, target_joints, scale: float, *,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_verified_joint_interpolation")
     if not traj.points:
         return False
 
@@ -1036,9 +1056,11 @@ def _execute_home_verified_interpolation(node, target_joints, scale: float) -> b
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_home_verified_interpolation")
     if not traj.points:
         return False
 
@@ -1200,9 +1222,11 @@ def _execute_home_verified_route(node, target_joints, scale: float) -> bool:
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_home_verified_route")
     if not traj.points:
         return False
 
@@ -1295,9 +1319,11 @@ def _execute_home_cartesian_pose_recovery(node, target_joints, scale: float) -> 
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_home_cartesian_pose_recovery")
     if not traj.points:
         return False
 
@@ -1416,9 +1442,11 @@ def _execute_graph_states(node, states, scale: float, label: str) -> bool:
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.5,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
         include_acc=False,
     )
+    log_retime(node, "_execute_graph_states")
     if not traj.points:
         return False
     node.trajectory_pub.publish(traj)
@@ -1726,7 +1754,11 @@ def plan_execute_js(
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=math.pi,  # UR10e physical joint limit; prevents clipping cuRobo's natural velocities
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    log_retime(node, "plan_execute_js")
 
     if getattr(node.cfg.planner, "log_phase_timings", False):
         node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
@@ -2002,7 +2034,12 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
     traj = build_trajectory(
         node.joint_order, states, dt=dt,
         stop_flag=lambda: node.stop_requested,
+        max_vel=planner.max_joint_velocity,
+        max_acc=planner.max_joint_acceleration,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    log_retime(node, "preplan_js")
     return traj, states
 
 
@@ -2030,7 +2067,10 @@ def execute_preplan(node, traj, states, label: str) -> bool:
     traj = build_trajectory(node.joint_order, states, dt=dt,
         stop_flag=lambda:node.stop_requested,
         max_vel=node.cfg.planner.max_joint_velocity,
-        max_acc=node.cfg.planner.max_joint_acceleration)
+        max_acc=node.cfg.planner.max_joint_acceleration,
+        ramp_points=getattr(node.cfg.planner, "ramp_points", 15),
+        enforce_limits=getattr(node.cfg.planner, "retime_trajectories", False))
+    log_retime(node, "execute_preplan")
     latest = node.current_joint_positions
     if (not traj.points or node.stop_requested or latest is None
             or len(latest) != len(current)
@@ -2117,6 +2157,7 @@ def blend_motion(node, pause=0.1):
         dt=0.02,
         stop_flag=lambda: node.stop_requested,
     )
+    log_retime(node, "blend_motion")
     if traj.points:
         node.trajectory_pub.publish(traj)
     time.sleep(pause)

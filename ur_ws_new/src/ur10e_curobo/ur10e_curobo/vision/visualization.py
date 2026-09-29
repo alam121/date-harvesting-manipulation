@@ -933,8 +933,17 @@ class VisionVisualizer:
         viz_only: Optional[List[Dict[str, Any]]] = None,
         lidar_uv: Optional[np.ndarray] = None,
         lidar_pts_cam: Optional[np.ndarray] = None,
+        only_best: bool = False,
     ) -> np.ndarray:
-        """Render a complete frame with all visualizations."""
+        """Render a complete frame with all visualizations.
+
+        only_best draws a single box/mask (best_idx) instead of up to
+        DRAW_TOP_N. Set for the flower model: pollination is looking at one
+        flower, found by _fv_best in vision/node.py, and drawing every other
+        bloom the model noticed makes it unclear which one the run is
+        actually tracking -- unlike harvest, where seeing every candidate
+        date is the point.
+        """
         if SKIP_DRAW:
             return image
 
@@ -995,7 +1004,9 @@ class VisionVisualizer:
         self.draw_blocking_fruits(image, targets, best_idx)
 
         draw_indices = set(range(len(targets)))
-        if not DRAW_ONLY_BEST and DRAW_TOP_N is not None and DRAW_TOP_N > 0:
+        if only_best:
+            draw_indices = {best_idx} if best_idx is not None else set()
+        elif not DRAW_ONLY_BEST and DRAW_TOP_N is not None and DRAW_TOP_N > 0:
             scored = sorted(
                 ((i, t.get("score", 0.0)) for i, t in enumerate(targets)),
                 key=lambda item: item[1],
@@ -1006,9 +1017,12 @@ class VisionVisualizer:
                 draw_indices.add(best_idx)
 
         for i, t in enumerate(targets):
-            if DRAW_ONLY_BEST and (best_idx is not None) and i != best_idx:
+            if only_best:
+                if i not in draw_indices:
+                    continue
+            elif DRAW_ONLY_BEST and (best_idx is not None) and i != best_idx:
                 continue
-            if not DRAW_ONLY_BEST and i not in draw_indices:
+            elif not DRAW_ONLY_BEST and i not in draw_indices:
                 continue
             self.draw_target(image, t, is_best=(i == best_idx), idx=i)
             if i == best_idx:

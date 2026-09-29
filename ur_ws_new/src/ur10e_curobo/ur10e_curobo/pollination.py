@@ -118,29 +118,48 @@ def _wait_for_vision(node, timeout_s, quiet_s=2.0):
     return False
 
 
-def _score_pose_here(node, cfg, label):
-    """Settle, then take the largest mask area seen over a few frames.
+def _score_pose_here(node, cfg, label, anchor_xyz=None, anchor_radius=None):
+    """Settle, then take the highest-confidence sighting over a few frames.
 
     Returns (area, xyz, conf, ok, frames_seen, frames_sampled).
 
-    Max rather than mean: a single frame where the flower is momentarily
-    occluded (by a leaf moving, or a dropped detection) should not penalise a
-    pose that genuinely has the best view.
+    Confidence rather than area picks WHICH detection in the burst to trust,
+    matching vision/node.py's own per-frame selection -- both answer "is this
+    really a flower", not "how good is this view of it". Ranking VIEWING POSES
+    against each other is a separate question the caller still answers with
+    area (see the sweep loop): apparent size tracks view angle cleanly, while
+    confidence saturates near 1.0 and jitters frame to frame, so it cannot
+    order two poses that both clearly see the flower.
+
+    anchor_xyz/anchor_radius, when given, restrict the burst to sightings
+    within anchor_radius of anchor_xyz before ranking -- so a second, brighter
+    bloom drifting into frame cannot be reported in place of the flower this
+    run is actually visiting. Frames outside the radius are dropped as if
+    nothing was seen, not merely outranked, matching the drift gate the sweep
+    loop already applies to its final choice of pose.
     """
     time.sleep(max(0.0, float(cfg.settle_s)))
-    best_area, best_xyz, best_conf, seen = 0.0, None, 0.0, 0
+    best_area, best_xyz, best_conf, seen = 0.0, None, -1.0, 0
     n = max(1, int(cfg.samples_per_pose))
+    _dropped = 0
     for _ in range(n):
         s = _flower_sample(node)
         if s is not None and s[0] > 0.0:
+            _xyz = [s[3], s[4], s[5]]
+            if anchor_xyz is not None and anchor_radius is not None:
+                if math.dist(_xyz, anchor_xyz) > float(anchor_radius):
+                    _dropped += 1
+                    time.sleep(float(getattr(cfg, "sample_interval_s", 0.15)))
+                    continue
             seen += 1
-            if s[0] > best_area:
+            if s[2] > best_conf:
                 best_area, best_conf = s[0], s[2]
-                best_xyz = [s[3], s[4], s[5]]
+                best_xyz = _xyz
         time.sleep(float(getattr(cfg, "sample_interval_s", 0.15)))
-    # Consistency is the reliability signal, not confidence -- see the table in
-    # config.py next to min_confidence. A flower held across a burst is real; a
-    # high score on 3 frames of 12 is a flicker.
+    best_conf = max(best_conf, 0.0)
+    # Consistency is the reliability signal on TOP of confidence -- see the
+    # table in config.py next to min_confidence. A flower held across a burst
+    # is real; a high score on 3 frames of 12 is a flicker.
     _need_frames = max(1, int(math.ceil(
         n * float(getattr(cfg, "min_frame_fraction", 0.5)))))
     ok = (best_area >= float(cfg.min_mask_area_px)
@@ -149,7 +168,9 @@ def _score_pose_here(node, cfg, label):
     node.get_logger().info(
         f"[POLLINATION_POSE] {label} area={best_area:.0f}px "
         f"conf={best_conf:.2f} frames_with_flower={seen}/{n} "
-        f"(need {_need_frames}) {'CANDIDATE' if ok else 'rejected'}")
+        f"(need {_need_frames})"
+        + (f" anchored, {_dropped} dropped as a different bloom" if anchor_xyz is not None else "")
+        + f" {'CANDIDATE' if ok else 'rejected'}")
     # Raw measurement alongside the verdict. min_mask_area_px is a guess until
     # a real flower has been swept, so a run that rejects everything has to say
     # what it actually saw or there is nothing to tune against.
@@ -495,8 +516,19 @@ def run_pollination(node):
     if prior_mode not in ("full", "reacquire", "reacquire_fast"):
         prior_mode = "full"
     visited = False
+    # Harvest runs with the trajectory retimer off (planner.retime_trajectories)
+    # to get its ~21s cycle back. Pollination was tuned while that retimer was
+    # still stretching every move, and it works close to a flower where slow is
+    # the point, so switch it back on for the duration and restore afterwards.
+    planner = node.cfg.planner
+    prior_retime = bool(getattr(planner, "retime_trajectories", False))
 
     try:
+        if bool(getattr(cfg, "slow_motion", True)):
+            planner.retime_trajectories = True
+            node.get_logger().info(
+                "[POLLINATION] slow motion ON (trajectory retiming enabled "
+                "for this run; harvest setting restored afterwards)")
         node.motion_phase = "POLLINATION"
         # Pressing Pollinate is a deliberate new action, so clear any stop left
         # over from a previous one -- the same thing home, dropoff, manual goal
@@ -713,6 +745,12 @@ def run_pollination(node):
                 node.get_logger().warn(f"[POLLINATION] {label}: move rejected, skipping")
                 continue
             last_idx = i
+            # NOT anchored here, unlike POLLINATION_REFIX below: the drift
+            # check right after this call is the thing that lets a run recover
+            # when the PREFIX fix itself was wrong (five poses agreeing with
+            # each other, all rejected against a bad centre -- see the
+            # consensus fallback below). Pre-filtering samples to the anchor
+            # here would starve that recovery of the very sightings it needs.
             area, xyz, conf, ok, _seen, _n = _score_pose_here(node, cfg, label)
             seen_any.append((label, area, conf))
             if ok and xyz is not None:
@@ -881,7 +919,8 @@ def run_pollination(node):
         # point toward a spurious blob, and the sweep's measurement is already
         # good enough to visit.
         area, xyz, conf, _ok, _, _ = _score_pose_here(
-            node, cfg, "POLLINATION_REFIX")
+            node, cfg, "POLLINATION_REFIX",
+            anchor_xyz=center_override, anchor_radius=_max_drift)
         # Only let the re-fix move the target if it is a BETTER measurement than
         # the sweep's winner, not merely a passing one. On 2026-09-15 a re-fix
         # at 40187px / 4-of-6 frames overrode a best view of 51696px / 6-of-6
@@ -991,6 +1030,41 @@ def run_pollination(node):
                 _dot = abs(sum(float(_cur[3 + i]) * float(approach[3 + i])
                                for i in range(4)))
                 _swing = math.degrees(2.0 * math.acos(max(0.0, min(1.0, _dot))))
+                # A large swing, attempted in place from the arc pose 30-40cm
+                # below the flower, keeps crossing the branch-flip boundary
+                # _rotate_towards exists to dodge -- see climb_before_aim_* in
+                # config.py for the field data. Climb most of the way to the
+                # standoff position first (pure translation, orientation held),
+                # then attempt the SAME reorientation from there. Only above
+                # the threshold: a small, uneventful swing does not need it and
+                # the climb itself is not free of leaf-contact risk.
+                _climb_thresh = float(getattr(
+                    cfg, "climb_before_aim_deg_threshold", 30.0))
+                if _swing > _climb_thresh:
+                    _frac = max(0.0, min(1.0, float(getattr(
+                        cfg, "climb_before_aim_fraction", 0.6))))
+                    _climb_xyz = [
+                        _cur[i] + _frac * (float(approach[i]) - _cur[i])
+                        for i in range(3)]
+                    node.get_logger().info(
+                        f"[POLLINATION_AIM] swing is {_swing:.0f}deg (over "
+                        f"{_climb_thresh:.0f}deg); climbing {_frac * 100:.0f}% "
+                        "of the way to the standoff first, to try to reach it "
+                        "on this wrist branch instead of flipping")
+                    if _direct_ik_move(
+                            node, [*_climb_xyz, *_cur[3:7]],
+                            label="POLLINATION_CLIMB", motion_type="approach",
+                            store_trajectory=False):
+                        _cur = lidar_scan_mod._current_tcp_pose(node) or _cur
+                        _dot = abs(sum(
+                            float(_cur[3 + i]) * float(approach[3 + i])
+                            for i in range(4)))
+                        _swing = math.degrees(
+                            2.0 * math.acos(max(0.0, min(1.0, _dot))))
+                    else:
+                        node.get_logger().warn(
+                            "[POLLINATION_AIM] climb move refused; attempting "
+                            "the reorientation from where the sweep left off")
                 if _swing < 1.0:
                     node.get_logger().info(
                         "[POLLINATION_AIM] orientation already correct for the "
@@ -1083,24 +1157,30 @@ def run_pollination(node):
         node.get_logger().error(f"[POLLINATION] aborted: {exc}")
         return visited
     finally:
-        for key, value in saved.items():
-            setattr(scan_cfg, key, value)
+        try:
+            for key, value in saved.items():
+                setattr(scan_cfg, key, value)
 
-        # HOME first, then the model swap. The restore is ~20s of vision
-        # restart during which nothing moves, and leaving the arm parked deep in
-        # the canopy for that long is the wrong order: get it out to a known
-        # pose while the geometry is still fresh, then do the slow bookkeeping.
-        if bool(getattr(cfg, "return_home_after", True)) and not node.stop_requested:
-            node.motion_phase = "HOME"
-            motions_mod.move_to_home_position(node)
+            # HOME first, then the model swap. The restore is ~20s of vision
+            # restart during which nothing moves, and leaving the arm parked deep in
+            # the canopy for that long is the wrong order: get it out to a known
+            # pose while the geometry is still fresh, then do the slow bookkeeping.
+            if bool(getattr(cfg, "return_home_after", True)) and not node.stop_requested:
+                node.motion_phase = "HOME"
+                motions_mod.move_to_home_position(node)
 
-        if bool(getattr(cfg, "restore_weights_after", True)) and prior_weights:
+            if bool(getattr(cfg, "restore_weights_after", True)) and prior_weights:
+                node.get_logger().info(
+                    "[POLLINATION] restoring the date model — vision restarts, "
+                    "~20s, Pollinate stays busy until it finishes")
+                _switch_model(node, prior_weights, "date")
+                _wait_for_vision(node, 40.0)
+            node.set_vision_mode(prior_mode)
             node.get_logger().info(
-                "[POLLINATION] restoring the date model — vision restarts, "
-                "~20s, Pollinate stays busy until it finishes")
-            _switch_model(node, prior_weights, "date")
-            _wait_for_vision(node, 40.0)
-        node.set_vision_mode(prior_mode)
-        node.get_logger().info(
-            f"[POLLINATION] vision restored to '{prior_mode}'")
-        node.motion_phase = "IDLE"
+                f"[POLLINATION] vision restored to '{prior_mode}'")
+            node.motion_phase = "IDLE"
+        finally:
+            # Last, after the return HOME, so the whole pollination action -- the
+            # trip out of the canopy included -- stays slow. In its own finally so a
+            # failed HOME or model swap cannot leave harvest stuck on slow motion.
+            planner.retime_trajectories = prior_retime

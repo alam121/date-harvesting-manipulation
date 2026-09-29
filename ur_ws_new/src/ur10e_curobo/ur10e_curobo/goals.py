@@ -97,7 +97,7 @@ from .config import (
     LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, PLAN_CFG_SCAN_PREFLIGHT,
     X_FORWARD_Y_LATERAL,
 )
-from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head
+from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head, log_retime
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt
 from .motions import move_to_dropoff_position, move_to_home_position
@@ -1273,7 +1273,9 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             stop_flag=lambda: node.stop_requested,
                             max_vel=planner.max_joint_velocity * 0.5,
                             max_acc=planner.max_joint_acceleration * 0.3,
-                            ramp_points=0, include_acc=False)
+                            ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False), include_acc=False)
+    log_retime(node, "_direct_ik_move")
     if node.stop_requested:
         return False
 
@@ -2101,7 +2103,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
 
 def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
                                     target_pose_list, dt, label="ENTRY",
-                                    duration_s=None):
+                                    duration_s=None, match_joint_step=None):
     """Joint states for a straight-line Cartesian entry, for appending to a plan.
 
     Same construction _direct_ik_move() uses for its required-Cartesian leg:
@@ -2158,6 +2160,28 @@ def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
 
     segments = len(wp_js) - 1
     total_steps = max(segments * 4, int(round(max(duration_s, 0.05) / max(dt, 1e-4))))
+
+    # Match the incoming leg's per-sample joint step when the caller supplies it.
+    #
+    # build_trajectory uses ONE dt for the whole concatenated trajectory, so
+    # sample spacing is speed -- and a step-size change at the junction reads as
+    # an enormous single-sample acceleration. It then retimes the WHOLE
+    # trajectory to respect it: measured 2026-09-16, staging at 0.36mm/sample
+    # spliced onto this leg at 0.91mm/sample forced dt 10ms -> 38.7ms, turning a
+    # 2.0s approach into 7.8s. Matching the density removes the discontinuity,
+    # so the retime has nothing to punish and both legs run at the asked-for dt.
+    if match_joint_step and match_joint_step > 1e-9:
+        _span = max(
+            max(abs(wp_js[i + 1][j] - wp_js[i][j]) for j in range(len(start_js)))
+            for i in range(segments))
+        _needed = int(math.ceil(_span / float(match_joint_step)))
+        _matched = max(segments * 4, _needed * segments)
+        if _matched != total_steps:
+            node.get_logger().info(
+                f"[ENTRY] {label}: density matched to the incoming leg "
+                f"({match_joint_step * 1000:.2f}mrad/sample): "
+                f"{total_steps} -> {_matched} states")
+        total_steps = _matched
     steps_per = max(4, total_steps // segments)
     out = []
     for si in range(segments):
@@ -2444,7 +2468,13 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     # accelerations that exceed what the robot can physically follow → jerks.
     # Scale > 1 ("go faster") has no effect — cuRobo already runs at max speed.
     raw_dt = base_dt / max(scale, 1e-6)
-    dt = min(max(raw_dt, curobo_dt), planner.max_dt)
+    # Floor at min_dt as well as curobo_dt. curobo_dt is the interpolation
+    # timestep (4ms); min_dt (10ms) is the rate the ARM will actually follow.
+    # Clamping only to curobo_dt let a fast phase through at 5ms on
+    # 2026-09-16 -- legal by that test, but the doubled velocities were not
+    # executable, so a 0.90s approach leg simply never arrived and the goal was
+    # rejected on the 10s settle timeout.
+    dt = min(max(raw_dt, curobo_dt, planner.min_dt), planner.max_dt)
     base_vel = 0.08        # slightly gentler than 0.1
     vel = min(base_vel * scale, 0.25)   # hard cap for safety
 
@@ -2461,7 +2491,14 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     # clearance is verified across the whole merged path).
     if extend_fn is not None:
         try:
-            _extra = extend_fn(list(states[-1]), float(dt))
+            # Per-sample joint step at the tail of this leg, so the extension
+            # can match it and the junction stays continuous in speed.
+            _join_step = None
+            if len(states) >= 2:
+                _a, _b = states[-1], states[-2]
+                _join_step = max(abs(float(_a[j]) - float(_b[j]))
+                                 for j in range(len(_a)))
+            _extra = extend_fn(list(states[-1]), float(dt), _join_step)
         except Exception as _ex:
             node.get_logger().error(f"[{label}] continuation leg raised: {_ex}")
             return False
@@ -2475,6 +2512,20 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
 
     node._planned_cartesian_path = cart_path
     node._planned_label = label
+
+    # Does the PLAN actually end where the caller will wait? A merged staging +
+    # entry path that stops short is indistinguishable from an arm that fails to
+    # execute, and both present as "approach pose not reached". Say which.
+    if cart_path and goal_xyz is not None:
+        _end = cart_path[-1]
+        _end_xyz = ([_end.x, _end.y, _end.z] if hasattr(_end, "x")
+                    else [float(v) for v in _end[:3]])
+        _plan_err = math.dist(_end_xyz, list(goal_xyz)[:3])
+        node.get_logger().info(
+            f"[PLAN_END] {label}: {len(states)} states, plan ends "
+            f"[{_end_xyz[0]:.3f},{_end_xyz[1]:.3f},{_end_xyz[2]:.3f}] "
+            f"= {_plan_err * 1000:.1f}mm from goal "
+            f"[{goal_xyz[0]:.3f},{goal_xyz[1]:.3f},{goal_xyz[2]:.3f}]")
 
     _clamp_mm, _safe_cutoff, _dest_mm = _log_forearm_flange_clearance(node, states, label)
     _clamp_threshold = float(getattr(node.cfg.planner, "clamp_safety_threshold_mm", 35.0))
@@ -2533,9 +2584,19 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         dt=dt,
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * planner.global_speed_multiplier,
+        # Apply the same multiplier to acceleration. Measured 2026-09-16:
+        # velocity got x5 and acceleration did not, so build_trajectory's
+        # retime was decided entirely by the acceleration term --
+        # vel_term=0.7ms vs acc_term=82.2ms, a 117x disparity. That stretched a
+        # 1.65s approach to 13.6s and the 10s settle timeout rejected every
+        # goal. 7.5 rad/s^2 remains well inside what a UR10e will follow.
         max_acc=planner.max_joint_acceleration,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    _retime = getattr(build_trajectory, "last_retime", None)
+    if _retime:
+        node.get_logger().warn(f"[RETIME] {label}: {_retime}")
 
     if node.stop_requested:
         node.get_logger().warn(f"Stop before sending {label} trajectory.")
@@ -2619,8 +2680,10 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
                 stop_flag=lambda: node.stop_requested,
                 max_vel=0.3,   # Very low max velocity
                 max_acc=0.2,   # Very low acceleration
-                ramp_points=0,
+                ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
             )
+            log_retime(node, "execute_reversed_trajectory")
             node.trajectory_pub.publish(initial_traj)
 
             # Wait for this slow motion to complete
@@ -2650,8 +2713,10 @@ def execute_reversed_trajectory(node, motion_type: str = "predropoff"):
         stop_flag=lambda: node.stop_requested,
         max_vel=getattr(planner, "max_joint_velocity", 2.0) * getattr(planner, "global_speed_multiplier", 1.0),
         max_acc=getattr(planner, "max_joint_acceleration", 1.0),
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    log_retime(node, "execute_reversed_trajectory")
 
     if node.stop_requested:
         node.get_logger().warn("Stop before sending reversed trajectory.")
@@ -2822,8 +2887,10 @@ def execute_partial_reverse(node, clearance_m: float = 0.35,
         stop_flag=lambda: node.stop_requested,
         max_vel=getattr(planner, "max_joint_velocity", 2.0) * reverse_velocity_scale,
         max_acc=getattr(planner, "max_joint_acceleration", 1.0) * reverse_acceleration_scale,
-        ramp_points=0,
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False),
     )
+    log_retime(node, "execute_partial_reverse")
 
     node.trajectory_pub.publish(traj)
     _record_motion = getattr(node, "_record_motion_plan_event", None)
@@ -2978,7 +3045,9 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
         stop_flag=lambda: node.stop_requested,
         max_vel=planner.max_joint_velocity * 0.5,
         max_acc=planner.max_joint_acceleration * 0.3,
-        ramp_points=0, include_acc=False)
+        ramp_points=getattr(planner, "ramp_points", 15),
+        enforce_limits=getattr(planner, "retime_trajectories", False), include_acc=False)
+    log_retime(node, "_apply_final_inflight_correction")
     # Everything above (IK, clearance, trajectory build) takes long enough that
     # the FINAL can finish or fail while it runs. Publishing after that point
     # sends the arm somewhere nobody is waiting on -- observed 2026-09-14
@@ -4785,7 +4854,7 @@ def plan_and_execute(node):
                     _tip_approach_tcp, _ = closure_center_corrected_tcp(
                         _tip_approach_closure, orientation, _tip_offset_tcp)
                     approach[:3] = list(_tip_approach_tcp)
-                    node.get_logger().debug(
+                    node.get_logger().info(
                         f"[TOOL_AXIS_AIM] class={_low_class} "
                         "source=DATE_TIP_3D geometry=COLLINEAR "
                         f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
@@ -4852,7 +4921,7 @@ def plan_and_execute(node):
                 _tip_approach_tcp, _ = closure_center_corrected_tcp(
                     _tip_approach_closure, orientation, _tip_offset_tcp)
                 ax, ay, az = _tip_approach_tcp
-                node.get_logger().debug(
+                node.get_logger().info(
                     "[TOOL_AXIS_AIM] class=MID_HIGH source=DATE_TIP_3D "
                     "geometry=COLLINEAR "
                     f"tip=[{_tip_anchor[0]:.3f},{_tip_anchor[1]:.3f},"
@@ -5417,10 +5486,36 @@ def plan_and_execute(node):
                         # on its own. Entry density is sized to hold that leg at
                         # approach_entry_duration_s even though the staging leg now
                         # runs fast (uniform dt => spacing is speed).
-                        def _entry_leg(_last_js, _dt, _pose=list(_alignment_pose),
+                        def _entry_leg(_last_js, _dt, _join_step=None,
+                                       _pose=list(_alignment_pose),
                                        _target=list(approach)):
+                            # Start the straight leg from where the staged path
+                            # ACTUALLY ends, not from the nominal alignment pose.
+                            #
+                            # The overshoot trim removes a few waypoints, so
+                            # states[-1] sits short of _alignment_pose. Building
+                            # the entry leg from the nominal pose then leaves a
+                            # joint discontinuity at the junction, and
+                            # build_trajectory retimes the WHOLE trajectory to
+                            # respect it: dt = max(dt, sqrt(accel_bound/max_acc)).
+                            # A 1.2deg jump inflates dt from 10ms to ~167ms and
+                            # turns a 1.63s approach into ~27s, which is why the
+                            # arm was only halfway through the leg when the 10s
+                            # settle timeout fired (2026-09-16).
+                            #
+                            # Orientation is fixed through the approach, so only
+                            # the start position needs correcting.
+                            _start = list(_pose)
+                            try:
+                                _fk = pose_from_joints(node, list(_last_js))
+                                if _fk:
+                                    _start[:3] = [float(v) for v in _fk[:3]]
+                            except Exception as _fx:
+                                node.get_logger().warn(
+                                    f"[ENTRY] FK for the junction failed ({_fx}); "
+                                    "using the nominal alignment pose")
                             _extra = straight_cartesian_entry_states(
-                                node, _last_js, _pose[:3], _pose[3:], _target,
+                                node, _last_js, _start[:3], _start[3:], _target,
                                 _dt, label="APPROACH_CARTESIAN")
                             if _extra:
                                 # Reverse replays only the near-fruit leg, as before.
@@ -5902,7 +5997,7 @@ def plan_and_execute(node):
          _mode_z_extra, _mode_axis) = _apply_mode_final_adjustment(
             desired_grasp_xyz, orientation)
         gx, gy, gz = desired_grasp_xyz
-        node.get_logger().debug(
+        node.get_logger().info(
             f"[GRIPPER_MODE] mode={_grasp_mode} "
             f"depth_extra={_mode_depth_extra*1000:+.1f}mm "
             f"z_extra={_mode_z_extra*1000:+.1f}mm "

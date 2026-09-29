@@ -560,7 +560,18 @@ class VisionNode:
         self.tf_buffer = None
         if not raw_yolo_view:
             self.tf_buffer = Buffer()
-            TransformListener(self.tf_buffer, self.node)
+            # spin_thread=True gives the listener its own executor and thread.
+            #
+            # Without it the /tf subscription lands in the node's default,
+            # mutually-exclusive callback group, queued behind a main loop that
+            # spends 100-240ms per iteration on YOLO and target extraction. The
+            # buffer then trails real time by 28ms median / 48ms p90 even though
+            # raw /tf arrives in ~1.5ms, and every lookup at an image stamp
+            # fails as "extrapolation into the future".
+            #
+            # That is a scheduling problem, not a transport one, so decouple the
+            # listener from the work that is starving it.
+            TransformListener(self.tf_buffer, self.node, spin_thread=True)
             required_tfs = [("base_link", self.cam_frame), ("gripper_tip", self.cam_frame)]
             for target, source in required_tfs:
                 wait_for_transform(self.tf_buffer, target, source, self.node, timeout=5.0)
@@ -887,6 +898,7 @@ class VisionNode:
                         viz_only=viz_only,
                         lidar_uv=uv_lidar,
                         lidar_pts_cam=pts_lidar,
+                        only_best=bool(getattr(self, "_is_flower_model", False)),
                     )
                     verification = self.visualizer.last_fingertip_verification
                     self.fingertip_verification_pub.publish(
@@ -950,6 +962,7 @@ class VisionNode:
             bunch_boxes  = []
             _YOLO_STALE_DRIFT = 0.008  # 8 mm — discard cached dets if camera drifted this far
             _last_viz_t = 0.0          # wall time of last visualization enqueue
+            _last_detection_result_t = None
             # Keep RViz/control local on Jetson, but cap only the expensive
             # annotated camera encoding/publication to 5 FPS. Detection, robot
             # state, commands and motion feedback retain their normal rates.
@@ -989,7 +1002,13 @@ class VisionNode:
                 except queue.Full:
                     pass
 
-            def _enqueue_raw_viz_frame():
+            def _enqueue_raw_viz_frame(force=False):
+                # Keep the last annotated image between inference results.
+                # Blank camera frames must not take the 5 Hz overlay slots.
+                # On pause/startup or a stalled detector, show live raw video.
+                if (not force and _last_detection_result_t is not None
+                        and time() - _last_detection_result_t < 0.5):
+                    return
                 _enqueue_viz_frame([], [], None, [], None, None)
 
             # ZED X Mini capture must not be paced by per-date geometry.  Keep
@@ -1179,7 +1198,7 @@ class VisionNode:
                     _inference_packet = None
                     self.yolo_thread.dets_ready.clear()
                     _capture_depth_request.set()
-                    _enqueue_raw_viz_frame()
+                    _enqueue_raw_viz_frame(force=True)
                     continue
                 else:
                     self.yolo_thread.paused = False
@@ -1244,6 +1263,7 @@ class VisionNode:
                 current_raw_viz = self.yolo_thread.get_raw_viz()
                 _latest_yolo_timing = self.yolo_thread.get_latest_timing()
                 fresh_detections = True
+                _last_detection_result_t = time()
                 trunk_boxes = self.yolo_thread.get_trunk_boxes()
                 bunch_boxes = self.yolo_thread.get_bunch_boxes()
 
@@ -1251,13 +1271,27 @@ class VisionNode:
                 try:
                     self._cached_tf_base = self._lookup_tf_at_image("base_link")
                     self._cached_tf_grip = self._lookup_tf_at_image("gripper_tip")
-                except Exception:
+                except Exception as exc:
                     self._cached_tf_base = self._cached_tf_grip = None
+                    # 2D detections remain displayable without a robot transform.
+                    # Use the inference image so boxes are never drawn on a later frame.
+                    raw_result = self.yolo_thread.get_raw_result()
+                    if raw_result is not None:
+                        _display_only = [dict(item, **{
+                            "class": str(item.get("class", "date")) + " (2D only: TF unavailable)"
+                        }) for item in raw_result["detections"]]
+                        _enqueue_viz_frame([], [], None, _display_only,
+                                           source_image=raw_result["image"])
+                    _now_tf = time()
+                    if _now_tf - getattr(self, "_last_display_tf_warning", 0.0) > 5.0:
+                        self._last_display_tf_warning = _now_tf
+                        self.node.get_logger().warn(f"[VISION] 2D detections only; acquisition TF unavailable: {exc}")
                     continue
                 _cur_t = self._cached_tf_base[1]
                 _prev_t = getattr(self, '_prev_cam_t', None)
                 if _prev_t is not None and float(np.linalg.norm(_cur_t - _prev_t)) > 0.005:
-                    self.tracker.detection_history.clear()
+                    # Tracks live in base_link: camera motion must not reset
+                    # their confirmation. Reset only camera-dependent geometry.
                     self.direction_history.clear()
                     self.best_history.clear()
                     self._cached_heatmaps.clear()
@@ -1339,10 +1373,18 @@ class VisionNode:
                 )
                 _t3 = time()
 
+                # Show detections immediately, while motion still uses only
+                # confirmed tracks. A first observation is visible as confirming.
+                _extracted_targets = targets
                 if fresh_detections:
-                    # Update temporal state once per new inference result, not
-                    # once per reused camera-loop detection.
                     targets = self.tracker.stabilize_detections(targets)
+                _confirmed_ids = {target["fruit_id"] for target in targets}
+                _confirming_viz = [
+                    {"bb": target["bb"], "class": "date (confirming)",
+                     "conf": float(target.get("confidence", 0.0))}
+                    for target in _extracted_targets
+                    if target["fruit_id"] not in _confirmed_ids
+                ]
 
                 if fresh_detections:
                     _full_profile_count += 1
@@ -1482,11 +1524,39 @@ class VisionNode:
                 })
                 self.fruit_observation_pub.publish(_obs_msg)
 
-                _fv_best, _fv_area = None, -1.0
+                # Single detection, highest confidence -- not the largest mask.
+                # Pollination's own scoring sweep (_score_pose_here) already
+                # ranks VIEWING POSES by mask area, where that is the right
+                # metric (apparent size tracks view angle, confidence jitters).
+                # This is a different question: which detected blob, in ONE
+                # frame that may hold several flowers, is the one to report at
+                # all. There the largest mask picked whichever flower happened
+                # to be biggest in frame, which could differ from the flower
+                # the run is actually after; confidence is the model's own
+                # answer to "which of these is really a flower" and does not
+                # have that failure mode.
+                _fv_best, _fv_conf = None, -1.0
                 for _t in _targets_by_score:
-                    _a = float(_t.get("mask_area_px", 0) or 0)
-                    if _a > _fv_area and _t.get("pt_base") is not None:
-                        _fv_best, _fv_area = _t, _a
+                    _c = float(_t.get("confidence", 0) or 0)
+                    if _c > _fv_conf and _t.get("pt_base") is not None:
+                        _fv_best, _fv_conf = _t, _c
+                _fv_area = float(_fv_best.get("mask_area_px", 0) or 0) if _fv_best else 0.0
+
+                # Make the on-screen SELECTED highlight (and, with only_best in
+                # _viz_worker, the ONLY box drawn) agree with what pollination
+                # actually acts on. best_idx above came from _select_best_fruit,
+                # which is tuned for grasping -- it scores by distance-to-grasp
+                # and other date-specific factors that have no meaning for a
+                # flower the arm only orbits and sprays. Left alone, the
+                # display could highlight (or, with only_best, show only) a
+                # different blob than the one _fv_best just picked, which is
+                # confusing at best when there are two flowers in frame.
+                if getattr(self, "_is_flower_model", False) and _fv_best is not None:
+                    for _bi, _bt in enumerate(targets):
+                        if _bt is _fv_best:
+                            best_idx = _bi
+                            break
+
                 _fv_msg = Float32MultiArray()
                 if _fv_best is None:
                     _fv_msg.data = [0.0] * 6
@@ -1602,13 +1672,13 @@ class VisionNode:
                     _enqueue_viz_frame(
                         _tgts_lite, rejected_targets,
                         best_idx,
-                        [],   # no trunk/bunch polygon overlays in reacquire mode
+                        _confirming_viz,   # display-only unconfirmed observations
                         uv_l if use_lidar else None,
                         pts_cam_l if use_lidar else None,
                     )
                     continue
 
-                trunk_viz = []
+                trunk_viz = list(_confirming_viz)
                 for bx1, by1, bx2, by2 in trunk_boxes:
                     tx1 = max(0, min(int(bx1 * image_scale[0]), image_left_ocv.shape[1] - 1))
                     ty1 = max(0, min(int(by1 * image_scale[1]), image_left_ocv.shape[0] - 1))
@@ -1931,9 +2001,31 @@ class VisionNode:
         stamp = self._latest_image_stamp
         if stamp is None:
             raise RuntimeError("No image timestamp available for localization")
-        return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
-            target_frame, self.cam_frame, stamp,
-            timeout=rclpyDuration(seconds=0.01)))
+        try:
+            return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
+                target_frame, self.cam_frame, stamp,
+                timeout=rclpyDuration(seconds=0.01)))
+        except Exception as exc:
+            # The image stamp is taken right after grab() returns and /tf
+            # arrives about every 1.5ms, so the stamp is routinely a hair NEWER
+            # than the newest transform -- observed 2026-09-16 as a 1.7ms
+            # "extrapolation into the future". Letting that propagate drops the
+            # entire frame: no targets, no tracker update, no goal.
+            #
+            # Using the latest transform instead costs ~0.5mm at 0.3 m/s tool
+            # speed for a 1.7ms gap. That is far cheaper than discarding the
+            # detection, so fall back rather than fail, and say so at most once
+            # every 5s since it is expected to happen occasionally.
+            _now = time()
+            if _now - getattr(self, "_last_tf_stamp_warn_t", 0.0) > 5.0:
+                self._last_tf_stamp_warn_t = _now
+                self.node.get_logger().warn(
+                    f"[TF] no {target_frame}<-{self.cam_frame} at the image "
+                    f"stamp ({exc}); using latest — adds pipeline latency to "
+                    "position error")
+            return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
+                target_frame, self.cam_frame, rclpyTime(),
+                timeout=rclpyDuration(seconds=0.02)))
 
     def _publish_camera_status(self) -> None:
         pub = getattr(self, "_camera_status_pub", None)

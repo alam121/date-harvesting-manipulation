@@ -64,16 +64,13 @@ _NEW_LAB_JOINTS = {
 }
 
 _OLD_LAB_JOINTS = {
-    # Re-taught on the rig 2026-09-14 by jogging the arm and reading
-    # /joint_states. TCP at this pose (base_link):
-    #   xyz  [0.29739, -1.01013, 0.34247]
-    #   quat [0.44906, 0.34690, 0.40271, -0.71821]  (x, y, z, w)
-    # Previous value, kept for reference in case the new one needs backing out:
-    #   [-1.4994238058673304, -0.7151940625957032, 1.7512252966510218,
-    #    -4.656813760797018, -1.7659905592547815, 1.1700091361999512]
+    # Re-taught on the lab rig 2026-09-16 from measured /joint_states.
+    # Previous HOME:
+    #   [-1.3516314665423792, -0.6408413213542481, 1.5598562399493616,
+    #    -4.552072664300436, -1.8974092642413538, 1.0977357625961304]
     "home": [
-        -1.3516314665423792, -0.6408413213542481, 1.5598562399493616,
-        -4.552072664300436, -1.8974092642413538, 1.0977357625961304,
+        -1.352599, -0.582120, 1.307726,
+        2.136123, -1.784902, -1.059150,
     ],
     "dropoff": [
         -1.90818959871401, -1.079150215988495, 2.008786980305807,
@@ -191,7 +188,15 @@ _LAB_GRASP_OFFSETS = {
     "low_side_final_depth_offset": 0.020,
     "low_left_final_z_offset": 0.020,
     "low_right_final_z_offset": 0.010,
-    "low_center_final_depth_offset": 0.020,
+    # 0.020 -> 0.005 -> -0.015 (2026-09-16/17). The 0.020 was measured at
+    # ~1.02 m range. At the ~1.39 m the rig now works at, 0.020 put the closure
+    # 12 mm behind the far surface of an 8.0 mm-radius date, and 0.005 still
+    # missed: a fresh REACQ observation, closure 5 mm past it, arm within
+    # 0.2 mm, 0/3 contacts, and the gripper visibly went AHEAD of the date --
+    # vision reports the date nearer than it is. Negative stops SHORT of the
+    # vision estimate. -0.015 is the first test value in that direction, not a
+    # measurement yet. Range-dependent correction points at the depth scale.
+    "low_center_final_depth_offset": -0.015,
     "low_center_final_z_offset": 0.0,
     "mid_center_final_depth_offset": 0.020,
     "mid_center_final_z_offset": 0.0,
@@ -472,6 +477,13 @@ class Planner:
     # reaches, not open-ended novel scenes) -- watch plan success rate and
     # trajectory smoothness on real grasps before trusting a value long-term.
     num_trajopt_seeds: int = int(os.environ.get("UR10E_NUM_TRAJOPT_SEEDS", "2"))
+    # 0.5 -> 1.0 on 2026-09-16. Every phase speed is divided by this, and at
+    # 0.5 the gross moves were saturated against max_dt: speed_home=0.35 asked
+    # for 114ms and got clamped to the 80ms ceiling, so HOME and DROPOFF were
+    # running as slowly as the system allows and the tuning next to them did
+    # nothing. FINAL is unaffected -- 0.06 still asks for 333ms and is still
+    # clamped to 80ms -- so this speeds the gross motion without touching the
+    # one leg that is genuinely near the fruit.
     speed_scale: float = 0.5
     base_dt: float = 0.02          # common base timestep (s)
 
@@ -524,13 +536,42 @@ class Planner:
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions
     max_joint_velocity: float = 1.5      # rad/s max velocity per joint
+    # 1.5 -> 7.5 on 2026-09-16. The UR10e declares has_acceleration_limits:
+    # false, so this was never a robot constraint -- it is our own ceiling, and
+    # every call site scales DOWN from it: x0.5 for reverse/dropoff/home gave
+    # 0.75 rad/s^2 and x0.3 for FINAL gave 0.45.
+    #
+    # build_trajectory retimes to dt = max(dt, sqrt(accel_bound/max_acc)), so a
+    # low ceiling silently stretched every phase: measured reverse 21.2s,
+    # dropoff 11.0s, home 10.5s against a ~20s whole cycle previously. The
+    # retime can only make a trajectory SLOWER than the dt its phase asked for,
+    # so raising this lets each phase reach its intended speed and never
+    # exceeds it -- speed_final's 80ms clamp still governs FINAL.
     max_joint_acceleration: float = 1.5  # rad/s^2 max acceleration (lower = less jerk at end)
-    ramp_points: int = 15                # number of points for accel/decel ramps
+    # Spread the rest-to-cruise transition over this many samples at each end
+    # so one end segment cannot set dt for the whole path (see build_trajectory).
+    # Interval k of the ramp lasts ramp_points/k times dt, so the ramp costs
+    # 2*dt*R*H(R) -- superlinear in R. At 15 that was 14.2s on a dt=142ms
+    # reverse, far more than the retime it saved. 4 keeps the end spike excluded
+    # for ~1/6 of the cost.
+    ramp_points: int = 4                 # number of points for accel/decel ramps
+    # Re-bound trajectories against Hermite derivative limits in
+    # build_trajectory(). Added 072f0dafc; before that every phase ran at the dt
+    # cuRobo asked for, which is how the ~20s cycles were measured. Turning it
+    # on stretched reverse from 1.6s to 16s on an identical 70-state path, so it
+    # is off by default. Runtime: ros2 param set <node> planner.retime_trajectories true
+    retime_trajectories: bool = False
 
     # === TRAJECTORY LIMITS ===
     # These control how fast trajectories can actually execute
     min_dt: float = 0.010                # minimum timestep — keep ≥0.010 to avoid UR joint velocity limit faults
-    max_dt: float = 0.08                 # allow slow approach/final trajectories
+    # FINAL's per-step time is pinned here, not by speed_final: 0.5*0.06 gives a
+    # raw request of 667ms, clamped straight down to this ceiling. Nothing else
+    # comes close -- home/dropoff/predropoff go through the min_dt floor
+    # instead (see speed_home's comment), and APPROACH/REVERSE use different dt
+    # mechanisms entirely -- so this is in practice a FINAL-only knob. Raised
+    # 0.08 -> 0.12 (2026-09-17): the close-in was pushing the date on contact.
+    max_dt: float = 0.12                 # allow slow approach/final trajectories
     approach_endpoint_settle_s: float = 0.25  # let zero-velocity endpoint finish; avoid hold preemption
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
     approach_max_joint_step_deg: float = 12.0  # reject APPROACH plans with abrupt per-waypoint joint jumps
@@ -785,7 +826,18 @@ class Planner:
     # from debug to info. Set back to False once the corridor question is
     # settled -- it is several lines per goal.
     log_corridor_candidates: bool = True
-    tool_axis_tip_aim_enabled: bool = True
+    # Disabled 2026-09-16 after measuring the tip-anchored FINAL geometry at
+    # ~1.39 m range: the detected tip sat 21.3 mm from the date centre (fruit
+    # radius 8.0 mm, so the anchor is already outside the fruit), and
+    #     _tip_anchored_final_grasp = _tip_anchor - _tip_depth * insert_dir
+    # backs a further _tip_depth AWAY from the fruit, landing the closure centre
+    # 33.5 mm from the date -- 0/3 contacts with the outer fingers at 8 mA.
+    # The sign is opposite to the corridor path, where add_axis_offsets(
+    # depth=-offset) drives TOWARD the fruit, and _tip_depth = abs(...) makes
+    # the corrective sign unreachable, so no value of
+    # low_center_final_depth_offset can centre the closure while this is on.
+    # Re-enable only with that sign fixed.
+    tool_axis_tip_aim_enabled: bool = False
     tool_axis_tip_max_age_s: float = 0.50
     # The detected tip is naturally displaced from the fruit centroid.  Keep
     # the proven 80 mm association gate; 15 mm rejected valid date tips and
@@ -1229,6 +1281,10 @@ class Pollination:
     # stops at each pose to look -- so that slowness buys nothing and costs
     # ~1.5s per arc leg. Move at a normal scan speed instead.
     arc_speed_factor: float = 0.08
+    # Re-enable the trajectory retimer for the whole pollination run (it is off
+    # for harvest). Pollination's speeds were tuned with it on; without it every
+    # arc leg and flower approach runs noticeably faster than it was set up for.
+    slow_motion: bool = True
     # Time to let the arm settle and vision produce fresh frames at each pose
     # before the mask area is read.
     # settle_s is NOT slack -- it is vision's recovery time. Every arc leg moves
@@ -1325,10 +1381,43 @@ class Pollination:
     # Z onto the flower; capped, because a large orientation change near the
     # plant risks an IK branch flip.
     aim_tool_at_flower: bool = True
-    # Raised 25 -> 35 -> 45: runs needed 26deg, then 38deg, and were capped each
-    # time, leaving the gripper a few degrees off-axis. The cap exists to avoid
-    # IK branch flips, so it is loosened, not removed.
+    # Raised 25 -> 35 -> 45 -> 65 -> reverted to 45 (2026-09-17). 65 was tried
+    # after a 59deg run, on the theory that closing the aim gap would shrink
+    # POLLINATION_APPROACH's own joint delta back down. The very next run
+    # needed 75deg and proved the opposite: a bigger commanded swing hit the
+    # branch-flip risk the cap exists for -- "IK too far (101.1deg)" on the
+    # first attempt, a second attempt landing only 39deg of the 65 (log:
+    # "a full turn flipped the IK branch") -- and APPROACH then needed
+    # 109.6deg, worse than the 82.5deg it needed at cap=45.
+    #
+    # 26 -> 38 -> 59 -> 75deg needed, back to back, is not noise to chase with
+    # a bigger cap; it is the arc sweeping 30-40cm BELOW the flower by design
+    # (arc_at_current_height) forcing an ever-larger swing once the arm climbs
+    # to spray. The cap should stay near where branch flips are still rare;
+    # the actual fix is levelling the sweep with the flower instead of asking
+    # AIM to correct a steep viewing angle after the fact -- see
+    # arc_at_current_height below.
     aim_max_deg: float = 45.0
+    # Climb part of the way toward the standoff position BEFORE attempting the
+    # big in-place reorientation, instead of turning fully then translating.
+    # Added 2026-09-17 once raising aim_max_deg proved the wrong lever (see the
+    # comment above): the swing needed is not noise (26/38/59/75deg across four
+    # consecutive runs) but the arc sweeping 30-40cm below the flower by
+    # design, so the in-place rotation is always attempted from a pose whose
+    # natural joint configuration has little to do with the standoff's.
+    #
+    # The Cartesian angle between start and target orientation does not depend
+    # on position -- climbing first does not shrink _swing. What it changes is
+    # which IK branch the solver lands nearest: a pose physically close to
+    # where the standoff sits is far more likely to share its wrist
+    # configuration than one 30-40cm below it aimed steeply upward.
+    # Translations rarely need branch flips (see _rotate_towards's docstring),
+    # so do the safe move first and attempt the SAME reorientation again from
+    # there. Trades leaf-contact margin arc_at_current_height exists to protect
+    # for a better shot at the direct standoff -- only engages above the
+    # threshold, so small, uneventful swings are unaffected.
+    climb_before_aim_deg_threshold: float = 30.0
+    climb_before_aim_fraction: float = 0.6
     # standoff_m is the distance from the GRIPPER TIP to the flower, not from
     # the TCP. gripper_tip sits [0, 0, 0.221] in tool0 -- 22.1cm straight out
     # along the pointing axis -- so a TCP-measured standoff was wildly wrong:

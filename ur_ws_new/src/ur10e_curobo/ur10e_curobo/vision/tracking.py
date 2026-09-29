@@ -5,6 +5,13 @@ import threading
 from time import time
 from typing import Dict, List, Any
 
+# Nearest-neighbour association in base_link. 15mm was tight against real
+# measurement jitter -- an arm moving at 0.3 m/s with 28ms of TF lag is already
+# ~8mm, before depth noise -- and every miss created a duplicate registry entry.
+ASSOCIATION_RADIUS_M = 0.025
+# Two candidates this close in distance are treated as a tie.
+AMBIGUITY_MARGIN_M = 0.003
+
 from .config import (
     FRUIT_ID_TIMEOUT,
     MAX_FRUIT_ATTEMPTS,
@@ -30,6 +37,7 @@ class FruitTracker:
         with self._registry_lock:
             self._claimed_ids.clear()
             self.cleanup_old_fruit_ids()
+            self._merge_duplicate_ids()
 
     def associate_fruit(self, position_xyz):
         """Nearest base-frame association, with at most one detection per ID."""
@@ -37,15 +45,56 @@ class FruitTracker:
             matches = sorted((math.dist(position_xyz, info["position"]), fid)
                              for fid, info in self.fruit_id_registry.items()
                              if fid not in self._claimed_ids)
-            ambiguous = len(matches) > 1 and matches[1][0] - matches[0][0] < 0.003
-            if matches and matches[0][0] <= 0.015 and not ambiguous:
-                fruit_id = matches[0][1]
-            else:
+            fruit_id = None
+            if matches and matches[0][0] <= ASSOCIATION_RADIUS_M:
+                # Ambiguity only matters when the two candidates are genuinely
+                # DIFFERENT fruit. If the top two registry entries sit within
+                # the association radius of each other they are duplicate
+                # records of the same fruit, and refusing to match simply mints
+                # a third -- which makes the next frame more ambiguous still.
+                #
+                # That is a trap with no exit: one frame of >radius jitter
+                # creates the first duplicate, and from then on a completely
+                # stationary date gets a fresh id every frame, never reaches
+                # MIN_FRAMES_TO_SHOW, and never reaches the goal publisher.
+                # Reproduced 2026-09-16 with /vision/all_fruit_poses publishing
+                # an empty list at 4.8 Hz while YOLO was detecting normally.
+                ambiguous = False
+                if (len(matches) > 1
+                        and matches[1][0] - matches[0][0] < AMBIGUITY_MARGIN_M):
+                    p0 = self.fruit_id_registry[matches[0][1]]["position"]
+                    p1 = self.fruit_id_registry[matches[1][1]]["position"]
+                    ambiguous = math.dist(p0, p1) > ASSOCIATION_RADIUS_M
+                if not ambiguous:
+                    fruit_id = matches[0][1]
+            if fruit_id is None:
                 fruit_id = self._next_fruit_id
                 self._next_fruit_id += 1
             self._claimed_ids.add(fruit_id)
             self.register_fruit(fruit_id, list(position_xyz))
             return fruit_id
+
+    def _merge_duplicate_ids(self) -> None:
+        """Drop registry entries that describe the same fruit.
+
+        Belt and braces for the trap above: even with the ambiguity fix, a
+        duplicate can still be created legitimately (a fruit seen, lost for
+        >MAX_FRAMES_TO_KEEP, then re-detected). Left in place they accumulate
+        and make association steadily less certain, so collapse them on the
+        entry that has been seen most recently.
+        """
+        ids = sorted(self.fruit_id_registry,
+                     key=lambda f: self.fruit_id_registry[f]["last_seen"],
+                     reverse=True)
+        keep = []
+        for fid in ids:
+            pos = self.fruit_id_registry[fid]["position"]
+            if any(math.dist(pos, self.fruit_id_registry[k]["position"])
+                   <= ASSOCIATION_RADIUS_M for k in keep):
+                del self.fruit_id_registry[fid]
+                self._claimed_ids.discard(fid)
+            else:
+                keep.append(fid)
 
     def increment_fruit_attempt(self, position_xyz: List[float]) -> None:
         """

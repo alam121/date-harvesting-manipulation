@@ -106,13 +106,15 @@ def ease_in_head(states: List[List[float]], head_count: int) -> List[List[float]
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float = 0.1, dt: float = 0.02,
                      stop_flag: Optional[Callable[[], bool]] = None,
                      max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8,
-                     include_acc: bool = False) -> JointTrajectory:
+                     include_acc: bool = False,
+                     enforce_limits: bool = True) -> JointTrajectory:
     """Build a uniformly retimed Hermite trajectory within derivative limits.
 
     Exact cubic extrema (or Bernstein bounds for quintics) cover interpolation
     between samples, including zero-velocity endpoints. The measured-state-to-first-point bridge must be
     supplied by the caller; it cannot be validated without the measured state.
     """
+    build_trajectory.last_retime = None   # cleared per call, not per retime
     msg = JointTrajectory()
     msg.joint_names = joint_names
     states_list = list(states)
@@ -130,7 +132,16 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
         v[1:-1] = (q[2:] - q[:-2]) / 2.0
         if include_acc:
             a[1:-1] = q[2:] - 2.0*q[1:-1] + q[:-2]
-    if len(q) > 1:
+    _acc_prof = None
+    _ramp = 0
+    # Until 072f0dafc this function emitted positions at a constant dt and let
+    # cuRobo's own velocity profiling stand -- that is the behaviour the ~20s
+    # cycles were measured with. The Hermite bounding below can only ever make
+    # a trajectory slower, and on a cuRobo plan it re-limits a path that was
+    # already dynamically feasible, using a cruder estimate. Callers that pass
+    # a cuRobo-profiled path therefore opt out; callers that synthesise their
+    # own waypoints keep it.
+    if len(q) > 1 and enforce_limits:
         if include_acc:
             controls = np.stack((q[:-1], q[:-1]+v[:-1]/5,
                 q[:-1]+2*v[:-1]/5+a[:-1]/20,
@@ -148,23 +159,116 @@ def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel:
             np.divide(-c2, 3*c3, out=extremum, where=np.abs(c3) > 1e-15)
             extremum = np.clip(extremum, 0.0, 1.0)
             interior_v = v[:-1] + 2*c2*extremum + 3*c3*extremum**2
+            _acc_prof = np.maximum(np.abs(2*c2), np.abs(2*c2+6*c3))
             speed_bound = max(float(np.max(np.abs(v))), float(np.max(np.abs(interior_v))))
-            accel_bound = max(float(np.max(np.abs(2*c2))),
-                              float(np.max(np.abs(2*c2+6*c3))))
-        dt = max(dt, speed_bound/max_vel, math.sqrt(accel_bound/max_acc))
+            accel_bound = float(np.max(_acc_prof))
+        # The first and last segments carry an artificial rest-to-cruise jump:
+        # v[0] and v[-1] are pinned to zero while their neighbours already hold
+        # a full sample step, so a cubic through them demands an acceleration
+        # that no interior segment needs. Under a single uniform dt that one
+        # segment sets the pace for the whole path, which makes total duration
+        # scale as sqrt(len(q)) -- the same move emitted at 276 waypoints took
+        # 3x longer than at 30. Bound dt on the interior instead and give the
+        # ends their own stretched intervals below, so the ramp costs a few
+        # long intervals at each end rather than slowing every point.
+        _ramp = 0
+        if _acc_prof is not None and ramp_points > 0 and len(q) >= 4:
+            _ramp = min(int(ramp_points), (len(q) - 1) // 3)
+        if _ramp >= 2:
+            _interior = _acc_prof[_ramp:-_ramp]
+            if _interior.size:
+                accel_bound = float(np.max(_interior))
+        else:
+            _ramp = 0
+        _dt_req = dt
+        _dt_vel = speed_bound / max_vel
+        _dt_acc = math.sqrt(accel_bound / max_acc)
+        dt = max(dt, _dt_vel, _dt_acc)
+        # Report when the retime actually bites. The caller logs the dt it
+        # ASKED for, so a trajectory silently stretched here looks like a fast
+        # plan that the arm mysteriously fails to finish.
+        if dt > _dt_req * 1.05:
+            _why = "acceleration" if _dt_acc >= _dt_vel else "velocity"
+            _spike = ""
+            if _why == "acceleration" and _acc_prof is not None:
+                # Report the peak that actually SET dt, i.e. the one inside the
+                # window accel_bound was taken over. The global peak normally
+                # sits on an end segment the ramp already excluded, so quoting
+                # it here would name a spike that is no longer costing anything.
+                _flat = _acc_prof.max(axis=1)              # worst joint per segment
+                _lo, _hi = (_ramp, len(_flat) - _ramp) if _ramp else (0, len(_flat))
+                _win = _flat[_lo:_hi]
+                _i = _lo + int(np.argmax(_win))
+                _p95 = float(np.percentile(_win, 95))
+                _dt95 = math.sqrt(_p95 / max_acc)
+                _spike = (f" | binding acc at seg {_i}/{len(_flat)}"
+                          f" ({100.0*_i/max(1,len(_flat)-1):.0f}% along),"
+                          f" peak={float(_flat[_i]):.5f} p95={_p95:.5f}"
+                          f" ratio={float(_flat[_i])/max(_p95,1e-12):.1f}x;"
+                          f" at p95 dt would be {_dt95*1000:.1f}ms"
+                          f" -> {len(q)*max(_dt_req,_dt95):.1f}s")
+                if _ramp:
+                    _spike += (f"; ramp={_ramp} excluded ends"
+                               f" (end peak {float(_flat.max()):.5f})")
+            build_trajectory.last_retime = (
+                f"dt {_dt_req * 1000:.1f}ms -> {dt * 1000:.1f}ms "
+                f"({dt / _dt_req:.1f}x, limited by {_why}: "
+                f"vel_term={_dt_vel * 1000:.1f}ms acc_term={_dt_acc * 1000:.1f}ms, "
+                f"max_vel={max_vel:.2f} max_acc={max_acc:.2f}) "
+                f"-> {len(q) * dt:.1f}s total" + _spike)
+        else:
+            build_trajectory.last_retime = None
     # Round upward once so serialized intervals do not undershoot the bound.
     step_ns = max(1, math.ceil(dt * 1e9))
     dt = step_ns / 1e9
+
+    # Per-interval durations. Uniform through the body; the ramp intervals are
+    # stretched so velocity climbs to cruise over `_ramp` steps instead of one.
+    # Holding position spacing fixed, a linear velocity ramp wants the k-th
+    # interval to last _ramp/k times as long, so the ends stay within max_acc
+    # without the interior paying for them. The path itself is not moved.
+    n_int = max(0, len(q) - 1)
+    steps_ns = [step_ns] * n_int
+    if _ramp >= 2 and n_int >= 2 * _ramp:
+        for k in range(1, _ramp + 1):
+            stretched = max(1, math.ceil(step_ns * _ramp / k))
+            steps_ns[k - 1] = stretched            # accelerating out of rest
+            steps_ns[n_int - k] = stretched        # decelerating back to rest
+
+    stamps_ns = [0] * len(q)
+    for i in range(1, len(q)):
+        stamps_ns[i] = stamps_ns[i - 1] + steps_ns[i - 1]
+
+    # Report the duration actually emitted. len(q)*dt is the UNIFORM estimate
+    # and ignores the stretched ramp intervals, which at a large dt dominate
+    # the trajectory -- a 70-state reverse at dt=142ms with ramp=15 really runs
+    # 19.7s, not the 10.0s a uniform count implies.
+    if build_trajectory.last_retime and _ramp:
+        _actual = (stamps_ns[-1] + step_ns) / 1e9
+        _uniform = len(q) * dt
+        build_trajectory.last_retime += (
+            f"; ACTUAL {_actual:.1f}s "
+            f"({_actual - _uniform:+.1f}s from ramp={_ramp})")
+
     for i, positions in enumerate(q):
         if stop_flag and stop_flag():
             msg.points.clear()
             return msg
         pt = JointTrajectoryPoint()
         pt.positions = positions.tolist()
-        pt.velocities = (v[i]/dt).tolist()
+        # v/a are per unit sample interval, so divide by the LOCAL interval,
+        # not the nominal dt, or the stretched ends would be reported as
+        # travelling at cruise speed while actually crawling.
+        # A single-point trajectory has no intervals at all, so fall back to
+        # the nominal step rather than indexing an empty list.
+        prev_ns = steps_ns[i - 1] if i > 0 else (steps_ns[0] if steps_ns else step_ns)
+        next_ns = steps_ns[i] if i < n_int else (steps_ns[-1] if steps_ns else step_ns)
+        local_dt = 0.5 * (prev_ns + next_ns) / 1e9
+        pt.velocities = (v[i]/local_dt).tolist()
         if include_acc:
-            pt.accelerations = (a[i]/(dt*dt)).tolist()
-        stamp_ns = (i+1)*step_ns
+            pt.accelerations = (a[i]/(local_dt*local_dt)).tolist()
+        # Stamps must be strictly increasing and start after t=0.
+        stamp_ns = stamps_ns[i] + step_ns
         pt.time_from_start.sec, pt.time_from_start.nanosec = divmod(stamp_ns, 1_000_000_000)
         msg.points.append(pt)
     return msg
@@ -205,7 +309,28 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
 
             # Completion requires the current pose, never a past closest approach.
             if time.monotonic() > _deadline:
-                node.get_logger().warn("Timeout waiting for a settled target pose.")
+                # Say WHERE it got to. "Timeout" alone cannot distinguish
+                # "stopped 2mm short and never settled" from "stopped 5cm short"
+                # from "never moved" -- three different faults with three
+                # different fixes.
+                _c = None
+                try:
+                    _c = node.get_end_effector_pose()
+                except Exception:
+                    pass
+                _d = math.dist(_c[:3], target_xyz) if _c else float("nan")
+                _v = getattr(node, 'current_joint_velocities', None)
+                _vmax = (max(abs(float(x)) for x in _v)
+                         if _v is not None and len(_v) else float("nan"))
+                node.get_logger().warn(
+                    f"Timeout waiting for a settled target pose. "
+                    f"now={_d * 1000:.1f}mm from target, "
+                    f"closest={_min_dist_seen * 1000:.1f}mm, tol={tol * 1000:.1f}mm, "
+                    f"max|jointvel|={_vmax:.4f} (needs <=0.0100 to count as settled), "
+                    f"at=[{_c[0]:.3f},{_c[1]:.3f},{_c[2]:.3f}] "
+                    f"target=[{target_xyz[0]:.3f},{target_xyz[1]:.3f},{target_xyz[2]:.3f}]"
+                    if _c else
+                    "Timeout waiting for a settled target pose. EE pose unavailable")
                 stalled = True
                 break
 
@@ -385,3 +510,18 @@ def compute_visibility_approach(node, x, y, z, dist=0.15):
     az = z - cam_fwd[2] * dist
 
     return ax, ay, az
+
+
+def log_retime(node, label):
+    """Emit build_trajectory()'s last retime, if it bit, against `label`.
+
+    build_trajectory() can only ever make a trajectory SLOWER than the dt its
+    caller asked for, and it does so silently. Without this the phase logs a
+    fast dt and then appears to take an unexplained multiple of it.
+    """
+    detail = getattr(build_trajectory, "last_retime", None)
+    if detail and node is not None:
+        try:
+            node.get_logger().warn(f"[RETIME] {label}: {detail}")
+        except Exception:
+            pass

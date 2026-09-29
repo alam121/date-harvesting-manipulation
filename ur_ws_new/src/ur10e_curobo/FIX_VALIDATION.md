@@ -23,7 +23,7 @@ python -m unittest discover -s ur_ws_new/src/ur10e_curobo/tests -v
 git diff --check
 ```
 
-42 regression tests passed (including the best-target publication path with real ROS messages). All 75 Python files in the package parsed successfully. A real ROS `JointTrajectory` serialization/deserialization round-trip passed, and the installed ZED image timestamp API was verified without opening a camera. Driver-bound functions are extracted for most unit tests so imports cannot start hardware or initialize planning models. These are logic tests, not end-to-end ROS/GPU tests.
+44 regression tests passed (including the best-target publication path with real ROS messages and blank-frame display suppression). All 75 Python files in the package parsed successfully. A real ROS `JointTrajectory` serialization/deserialization round-trip passed, and the installed ZED image timestamp API was verified without opening a camera. Driver-bound functions are extracted for most unit tests so imports cannot start hardware or initialize planning models. These are logic tests, not end-to-end ROS/GPU tests.
 
 Deployment and behavior changes:
 
@@ -46,3 +46,5 @@ The initial patch added conservatism without a measured throughput benefit. The 
 The regression test verifies 100 unchanged-state requests invoke FK once and that returned copies cannot corrupt the cache. Existing interpolated velocity/acceleration tests still pass. No hardware run or total harvest-cycle speedup is claimed.
 
 Crash fix: initialize the selected base-frame point before publishing its tip timestamp. The new regression reproduced the reported UnboundLocalError before the fix and passes for valid, absent, and nonfinite tip inputs afterward. The package was rebuilt with colcon; source/build/install vision files match. The build completed with an existing setuptools/setuptools-scm compatibility warning. Running vision processes must be restarted to load the fix.
+
+Display flicker fix: retain the annotated image between inference results instead of queuing blank RGB frames into the limited display slots. Raw preview remains available at startup, while paused, or after a 0.5 s inference stall. Camera motion no longer clears base-frame track confirmation. Unconfirmed detections appear as `date (confirming)` without becoming confirmed motion targets. Missing acquisition TF allows labeled 2D-only detection display but still prevents 3D target publication. Two display regression tests cover inter-result suppression and preview recovery. The package was rebuilt and source/build/install vision files match; live-camera behavior remains untested.

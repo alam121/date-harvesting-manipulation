@@ -219,6 +219,19 @@ class TrajectoryTests(unittest.TestCase):
                         a=np.polynomial.polynomial.polyval(u,np.polynomial.polynomial.polyder(coeff,2))/dt**2
                         self.assertLessEqual(np.abs(v).max(),.5+1e-8)
                         self.assertLessEqual(np.abs(a).max(),1+1e-8)
+    def test_degenerate_lengths_survive_end_ramps(self):
+        # The end-interval ramp indexes a per-interval list; a single-point
+        # trajectory has no intervals, which used to raise IndexError from
+        # blend_motion's one-point path.
+        for n in range(0, 9):
+            q=[[.1*k]*3 for k in range(n)]
+            for ramp in (0, 8, 15):
+                traj=self.fn(['j']*3,q,dt=.01,max_vel=.5,max_acc=1,ramp_points=ramp)
+                self.assertEqual(len(traj.points),n)
+                t=[p.time_from_start.sec+p.time_from_start.nanosec/1e9 for p in traj.points]
+                self.assertTrue(all(b>a for a,b in zip(t,t[1:])),(n,ramp,t))
+                self.assertTrue(all(x>0 for x in t),(n,ramp,t))
+
     def test_cancel_discards_partial_trajectory(self):
         calls=iter([False,True])
         self.assertFalse(self.fn(['j'],[[0],[1]],stop_flag=lambda:next(calls)).points)
@@ -230,7 +243,10 @@ class TrajectoryTests(unittest.TestCase):
 class AssociationTests(unittest.TestCase):
     def setUp(self):
         env=dict(math=math,time=lambda:1.0,MIN_FRAMES_TO_SHOW=2,MAX_FRAMES_TO_KEEP=2,
-                 FRUIT_ID_TIMEOUT=10,MAX_FRUIT_ATTEMPTS=3)
+                 FRUIT_ID_TIMEOUT=10,MAX_FRUIT_ATTEMPTS=3,
+                 # Mirror tracking.py's module-level constants; load() execs the
+                 # class alone, so anything it closes over has to be supplied.
+                 ASSOCIATION_RADIUS_M=0.025,AMBIGUITY_MARGIN_M=0.003)
         self.tracker=load('vision/tracking.py','FruitTracker',env)()
     def test_rounding_boundary_retains_identity(self):
         self.tracker.begin_frame(); first=self.tracker.associate_fruit([.104,0,0])
@@ -377,6 +393,34 @@ class BestTargetPublicationTests(unittest.TestCase):
                     self.assertAlmostEqual(tips[0].point.z,.43)
                 else:
                     self.assertFalse(tips)
+
+
+class DetectionDisplayTests(unittest.TestCase):
+    def setUp(self):
+        tree=ast.parse((ROOT/'vision/node.py').read_text())
+        function=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef)
+                      and n.name=='_enqueue_raw_viz_frame')
+        self.clock=Clock();self.frames=[]
+        self.env=dict(time=self.clock.time,_last_detection_result_t=1.0,
+                      _enqueue_viz_frame=lambda *a:self.frames.append(a))
+        module=ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[]))
+        exec(compile(module,'raw_display_gate','exec'),self.env)
+        self.enqueue=self.env['_enqueue_raw_viz_frame']
+    def test_rgb_frames_do_not_erase_recent_detections(self):
+        for offset in [0,.033,.066,.1,.2,.4]:
+            self.clock.t=1+offset
+            self.enqueue()
+        self.assertFalse(self.frames)
+    def test_pause_startup_and_stall_show_live_video(self):
+        self.enqueue(force=True)
+        self.assertEqual(len(self.frames),1)
+        self.env['_last_detection_result_t']=None
+        self.enqueue()
+        self.assertEqual(len(self.frames),2)
+        self.env['_last_detection_result_t']=1.
+        self.clock.t=1.6
+        self.enqueue()
+        self.assertEqual(len(self.frames),3)
 
 
 if __name__=='__main__': unittest.main()
