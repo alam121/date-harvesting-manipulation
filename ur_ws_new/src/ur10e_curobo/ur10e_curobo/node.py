@@ -46,6 +46,27 @@ from .managers import ConfigManager, StateManager, MotionExecutor
 # _classifier_tick()	    timer	                  Runs periodic classifier update
 
 
+def _curobo_version_label() -> str:
+    """"cuRobo: v2 (0.8.0)" for the RViz robot-config line, or why not.
+
+    find_spec rather than import: this runs during __init__ and the answer is
+    only needed for a label, so it is not worth paying an import of the
+    planning stack to get it. curobo.motion_planner exists only in v2 -- v1
+    puts the equivalent under curobo.wrap.reacher.motion_gen.
+    """
+    try:
+        import curobo
+        version = str(getattr(curobo, "__version__", "?"))
+    except Exception as exc:
+        return f"cuRobo: NOT IMPORTABLE ({type(exc).__name__})"
+    try:
+        import importlib.util
+        major = "v2" if importlib.util.find_spec("curobo.motion_planner") else "v1"
+    except Exception:
+        major = "v?"
+    return f"cuRobo: {major} ({version})"
+
+
 class UR10eCuroboMoveIt(Node):
     # Speed multiplier for "Execute Queue" goal moves, relative to the active
     # velocity scale. <1.0 makes these waypoint moves slower than normal motions.
@@ -218,8 +239,19 @@ class UR10eCuroboMoveIt(Node):
         # Active robot type + environment for the RViz panel. Republished periodically so
         # the panel shows it regardless of who started first.
         self.robot_config_pub = self.create_publisher(String, "/robot_config_info", 10)
+        # Which cuRobo is actually loaded. Resolved once, not per tick: it
+        # cannot change without restarting the process, and the answer is not
+        # obvious from the outside -- runtime_entry re-execs into a venv, so
+        # the interpreter that ran `ros2 run` is not the one doing the
+        # planning, and system python still resolves the vendored v1 tree.
+        # Detected from the module layout rather than __version__, because the
+        # version string is what a build stamped, while the layout is what the
+        # code will actually import.
+        self._curobo_label = _curobo_version_label()
+        self.get_logger().info(f"[CUROBO] {self._curobo_label}")
         self.create_timer(2.0, lambda: self.robot_config_pub.publish(
-            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {self.active_environment}")))
+            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {self.active_environment}"
+                        f"  |  {self._curobo_label}")))
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz
