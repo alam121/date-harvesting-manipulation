@@ -92,3 +92,12 @@ On the Jetson Orin (Python 3.10, NVIDIA PyTorch 2.3 / CUDA 12.2):
 These are local compatibility checks, not a change to NVIDIA's documented
 platform support or validation of real robot execution. The existing live
 control process was not restarted during migration.
+
+### Graph attempt policy
+
+`PlanOptions.graph_attempt` is one-based: `1` permits graph seeding on the
+first attempt, and `None` permits it on the final attempt. The adapter converts
+to cuRobo v2's zero-based index; for eight attempts, `None` becomes `7`.
+Out-of-range indices are clamped to the available attempts. This policy does
+not use `None` to disable graph seeding. The general default is five attempts;
+explicit production policies in `config.py` retain their own attempt limits.

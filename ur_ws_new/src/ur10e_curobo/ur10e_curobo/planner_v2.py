@@ -5,6 +5,7 @@ keeps ROS trajectory construction independent of upstream solver internals.
 """
 import copy
 import math
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,15 +48,91 @@ class RobotKinematics:
                 state.robot_spheres.reshape(q.shape[0], -1, 4))
 
 
+def _as_float(value):
+    """Return a plain float for a scalar/tensor diagnostic, else None."""
+    if value is None:
+        return None
+    try:
+        tensor = torch.as_tensor(value).reshape(-1)
+        if tensor.numel() == 0:
+            return None
+        return float(tensor[0].item())
+    except Exception:
+        return None
+
+
 class PlanResult:
-    def __init__(self, result, dt):
+    """Application view of one v2 planning result.
+
+    v2 returns ``Optional[TrajOptSolverResult]`` (``None`` when planning fails)
+    and reports *feasibility* separately from *pose convergence*. The v1
+    diagnostics the rest of the application logs -- ``status`` and
+    ``valid_query`` -- are reconstructed here so callers keep that vocabulary
+    without reaching into upstream internals.
+    """
+
+    def __init__(self, result, dt, *, wall_time=0.0, graph_attempt=None,
+                 graph_attempt_index=None, graph_seeding_available=None):
         self.result = result
-        self.success = bool(result is not None and torch.as_tensor(result.success).all().item())
-        self.status = 'SUCCESS' if self.success else 'PLANNING_FAILED'
+        self.success = bool(
+            result is not None and torch.as_tensor(result.success).all().item())
         self.interpolation_dt = float(dt)
-        self.solve_time = float(getattr(result, 'solve_time', 0.0))
-        self.total_time = float(getattr(result, 'total_time', 0.0))
+        self.solve_time = float(getattr(result, 'solve_time', 0.0) or 0.0)
+        self.total_time = float(getattr(result, 'total_time', 0.0) or 0.0)
+        # Wall clock measured in this process around the planner call. Compare
+        # against solve_time/total_time (GPU-reported, summed over attempts) to
+        # see how much of a plan is contention and launch overhead rather than
+        # solver work.
+        self.wall_time = float(wall_time)
+        # v2's `feasible` is "constraints (collision, joint limits) satisfied,
+        # independent of pose convergence" -- the same question v1's valid_query
+        # answered. A single robot needs every seed feasible.
+        feasible = None if result is None else getattr(result, 'feasible', None)
+        self.valid_query = (
+            bool(torch.as_tensor(feasible).all().item())
+            if feasible is not None else None)
+        self.position_error = _as_float(getattr(result, 'position_error', None))
+        self.rotation_error = _as_float(getattr(result, 'rotation_error', None))
+        self.num_seeds = int(getattr(result, 'num_seeds', 0) or 0)
+        self.batch_size = int(getattr(result, 'batch_size', 0) or 0)
+        # Application policy value and the index v2 actually received, so a
+        # misconfigured graph policy is visible in the log rather than silent.
+        self.graph_attempt = graph_attempt
+        self.graph_attempt_index = graph_attempt_index
+        self.graph_seeding_available = graph_seeding_available
+        self.status = self._status()
         self._plan = self._freeze_plan() if self.success else None
+
+    def _status(self):
+        if self.success:
+            return 'SUCCESS'
+        if self.result is None:
+            return 'NO_RESULT'
+        if self.valid_query is False:
+            # Endpoints are invalid, so retrying cannot help -- the same
+            # distinction v1's status made and the callers' diagnostic text
+            # assumes.
+            return 'COLLISION_OR_JOINT_LIMIT'
+        return 'PLANNING_FAILED'
+
+    def diagnostics(self):
+        """Structured v2 fields for the durable motion log."""
+        return {
+            'status': self.status,
+            'valid_query': self.valid_query,
+            'v2_solve_ms': round(self.solve_time * 1000.0, 1),
+            'v2_total_ms': round(self.total_time * 1000.0, 1),
+            'v2_wall_ms': round(self.wall_time * 1000.0, 1),
+            'v2_position_error_m': (None if self.position_error is None
+                                    else round(self.position_error, 5)),
+            'v2_rotation_error_rad': (None if self.rotation_error is None
+                                      else round(self.rotation_error, 5)),
+            'v2_seeds': self.num_seeds,
+            'v2_batch': self.batch_size,
+            'graph_attempt': self.graph_attempt,
+            'graph_attempt_index': self.graph_attempt_index,
+            'graph_seeding_available': self.graph_seeding_available,
+        }
 
     def _freeze_plan(self):
         if not self.success:
@@ -75,6 +152,21 @@ class PlanResult:
         if self._plan is None:
             raise RuntimeError('Cannot execute an unsuccessful v2 plan')
         return self._plan
+
+
+def plan_diagnostics(result) -> dict:
+    """Structured v2 diagnostics for the durable motion log.
+
+    Tolerates a missing result so call sites can splat this unconditionally:
+    a failed graph-seeding retry clears the result before logging.
+    """
+    if result is None:
+        return {'status': 'NO_RESULT', 'valid_query': None}
+    diagnostics = getattr(result, 'diagnostics', None)
+    if not callable(diagnostics):
+        return {'status': str(getattr(result, 'status', 'UNKNOWN')),
+                'valid_query': getattr(result, 'valid_query', None)}
+    return diagnostics()
 
 
 class PlannerV2:
@@ -100,21 +192,34 @@ class PlannerV2:
     def _goal(self, pose):
         return GoalToolPose.from_poses({self.tool_frame: pose})
 
-    def plan_pose(self, start, goal, options=None):
+    def _graph_planner_available(self):
+        return getattr(self.planner, 'graph_planner', None) is not None
+
+    def _run_plan(self, call, start, goal_arg, options):
+        """Run one v2 planner call and attach the application's diagnostics.
+
+        `label`-free by design: the callers already name the phase, and the
+        diagnostics travel back on the PlanResult into the durable motion log.
+        """
         options = options or PlanOptions()
-        result = self.planner.plan_pose(
-            self._goal(goal), start, max_attempts=options.max_attempts,
-            enable_graph_attempt=(options.max_attempts if options.graph_attempt is None
-                                  else options.graph_attempt))
-        return PlanResult(result, self.interpolation_dt)
+        graph_index = options.enable_graph_attempt()
+        t0 = time.perf_counter()
+        result = call(goal_arg, start, max_attempts=options.max_attempts,
+                      enable_graph_attempt=graph_index)
+        return PlanResult(
+            result, self.interpolation_dt,
+            wall_time=time.perf_counter() - t0,
+            graph_attempt=options.graph_attempt,
+            graph_attempt_index=graph_index,
+            graph_seeding_available=self._graph_planner_available())
+
+    def plan_pose(self, start, goal, options=None):
+        return self._run_plan(
+            self.planner.plan_pose, start, self._goal(goal), options)
 
     def plan_joint(self, start, goal, options=None):
-        options = options or PlanOptions()
-        result = self.planner.plan_cspace(
-            goal, start, max_attempts=options.max_attempts,
-            enable_graph_attempt=(options.max_attempts if options.graph_attempt is None
-                                  else options.graph_attempt))
-        return PlanResult(result, self.interpolation_dt)
+        return self._run_plan(self.planner.plan_cspace, start, goal, options)
+
 
     def solve_ik(self, pose, seed_config=None, retract_config=None, return_seeds=1):
         current = (JointState.from_position(retract_config.reshape(1, -1),

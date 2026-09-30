@@ -48,15 +48,27 @@ class V2ResultTests(unittest.TestCase):
 
 
 class V2PolicyTests(unittest.TestCase):
-    def test_disabled_graph_does_not_enable_it_on_a_retry(self):
-        p = object.__new__(PlannerV2)
-        p.planner = Mock()
-        p.planner.plan_cspace.return_value = None
-        p.interpolation_dt = .004
-        start, goal = object(), object()
-        p.plan_joint(start, goal, PlanOptions(max_attempts=8, graph_attempt=None))
-        p.planner.plan_cspace.assert_called_once_with(
-            goal, start, max_attempts=8, enable_graph_attempt=8)
+    def test_graph_policy_reaches_requested_attempt_for_both_planners(self):
+        # Upstream compares a zero-based loop index to enable_graph_attempt.
+        for attempts, requested, expected in [(8, None, 7), (8, 1, 0),
+                                              (8, 3, 2), (1, None, 0),
+                                              (8, 99, 7), (8, 0, 0)]:
+            for kind in ('joint', 'pose'):
+                with self.subTest(attempts=attempts, requested=requested, kind=kind):
+                    p = object.__new__(PlannerV2)
+                    p.planner = Mock()
+                    p.interpolation_dt = .004
+                    p._goal = lambda goal: goal
+                    native = p.planner.plan_cspace if kind == 'joint' else p.planner.plan_pose
+                    native.return_value = None
+                    start, goal = object(), object()
+                    options = PlanOptions(max_attempts=attempts, graph_attempt=requested)
+                    result = (p.plan_joint if kind == 'joint' else p.plan_pose)(start, goal, options)
+                    native.assert_called_once_with(goal, start, max_attempts=attempts,
+                                                   enable_graph_attempt=expected)
+                    self.assertEqual(result.graph_attempt_index, expected)
+                    self.assertEqual(options.graph_on_first_attempt(), expected == 0)
+                    self.assertLess(expected, attempts)
 
     def test_custom_gripper_and_collision_model_are_preserved(self):
         k = load_robot_config()['robot_cfg']['kinematics']
