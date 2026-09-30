@@ -2176,6 +2176,10 @@ class UR10eCuroboMoveIt(Node):
             val = cmd.split()[1].lower()
             self.cfg.planner.debug_plan_preview = val in ("true", "1", "yes")
             self.get_logger().info(f"Debug plan preview set to {self.cfg.planner.debug_plan_preview}")
+        elif cmd.startswith("set_level_insertion "):
+            enabled = cmd.split()[1].lower() in ('true', '1', 'yes', 'on')
+            self.cfg.planner.low_center_level_insertion_enabled = enabled
+            self.get_logger().info(f'[LEVEL_INSERTION] enabled={enabled}; applies at next FINAL target calculation')
         elif cmd.startswith("set_demo_capture "):
             enabled = cmd.split()[1].lower() in ("true", "1", "yes", "on")
             self.cfg.planner.demo_capture_enabled = enabled

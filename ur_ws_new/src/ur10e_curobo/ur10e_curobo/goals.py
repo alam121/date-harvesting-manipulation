@@ -1,3 +1,4 @@
+from .level_insertion import level_target
 # ruff: noqa
 import time, math, re, torch
 import threading
@@ -2994,7 +2995,8 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     if not cur or len(cur) < 7:
         return False
 
-    corrected = [float(tcp[i]) + float(delta[i]) for i in range(3)]
+    corrected = level_target([float(tcp[i]) + float(delta[i]) for i in range(3)],
+                             getattr(node, "_level_final_z", None))
     ok, why = goal_is_in_robot_workspace(node, corrected)
     if not ok:
         node.get_logger().warn(f"[FINAL_INFLIGHT] retarget outside workspace: {why}")
@@ -3136,6 +3138,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
                 < float(getattr(planner, "final_inflight_min_interval_s", 0.25))):
             continue
         delta = [best[i] - target_xyz[i] for i in range(3)]
+        if getattr(node, "_level_final_z", None) is not None:
+            delta[2] = 0.0
         if math.dist([0.0, 0.0, 0.0], delta) + report["applied_total"] > max_d:
             report["above_max"] += 1
             continue
@@ -4190,6 +4194,7 @@ def plan_and_execute(node):
             if not _vision_pause():
                 break
 
+        node._level_final_z = None
         # Clear stored trajectory for partial reverse after grasp
         node.stored_trajectory_states = []
 
@@ -6093,6 +6098,24 @@ def plan_and_execute(node):
             tcp_xyz = _baseline_tcp_xyz
             closure_offset_base = _baseline_offset_base
             final_target = _baseline_final_target
+        _level_z = None
+        if (is_low and not is_side_approach and bool(getattr(
+                node.cfg.planner, 'low_center_level_insertion_enabled', False))):
+            _level_pose = node.get_end_effector_pose()
+            if not _level_pose or not math.isfinite(float(_level_pose[2])):
+                node.get_logger().warn('[LEVEL_INSERTION] No measured APPROACH height; stopping attempt')
+                node.stop_requested = True
+                break
+            _level_z = float(_level_pose[2])
+            _nominal_final_z = final_target[2]
+            final_target = level_target(final_target, _level_z)
+            _baseline_final_target = level_target(_baseline_final_target, _level_z)
+            _baseline_tcp_xyz = level_target(_baseline_tcp_xyz, _level_z)
+            tcp_xyz = level_target(tcp_xyz, _level_z)
+            node.get_logger().info(
+                f'[LEVEL_INSERTION] APPROACH TCP Z={_level_z:.4f}m; '
+                f'FINAL Z {_nominal_final_z:.4f}->{_level_z:.4f}m; X/Y and orientation unchanged')
+        node._level_final_z = _level_z
         _goal_forward = x if X_FORWARD_Y_LATERAL else -y
         _target_forward = tcp_xyz[0] if X_FORWARD_Y_LATERAL else -tcp_xyz[1]
         _forward_delta_mm = (_target_forward - _goal_forward) * 1000.0
@@ -6281,8 +6304,8 @@ def plan_and_execute(node):
                         desired_grasp_xyz,
                         _pre_final_approach_yaw_orientation,
                         closure_offset_tcp))
-                _yaw_fallback_target = [
-                    *_yaw_fallback_tcp, *_pre_final_approach_yaw_orientation]
+                _yaw_fallback_target = level_target([
+                    *_yaw_fallback_tcp, *_pre_final_approach_yaw_orientation], _level_z)
                 node.get_logger().warn(
                     "[FINAL_APPROACH_YAW] adjusted FINAL failed IK/path; "
                     "retrying unchanged APPROACH orientation")
@@ -6300,8 +6323,8 @@ def plan_and_execute(node):
                     _fallback_tcp_xyz, _fallback_offset_base = closure_center_corrected_tcp(
                         desired_grasp_xyz, _approach_orientation_for_final,
                         closure_offset_tcp)
-                    approach_orientation_target = [
-                        *_fallback_tcp_xyz, *_approach_orientation_for_final]
+                    approach_orientation_target = level_target([
+                        *_fallback_tcp_xyz, *_approach_orientation_for_final], _level_z)
                     node.get_logger().warn(
                         "FINAL tilted IK failed — retrying with original approach "
                         "orientation and its recomputed closure-centre TCP")
@@ -6383,6 +6406,7 @@ def plan_and_execute(node):
                         _corrected_final = [
                             _cur_final[i] - _backoff * approach_dir[i] for i in range(3)
                         ] + list(_cur_final[3:])
+                        _corrected_final = level_target(_corrected_final, _level_z)
                         node.get_logger().info(
                             f"[FINAL_OVERSHOOT] past target by {_past*1000:.1f}mm — "
                             f"pulling back {_backoff*1000:.1f}mm before close")

@@ -663,6 +663,7 @@ class Planner:
     very_low_center_approach_z_offset: float = 0.001  # legacy; center approach is derived from insertion angle
 
 
+    low_center_level_insertion_enabled: bool = True  # supervised level FINAL experiment
     low_center_insertion_pitch_deg: float = 12.0     # approach from below, then insert upward
     very_low_center_approach_pitch_deg: float = 0.0  # legacy; orientation follows the insertion vector
     low_center_forward_align_max_deg: float = 45.0    # align gripper local +Z with insertion direction

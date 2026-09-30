@@ -375,3 +375,21 @@ explicitly tagged with `correction_reference`. Do not mix them with older
 FINAL correction samples. The planned FINAL pose is retained under `before`.
 These records still contain endpoint images and a joint/pose jog trace, not
 synchronized video for ACT sequence training. Restart main and RViz to activate.
+
+### Supervised level-insertion test
+
+`planner.low_center_level_insertion_enabled` defaults to true. For LOW/VERY_LOW
+center approaches only, FINAL TCP Z is set to the measured settled APPROACH TCP
+Z after closure-center compensation. FINAL X/Y and orientation are preserved;
+APPROACH geometry and MID/HIGH or side approaches are unchanged. Fallback
+endpoints and in-flight corrections retain the same height. Existing IK,
+collision and trajectory checks remain active. Watch `[LEVEL_INSERTION]` for
+nominal versus commanded Z. This is not a fix for Y depth overshoot.
+
+Runtime switch via `/ui_command` (`std_msgs/msg/String`):
+`set_level_insertion true` or `set_level_insertion false`, effective when the
+next FINAL target is calculated. Restart main to load the new implementation.
+With Demo enabled, insertion is still manual. Disable Demo to test automatic
+level insertion under supervision. Record five outcomes and remaining manual
+X/Y corrections before assessing improvement. Demo JSON records the switch
+and actual constrained height so these samples can be separated from older ones.

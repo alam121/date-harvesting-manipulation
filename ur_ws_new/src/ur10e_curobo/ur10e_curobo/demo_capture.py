@@ -239,6 +239,8 @@ def _capture_correction(node) -> Optional[str]:
     residual = ([after_pose[i] - planned_final[i] for i in range(3)]
                 if planned_final else None)
     sample = {
+        "level_insertion_enabled": bool(getattr(planner, "low_center_level_insertion_enabled", False)),
+        "level_final_z_m": getattr(node, "_level_final_z", None),
         "schema_version": 2,
         "observation_stage": "APPROACH",
         "desired_motion_base_m": delta_base,
