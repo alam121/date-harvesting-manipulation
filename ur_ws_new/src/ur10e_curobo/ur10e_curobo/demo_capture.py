@@ -90,6 +90,7 @@ def target_preview(image, metadata, goal):
 
 
 def capture_correction(node) -> Optional[str]:
+    node._demo_target_selection = None
     node._demo_confirm = None
     node._demo_capture_ready = False
     node._demo_capture_active = True
@@ -176,7 +177,11 @@ def _capture_correction(node) -> Optional[str]:
             node.get_logger().warn("[DEMO] stop requested; discarding")
             return None
         if getattr(node, "_demo_confirm", None) is not None:
-            break
+            if node._demo_confirm and not getattr(node, '_demo_target_selection', None):
+                node._demo_confirm = None
+                node.get_logger().warn('[DEMO] Click the intended date in the Motion panel image, then press Close again.')
+            else:
+                break
         pose = _pose_now(node)
         if pose is not None:
             path.append({"t": round(time.time(), 3), "pose": pose,
@@ -190,6 +195,19 @@ def _capture_correction(node) -> Optional[str]:
     if not accepted:
         node.get_logger().info("[DEMO] operator discarded this one")
         return None
+
+    selection = copy.deepcopy(node._demo_target_selection)
+    px, py = selection['pixel_xy']
+    hits = [c['fruit_id'] for c in target_label['candidates']
+            if c['saved_bbox_xyxy'][0] <= px <= c['saved_bbox_xyxy'][2]
+            and c['saved_bbox_xyxy'][1] <= py <= c['saved_bbox_xyxy'][3]]
+    target_label['operator_selection'] = selection
+    target_label['clicked_candidate_ids'] = hits
+    target_label['selected_fruit_id'] = hits[0] if len(hits) == 1 else None
+    target_label['identity_verified'] = len(hits) == 1
+    target_label['operator_point_confirmed'] = True
+    import cv2
+    cv2.circle(marked_full, (round(px), round(py)), 15, (0, 255, 0), 3)
 
     after_pose = _pose_now(node)
     if after_pose is None:

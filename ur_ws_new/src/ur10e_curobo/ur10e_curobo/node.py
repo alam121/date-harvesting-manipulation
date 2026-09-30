@@ -382,9 +382,31 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(CompressedImage, '/vision/demo_full/compressed',
                                  _demo_full_cb, qos_profile_sensor_data)
 
+        self._demo_target_selection = None
+        self._demo_preview_token = None
+        def _demo_select_cb(msg):
+            if not getattr(self, '_demo_capture_ready', False):
+                return
+            try:
+                selection = json.loads(msg.data)
+                if selection.get('token') != self._demo_preview_token:
+                    return
+                x, y = float(selection['x']), float(selection['y'])
+                height, width = self._demo_preview_shape[:2]
+                if not (0 <= x < width and 0 <= y < height):
+                    return
+                self._demo_target_selection = {'pixel_xy': [x, y], 'source': 'operator_click',
+                                               'preview_token': self._demo_preview_token}
+                self.get_logger().info(f'[DEMO] Target click accepted at ({x:.0f}, {y:.0f}); Close can now save.')
+            except (ValueError, KeyError, TypeError):
+                return
+        self.create_subscription(String, '/demo/select_target', _demo_select_cb, 10)
+
         def _demo_publish_preview(frame):
             msg = self._get_camera_bridge().cv2_to_imgmsg(frame, encoding='bgr8')
             msg.header.stamp = self.get_clock().now().to_msg()
+            self._demo_preview_token = f'{msg.header.stamp.sec}:{msg.header.stamp.nanosec}'
+            self._demo_preview_shape = frame.shape
             self._demo_preview_pub.publish(msg)
         self._demo_publish_preview = _demo_publish_preview
 

@@ -1,3 +1,7 @@
+#include <QMouseEvent>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QPainter>
 #include "rviz_ur10e_panel/ur10e_panel.hpp"
 
 #include <QGroupBox>
@@ -1034,6 +1038,16 @@ UR10ePanel::UR10ePanel(QWidget * parent)
       : "Demo disabled");
   });
   motion_layout->addWidget(demo_capture_cb_, 13, 0, 1, 2);
+  demo_image_label_ = new QLabel("Demo: waiting for frozen image");
+  demo_image_label_->setFixedSize(400, 225);
+  demo_image_label_->setAlignment(Qt::AlignCenter);
+  demo_image_label_->setCursor(Qt::CrossCursor);
+  demo_image_label_->installEventFilter(this);
+  demo_image_label_->setToolTip("Click the intended date in this frozen pre-jog image before Close.");
+  motion_layout->addWidget(demo_image_label_, 14, 0, 1, 2);
+  demo_click_status_ = new QLabel("Click the intended date before Close");
+  motion_layout->addWidget(demo_click_status_, 15, 0, 1, 2);
+
 
   motion_tab_layout->addWidget(motion_group);
 
@@ -1822,6 +1836,25 @@ void UR10ePanel::onInitialize()
 
 bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
 {
+  if (obj == demo_image_label_ && event->type() == QEvent::MouseButtonPress && !demo_image_.isNull()) {
+    auto * mouse = static_cast<QMouseEvent *>(event);
+    if (mouse->button() != Qt::LeftButton || !demo_click_pub_) return false;
+    const QSize size = demo_image_.size().scaled(demo_image_label_->size(), Qt::KeepAspectRatio);
+    const QPoint origin((demo_image_label_->width()-size.width())/2,
+                        (demo_image_label_->height()-size.height())/2);
+    const QPoint click = mouse->pos()-origin;
+    if (click.x()<0 || click.y()<0 || click.x()>=size.width() || click.y()>=size.height()) return true;
+    const double x = double(click.x())*demo_image_.width()/size.width();
+    const double y = double(click.y())*demo_image_.height()/size.height();
+    QJsonObject payload; payload["token"] = demo_image_token_; payload["x"] = x; payload["y"] = y;
+    std_msgs::msg::String msg; msg.data = QJsonDocument(payload).toJson(QJsonDocument::Compact).toStdString();
+    demo_click_pub_->publish(msg);
+    QImage marked = demo_image_.copy(); QPainter painter(&marked);
+    painter.setPen(QPen(Qt::green, 4)); painter.drawEllipse(QPointF(x,y), 15, 15); painter.end();
+    demo_image_label_->setPixmap(QPixmap::fromImage(marked).scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    demo_click_status_->setText("Target click sent — check DEMO log for acceptance");
+    return true;
+  }
   if (event->type() == QEvent::KeyPress) {
     // Don't intercept keys when typing in text fields
     auto * focus = QApplication::focusWidget();
@@ -1872,6 +1905,21 @@ void UR10ePanel::setupRos()
   gripper_target_pub_ =
     node_->create_publisher<std_msgs::msg::Float32MultiArray>("/gripper/target_joint", 10);
 
+  demo_click_pub_ = node_->create_publisher<std_msgs::msg::String>("/demo/select_target", 10);
+  demo_image_sub_ = node_->create_subscription<sensor_msgs::msg::Image>(
+    "/demo/before_image", rclcpp::QoS(1).reliable().transient_local(),
+    [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+      if (msg->encoding != "bgr8" || msg->width == 0 || msg->height == 0 ||
+          msg->step < msg->width*3 || msg->data.size() < size_t(msg->step)*msg->height) return;
+      QImage image(msg->data.data(), msg->width, msg->height, msg->step, QImage::Format_BGR888);
+      const auto owned = image.copy();
+      const QString token = QString::number(msg->header.stamp.sec) + ":" + QString::number(msg->header.stamp.nanosec);
+      QMetaObject::invokeMethod(this, [this, owned, token]() {
+        demo_image_ = owned; demo_image_token_ = token;
+        demo_image_label_->setPixmap(QPixmap::fromImage(owned).scaled(demo_image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        demo_click_status_->setText("Click the intended date before Close");
+      }, Qt::QueuedConnection);
+    });
   joint_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
     "/joint_states", 10,
     [this](sensor_msgs::msg::JointState::SharedPtr msg) {

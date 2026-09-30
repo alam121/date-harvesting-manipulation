@@ -43,6 +43,7 @@ class CaptureTests(unittest.TestCase):
                 else:
                     node.pose = [.012, 0., 0., 1., 0., 0., 0.]
                     node._latest_grasp_crop[:] = 200
+                    node._demo_target_selection = {"pixel_xy": [2, 2], "source": "operator_click"}
                     node._demo_confirm = verdict
                     node.stop_requested = stopped
                 calls.append(seconds)

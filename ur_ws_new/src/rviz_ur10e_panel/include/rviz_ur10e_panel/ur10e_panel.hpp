@@ -2,6 +2,8 @@
 #define RVIZ_UR10E_PANEL_HPP
 
 #include <QWidget>
+#include <QImage>
+#include <sensor_msgs/msg/image.hpp>
 #include <QPushButton>
 #include <QSlider>
 #include <QLabel>
@@ -50,6 +52,14 @@ public:
   void save(rviz_common::Config config) const override;
   void load(const rviz_common::Config & config) override;
   bool eventFilter(QObject * obj, QEvent * event) override;
+
+private:
+  QLabel * demo_image_label_{nullptr};
+  QLabel * demo_click_status_{nullptr};
+  QImage demo_image_;
+  QString demo_image_token_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr demo_image_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr demo_click_pub_;
 
 private Q_SLOTS:
   void onStop();
