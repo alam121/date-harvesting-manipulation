@@ -62,6 +62,33 @@ def _write_crop(image, path, name) -> bool:
         return False
 
 
+def target_preview(image, metadata, goal):
+    """Label every candidate; proximity is a suggestion, never verified identity."""
+    import cv2
+    marked = image.copy()
+    candidates = copy.deepcopy(metadata.get('candidates', []))
+    width, height = metadata.get('source_size', [image.shape[1], image.shape[0]])
+    for item in candidates:
+        item['goal_distance_m'] = math.dist(item['base_xyz'], goal) if goal else None
+    ranked = sorted(candidates, key=lambda c: c['goal_distance_m'] if c['goal_distance_m'] is not None else math.inf)
+    suggested = (ranked[0] if ranked and goal and ranked[0]['goal_distance_m'] <= .05
+                 and (len(ranked) == 1 or ranked[1]['goal_distance_m'] - ranked[0]['goal_distance_m'] >= .02) else None)
+    for item in candidates:
+        box = [round(v * (image.shape[1] / width if i % 2 == 0 else image.shape[0] / height))
+               for i, v in enumerate(item['bbox_xyxy'])]
+        item['saved_bbox_xyxy'] = box
+        chosen = item is suggested
+        color = (0, 255, 255) if chosen else (255, 180, 0)
+        cv2.rectangle(marked, tuple(box[:2]), tuple(box[2:]), color, 2)
+        cv2.putText(marked, f"ID {item['fruit_id']}" + (' TARGET? VERIFY' if chosen else ''),
+                    (max(0, box[0]), max(45, box[1]-5)), cv2.FONT_HERSHEY_SIMPLEX, .5, color, 2)
+    cv2.putText(marked, 'VERIFY TARGET - discard if wrong' if suggested else 'TARGET UNCONFIRMED - discard if ambiguous',
+                (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
+    return marked, {'attempt_goal_base_xyz': goal, 'candidates': candidates,
+                    'suggested_fruit_id': suggested['fruit_id'] if suggested else None,
+                    'identity_verified': False, 'association': 'base_proximity_50mm_margin_20mm'}
+
+
 def capture_correction(node) -> Optional[str]:
     node._demo_confirm = None
     node._demo_capture_ready = False
@@ -96,9 +123,21 @@ def _capture_correction(node) -> Optional[str]:
             node.get_logger().warn("[DEMO] no fresh FINAL crop/full frame; stopping attempt")
             return None
         time.sleep(0.02)
-    full_frame, full_received, full_stamp = node._demo_full_frame
+    snapshot = node._demo_full_frame
+    full_frame, full_received, full_stamp = snapshot[:3]
+    frame_ns = snapshot[3] if len(snapshot) > 3 else None
+    target_meta = {}
+    if frame_ns is not None:
+        meta_deadline = time.monotonic() + 1.0
+        while frame_ns not in node._demo_targets and time.monotonic() < meta_deadline:
+            if getattr(node, 'stop_requested', False):
+                return None
+            time.sleep(.02)
+        target_meta = copy.deepcopy(node._demo_targets.get(frame_ns, {}))
     before_full = full_frame.copy()
-    node._demo_publish_preview(before_full)
+    marked_full, target_label = target_preview(before_full, target_meta,
+        copy.deepcopy(getattr(node, '_demo_attempt_goal_xyz', None)))
+    node._demo_publish_preview(marked_full)
     before_image = node._latest_grasp_crop.copy()
     before_image_t = node._latest_grasp_crop_t
     before_pose = _pose_now(node)
@@ -107,6 +146,7 @@ def _capture_correction(node) -> Optional[str]:
         return None
 
     before = {
+        "target_label": target_label,
         "pose": before_pose,
         "joints": list(getattr(node, "current_joint_positions", None) or []),
         "goal_pose": getattr(node, "latest_goal_pose", None),
@@ -192,7 +232,8 @@ def _capture_correction(node) -> Optional[str]:
         node.get_logger().warn(f"[DEMO] cannot write sample.json: {exc}")
         return None
     if not (_write_crop(before_image, out, "crop_before.jpg")
-            and _write_crop(before_full, out, "full_before.jpg")):
+            and _write_crop(before_full, out, "full_before.jpg")
+            and _write_crop(marked_full, out, "full_before_marked.jpg")):
         node.get_logger().warn("[DEMO] cannot save FINAL crop; stopping attempt")
         os.remove(os.path.join(out, "sample.json"))
         return None

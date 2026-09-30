@@ -332,3 +332,14 @@ receipt timestamps and dimensions. Crop and full-frame observations are fresh
 but not guaranteed to be from the same camera exposure. The preview remains
 frozen until the next capture; it is not a live jogging view. Existing demos
 cannot be retroactively supplied with full images.
+
+The frozen demo preview labels detected fruit IDs and suggests a target only
+when its base-frame position is within 50 mm of the attempted goal and at least
+20 mm closer than the next candidate. This is an unverified proximity match,
+not persistent identity tracking; inspect it before accepting. Ambiguous or
+missing matches are explicitly unconfirmed. `full_before_marked.jpg` preserves
+the overlay; `full_before.jpg` stays clean. `before.target_label` records the
+attempted goal, candidates, IDs and original/saved bounding boxes. Metadata is
+matched to the full frame by the exact publication timestamp. These IDs should
+not be treated as globally unique across runs. Restart vision and main to load
+this change.

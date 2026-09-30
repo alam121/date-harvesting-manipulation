@@ -63,6 +63,18 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(list(Path(root).rglob('sample.json')), [])
             return data, images
 
+    def test_target_labels_scale_and_reject_ambiguous_matches(self):
+        image = np.zeros((100, 200, 3), dtype=np.uint8)
+        meta = {'source_size': [400, 200], 'candidates': [
+            {'fruit_id': 4, 'bbox_xyxy': [100, 50, 200, 100], 'base_xyz': [0, 0, 0]}]}
+        _, label = demo.target_preview(image, meta, [0, 0, 0])
+        self.assertEqual(label['suggested_fruit_id'], 4)
+        self.assertEqual(label['candidates'][0]['saved_bbox_xyxy'], [50, 25, 100, 50])
+        self.assertFalse(label['identity_verified'])
+        meta['candidates'].append({'fruit_id': 5, 'bbox_xyxy': [0, 0, 20, 20], 'base_xyz': [.01, 0, 0]})
+        _, label = demo.target_preview(image, meta, [0, 0, 0])
+        self.assertIsNone(label['suggested_fruit_id'])
+
     def test_missing_full_frame_stops_capture(self):
         data, images = self.run_capture(full_fresh=False)
         self.assertIsNone(data)

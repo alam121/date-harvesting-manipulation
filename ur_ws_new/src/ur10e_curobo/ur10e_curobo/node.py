@@ -350,6 +350,17 @@ class UR10eCuroboMoveIt(Node):
         self._latest_grasp_crop_t = 0.0
         self._latest_grasp_crop_meta = None
         self._demo_full_frame = None
+        self._demo_targets = {}
+        def _demo_targets_cb(msg):
+            try:
+                meta = json.loads(msg.data)
+                self._demo_targets[meta['stamp_ns']] = meta
+                while len(self._demo_targets) > 20:
+                    self._demo_targets.pop(next(iter(self._demo_targets)))
+            except (ValueError, KeyError):
+                pass
+        self.create_subscription(String, '/vision/demo_targets', _demo_targets_cb, 10)
+
         from sensor_msgs.msg import CompressedImage
         from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
         preview_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -363,7 +374,8 @@ class UR10eCuroboMoveIt(Node):
                 frame = self._get_camera_bridge().compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 # One tuple assignment keeps image and timestamps paired.
                 self._demo_full_frame = (frame, time.time(),
-                    msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
+                    msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                    msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec)
             except Exception as exc:
                 self.get_logger().warn(f'[DEMO] full-frame decode failed: {exc}')
 

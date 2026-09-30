@@ -6392,6 +6392,7 @@ def plan_and_execute(node):
         if bool(getattr(node.cfg.planner, "demo_capture_enabled", False)):
             _vision_resume()
             try:
+                node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
                 _demo_saved = demo_capture.capture_correction(node)
             except Exception as _demo_exc:
                 _demo_saved = None

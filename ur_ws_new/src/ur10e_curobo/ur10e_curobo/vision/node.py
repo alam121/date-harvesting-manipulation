@@ -321,6 +321,7 @@ class VisionNode:
         from sensor_msgs.msg import CompressedImage
         self.demo_full_pub = self.node.create_publisher(
             CompressedImage, "/vision/demo_full/compressed", 1)
+        self.demo_targets_pub = self.node.create_publisher(StdString, "/vision/demo_targets", 10)
         self._demo_full_last = 0.0
         self.raw_image_pub = self.node.create_publisher(
             ROSImage, "/vision/raw", fast_qos)
@@ -913,6 +914,17 @@ class VisionNode:
                             msg.header.stamp = stamp
                             msg.format = 'jpeg'
                             msg.data = jpeg.tobytes()
+                            candidates = []
+                            for target in tgts:
+                                point = target['pt_base'].point
+                                candidates.append({
+                                    'fruit_id': int(target.get('fruit_id', -1)),
+                                    'bbox_xyxy': [float(v) for v in target['bb']],
+                                    'base_xyz': [float(point.x), float(point.y), float(point.z)]})
+                            meta = StdString()
+                            meta.data = json.dumps({'stamp_ns': int(stamp.sec) * 1000000000 + int(stamp.nanosec),
+                                'source_size': [width, height], 'candidates': candidates})
+                            self.demo_targets_pub.publish(meta)
                             self.demo_full_pub.publish(msg)
                             self._demo_full_last = time()
                     raw_stream_active = (
