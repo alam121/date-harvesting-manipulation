@@ -357,3 +357,21 @@ box; overlapping/no boxes leave the ID unknown, while retaining the clicked
 point. Restart RViz and the motion node to load the click feature, and vision
 if full-frame publishing is not yet running. This does not move the robot when
 you click.
+
+### Current demo flow: APPROACH observation (schema 2)
+
+This supersedes the FINAL-hold instructions above. Enable **Demo: jog APPROACH
+to grasp, then Close**. After the normal approach and target calculation, the
+robot holds before automatic insertion. Click the intended date in the Motion
+panel frozen image, jog to the actual grasp endpoint, restore External Control,
+and press Close. No nominal FINAL movement is executed after the manual jog.
+The recorded jog joint samples are appended to the withdrawal path.
+
+Samples have `observation_stage: APPROACH` and `schema_version: 2`.
+`desired_motion_base_m`/`desired_motion_tool_m` measure grasp minus APPROACH;
+`residual_from_planned_final_base_m` measures grasp minus nominal FINAL.
+The legacy correction fields now refer to the APPROACH displacement and are
+explicitly tagged with `correction_reference`. Do not mix them with older
+FINAL correction samples. The planned FINAL pose is retained under `before`.
+These records still contain endpoint images and a joint/pose jog trace, not
+synchronized video for ACT sequence training. Restart main and RViz to activate.

@@ -6115,295 +6115,303 @@ def plan_and_execute(node):
                 f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
                 f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}] "
                 f"forward_delta={_forward_delta_mm:+.0f}mm")
-        node.motion_phase = "FINAL"
-        # Vision was historically kept "paused" through the FINAL move, on the
-        # grounds that cuRobo needs the GPU. It does not: by this point planning
-        # is finished and the arm is replaying a trajectory computed a moment
-        # ago, so nothing is competing. That pause is the reason the last ~7cm
-        # is dead-reckoned.
-        #
-        # With observe enabled, vision runs through the leg and records what it
-        # sees. It does NOT change the target -- see _final_inflight_monitor.
-        _t_final = time.time()
-        _inflight_report = {
-            "frames": 0, "matched": 0, "rejected": 0, "no_candidate": 0,
-            "below_min": 0, "above_max": 0, "usable": 0,
-            "latest": None, "latest_d": 0.0, "latest_t": 0.0,
-            "last_reject": "", "applied": 0, "applied_total": 0.0,
-            "last_apply_t": 0.0,
-        }
-        _inflight_stop = threading.Event()
-        node._final_inflight_stop = _inflight_stop
-        _inflight_thread = None
-        _final_inplace_retried = False
-        if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
-            # _direct_ik_move publishes its trajectory ~25 lines BEFORE it
-            # assigns node._final_live_wait_xyz, and this thread starts before
-            # _direct_ik_move is even called. That left a window (~1s of IK) in
-            # which the monitor read the PREVIOUS cycle's target and retargeted
-            # against it. Observed 2026-09-14 11:52:52: an "8.2mm" correction
-            # produced [0.203,-1.037,0.394] for a goal at [0.286,-1.059,0.375]
-            # -- 80mm off, because the base was a stale list. The arm drove
-            # there, the endpoint check measured 76.6mm against the real target
-            # and failed a grasp that was never given a chance.
-            # Clearing both here makes _apply_final_inflight_correction's
-            # `tcp is None` guard a no-op gate until the real target is live.
-            node._final_live_wait_xyz = None
-            node._final_retarget_xyz = None
-            node._final_live_quat = list(final_target[3:7])
-            node.set_vision_mode("reacquire_fast")
-            # Compare against the FRUIT goal (x,y,z), not final_target.
-            # final_target is the TCP pose, which sits ~28mm from the fruit by
-            # design (grasp depth/z offsets plus the closure-centre correction).
-            # Measuring fruit detections against it made every candidate read
-            # as >25mm off, so the first run reported above_max=10 usable=0 --
-            # an artefact of the wrong reference, not a real miss.
-            _inflight_thread = threading.Thread(
-                target=_final_inflight_monitor,
-                args=(node, [float(x), float(y), float(z)], _inflight_stop,
-                      _inflight_report),
-                daemon=True)
-            _inflight_thread.start()
-        try:
-            final_ok = _direct_ik_move(node, final_target, label="FINAL",
-                                       motion_type="final", store_trajectory=True)
-        finally:
-            with node._final_command_lock:
-                _inflight_stop.set()
-            if _inflight_thread is not None:
-                _inflight_thread.join(timeout=0.5)
-                # Freeze the last crop BEFORE re-pausing vision. This is the
-                # model input for a ready-to-close judgement: the date between
-                # the fingertips at the moment the arm has finished closing in
-                # and is about to grip. Taken here it is a few hundred ms old;
-                # the recorder otherwise saves whatever survives until the
-                # outcome fires, which is after the close AND the reverse --
-                # measured at 2.9s stale, by which time the gripper has moved
-                # and the image no longer describes the decision.
-                try:
-                    _cc = getattr(node, "_latest_grasp_crop", None)
-                    node._grasp_crop_at_close = (
-                        _cc.copy() if _cc is not None else None)
-                    node._grasp_crop_at_close_meta = list(
-                        getattr(node, "_latest_grasp_crop_meta", None) or [])
-                    node._grasp_crop_at_close_age = round(
-                        time.time() - float(getattr(
-                            node, "_latest_grasp_crop_t", 0.0)), 3)
-                except Exception:
-                    node._grasp_crop_at_close = None
-                # Restore the pause the rest of the sequence expects.
-                node.set_vision_mode("paused")
-                if not node.wait_for_vision_paused(timeout=2.0):
-                    node.stop_requested = True
-                node._last_inflight_report = dict(_inflight_report)
-                _r = _inflight_report
-                _latest = (
-                    f" nearest_usable={_r['latest_d']*1000:.1f}mm"
-                    f"@{_r['latest_t']:.2f}s"
-                    if _r["latest"] is not None else " nearest_usable=NONE")
-                node.get_logger().info(
-                    "[FINAL_INFLIGHT] "
-                    f"frames={_r['frames']} matched={_r['matched']} "
-                    f"no_candidate={_r['no_candidate']} "
-                    f"rejected_quality={_r['rejected']} "
-                    f"below_min={_r['below_min']} above_max={_r['above_max']} "
-                    f"usable={_r['usable']}{_latest} "
-                    f"applied={_r['applied']} "
-                    f"applied_total={_r['applied_total']*1000:.1f}mm "
-                    f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
-                    + (f" last_reject={_r['last_reject']}"
-                       if _r["last_reject"] else ""))
-        # A FINAL that solved, planned and flew, but finished off-target, is not
-        # evidence against the corridor -- this one had CORRIDOR_PREFLIGHT=PASS,
-        # IK pos_err=0.0000 and PATH_LATERAL max_deviation=0.1mm. Excluding it
-        # and flying HOME to re-plan threw away ~11s and a perfectly good
-        # approach, and after 9 such failures the goal is abandoned outright.
-        # The arm is still centimetres from the fruit with a valid seed target,
-        # so re-fly the same leg from where it is. One attempt: if the second
-        # one also lands off-target the cause is not transient and the corridor
-        # logic below is the right answer.
-        if (not final_ok
-                and getattr(node, "_final_fail_reason", None) == "ENDPOINT_ERROR"
-                and not _final_inplace_retried
-                and not node.stop_requested):
-            _final_inplace_retried = True
-            node.get_logger().warn(
-                "[FINAL_RETRY] endpoint miss on a corridor that passed "
-                "preflight — re-flying the same leg from the current pose "
-                "instead of returning HOME")
-            final_ok = _direct_ik_move(
-                node, final_target, label="FINAL_RETRY",
-                motion_type="final", store_trajectory=True)
-
-        if not final_ok and _phase4_yaw_applied:
-            node.get_logger().warn(
-                "[PHASE4_YAW] candidate execution IK/path failed; retrying "
-                "unchanged FINAL orientation with recomputed TCP")
-            final_target = _baseline_final_target
-            orientation = _baseline_final_orientation
-            tcp_xyz = _baseline_tcp_xyz
-            closure_offset_base = _baseline_offset_base
-            _phase4_yaw_applied = False
-            final_ok = _direct_ik_move(
-                node, final_target, label="FINAL",
-                motion_type="final", store_trajectory=True)
-        if not final_ok and _final_approach_yaw_applied:
-            _yaw_fallback_tcp, _yaw_fallback_offset = (
-                closure_center_corrected_tcp(
-                    desired_grasp_xyz,
-                    _pre_final_approach_yaw_orientation,
-                    closure_offset_tcp))
-            _yaw_fallback_target = [
-                *_yaw_fallback_tcp, *_pre_final_approach_yaw_orientation]
-            node.get_logger().warn(
-                "[FINAL_APPROACH_YAW] adjusted FINAL failed IK/path; "
-                "retrying unchanged APPROACH orientation")
-            final_ok = _direct_ik_move(
-                node, _yaw_fallback_target, label="FINAL_YAW_FALLBACK",
-                motion_type="final", store_trajectory=True)
-            if final_ok:
-                orientation = list(_pre_final_approach_yaw_orientation)
-                tcp_xyz = list(_yaw_fallback_tcp)
-                closure_offset_base = list(_yaw_fallback_offset)
-                final_target = list(_yaw_fallback_target)
-                _final_approach_yaw_applied = False
-        if not final_ok:
-            if _used_side_low_tilt:
-                _fallback_tcp_xyz, _fallback_offset_base = closure_center_corrected_tcp(
-                    desired_grasp_xyz, _approach_orientation_for_final,
-                    closure_offset_tcp)
-                approach_orientation_target = [
-                    *_fallback_tcp_xyz, *_approach_orientation_for_final]
-                node.get_logger().warn(
-                    "FINAL tilted IK failed — retrying with original approach "
-                    "orientation and its recomputed closure-centre TCP")
-                final_ok = _direct_ik_move(
-                    node, approach_orientation_target, label="FINAL_APPROACH_ORIENT",
-                    motion_type="final", store_trajectory=True)
-                if final_ok:
-                    final_target = approach_orientation_target
-        if (not final_ok and not bool(getattr(
-                node.cfg.planner, "strict_final_cartesian_only", True))):
-            # Fallback: full cuRobo plan_and_send (handles branch changes, no IK restriction)
-            node.get_logger().warn("FINAL IK failed — trying plan_and_send as fallback...")
-            _final_joints = _valid_joint_positions()
-            if _final_joints is not None:
-                _final_start = JointState.from_position(
-                    torch.tensor([_final_joints], dtype=torch.float32, device=device),
-                    joint_names=node.joint_order,
-                )
-                final_ok = plan_and_send(node, _final_start, Pose.from_list(final_target),
-                    label="FINAL_PLAN", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True)
-                if final_ok:
-                    final_ok = wait_until_xyz(
-                        node, final_target[:3],
-                        tol=float(getattr(
-                            node.cfg.planner, "final_endpoint_tolerance", 0.004)))
-        if not final_ok:
-            if _active_corridor not in (None, "NONE"):
-                node._corridor_exclusions.add(_active_corridor)
-                remaining = 9 - len(node._corridor_exclusions)
-                if remaining > 0:
-                    node.get_logger().warn(
-                        f"[CORRIDOR_RETRY] rejected={_active_corridor} "
-                        f"reason=STRAIGHT_FINAL_IK remaining={remaining}; "
-                        "returning HOME and trying next-best corridor")
-                    node.motion_phase = "HOME"
-                    move_to_home_position(node)
-                    node.goal_poses.insert(0, goal)
-                    unlock_target(node)
-                    _vision_resume()
-                    continue
-            node.get_logger().warn(
-                "All candidate corridors failed straight Cartesian FINAL — "
-                "skipping grasp without closing.")
-            node._corridor_exclusions = set()
-            node._corridor_retry_goal = None
-            unlock_target(node)
-            continue
-        log_path_deviation(node, "FINAL")
-        _timing["final"] = time.time() - _t_final
-        if _log_phase_timings:
-            node.get_logger().info(
-                f"[TIMING] final={_timing['final']:.2f}s ok={final_ok} "
-                f"target=[{final_target[0]:.3f},{final_target[1]:.3f},{final_target[2]:.3f}]")
-
-        # If stop was requested but arm is already at the final target, proceed with grasp.
-        # E-stop during the wait does not mean the arm failed — check actual EE position.
-        if getattr(node, '_stop_was_requested', False):
-            _cur_ee = node.get_end_effector_pose()
-            _dist_to_final = math.dist(_cur_ee[:3], final_target[:3]) if _cur_ee else float('inf')
-            if _dist_to_final < 0.015:  # within 15mm — arm is at the goal, safe to grasp
-                node.get_logger().info(
-                    f"Stop was requested but arm is at final target ({_dist_to_final*100:.1f}cm) — proceeding with grasp.")
-                node._stop_was_requested = False
-            else:
-                node.get_logger().warn(
-                    f"Stop requested and arm is {_dist_to_final*100:.1f}cm from final target — aborting.")
-                break
-
-        if _check_stop(): break
-
-        if approach_dir is not None:
-            _cur_final = node.get_end_effector_pose()
-            if _cur_final:
-                _past = sum((_cur_final[i] - final_target[i]) * approach_dir[i] for i in range(3))
-                _overshoot_thresh = getattr(node.cfg.planner, "final_overshoot_threshold", 0.004)
-                if _past > _overshoot_thresh:
-                    _max_backoff = getattr(node.cfg.planner, "final_overshoot_max_backoff", 0.012)
-                    _backoff = min(_past, _max_backoff)
-                    _corrected_final = [
-                        _cur_final[i] - _backoff * approach_dir[i] for i in range(3)
-                    ] + list(_cur_final[3:])
-                    node.get_logger().info(
-                        f"[FINAL_OVERSHOOT] past target by {_past*1000:.1f}mm — "
-                        f"pulling back {_backoff*1000:.1f}mm before close")
-                    _direct_ik_move(node, _corrected_final, label="FINAL_BACKOFF",
-                                    motion_type="final", store_trajectory=True)
-
-        _measured_final = node.get_end_effector_pose()
-        if _measured_final:
-            # Report against the goal the arm was actually driving to. An
-            # in-flight retarget moves it, and printing the original target here
-            # showed an error that is really the size of the correction -- seen
-            # as "error=5.2mm" on a move the endpoint check (which does use the
-            # retargeted goal) passed at 3.2mm. Two references in adjacent lines
-            # reads like a near-miss when nothing is wrong.
-            _reached_ref = getattr(node, "_final_retarget_xyz", None) or final_target[:3]
-            _retarget_note = (
-                f" retargeted_from=[{final_target[0]:.3f},"
-                f"{final_target[1]:.3f},{final_target[2]:.3f}]"
-                if getattr(node, "_final_retarget_xyz", None) else "")
-            _final_error_mm = math.dist(
-                _measured_final[:3], _reached_ref) * 1000.0
-            node.get_logger().info(
-                f"[FINAL_REACHED] target=[{_reached_ref[0]:.3f},{_reached_ref[1]:.3f},{_reached_ref[2]:.3f}] "
-                f"actual=[{_measured_final[0]:.3f},{_measured_final[1]:.3f},{_measured_final[2]:.3f}] "
-                f"error={_final_error_mm:.1f}mm{_retarget_note}")
-        else:
-            node.get_logger().warn(
-                "[FINAL_REACHED] Actual TCP unavailable before gripper close")
-
-        # Operator-correction capture, before the observation window and before
-        # the gripper closes: the arm is standing exactly where the pipeline
-        # decided, which is the error this is here to measure. Vision is resumed
-        # first so the crop written alongside the correction is what the camera
-        # saw from the uncorrected pose. Off unless demo_capture_enabled.
         if bool(getattr(node.cfg.planner, "demo_capture_enabled", False)):
+            # Observe before insertion. The operator performs the entire remaining
+            # APPROACH-to-grasp movement; never execute the nominal FINAL afterward.
+            node.motion_phase = "DEMO_APPROACH"
+            node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
+            node._demo_planned_final_pose = list(final_target)
             _vision_resume()
+            _demo_t = time.time()
             try:
-                node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
                 _demo_saved = demo_capture.capture_correction(node)
-            except Exception as _demo_exc:
+            except Exception as exc:
                 _demo_saved = None
-                node.get_logger().warn(f"[DEMO] capture failed: {_demo_exc}")
+                node.get_logger().warn(f"[DEMO] capture failed: {exc}")
             if not _demo_saved or node.stop_requested:
                 node._auto_harvest_abort = True
                 node.stop_requested = True
                 node.get_logger().warn("[DEMO] attempt stopped without closing")
                 break
+            # Continue from the demonstrated endpoint, retaining the sampled jog
+            # joint path for the existing reverse routine instead of bridging
+            # straight from the corrected grasp back to the old approach path.
+            node.stored_trajectory_states.extend(node._demo_jog_joint_path)
+            final_target = list(node.get_end_effector_pose())
+            node._final_retarget_xyz = None
+            _timing["final"] = time.time() - _demo_t
             if not _vision_pause():
                 break
+        else:
+            node.motion_phase = "FINAL"
+            # Vision was historically kept "paused" through the FINAL move, on the
+            # grounds that cuRobo needs the GPU. It does not: by this point planning
+            # is finished and the arm is replaying a trajectory computed a moment
+            # ago, so nothing is competing. That pause is the reason the last ~7cm
+            # is dead-reckoned.
+            #
+            # With observe enabled, vision runs through the leg and records what it
+            # sees. It does NOT change the target -- see _final_inflight_monitor.
+            _t_final = time.time()
+            _inflight_report = {
+                "frames": 0, "matched": 0, "rejected": 0, "no_candidate": 0,
+                "below_min": 0, "above_max": 0, "usable": 0,
+                "latest": None, "latest_d": 0.0, "latest_t": 0.0,
+                "last_reject": "", "applied": 0, "applied_total": 0.0,
+                "last_apply_t": 0.0,
+            }
+            _inflight_stop = threading.Event()
+            node._final_inflight_stop = _inflight_stop
+            _inflight_thread = None
+            _final_inplace_retried = False
+            if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
+                # _direct_ik_move publishes its trajectory ~25 lines BEFORE it
+                # assigns node._final_live_wait_xyz, and this thread starts before
+                # _direct_ik_move is even called. That left a window (~1s of IK) in
+                # which the monitor read the PREVIOUS cycle's target and retargeted
+                # against it. Observed 2026-09-14 11:52:52: an "8.2mm" correction
+                # produced [0.203,-1.037,0.394] for a goal at [0.286,-1.059,0.375]
+                # -- 80mm off, because the base was a stale list. The arm drove
+                # there, the endpoint check measured 76.6mm against the real target
+                # and failed a grasp that was never given a chance.
+                # Clearing both here makes _apply_final_inflight_correction's
+                # `tcp is None` guard a no-op gate until the real target is live.
+                node._final_live_wait_xyz = None
+                node._final_retarget_xyz = None
+                node._final_live_quat = list(final_target[3:7])
+                node.set_vision_mode("reacquire_fast")
+                # Compare against the FRUIT goal (x,y,z), not final_target.
+                # final_target is the TCP pose, which sits ~28mm from the fruit by
+                # design (grasp depth/z offsets plus the closure-centre correction).
+                # Measuring fruit detections against it made every candidate read
+                # as >25mm off, so the first run reported above_max=10 usable=0 --
+                # an artefact of the wrong reference, not a real miss.
+                _inflight_thread = threading.Thread(
+                    target=_final_inflight_monitor,
+                    args=(node, [float(x), float(y), float(z)], _inflight_stop,
+                          _inflight_report),
+                    daemon=True)
+                _inflight_thread.start()
+            try:
+                final_ok = _direct_ik_move(node, final_target, label="FINAL",
+                                           motion_type="final", store_trajectory=True)
+            finally:
+                with node._final_command_lock:
+                    _inflight_stop.set()
+                if _inflight_thread is not None:
+                    _inflight_thread.join(timeout=0.5)
+                    # Freeze the last crop BEFORE re-pausing vision. This is the
+                    # model input for a ready-to-close judgement: the date between
+                    # the fingertips at the moment the arm has finished closing in
+                    # and is about to grip. Taken here it is a few hundred ms old;
+                    # the recorder otherwise saves whatever survives until the
+                    # outcome fires, which is after the close AND the reverse --
+                    # measured at 2.9s stale, by which time the gripper has moved
+                    # and the image no longer describes the decision.
+                    try:
+                        _cc = getattr(node, "_latest_grasp_crop", None)
+                        node._grasp_crop_at_close = (
+                            _cc.copy() if _cc is not None else None)
+                        node._grasp_crop_at_close_meta = list(
+                            getattr(node, "_latest_grasp_crop_meta", None) or [])
+                        node._grasp_crop_at_close_age = round(
+                            time.time() - float(getattr(
+                                node, "_latest_grasp_crop_t", 0.0)), 3)
+                    except Exception:
+                        node._grasp_crop_at_close = None
+                    # Restore the pause the rest of the sequence expects.
+                    node.set_vision_mode("paused")
+                    if not node.wait_for_vision_paused(timeout=2.0):
+                        node.stop_requested = True
+                    node._last_inflight_report = dict(_inflight_report)
+                    _r = _inflight_report
+                    _latest = (
+                        f" nearest_usable={_r['latest_d']*1000:.1f}mm"
+                        f"@{_r['latest_t']:.2f}s"
+                        if _r["latest"] is not None else " nearest_usable=NONE")
+                    node.get_logger().info(
+                        "[FINAL_INFLIGHT] "
+                        f"frames={_r['frames']} matched={_r['matched']} "
+                        f"no_candidate={_r['no_candidate']} "
+                        f"rejected_quality={_r['rejected']} "
+                        f"below_min={_r['below_min']} above_max={_r['above_max']} "
+                        f"usable={_r['usable']}{_latest} "
+                        f"applied={_r['applied']} "
+                        f"applied_total={_r['applied_total']*1000:.1f}mm "
+                        f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
+                        + (f" last_reject={_r['last_reject']}"
+                           if _r["last_reject"] else ""))
+            # A FINAL that solved, planned and flew, but finished off-target, is not
+            # evidence against the corridor -- this one had CORRIDOR_PREFLIGHT=PASS,
+            # IK pos_err=0.0000 and PATH_LATERAL max_deviation=0.1mm. Excluding it
+            # and flying HOME to re-plan threw away ~11s and a perfectly good
+            # approach, and after 9 such failures the goal is abandoned outright.
+            # The arm is still centimetres from the fruit with a valid seed target,
+            # so re-fly the same leg from where it is. One attempt: if the second
+            # one also lands off-target the cause is not transient and the corridor
+            # logic below is the right answer.
+            if (not final_ok
+                    and getattr(node, "_final_fail_reason", None) == "ENDPOINT_ERROR"
+                    and not _final_inplace_retried
+                    and not node.stop_requested):
+                _final_inplace_retried = True
+                node.get_logger().warn(
+                    "[FINAL_RETRY] endpoint miss on a corridor that passed "
+                    "preflight — re-flying the same leg from the current pose "
+                    "instead of returning HOME")
+                final_ok = _direct_ik_move(
+                    node, final_target, label="FINAL_RETRY",
+                    motion_type="final", store_trajectory=True)
+
+            if not final_ok and _phase4_yaw_applied:
+                node.get_logger().warn(
+                    "[PHASE4_YAW] candidate execution IK/path failed; retrying "
+                    "unchanged FINAL orientation with recomputed TCP")
+                final_target = _baseline_final_target
+                orientation = _baseline_final_orientation
+                tcp_xyz = _baseline_tcp_xyz
+                closure_offset_base = _baseline_offset_base
+                _phase4_yaw_applied = False
+                final_ok = _direct_ik_move(
+                    node, final_target, label="FINAL",
+                    motion_type="final", store_trajectory=True)
+            if not final_ok and _final_approach_yaw_applied:
+                _yaw_fallback_tcp, _yaw_fallback_offset = (
+                    closure_center_corrected_tcp(
+                        desired_grasp_xyz,
+                        _pre_final_approach_yaw_orientation,
+                        closure_offset_tcp))
+                _yaw_fallback_target = [
+                    *_yaw_fallback_tcp, *_pre_final_approach_yaw_orientation]
+                node.get_logger().warn(
+                    "[FINAL_APPROACH_YAW] adjusted FINAL failed IK/path; "
+                    "retrying unchanged APPROACH orientation")
+                final_ok = _direct_ik_move(
+                    node, _yaw_fallback_target, label="FINAL_YAW_FALLBACK",
+                    motion_type="final", store_trajectory=True)
+                if final_ok:
+                    orientation = list(_pre_final_approach_yaw_orientation)
+                    tcp_xyz = list(_yaw_fallback_tcp)
+                    closure_offset_base = list(_yaw_fallback_offset)
+                    final_target = list(_yaw_fallback_target)
+                    _final_approach_yaw_applied = False
+            if not final_ok:
+                if _used_side_low_tilt:
+                    _fallback_tcp_xyz, _fallback_offset_base = closure_center_corrected_tcp(
+                        desired_grasp_xyz, _approach_orientation_for_final,
+                        closure_offset_tcp)
+                    approach_orientation_target = [
+                        *_fallback_tcp_xyz, *_approach_orientation_for_final]
+                    node.get_logger().warn(
+                        "FINAL tilted IK failed — retrying with original approach "
+                        "orientation and its recomputed closure-centre TCP")
+                    final_ok = _direct_ik_move(
+                        node, approach_orientation_target, label="FINAL_APPROACH_ORIENT",
+                        motion_type="final", store_trajectory=True)
+                    if final_ok:
+                        final_target = approach_orientation_target
+            if (not final_ok and not bool(getattr(
+                    node.cfg.planner, "strict_final_cartesian_only", True))):
+                # Fallback: full cuRobo plan_and_send (handles branch changes, no IK restriction)
+                node.get_logger().warn("FINAL IK failed — trying plan_and_send as fallback...")
+                _final_joints = _valid_joint_positions()
+                if _final_joints is not None:
+                    _final_start = JointState.from_position(
+                        torch.tensor([_final_joints], dtype=torch.float32, device=device),
+                        joint_names=node.joint_order,
+                    )
+                    final_ok = plan_and_send(node, _final_start, Pose.from_list(final_target),
+                        label="FINAL_PLAN", motion_type="final", goal_xyz=final_target[:3], store_trajectory=True)
+                    if final_ok:
+                        final_ok = wait_until_xyz(
+                            node, final_target[:3],
+                            tol=float(getattr(
+                                node.cfg.planner, "final_endpoint_tolerance", 0.004)))
+            if not final_ok:
+                if _active_corridor not in (None, "NONE"):
+                    node._corridor_exclusions.add(_active_corridor)
+                    remaining = 9 - len(node._corridor_exclusions)
+                    if remaining > 0:
+                        node.get_logger().warn(
+                            f"[CORRIDOR_RETRY] rejected={_active_corridor} "
+                            f"reason=STRAIGHT_FINAL_IK remaining={remaining}; "
+                            "returning HOME and trying next-best corridor")
+                        node.motion_phase = "HOME"
+                        move_to_home_position(node)
+                        node.goal_poses.insert(0, goal)
+                        unlock_target(node)
+                        _vision_resume()
+                        continue
+                node.get_logger().warn(
+                    "All candidate corridors failed straight Cartesian FINAL — "
+                    "skipping grasp without closing.")
+                node._corridor_exclusions = set()
+                node._corridor_retry_goal = None
+                unlock_target(node)
+                continue
+            log_path_deviation(node, "FINAL")
+            _timing["final"] = time.time() - _t_final
+            if _log_phase_timings:
+                node.get_logger().info(
+                    f"[TIMING] final={_timing['final']:.2f}s ok={final_ok} "
+                    f"target=[{final_target[0]:.3f},{final_target[1]:.3f},{final_target[2]:.3f}]")
+
+            # If stop was requested but arm is already at the final target, proceed with grasp.
+            # E-stop during the wait does not mean the arm failed — check actual EE position.
+            if getattr(node, '_stop_was_requested', False):
+                _cur_ee = node.get_end_effector_pose()
+                _dist_to_final = math.dist(_cur_ee[:3], final_target[:3]) if _cur_ee else float('inf')
+                if _dist_to_final < 0.015:  # within 15mm — arm is at the goal, safe to grasp
+                    node.get_logger().info(
+                        f"Stop was requested but arm is at final target ({_dist_to_final*100:.1f}cm) — proceeding with grasp.")
+                    node._stop_was_requested = False
+                else:
+                    node.get_logger().warn(
+                        f"Stop requested and arm is {_dist_to_final*100:.1f}cm from final target — aborting.")
+                    break
+
+            if _check_stop(): break
+
+            if approach_dir is not None:
+                _cur_final = node.get_end_effector_pose()
+                if _cur_final:
+                    _past = sum((_cur_final[i] - final_target[i]) * approach_dir[i] for i in range(3))
+                    _overshoot_thresh = getattr(node.cfg.planner, "final_overshoot_threshold", 0.004)
+                    if _past > _overshoot_thresh:
+                        _max_backoff = getattr(node.cfg.planner, "final_overshoot_max_backoff", 0.012)
+                        _backoff = min(_past, _max_backoff)
+                        _corrected_final = [
+                            _cur_final[i] - _backoff * approach_dir[i] for i in range(3)
+                        ] + list(_cur_final[3:])
+                        node.get_logger().info(
+                            f"[FINAL_OVERSHOOT] past target by {_past*1000:.1f}mm — "
+                            f"pulling back {_backoff*1000:.1f}mm before close")
+                        _direct_ik_move(node, _corrected_final, label="FINAL_BACKOFF",
+                                        motion_type="final", store_trajectory=True)
+
+            _measured_final = node.get_end_effector_pose()
+            if _measured_final:
+                # Report against the goal the arm was actually driving to. An
+                # in-flight retarget moves it, and printing the original target here
+                # showed an error that is really the size of the correction -- seen
+                # as "error=5.2mm" on a move the endpoint check (which does use the
+                # retargeted goal) passed at 3.2mm. Two references in adjacent lines
+                # reads like a near-miss when nothing is wrong.
+                _reached_ref = getattr(node, "_final_retarget_xyz", None) or final_target[:3]
+                _retarget_note = (
+                    f" retargeted_from=[{final_target[0]:.3f},"
+                    f"{final_target[1]:.3f},{final_target[2]:.3f}]"
+                    if getattr(node, "_final_retarget_xyz", None) else "")
+                _final_error_mm = math.dist(
+                    _measured_final[:3], _reached_ref) * 1000.0
+                node.get_logger().info(
+                    f"[FINAL_REACHED] target=[{_reached_ref[0]:.3f},{_reached_ref[1]:.3f},{_reached_ref[2]:.3f}] "
+                    f"actual=[{_measured_final[0]:.3f},{_measured_final[1]:.3f},{_measured_final[2]:.3f}] "
+                    f"error={_final_error_mm:.1f}mm{_retarget_note}")
+            else:
+                node.get_logger().warn(
+                    "[FINAL_REACHED] Actual TCP unavailable before gripper close")
+
 
         # Observation only: briefly resume live detection at the actual FINAL pose
         # so the vision overlay can verify the physical red fingertips around the

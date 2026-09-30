@@ -1026,7 +1026,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   plan_cancel_btn_->setVisible(false);
   motion_layout->addWidget(plan_cancel_btn_, 12, 1);
 
-  demo_capture_cb_ = new QCheckBox("Demo: correct FINAL, then Close");
+  demo_capture_cb_ = new QCheckBox("Demo: jog APPROACH to grasp, then Close");
   demo_capture_cb_->setToolTip(
     "Hold before grasping. Jog the pendant to the correct pose, restore ROS control, "
     "then press Close to save the image and correction and continue harvesting. "
@@ -1034,7 +1034,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(demo_capture_cb_, &QCheckBox::toggled, this, [this](bool enabled) {
     publishCmd(enabled ? "set_demo_capture true" : "set_demo_capture false");
     status_label_->setText(enabled
-      ? "Demo enabled: at FINAL, jog then press Close"
+      ? "Demo enabled: at APPROACH, select date, jog then Close"
       : "Demo disabled");
   });
   motion_layout->addWidget(demo_capture_cb_, 13, 0, 1, 2);
@@ -3243,7 +3243,7 @@ void UR10ePanel::updateDisplay()
     demo_capture_cb_->setChecked(demo_capture_enabled_);
     demo_capture_cb_->setText(demo_capture_active_
       ? "Demo holding: jog, then press Close"
-      : "Demo: correct FINAL, then Close");
+      : "Demo: jog APPROACH to grasp, then Close");
     demo_capture_cb_->blockSignals(false);
   }
 

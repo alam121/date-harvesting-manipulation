@@ -28,6 +28,7 @@ class CaptureTests(unittest.TestCase):
                 _demo_full_frame=None, _demo_publish_preview=Mock(),
                 _latest_grasp_crop_t=0, _latest_grasp_crop_meta=[1],
                 current_joint_positions=[0.0] * 6, stop_requested=False,
+                _demo_planned_final_pose=[.010, 0., 0., 1., 0., 0., 0.],
                 pose=[0., 0., 0., 1., 0., 0., 0.],
                 get_logger=lambda: Mock())
             node.get_end_effector_pose = lambda: node.pose
@@ -76,6 +77,13 @@ class CaptureTests(unittest.TestCase):
         meta['candidates'].append({'fruit_id': 5, 'bbox_xyxy': [0, 0, 20, 20], 'base_xyz': [.01, 0, 0]})
         _, label = demo.target_preview(image, meta, [0, 0, 0])
         self.assertIsNone(label['suggested_fruit_id'])
+
+    def test_approach_motion_and_final_residual_have_distinct_labels(self):
+        data, _ = self.run_capture()
+        self.assertEqual(data['observation_stage'], 'APPROACH')
+        self.assertEqual(data['desired_motion_base_m'], [.012, 0., 0.])
+        self.assertAlmostEqual(data['residual_from_planned_final_base_m'][0], .002)
+        self.assertEqual(data['before']['planned_final_pose'][:3], [.010, 0., 0.])
 
     def test_close_without_click_does_not_save(self):
         data, images = self.run_capture(clicked=False)

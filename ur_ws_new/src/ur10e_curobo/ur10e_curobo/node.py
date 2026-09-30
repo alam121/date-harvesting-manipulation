@@ -1640,7 +1640,7 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "close":
             if self._demo_capture_active:
                 if not getattr(self, "_demo_capture_ready", False):
-                    self.get_logger().warn("[DEMO] Wait for the fresh FINAL image before Close")
+                    self.get_logger().warn("[DEMO] Wait for the fresh APPROACH image before Close")
                     return
                 if not self.robot_running:
                     self.get_logger().warn("[DEMO] Restore the robot External Control program before Close")
@@ -2182,7 +2182,7 @@ class UR10eCuroboMoveIt(Node):
             if not enabled and self._demo_capture_active:
                 self._demo_confirm = False
             self.get_logger().info(
-                f"[DEMO] {'ENABLED: hold at FINAL, then press Close' if enabled else 'DISABLED'}")
+                f"[DEMO] {'ENABLED: hold at APPROACH, then press Close' if enabled else 'DISABLED'}")
         elif cmd.startswith("set_final_reacquire "):
             val = cmd.split()[1].lower()
             enabled = val in ("true", "1", "yes", "on")

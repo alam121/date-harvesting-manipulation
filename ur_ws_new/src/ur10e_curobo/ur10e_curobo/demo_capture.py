@@ -1,9 +1,9 @@
-"""Record operator corrections to the FINAL pose, for training a residual policy.
+"""Record operator corrections to the APPROACH pose, for training a residual policy.
 
 The pipeline drives to where it thinks the date is, which is wrong by a
 range-dependent amount nobody has pinned down (see low_center_final_depth_offset
 in config.py). This captures the correction instead of hand-tuning it: the arm
-stops at its FINAL pose, the operator jogs the teach pendant to the pose that
+stops at its APPROACH pose, the operator jogs the teach pendant to the pose that
 would actually grasp, and the delta between the two is one training sample.
 
 Deliberately NOT a full-trajectory demo recorder. The policy being trained fixes
@@ -90,6 +90,7 @@ def target_preview(image, metadata, goal):
 
 
 def capture_correction(node) -> Optional[str]:
+    node._demo_jog_joint_path = []
     node._demo_target_selection = None
     node._demo_confirm = None
     node._demo_capture_ready = False
@@ -102,7 +103,7 @@ def capture_correction(node) -> Optional[str]:
 
 
 def _capture_correction(node) -> Optional[str]:
-    """Hold at FINAL, wait for the operator's corrected pose, write one sample.
+    """Hold at APPROACH, wait for the operator's corrected pose, write one sample.
 
     Returns the directory written, or None if disabled/skipped/timed out.
     The caller stops the attempt if recording fails.
@@ -111,7 +112,7 @@ def _capture_correction(node) -> Optional[str]:
     if not bool(getattr(planner, "demo_capture_enabled", False)):
         return None
 
-    # Vision has just resumed. Do not pair a stale approach image with FINAL.
+    # Vision has just resumed. Do not pair a stale approach image with APPROACH.
     requested_at = time.time()
     deadline = time.monotonic() + 3.0
     while (getattr(node, "_latest_grasp_crop_t", 0.0) <= requested_at
@@ -121,7 +122,7 @@ def _capture_correction(node) -> Optional[str]:
         if getattr(node, "stop_requested", False):
             return None
         if time.monotonic() >= deadline:
-            node.get_logger().warn("[DEMO] no fresh FINAL crop/full frame; stopping attempt")
+            node.get_logger().warn("[DEMO] no fresh APPROACH crop/full frame; stopping attempt")
             return None
         time.sleep(0.02)
     snapshot = node._demo_full_frame
@@ -143,10 +144,11 @@ def _capture_correction(node) -> Optional[str]:
     before_image_t = node._latest_grasp_crop_t
     before_pose = _pose_now(node)
     if before_pose is None:
-        node.get_logger().warn("[DEMO] no TCP pose at FINAL; not recording")
+        node.get_logger().warn("[DEMO] no TCP pose at APPROACH; not recording")
         return None
 
     before = {
+        "planned_final_pose": copy.deepcopy(getattr(node, "_demo_planned_final_pose", None)),
         "target_label": target_label,
         "pose": before_pose,
         "joints": list(getattr(node, "current_joint_positions", None) or []),
@@ -166,7 +168,7 @@ def _capture_correction(node) -> Optional[str]:
     hz = max(1.0, float(getattr(planner, "demo_capture_sample_hz", 10.0)))
     node._demo_capture_ready = True
     node.get_logger().warn(
-        "[DEMO] holding at FINAL. Jog the pendant to the pose that would "
+        "[DEMO] holding at APPROACH. Jog the pendant to the pose that would "
         "actually grasp, restore ROS control, then press Close in RViz to save "
         "and continue. Uncheck Demo to discard and stop this attempt.")
 
@@ -233,7 +235,17 @@ def _capture_correction(node) -> Optional[str]:
         node.get_logger().warn(f"[DEMO] cannot create {out}: {exc}")
         return None
 
+    planned_final = before.get('planned_final_pose')
+    residual = ([after_pose[i] - planned_final[i] for i in range(3)]
+                if planned_final else None)
     sample = {
+        "schema_version": 2,
+        "observation_stage": "APPROACH",
+        "desired_motion_base_m": delta_base,
+        "desired_motion_tool_m": delta_tool,
+        "residual_from_planned_final_base_m": residual,
+        "correction_reference": "actual_approach_pose",
+
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
         "before": before,
         "after": {"pose": after_pose,
@@ -255,7 +267,7 @@ def _capture_correction(node) -> Optional[str]:
     if not (_write_crop(before_image, out, "crop_before.jpg")
             and _write_crop(before_full, out, "full_before.jpg")
             and _write_crop(marked_full, out, "full_before_marked.jpg")):
-        node.get_logger().warn("[DEMO] cannot save FINAL crop; stopping attempt")
+        node.get_logger().warn("[DEMO] cannot save APPROACH crop; stopping attempt")
         os.remove(os.path.join(out, "sample.json"))
         return None
     _write_crop(getattr(node, "_latest_grasp_crop", None), out, "crop_after.jpg")
@@ -270,6 +282,9 @@ def _capture_correction(node) -> Optional[str]:
         + (f" tool=[{delta_tool[0]*1000:+.1f},{delta_tool[1]*1000:+.1f},"
            f"{delta_tool[2]*1000:+.1f}]mm" if delta_tool else "")
         + f" at {sample['range_m']}m -> {out}")
+    node._demo_jog_joint_path = [list(before['joints'])]
+    node._demo_jog_joint_path.extend(list(item['joints']) for item in path if len(item['joints']) == 6)
+    node._demo_jog_joint_path.append(list(sample['after']['joints']))
     return out
 
 
