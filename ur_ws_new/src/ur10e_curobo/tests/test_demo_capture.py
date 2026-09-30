@@ -17,7 +17,7 @@ spec.loader.exec_module(demo)
 
 
 class CaptureTests(unittest.TestCase):
-    def run_capture(self, verdict=True, fresh=True, stopped=False, write_ok=True):
+    def run_capture(self, verdict=True, fresh=True, stopped=False, write_ok=True, full_fresh=True):
         with TemporaryDirectory() as root:
             clock = SimpleNamespace(now=10.0)
             node = SimpleNamespace(
@@ -25,6 +25,7 @@ class CaptureTests(unittest.TestCase):
                     demo_capture_enabled=True, demo_capture_dir=root,
                     demo_capture_timeout_s=0.3, demo_capture_sample_hz=10)),
                 _latest_grasp_crop=np.zeros((3, 3, 3), dtype=np.uint8),
+                _demo_full_frame=None, _demo_publish_preview=Mock(),
                 _latest_grasp_crop_t=0, _latest_grasp_crop_meta=[1],
                 current_joint_positions=[0.0] * 6, stop_requested=False,
                 pose=[0., 0., 0., 1., 0., 0., 0.],
@@ -37,6 +38,8 @@ class CaptureTests(unittest.TestCase):
                 if fresh and not calls:
                     node._latest_grasp_crop_t = clock.now
                     node._latest_grasp_crop[:] = 30
+                    if full_fresh:
+                        node._demo_full_frame = (np.full((4, 6, 3), 42, dtype=np.uint8), clock.now, clock.now)
                 else:
                     node.pose = [.012, 0., 0., 1., 0., 0., 0.]
                     node._latest_grasp_crop[:] = 200
@@ -60,6 +63,11 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(list(Path(root).rglob('sample.json')), [])
             return data, images
 
+    def test_missing_full_frame_stops_capture(self):
+        data, images = self.run_capture(full_fresh=False)
+        self.assertIsNone(data)
+        self.assertEqual(images, {})
+
     def test_before_image_is_frozen_and_delta_is_metres(self):
         data, images = self.run_capture()
         self.assertEqual(data['correction_base_m'], [.012, 0., 0.])
@@ -68,6 +76,7 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(np.all(images['crop_before.jpg'] == 30))
         self.assertTrue(np.all(images['crop_after.jpg'] == 200))
         self.assertGreater(data['jog_samples'], 0)
+        self.assertTrue(np.all(images["full_before.jpg"] == 42))
 
     def test_discard(self):
         self.assertIsNone(self.run_capture(verdict=False)[0])

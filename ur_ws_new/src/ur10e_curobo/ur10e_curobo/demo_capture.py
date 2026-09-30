@@ -87,13 +87,18 @@ def _capture_correction(node) -> Optional[str]:
     requested_at = time.time()
     deadline = time.monotonic() + 3.0
     while (getattr(node, "_latest_grasp_crop_t", 0.0) <= requested_at
-           or getattr(node, "_latest_grasp_crop", None) is None):
+           or getattr(node, "_latest_grasp_crop", None) is None
+           or getattr(node, "_demo_full_frame", None) is None
+           or node._demo_full_frame[1] <= requested_at):
         if getattr(node, "stop_requested", False):
             return None
         if time.monotonic() >= deadline:
-            node.get_logger().warn("[DEMO] no fresh FINAL crop; stopping attempt")
+            node.get_logger().warn("[DEMO] no fresh FINAL crop/full frame; stopping attempt")
             return None
         time.sleep(0.02)
+    full_frame, full_received, full_stamp = node._demo_full_frame
+    before_full = full_frame.copy()
+    node._demo_publish_preview(before_full)
     before_image = node._latest_grasp_crop.copy()
     before_image_t = node._latest_grasp_crop_t
     before_pose = _pose_now(node)
@@ -108,6 +113,11 @@ def _capture_correction(node) -> Optional[str]:
         "final_retarget_xyz": getattr(node, "_final_retarget_xyz", None),
         "crop_meta": copy.deepcopy(getattr(node, "_latest_grasp_crop_meta", None)),
         "crop_time": before_image_t,
+        "full_frame_received_time": full_received,
+        "full_frame_source_stamp": full_stamp,
+        "full_frame_shape": list(before_full.shape),
+        "full_frame_topic": "/vision/demo_full/compressed",
+        "full_frame_annotated": False,
         "fruit_radius": getattr(node, "latest_fruit_radius", None),
     }
 
@@ -181,11 +191,15 @@ def _capture_correction(node) -> Optional[str]:
     except Exception as exc:
         node.get_logger().warn(f"[DEMO] cannot write sample.json: {exc}")
         return None
-    if not _write_crop(before_image, out, "crop_before.jpg"):
+    if not (_write_crop(before_image, out, "crop_before.jpg")
+            and _write_crop(before_full, out, "full_before.jpg")):
         node.get_logger().warn("[DEMO] cannot save FINAL crop; stopping attempt")
         os.remove(os.path.join(out, "sample.json"))
         return None
     _write_crop(getattr(node, "_latest_grasp_crop", None), out, "crop_after.jpg")
+    after_frame = getattr(node, '_demo_full_frame', None)
+    if after_frame is not None and time.time() - after_frame[1] < 1.0:
+        _write_crop(after_frame[0], out, 'full_after.jpg')
 
     node.get_logger().warn(
         f"[DEMO] correction {sample['correction_mm']:.1f}mm "

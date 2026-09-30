@@ -318,6 +318,10 @@ class VisionNode:
         # frames when rendering cannot keep up.
         self.image_pub = self.node.create_publisher(
             ROSImage, "/vision/display", fast_qos)
+        from sensor_msgs.msg import CompressedImage
+        self.demo_full_pub = self.node.create_publisher(
+            CompressedImage, "/vision/demo_full/compressed", 1)
+        self._demo_full_last = 0.0
         self.raw_image_pub = self.node.create_publisher(
             ROSImage, "/vision/raw", fast_qos)
         self.fingertip_verification_pub = self.node.create_publisher(
@@ -894,6 +898,23 @@ class VisionNode:
                             self._request_exit()
                         continue
                     stamp = self.node.get_clock().now().to_msg()
+                    # Preserve the full field of view before annotations; JPEG keeps
+                    # the campus link usable. Encode only when subscribed, at 3 Hz.
+                    if (self.demo_full_pub.get_subscription_count() and
+                            time() - self._demo_full_last >= 1.0 / 3.0):
+                        from sensor_msgs.msg import CompressedImage
+                        full = img_ocv[:, :, :3]
+                        height, width = full.shape[:2]
+                        if width > 1280:
+                            full = cv2.resize(full, (1280, round(height * 1280 / width)))
+                        ok, jpeg = cv2.imencode('.jpg', full, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if ok:
+                            msg = CompressedImage()
+                            msg.header.stamp = stamp
+                            msg.format = 'jpeg'
+                            msg.data = jpeg.tobytes()
+                            self.demo_full_pub.publish(msg)
+                            self._demo_full_last = time()
                     raw_stream_active = (
                         self._raw_stream_enabled or time() < self._raw_stream_until)
                     if raw_stream_active:

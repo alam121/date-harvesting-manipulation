@@ -315,3 +315,20 @@ Validate pair arrival and recovered scale on the remote recorder before a datase
 
 Existing `/vision/raw` is independently gated by `raw_stream on`; publisher
 presence alone does not mean raw streaming has been enabled.
+
+### Demo full-frame observations
+
+Restart both vision and the motion node after this change; reload `view_robot.rviz`
+to see **Demo Before (frozen)**. At FINAL, demo capture requires a fresh crop and
+an unannotated full field-of-view image. `/vision/demo_full/compressed` publishes
+JPEG at up to 3 Hz and 1280 pixels wide. `/demo/before_image` holds the exact
+pre-jog full frame for RViz. Check that the target and fingertips are visible
+before jogging; uncheck Demo to discard if they are obscured.
+
+Samples retain `crop_before.jpg` and `crop_after.jpg`, and add required
+`full_before.jpg` plus `full_after.jpg` when a frame received within one second
+is available at confirmation. JSON records the before full-frame source and
+receipt timestamps and dimensions. Crop and full-frame observations are fresh
+but not guaranteed to be from the same camera exposure. The preview remains
+frozen until the next capture; it is not a live jogging view. Existing demos
+cannot be retroactively supplied with full images.

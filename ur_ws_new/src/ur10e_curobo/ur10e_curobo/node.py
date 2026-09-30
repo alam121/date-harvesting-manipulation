@@ -349,6 +349,33 @@ class UR10eCuroboMoveIt(Node):
         self._latest_grasp_crop = None
         self._latest_grasp_crop_t = 0.0
         self._latest_grasp_crop_meta = None
+        self._demo_full_frame = None
+        from sensor_msgs.msg import CompressedImage
+        from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+        preview_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                 reliability=ReliabilityPolicy.RELIABLE)
+        self._demo_preview_pub = self.create_publisher(Image, '/demo/before_image', preview_qos)
+
+        def _demo_full_cb(msg):
+            if not getattr(self, '_demo_capture_active', False):
+                return
+            try:
+                frame = self._get_camera_bridge().compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                # One tuple assignment keeps image and timestamps paired.
+                self._demo_full_frame = (frame, time.time(),
+                    msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
+            except Exception as exc:
+                self.get_logger().warn(f'[DEMO] full-frame decode failed: {exc}')
+
+        self.create_subscription(CompressedImage, '/vision/demo_full/compressed',
+                                 _demo_full_cb, qos_profile_sensor_data)
+
+        def _demo_publish_preview(frame):
+            msg = self._get_camera_bridge().cv2_to_imgmsg(frame, encoding='bgr8')
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self._demo_preview_pub.publish(msg)
+        self._demo_publish_preview = _demo_publish_preview
+
 
         # Operator verdict on a demo_capture hold: True keeps the correction,
         # False discards it. None means "still jogging" -- the capture loop
