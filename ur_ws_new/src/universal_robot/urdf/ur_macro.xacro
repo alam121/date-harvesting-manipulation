@@ -543,8 +543,8 @@
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_new_lab_rpy" value="-0.206146 0.001382 -1.835627"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_new_outdoor_xyz" value="-0.077883 -0.090478 0.078155"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_new_outdoor_rpy" value="-0.202440 0.016049 -0.497189"/>
-    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_xyz" value="0.087639 -0.080624 0.074716"/>
-    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_rpy" value="-0.108100 0.009920 1.053293"/>
+    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_xyz" value="0.090454 -0.080254 0.073331"/>
+    <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_lab_rpy" value="-0.113475 0.009291 1.050907"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_xyz" value="-0.115138 -0.075365 0.080713"/>
     <xacro:property name="hand_eye_zed_mini_left_camera_frame_old_outdoor_rpy" value="-0.187840 -0.004377 -0.796829"/>
     <origin
