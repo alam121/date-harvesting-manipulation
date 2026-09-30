@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark cuRobo IK solve_single in the exact shapes goals.py uses.
+"""Benchmark the v2 IK cold/steady-state cost and world-update overhead.
 
-*** GPU-HEAVY. Do NOT run while the robot stack is live. ***
-Check first:  ps -eo args | grep -c "use_fake_hardware:=false"
-
-Why this exists
----------------
-Field logs show every ik_solver.solve_single() taking 200-350ms, against ~22ms
-documented in goals.py. lock_wait_ms is 0, so it is not GPU contention with
-YOLO, and the first call in a batch is not the slow one, so it is not one-off
-capture cost. That points at the CUDA graph never being reused for this call.
-
-MotionGen.warmup() warms plan_single_js, graph_planner, plan_single and
-plan_goalset -- it never calls ik_solver.solve_single(). goals.py calls the IK
-solver directly, in two different shapes:
-
-    A (corridor preflight)  solve_single(pose, seed_config=, retract_config=)
-    B (VERY_LOW search)     solve_single(pose, seed_config=, retract_config=,
-                                         return_seeds=8)
-
-cuRobo caches a CUDA graph per solve state, and its own docs warn that changing
-return_seeds is not allowed once a graph is captured. So the suspects are:
-(1) the shapes are never warmed, so each call pays the slow path, and/or
-(2) A and B alternate at runtime and evict each other.
-
-This measures which. Run it, read the verdict, then change warmup accordingly --
-do not guess.
+Run with the cuRobo v2 environment: python -m ur10e_curobo.bench_ik_speed.
+This benchmark computes plans only and never sends robot commands.
 """
 
 from __future__ import annotations
@@ -36,12 +13,8 @@ import time
 from typing import Callable, List
 
 import torch
-from curobo.geom.types import WorldConfig
-from curobo.types.base import TensorDeviceType
-from curobo.types.math import Pose
-from curobo.types.state import JointState
-from curobo.util_file import get_robot_configs_path, join_path, load_yaml
-from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
+from curobo.types import Pose, JointState
+from .planner_v2 import PlannerV2, load_robot_config
 
 try:
     from ur10e_curobo.config import WORLD_CONFIG as PROD_WORLD
@@ -84,42 +57,30 @@ def main() -> None:
                          "2cm nudge off the retract config")
     args = ap.parse_args()
 
-    print("\ncuRobo IK benchmark — building MotionGen (this takes a while)…")
-    robot_cfg = load_yaml(join_path(get_robot_configs_path(), args.robot_config))
+    print("\ncuRobo IK benchmark — building the v2 planner (this takes a while)…")
+    robot_cfg = load_robot_config(args.robot_config)
     # Match production's collision world. The first version of this benchmark
     # used an empty world and measured 17ms while the field sees 250ms, so the
     # world is one of the two remaining differences.
     if args.empty_world or PROD_WORLD is None:
-        world = WorldConfig()
+        world = {}
         print("world: EMPTY")
     else:
-        world = WorldConfig.from_dict(PROD_WORLD)
+        world = PROD_WORLD
         n_obs = sum(len(v) for v in PROD_WORLD.values() if hasattr(v, "__len__"))
         print(f"world: production WORLD_CONFIG ({n_obs} obstacle(s))")
-    cfg = MotionGenConfig.load_from_robot_config(
-        robot_cfg,
-        world,
-        interpolation_dt=0.004,
-        collision_cache={"obb": 64, "mesh": 10},
-        num_trajopt_seeds=2,
-    )
-    mg = MotionGen(cfg)
+    mg = PlannerV2(robot_cfg, world, interpolation_dt=0.004, num_trajopt_seeds=2)
     mg.warmup()
-    print("warmup done (the same warmup() production calls)\n")
-
-    tdt = TensorDeviceType()
-    dev = tdt.device
-    ik = mg.ik_solver
-    start_js = mg.get_retract_config().view(1, -1).clone()
-    seed_t = start_js.clone().unsqueeze(0).to(dev)
-    retract_t = start_js.clone().to(dev)
-
-    # A guaranteed-reachable pose: forward kinematics of the retract config,
-    # nudged 2cm so the solver has something to do. Same approach warmup() uses.
-    state = mg.rollout_fn.compute_kinematics(
-        JointState.from_position(start_js, joint_names=mg.rollout_fn.joint_names))
-    pos = state.ee_pos_seq.clone().view(1, 3)
-    quat = state.ee_quat_seq.clone().view(1, 4)
+    print("v2 warmup done")
+    dev = torch.device('cuda')
+    start_js = mg.planner.default_joint_state.position.view(1, -1).clone()
+    seed_t = start_js.clone().unsqueeze(0)
+    retract_t = start_js.clone()
+    state = mg.planner.compute_kinematics(
+        JointState.from_position(start_js, joint_names=mg.planner.joint_names))
+    tool = state.tool_poses.get_link_pose(mg.tool_frame)
+    pos = tool.position.clone().view(1, 3)
+    quat = tool.quaternion.clone().view(1, 4)
     if args.hard_pose:
         # A real VERY_LOW target from the field logs: far out, low, near the
         # edge of the workspace. IK difficulty is the other difference between
@@ -132,10 +93,10 @@ def main() -> None:
     goal = Pose(position=pos.to(dev), quaternion=quat.to(dev))
 
     def call_a() -> None:
-        ik.solve_single(goal, seed_config=seed_t, retract_config=retract_t)
+        mg.solve_ik(goal, seed_config=seed_t, retract_config=retract_t)
 
     def call_b() -> None:
-        ik.solve_single(goal, seed_config=seed_t, retract_config=retract_t,
+        mg.solve_ik(goal, seed_config=seed_t, retract_config=retract_t,
                         return_seeds=args.return_seeds)
 
     if args.update_world:
@@ -143,7 +104,7 @@ def main() -> None:
         # motion_gen.update_world() to add the safe-zone wall panels. A world
         # update invalidates cuRobo's captured CUDA graphs, so if that is what
         # costs the field its 150-400ms per solve, it will show up here.
-        from curobo.geom.types import Cuboid
+        from curobo.scene import Cuboid
         wm = mg.world_model
         wm.cuboid = list(wm.cuboid or []) + [
             Cuboid(name=f"safezone_{i}", pose=[0.0, 0.0, -2.0, 1, 0, 0, 0],
@@ -193,7 +154,7 @@ def main() -> None:
         print(f"  Shapes are slow even in isolation (A {a_warm:.0f}ms, "
               f"B {b_warm:.0f}ms) and match the field's ~{field_ms:.0f}ms.")
         print("  The IK CUDA graph is not being used for this entry point.")
-        print("  FIX: warm ik_solver.solve_single() with BOTH exact shapes right")
+        print("  FIX: warm PlannerV2.solve_ik() with BOTH exact shapes right")
         print("       after motion_gen.warmup(), and keep the signatures stable.")
     if a_cold > a_warm * 2:
         print(f"\n  (A's first call is {a_cold / max(a_warm, 1e-6):.1f}x the steady "

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import List
 import os
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
+from .planner_options import PlanOptions
 
 # ---------- QoS ----------
 DEFAULT_QOS = QoSProfile(
@@ -396,49 +396,12 @@ WORLD_CONFIG = {
     }
 }
 
-PLAN_CFG_DEFAULT = MotionGenPlanConfig(max_attempts=20, enable_finetune_trajopt=True)
-
-# For joint-space planning (plan_single_js): no graph search needed since start/goal joints
-# are already known. Graph search resizes internal buffers which corrupts plan_single_js state.
-PLAN_CFG_JS = MotionGenPlanConfig(
-    max_attempts=20,
-    enable_finetune_trajopt=True,
-    enable_graph=False,
-    enable_graph_attempt=None,
-)
-
-# Fallback for when finetune trajopt fails (FINETUNE_TRAJOPT_FAIL).
-# Used as a second attempt in plan_execute_js — skips fine-tune smoothing
-# but still produces a valid collision-free trajectory.
-PLAN_CFG_JS_NO_FINETUNE = MotionGenPlanConfig(
-    max_attempts=20,
-    enable_finetune_trajopt=False,
-    enable_graph=False,
-    enable_graph_attempt=None,
-)
-
-# Last-resort recovery for large/contorted reconfigurations (e.g. HOME ~170deg away from a
-# flipped in-zone pose) where the straight-line trajopt seed sweeps through obstacles and the
-# optimizer can't converge from any local seed. The graph planner finds a collision-free
-# GLOBAL seed that trajopt then smooths. Graph search resizes internal buffers that otherwise
-# corrupt subsequent plan_single_js calls, so the caller MUST motion_gen.reset() afterward.
-PLAN_CFG_JS_GRAPH = MotionGenPlanConfig(
-    max_attempts=8,
-    enable_finetune_trajopt=True,
-    enable_graph=True,
-    enable_graph_attempt=1,
-)
-
-# Cheap config for reachability PREFLIGHT (e.g. lidar-scan candidate probing). A preflight
-# only needs a yes/no "can the arm get here" answer, not a polished trajectory. The big cost
-# was the strict finetune smoothing pass (~12s per failure, and FINETUNE_TRAJOPT_FAIL on
-# reachable poses) — dropping it gives most of the speedup. max_attempts is kept moderately
-# high because it controls IK-seed diversity: too low (e.g. 4) makes borderline-reachable
-# semicircle poses spuriously IK_FAIL and collapses the sweep to a tiny fallback arc.
-PLAN_CFG_SCAN_PREFLIGHT = MotionGenPlanConfig(
-    max_attempts=20,
-    enable_finetune_trajopt=False,
-)
+# v2 owns B-spline refinement; the v1 finetune switch no longer exists.
+PLAN_CFG_DEFAULT = PlanOptions(max_attempts=20)
+PLAN_CFG_JS = PlanOptions(max_attempts=20, graph_attempt=None)
+PLAN_CFG_JS_RETRY = PlanOptions(max_attempts=8, graph_attempt=1)
+PLAN_CFG_JS_GRAPH = PlanOptions(max_attempts=8, graph_attempt=1)
+PLAN_CFG_SCAN_PREFLIGHT = PlanOptions(max_attempts=20)
 
 # ---------- Runtime parameters (override via ROS params / env) ----------
 @dataclass

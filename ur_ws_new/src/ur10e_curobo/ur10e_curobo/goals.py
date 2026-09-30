@@ -4,8 +4,8 @@ import threading
 import copy
 import numpy as np
 from geometry_msgs.msg import Pose as ROSPose, PoseStamped, PointStamped
-from curobo.types.math import Pose
-from curobo.types.robot import JointState
+from curobo.types import Pose
+from curobo.types import JointState
 
 
 def try_cuda_recovery(node) -> bool:
@@ -943,7 +943,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
             # retract_config: (1, dof) — pull solution towards current joints
             retract = torch.tensor([start_js], dtype=torch.float32, device=device)
-            ik_result = node.motion_gen.ik_solver.solve_single(
+            ik_result = node.motion_gen.solve_ik(
                 goal_pose, seed_config=seed, retract_config=retract
             )
             if ik_result.success.item():
@@ -1018,7 +1018,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             _best_total = _total_delta
             for _s in _seeds:
                 _seed_t = torch.tensor([_s], dtype=torch.float32, device=device).unsqueeze(0)
-                _r = node.motion_gen.ik_solver.solve_single(goal_pose, seed_config=_seed_t, retract_config=retract)
+                _r = node.motion_gen.solve_ik(goal_pose, seed_config=_seed_t, retract_config=retract)
                 if _r.success.item():
                     _candidate = nearest_joint_config(start_js, _r.js_solution.position.squeeze().cpu().tolist())
                     _d = sum(abs(g - c) for g, c in zip(_candidate, start_js))
@@ -1080,7 +1080,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     _use_cartesian_ik = (label == "FINAL" or require_cartesian) and _N_CART > 0
     if _use_cartesian_ik and _cur_ee is not None and not getattr(node, "_cuda_faulted", False):
         # Hold the YOLO inference lock across this IK burst. plan_and_send()
-        # already does this for plan_single -- YOLO TRT and cuRobo kernels
+        # already does this for plan_pose -- YOLO TRT and cuRobo kernels
         # contending on the shared Jetson GPU is both slower and the documented
         # source of device-side asserts -- but this path solved unlocked, so the
         # per-waypoint chain (plus its branch retries) raced vision inference at
@@ -1110,7 +1110,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                 _quat_t  = torch.tensor([_wp_quat], dtype=torch.float32, device=_dev)
                 _seed_t  = torch.tensor([_prev_js], dtype=torch.float32, device=_dev).unsqueeze(0)
                 _ret_t   = torch.tensor([_prev_js], dtype=torch.float32, device=_dev)
-                _r = node.motion_gen.ik_solver.solve_single(
+                _r = node.motion_gen.solve_ik(
                     Pose(position=_pos_t, quaternion=_quat_t),
                     seed_config=_seed_t, retract_config=_ret_t)
                 # A single seeded solve can miss a valid nearby branch. Retry
@@ -1127,7 +1127,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                             _retry_seed_t = torch.tensor(
                                 [_retry_seed], dtype=torch.float32,
                                 device=_dev).unsqueeze(0)
-                            _rr = node.motion_gen.ik_solver.solve_single(
+                            _rr = node.motion_gen.solve_ik(
                                 Pose(position=_pos_t, quaternion=_quat_t),
                                 seed_config=_retry_seed_t,
                                 retract_config=_ret_t)
@@ -1173,7 +1173,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                 _quat_final = torch.tensor([_target_quat], dtype=torch.float32, device=_dev)
                 _seed_final = torch.tensor([_prev_js], dtype=torch.float32, device=_dev).unsqueeze(0)
                 _ret_final  = torch.tensor([_prev_js], dtype=torch.float32, device=_dev)
-                _r_final = node.motion_gen.ik_solver.solve_single(
+                _r_final = node.motion_gen.solve_ik(
                     Pose(position=_pos_final, quaternion=_quat_final),
                     seed_config=_seed_final, retract_config=_ret_final)
                 if _r_final.success.item():
@@ -1477,7 +1477,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
     """Validate APPROACH and fixed-orientation straight FINAL before motion.
 
     Holds the YOLO inference lock across the whole IK burst. plan_and_send()
-    already does this for plan_single -- YOLO TRT and cuRobo kernels contending
+    already does this for plan_pose -- YOLO TRT and cuRobo kernels contending
     on the shared Jetson GPU is both slower and the source of device-side
     asserts -- but this preflight was solving unlocked, so its chain of solves
     raced vision inference at ~7Hz. Taking the lock once for the burst costs at
@@ -1509,24 +1509,9 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         def solve(pose, seed):
-            # cuRobo's IK solver already searches ik_solver.num_seeds (32 by
-            # default) candidates in parallel inside ONE solve_single() call,
-            # regularized toward retract_config (== seed here) so it already
-            # favors the branch closest to the current joint state -- that's
-            # what the old manual 5-seed Python retry loop was trying to
-            # approximate by hand, at ~6x the cost of one plain call (measured
-            # ~127ms sequential-loop vs ~22ms single call on this hardware),
-            # since each of its 5 calls *also* internally ran the same 32-seed
-            # search. Kept to a single plain-shape call so it matches the
-            # solve state MotionGen.warmup() already CUDA-graphs -- passing a
-            # custom num_seeds/return_seeds here breaks the graph on this
-            # cuRobo/CUDA build ("changing goal type, cuda graph reset not
-            # available"). Trade-off vs. the old code: this no longer retries
-            # with hand-nudged wrist seeds when the first result isn't
-            # continuous enough -- it may reject a few corridors the manual
-            # nudge would have rescued, but never accepts a worse branch than
-            # the manual loop would have, and the continuity/branch-switch
-            # checks below still run on whatever this returns.
+            # v2 searches its configured parallel seed set and uses the
+            # current state as the posture preference. The continuity and
+            # branch-switch checks below still validate the returned solution.
             _solve_t0 = time.time()
             _prep_t0 = _solve_t0
             pos = torch.tensor([pose[:3]], dtype=torch.float32, device=dev)
@@ -1558,7 +1543,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             #                   contention) and cuRobo is not the problem
             _call_t0 = time.time()
             _call_c0 = time.thread_time()
-            result = node.motion_gen.ik_solver.solve_single(
+            result = node.motion_gen.solve_ik(
                 goal_pose, seed_config=seed_t, retract_config=retract_t)
             _call_cpu_ms = (time.thread_time() - _call_c0) * 1000.0
             _sync_t0 = time.time()
@@ -1829,7 +1814,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
     max_delta = math.radians(float(
         getattr(planner, "very_low_ik_max_joint_delta_deg", 75.0)))
     requested = max(1, int(getattr(planner, "very_low_ik_return_seeds", 8)))
-    solver_seeds = int(getattr(node.motion_gen.ik_solver, "num_seeds", requested))
+    solver_seeds = int(getattr(node.motion_gen, "num_ik_seeds", requested))
     return_seeds = min(requested, solver_seeds)
     # No sticky pitch: every goal starts from the configured preferred pitch and
     # re-sweeps -5 -> -10 -> -20 -> -30 from scratch, landing on the gentlest safe
@@ -1898,7 +1883,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
             quat_t = torch.tensor([pose[3:]], dtype=torch.float32, device=device)
 
             try:
-                result = node.motion_gen.ik_solver.solve_single(
+                result = node.motion_gen.solve_ik(
                     Pose(position=pos_t, quaternion=quat_t),
                     seed_config=seed,
                     retract_config=retract,
@@ -1989,7 +1974,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
                         _align_quat_t = torch.tensor(
                             [alignment_pose[3:]], dtype=torch.float32, device=device)
                         try:
-                            _align_result = node.motion_gen.ik_solver.solve_single(
+                            _align_result = node.motion_gen.solve_ik(
                                 Pose(position=_align_pos_t, quaternion=_align_quat_t),
                                 seed_config=seed, retract_config=retract,
                                 return_seeds=return_seeds)
@@ -2137,7 +2122,7 @@ def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
                   for i in range(3)]
         wp_quat = quat_slerp(list(start_quat), target_quat, min(a, 1.0))
         try:
-            r = node.motion_gen.ik_solver.solve_single(
+            r = node.motion_gen.solve_ik(
                 Pose(position=torch.tensor([wp_xyz], dtype=torch.float32, device=dev),
                      quaternion=torch.tensor([wp_quat], dtype=torch.float32, device=dev)),
                 seed_config=torch.tensor(
@@ -2216,7 +2201,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if _yolo_lock: _yolo_lock.acquire()
     if lock: lock.acquire()
     try:
-        res = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+        res = node.motion_gen.plan_pose(start_state, goal_pose, plan_cfg)
     finally:
         if lock: lock.release()
         if _yolo_lock: _yolo_lock.release()
@@ -2227,7 +2212,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         if callable(_record_motion):
             _record_motion(
                 stage="PLAN", label=label, motion_type=motion_type,
-                planner="curobo.plan_single", result="FAILED",
+                planner="curobo.v2.plan_pose", result="FAILED",
                 status=str(status), planning_ms=round(_planning_ms, 1),
                 goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
@@ -2243,7 +2228,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if callable(_record_motion):
         _record_motion(
             stage="PLAN", label=label, motion_type=motion_type,
-            planner="curobo.plan_single", result="SUCCESS",
+            planner="curobo.v2.plan_pose", result="SUCCESS",
             status=str(getattr(res, 'status', 'SUCCESS')),
             planning_ms=round(_planning_ms, 1),
             goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
@@ -2269,7 +2254,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     def _replan_once(reason):
         if lock: lock.acquire()
         try:
-            replanned = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+            replanned = node.motion_gen.plan_pose(start_state, goal_pose, plan_cfg)
         finally:
             if lock: lock.release()
         if not replanned.success:
@@ -2375,7 +2360,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
             if ratio > 1.8 and straight > 0.02:
                 if lock: lock.acquire()
                 try:
-                    res2 = node.motion_gen.plan_single(start_state, goal_pose, plan_cfg)
+                    res2 = node.motion_gen.plan_pose(start_state, goal_pose, plan_cfg)
                 finally:
                     if lock: lock.release()
                 if res2.success:
@@ -2621,7 +2606,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if callable(_record_motion):
         _record_motion(
             stage="EXECUTE", label=label, motion_type=motion_type,
-            planner="curobo.plan_single", result="PUBLISHED",
+            planner="curobo.v2.plan_pose", result="PUBLISHED",
             trajectory_samples=len(states), dt_s=round(float(dt), 5),
             trajectory_duration_s=round(float(dt) * max(len(states) - 1, 0), 3),
             path_length_m=(round(float(_path_len_diag), 4)
@@ -5420,7 +5405,7 @@ def plan_and_execute(node):
                                     [_align_seed_js], dtype=torch.float32, device=device).unsqueeze(0)
                                 _a_retract = torch.tensor(
                                     [_align_seed_js], dtype=torch.float32, device=device)
-                                _a_result = node.motion_gen.ik_solver.solve_single(
+                                _a_result = node.motion_gen.solve_ik(
                                     Pose(position=_a_pos, quaternion=_a_quat),
                                     seed_config=_a_seed, retract_config=_a_retract)
                                 if bool(_a_result.success.item()):
@@ -5435,7 +5420,7 @@ def plan_and_execute(node):
                                         [_align_js], dtype=torch.float32, device=device).unsqueeze(0)
                                     _app_retract = torch.tensor(
                                         [_align_js], dtype=torch.float32, device=device)
-                                    _app_result = node.motion_gen.ik_solver.solve_single(
+                                    _app_result = node.motion_gen.solve_ik(
                                         Pose(position=_app_pos, quaternion=_app_quat),
                                         seed_config=_app_seed, retract_config=_app_retract)
                                     if bool(_app_result.success.item()):
@@ -5630,7 +5615,7 @@ def plan_and_execute(node):
                 node._approach_truncated = False
                 _approach_ok = plan_and_send(node, start, Pose.from_list(approach), label="APPROACH", motion_type="approach", goal_xyz=approach[:3], store_trajectory=True)
                 if not _approach_ok and not getattr(node, '_approach_clamp_rejected', False):
-                    # Fallback: direct IK move (different solver, handles cases plan_single can't).
+                    # Fallback: direct IK move (different solver, handles cases plan_pose can't).
                     # Skip if the failure was a clamping rejection — same config, same result.
                     node.get_logger().warn("APPROACH plan failed — retrying with direct IK...")
                     _approach_ok = _direct_ik_move(node, approach, label="APPROACH_IK",
@@ -6062,7 +6047,7 @@ def plan_and_execute(node):
                         _retract_t = torch.tensor(
                             [_candidate_start_js], dtype=torch.float32,
                             device=_dev)
-                        _ik = node.motion_gen.ik_solver.solve_single(
+                        _ik = node.motion_gen.solve_ik(
                             _candidate_pose, seed_config=_seed_t,
                             retract_config=_retract_t)
                         if _ik.success.item():
@@ -7026,7 +7011,7 @@ def plan_and_execute(node):
                     if _yolo_l: _yolo_l.acquire()
                     if lock: lock.acquire()
                     try:
-                        test_res = node.motion_gen.plan_single(
+                        test_res = node.motion_gen.plan_pose(
                             next_start, Pose.from_list(next_approach), plan_cfg)
                     finally:
                         if lock: lock.release()

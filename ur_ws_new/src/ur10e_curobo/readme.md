@@ -1,5 +1,8 @@
 # UR10e cuRobo Control System
 
+This branch uses **cuRobo v2**. See [installation, migration, and verification](CUROBO_V2.md)
+before launching the motion node.
+
 This README describes how to launch and operate the UR10e robot system with cuRobo motion planning, vision, teleop, and GUI.
 
 For day-to-day operation from RViz, including reachability goals, LiDAR scanning,

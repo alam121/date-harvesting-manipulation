@@ -13,8 +13,7 @@ from geometry_msgs.msg import Twist
 from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
-from curobo.util_file import get_assets_path, get_robot_configs_path, join_path, load_yaml
+from ..planner_v2 import PlannerV2, load_robot_config
 
 from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES, ENVIRONMENT
 from ..dynamic_obstacle import DynamicObstacleManager
@@ -36,8 +35,8 @@ class MotionExecutor:
         self._state = state
 
         # cuRobo planner
-        self.motion_gen_config: Optional[MotionGenConfig] = None
-        self.motion_gen: Optional[MotionGen] = None
+        self.motion_gen_config: Optional[object] = None
+        self.motion_gen: Optional[PlannerV2] = None
 
         # Obstacles
         self.obstacles: Optional[DynamicObstacleManager] = None
@@ -103,21 +102,11 @@ class MotionExecutor:
         robot_config = self._profile_curobo_config()
         self._node.get_logger().info(
             f"Loading cuRobo configuration for robot profile {ROBOT_PROFILE!r}...")
-        self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            robot_config,
-            world_config,
+        self.motion_gen = PlannerV2(
+            robot_config, world_config,
             interpolation_dt=self._config.cfg.planner.interpolation_dt,
-            # Pre-allocate room for static obstacles + the 6 safe-zone wall panels (+ head-
-            # room). Without this the OBB cache is sized to the initial world and adding the
-            # walls fails with "number of OBB is larger than collision cache".
-            collision_cache={"obb": 64, "mesh": 10},
-            # cuRobo default is 4 parallel trajopt seeds per plan; testing a
-            # lower value (see Planner.num_trajopt_seeds) to cut GPU time
-            # cuRobo takes from YOLO on every approach/final/dropoff/home move.
-            num_trajopt_seeds=self._config.cfg.planner.num_trajopt_seeds,
-        )
-
-        self.motion_gen = MotionGen(self.motion_gen_config)
+            num_trajopt_seeds=self._config.cfg.planner.num_trajopt_seeds)
+        self.motion_gen_config = self.motion_gen.config
 
         # Initialize isolated FK model BEFORE warmup so its GPU allocation
         # is included in CUDA graph capture (avoids 20s+ delay on first plan)
@@ -156,10 +145,9 @@ class MotionExecutor:
     def _profile_curobo_config(self):
         """Return a cuRobo config matching the robot and camera profile."""
         config_name = self._config.cfg.planner.urdf_config
-        robot_config = load_yaml(
-            join_path(get_robot_configs_path(), config_name))
+        robot_config = load_robot_config(config_name)
         kinematics = robot_config["robot_cfg"]["kinematics"]
-        source_urdf = Path(join_path(get_assets_path(), kinematics["urdf_path"]))
+        source_urdf = Path(kinematics["urdf_path"])
         text = source_urdf.read_text(encoding="utf-8")
 
         camera_profile = load_camera_profile()
@@ -508,7 +496,7 @@ class MotionExecutor:
         region unobstructed. Panels are centered on each face (thickness T), oversized in z
         by V so they fence tall reaches, and by M laterally to seal corners. Any panel that
         still contains the base origin is skipped."""
-        from curobo.geom.types import Cuboid
+        from curobo.scene import Cuboid
         T, M, V = 0.10, 0.10, 0.40
         sx, sy, sz = hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
         cx, cy, cz = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0

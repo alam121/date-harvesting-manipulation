@@ -1,4 +1,4 @@
-from curobo.geom.types import Sphere, Cuboid
+from curobo.scene import Sphere, Cuboid
 from visualization_msgs.msg import Marker, MarkerArray
 
 class DynamicObstacleManager:

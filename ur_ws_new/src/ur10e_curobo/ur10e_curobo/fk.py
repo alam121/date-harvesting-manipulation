@@ -2,13 +2,13 @@
 import threading
 from typing import List, Optional
 import torch
-from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+from .planner_v2 import RobotKinematics
 from geometry_msgs.msg import Point
 
 # Module-level cache for the isolated FK kinematics model.
 # This is completely separate from motion_gen.kinematics and will never be
 # corrupted by graph planner buffer resizing.
-_fk_kin_model: Optional[CudaRobotModel] = None
+_fk_kin_model: Optional[RobotKinematics] = None
 _fk_lock = threading.RLock()
 
 
@@ -17,12 +17,12 @@ def init_fk_model(node):
 
     This ensures GPU memory allocation happens before CUDA graph capture,
     so the pre-captured graphs remain valid.  Must be called after
-    MotionGen is constructed but before motion_gen.warmup().
+    PlannerV2 is constructed but before motion_gen.warmup().
     """
     global _fk_kin_model
     with _fk_lock:
         if _fk_kin_model is None:
-            _fk_kin_model = CudaRobotModel(node.motion_gen.robot_cfg.kinematics)
+            _fk_kin_model = RobotKinematics(node.motion_gen.fk_config)
             try:
                 node.get_logger().info("FK model initialized (pre-warmup)")
             except Exception:
@@ -34,7 +34,7 @@ def _is_planning_active(node) -> bool:
     """Non-blocking check: is a planning operation currently holding the lock?
 
     Returns True if we should skip CUDA FK to avoid corrupting
-    CUDA graph capture in plan_single().
+    CUDA graph capture in plan_pose().
     """
     lock = getattr(node, '_planning_lock', None)
     if lock is None:
@@ -43,7 +43,7 @@ def _is_planning_active(node) -> bool:
 
 
 def _get_kin_model(node):
-    """Get an isolated CudaRobotModel for pure FK.
+    """Get an isolated RobotKinematics for pure FK.
 
     Creates a separate instance on first call so that the graph planner's
     internal buffer resizing (7000-10000 batch) never corrupts FK results.
@@ -51,9 +51,9 @@ def _get_kin_model(node):
     global _fk_kin_model
     with _fk_lock:
         if _fk_kin_model is None:
-            # Create a fresh CudaRobotModel from the original robot config (clean
-            # CudaRobotModelConfig, no runtime attrs like _batch_size).
-            _fk_kin_model = CudaRobotModel(node.motion_gen.robot_cfg.kinematics)
+            # Create a fresh RobotKinematics from the original robot config (clean
+            # RobotKinematicsConfig, no runtime attrs like _batch_size).
+            _fk_kin_model = RobotKinematics(node.motion_gen.fk_config)
     return _fk_kin_model
 
 
@@ -105,7 +105,7 @@ def pose_from_joints(node, joint_positions: List[float]) -> Optional[list]:
 
 
 def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
-    """Single-waypoint FK using CudaRobotModel.forward() directly.
+    """Single-waypoint FK using RobotKinematics.forward() directly.
     Does NOT touch rollout_fn or collision state."""
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -123,7 +123,7 @@ def forward_kinematics(node, joint_positions: List[float]) -> Optional[Point]:
 
 def forward_kinematics_batch(node, joint_states: List[List[float]]) -> List[Point]:
     """Compute FK for all waypoints in a single batched GPU call.
-    Uses CudaRobotModel.forward() directly — no rollout_fn, no collision state.
+    Uses RobotKinematics.forward() directly — no rollout_fn, no collision state.
     Does NOT reset internal buffers (that corrupts graph planner state)."""
     if not joint_states:
         return []

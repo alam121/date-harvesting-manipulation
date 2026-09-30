@@ -1,4 +1,5 @@
 from setuptools import setup
+from pathlib import Path
 
 package_name = "ur10e_curobo"
 
@@ -12,6 +13,8 @@ setup(
         f"{package_name}.teleop",
     ],
     package_data={
+        package_name: [str(p.relative_to(package_name)) for p in
+                       Path(package_name, "robot_assets").rglob("*") if p.is_file()],
         f"{package_name}.vision": [
             "charuco_7x24_30mm_22mm_dict5x5_100.png",
             "calibration_profiles/*.yaml",
@@ -39,7 +42,7 @@ setup(
     license="MIT",
     entry_points={
         "console_scripts": [
-            "main = ur10e_curobo.main:main",   # <- REQUIRED
+            "main = ur10e_curobo.runtime_entry:main",   # <- REQUIRED
             "gui = ur10e_curobo.gui:main",     # Desktop GUI control panel
             "vision = ur10e_curobo.vision:main",  # ZED/YOLO vision node
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control

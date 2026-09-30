@@ -1,12 +1,12 @@
 # ruff: noqa
 import itertools, math, time, torch
 from typing import List
-from curobo.types.math import Pose
-from curobo.types.robot import JointState
+from curobo.types import Pose
+from curobo.types import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import (PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_GRAPH,
-                     PLAN_CFG_JS_NO_FINETUNE)
+                     PLAN_CFG_JS_RETRY)
 from .utils import build_trajectory, wait_until_xyz, log_retime
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 
@@ -92,7 +92,7 @@ def _plan_cartesian_states_from_joints(node, start_joints, pose, label: str, pla
         if lock:
             lock.acquire()
         try:
-            res = node.motion_gen.plan_single(start, goal, plan_cfg or PLAN_CFG_DEFAULT)
+            res = node.motion_gen.plan_pose(start, goal, plan_cfg or PLAN_CFG_DEFAULT)
         except Exception as e:
             msg = str(e)
             if "CUDA error" in msg or "illegal memory access" in msg:
@@ -192,7 +192,7 @@ def execute_single_pose(node, pose: list, motion_type: str = "default",
     lock = getattr(node, '_planning_lock', None)
     if lock: lock.acquire()
     try:
-        res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+        res = node.motion_gen.plan_pose(start, goal, PLAN_CFG_DEFAULT)
     finally:
         if lock: lock.release()
     if not res.success:
@@ -365,8 +365,8 @@ def estimate_nearest_ik_delta_deg(node, pose: list) -> float:
         seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
         retract = torch.tensor([start_js], dtype=torch.float32, device=device)
         n = max(1, int(getattr(node.cfg.planner, "shortest_ik_seeds", 8)))
-        solver_seeds = int(getattr(node.motion_gen.ik_solver, "num_seeds", n))
-        ik_result = node.motion_gen.ik_solver.solve_single(
+        solver_seeds = int(getattr(node.motion_gen, "num_ik_seeds", n))
+        ik_result = node.motion_gen.solve_ik(
             goal_pose,
             seed_config=seed,
             retract_config=retract,
@@ -452,8 +452,8 @@ def execute_pose_shortest(node, pose: list, label: str = "MOVE",
             # we try the next-nearest before ever resorting to an unconstrained Cartesian
             # plan (which can pick a wrist-flip/elbow-over branch and swing the long way).
             _n = max(1, int(getattr(node.cfg.planner, "shortest_ik_seeds", 8)))
-            _solver_seeds = int(getattr(node.motion_gen.ik_solver, "num_seeds", _n))
-            ik_result = node.motion_gen.ik_solver.solve_single(
+            _solver_seeds = int(getattr(node.motion_gen, "num_ik_seeds", _n))
+            ik_result = node.motion_gen.solve_ik(
                 goal_pose, seed_config=seed, retract_config=retract,
                 return_seeds=min(_n, _solver_seeds))
             sols = ik_result.js_solution.position
@@ -474,7 +474,7 @@ def execute_pose_shortest(node, pose: list, label: str = "MOVE",
             # mostly random seeds and can miss the near branch; seeding once from the
             # current config is the best shot at the genuinely-nearest solution.
             try:
-                ik1 = node.motion_gen.ik_solver.solve_single(
+                ik1 = node.motion_gen.solve_ik(
                     goal_pose, seed_config=seed, retract_config=retract)
                 _s1 = ik1.js_solution.position
                 _ok1 = ik1.success
@@ -1272,7 +1272,7 @@ def _execute_home_cartesian_pose_recovery(node, target_joints, scale: float) -> 
         if lock:
             lock.acquire()
         try:
-            res = node.motion_gen.plan_single(start, goal, PLAN_CFG_DEFAULT)
+            res = node.motion_gen.plan_pose(start, goal, PLAN_CFG_DEFAULT)
         except Exception as e:
             msg = str(e)
             if "CUDA error" in msg or "illegal memory access" in msg:
@@ -1462,9 +1462,8 @@ def _execute_home_staged(node, target_joints, chunk_deg: float = 45.0) -> bool:
 
     A 170+deg joint move has a straight-line trajopt seed that sweeps through obstacles, so
     the optimizer can't make it collision-free (TRAJOPT_FAIL). Split it into collision-checked
-    ``plan_single_js`` sub-segments small enough for trajopt to converge, and chain them. Each
-    segment plans from the robot's *actual* current state, so this is robust. Avoids the graph
-    planner (corrupts plan_single_js buffers here) and the unsafe blind interpolation.
+    ``plan_joint`` sub-segments small enough for trajopt to converge, and chain them. Each
+    segment plans from the robot's actual current state and is collision checked.
     Returns True only if every segment plans and executes."""
     current = node.current_joint_positions
     if current is None or len(current) != len(target_joints):
@@ -1576,7 +1575,7 @@ def plan_execute_js(
         else:
             if lock: lock.acquire()
             try:
-                res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+                res = node.motion_gen.plan_joint(start, goal_js, PLAN_CFG_JS)
             except Exception as e:
                 msg = str(e)
                 if "CUDA error" in msg or "illegal memory access" in msg:
@@ -1588,26 +1587,20 @@ def plan_execute_js(
 
         if (not home_graph_first) and (res is None or not res.success):
             status = getattr(res, 'status', 'unknown') if res is not None else 'None'
-            # The no-finetune pass can recover both a failed smoothing pass and
-            # some plain trajopt failures without enabling graph-buffer resizing.
-            if res is not None and (
-                "FINETUNE" in str(status) or "TRAJOPT" in str(status)
-            ):
-                node.get_logger().info(
-                    f"Joint-space plan to {label}: {status}, retrying without finetune")
-                if lock: lock.acquire()
-                try:
-                    res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS_NO_FINETUNE)
-                except Exception as e:
-                    node.get_logger().warn(f"Joint-space retry to {label} exception: {e}")
-                    return False
-                finally:
-                    if lock: lock.release()
-        # Graph-planner recovery for HOME: when trajopt can't seed a large/contorted
-        # reconfiguration, the graph planner finds a collision-free global seed. It resizes
-        # internal buffers that corrupt later plan_single_js calls, so reset right after.
-        # If trajopt then fails to SMOOTH that seed (TRAJOPT_FAIL while used_graph), we
-        # salvage the raw collision-free graph path and execute it directly (see below).
+            # v2 owns B-spline refinement; retry with graph seeding rather
+            # than pretending the removed v1 finetune switch still exists.
+            node.get_logger().info(
+                f"Joint-space plan to {label}: {status}, retrying with graph seeding")
+            if lock: lock.acquire()
+            try:
+                res = node.motion_gen.plan_joint(start, goal_js, PLAN_CFG_JS_RETRY)
+            except Exception as e:
+                node.get_logger().warn(f"Joint-space retry to {label} exception: {e}")
+                return False
+            finally:
+                if lock: lock.release()
+        # Graph seeding can recover large HOME reconfigurations when a local
+        # trajectory seed cannot avoid the surrounding obstacles.
         if (res is None or not res.success) and label == "HOME":
             status = getattr(res, 'status', 'unknown') if res is not None else 'None'
             if home_graph_first:
@@ -1648,7 +1641,7 @@ def plan_execute_js(
                         f"HOME world: {len(names)} cuboids={names} | voxel_grids={nvox}")
                 except Exception as e:
                     node.get_logger().warn(f"HOME world inspect failed: {e}")
-                res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS_GRAPH)
+                res = node.motion_gen.plan_joint(start, goal_js, PLAN_CFG_JS_GRAPH)
                 if res is None or not res.success:
                     graph_states = _extract_graph_states(node, res, target_joints)
             except Exception as e:
@@ -1690,7 +1683,7 @@ def plan_execute_js(
         if callable(_record_motion):
             _record_motion(
                 stage="PLAN", label=label, motion_type=motion_type,
-                planner="curobo.plan_single_js", result="FAILED",
+                planner="curobo.v2.plan_cspace", result="FAILED",
                 status=str(getattr(res, 'status', 'None')),
                 valid_query=str(getattr(res, 'valid_query', None)),
                 planning_ms=round(
@@ -1737,7 +1730,7 @@ def plan_execute_js(
     if callable(_record_motion):
         _record_motion(
             stage="PLAN", label=label, motion_type=motion_type,
-            planner="curobo.plan_single_js", result="SUCCESS",
+            planner="curobo.v2.plan_cspace", result="SUCCESS",
             status=str(getattr(res, 'status', 'SUCCESS')),
             valid_query=str(getattr(res, 'valid_query', None)),
             planning_ms=round(
@@ -1767,7 +1760,7 @@ def plan_execute_js(
         if callable(_record_motion):
             _record_motion(
                 stage="EXECUTE", label=label, motion_type=motion_type,
-                planner="curobo.plan_single_js", result="PUBLISHED",
+                planner="curobo.v2.plan_cspace", result="PUBLISHED",
                 trajectory_samples=len(states), dt_s=round(float(dt), 5),
                 trajectory_duration_s=round(
                     float(dt) * max(len(states) - 1, 0), 3),
@@ -1979,7 +1972,7 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
     try:
         if lock: lock.acquire()
         try:
-            res = node.motion_gen.plan_single_js(start, goal_js, PLAN_CFG_JS)
+            res = node.motion_gen.plan_joint(start, goal_js, PLAN_CFG_JS)
         finally:
             if lock: lock.release()
     finally:
@@ -2008,7 +2001,7 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
         except Exception:
             pass
         node.get_logger().warn(
-            f"[{label}] cuRobo plan_single_js FAILED — status={_status} valid_query={_valid} "
+            f"[{label}] cuRobo plan_joint FAILED — status={_status} valid_query={_valid} "
             "(valid_query=False ⇒ goal/start out of limits or in collision; "
             "True ⇒ endpoints OK but no collision-free path found)")
         return None

@@ -1,5 +1,8 @@
 # Date Harvesting Manipulation
 
+On `curobo-v2`, follow the [cuRobo v2 setup guide](ur_ws_new/src/ur10e_curobo/CUROBO_V2.md) before launching the motion node.
+
+
 Professional ROS 2 workspace for selective date-palm harvesting with a UR10e
 manipulator, cuRobo motion planning, ZED vision, LiDAR-assisted scene capture,
 and a Delto 3-finger gripper.
