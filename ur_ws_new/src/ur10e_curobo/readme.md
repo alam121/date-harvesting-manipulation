@@ -343,3 +343,17 @@ attempted goal, candidates, IDs and original/saved bounding boxes. Metadata is
 matched to the full frame by the exact publication timestamp. These IDs should
 not be treated as globally unique across runs. Restart vision and main to load
 this change.
+
+#### Operator target click
+
+At the FINAL hold, click the intended fruit in the frozen image in the RViz
+**Motion** panel (the separate Image display is not clickable). A green circle
+shows the sent click. Wait for `[DEMO] Target click accepted`, jog, restore
+External Control, then press Close. Close without a click is rejected. Clicking
+again changes the selected pixel; a new capture resets selection and rejects
+old-frame clicks. The marked image and JSON preserve the operator point even
+when no detector box matches it. A fruit ID is assigned only for one matching
+box; overlapping/no boxes leave the ID unknown, while retaining the clicked
+point. Restart RViz and the motion node to load the click feature, and vision
+if full-frame publishing is not yet running. This does not move the robot when
+you click.

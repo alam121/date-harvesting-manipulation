@@ -196,6 +196,9 @@ def _capture_correction(node) -> Optional[str]:
         node.get_logger().info("[DEMO] operator discarded this one")
         return None
 
+    if not getattr(node, "_demo_target_selection", None):
+        node.get_logger().warn("[DEMO] No target click; discarding")
+        return None
     selection = copy.deepcopy(node._demo_target_selection)
     px, py = selection['pixel_xy']
     hits = [c['fruit_id'] for c in target_label['candidates']

@@ -1645,6 +1645,9 @@ class UR10eCuroboMoveIt(Node):
                 if not self.robot_running:
                     self.get_logger().warn("[DEMO] Restore the robot External Control program before Close")
                     return
+                if not getattr(self, '_demo_target_selection', None):
+                    self.get_logger().warn('[DEMO] Click the intended date in the Motion panel image before Close')
+                    return
                 self._demo_confirm = True
                 self.get_logger().info("[DEMO] Close accepted; saving correction before grasp")
                 return

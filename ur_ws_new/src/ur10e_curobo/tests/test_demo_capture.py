@@ -17,7 +17,7 @@ spec.loader.exec_module(demo)
 
 
 class CaptureTests(unittest.TestCase):
-    def run_capture(self, verdict=True, fresh=True, stopped=False, write_ok=True, full_fresh=True):
+    def run_capture(self, verdict=True, fresh=True, stopped=False, write_ok=True, full_fresh=True, clicked=True):
         with TemporaryDirectory() as root:
             clock = SimpleNamespace(now=10.0)
             node = SimpleNamespace(
@@ -43,7 +43,8 @@ class CaptureTests(unittest.TestCase):
                 else:
                     node.pose = [.012, 0., 0., 1., 0., 0., 0.]
                     node._latest_grasp_crop[:] = 200
-                    node._demo_target_selection = {"pixel_xy": [2, 2], "source": "operator_click"}
+                    if clicked:
+                        node._demo_target_selection = {"pixel_xy": [2, 2], "source": "operator_click"}
                     node._demo_confirm = verdict
                     node.stop_requested = stopped
                 calls.append(seconds)
@@ -75,6 +76,19 @@ class CaptureTests(unittest.TestCase):
         meta['candidates'].append({'fruit_id': 5, 'bbox_xyxy': [0, 0, 20, 20], 'base_xyz': [.01, 0, 0]})
         _, label = demo.target_preview(image, meta, [0, 0, 0])
         self.assertIsNone(label['suggested_fruit_id'])
+
+    def test_close_without_click_does_not_save(self):
+        data, images = self.run_capture(clicked=False)
+        self.assertIsNone(data)
+        self.assertEqual(images, {})
+
+    def test_operator_point_saved_without_detector_match(self):
+        data, _ = self.run_capture()
+        label = data['before']['target_label']
+        self.assertEqual(label['operator_selection']['pixel_xy'], [2, 2])
+        self.assertTrue(label['operator_point_confirmed'])
+        self.assertIsNone(label['selected_fruit_id'])
+        self.assertFalse(label['identity_verified'])
 
     def test_missing_full_frame_stops_capture(self):
         data, images = self.run_capture(full_fresh=False)
@@ -125,6 +139,7 @@ class DemoCommandTests(unittest.TestCase):
         self.node = SimpleNamespace(
             cfg=SimpleNamespace(planner=SimpleNamespace(concise_console_logs=True)),
             _demo_capture_active=True, _demo_capture_ready=True, _demo_confirm=None,
+            _demo_target_selection={"pixel_xy": [2, 2]},
             robot_running=True, get_logger=lambda: Mock(),
             _session_record_gripper_action=Mock())
 
