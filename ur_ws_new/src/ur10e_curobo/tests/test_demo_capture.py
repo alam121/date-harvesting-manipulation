@@ -29,6 +29,7 @@ class CaptureTests(unittest.TestCase):
                 _latest_grasp_crop_t=0, _latest_grasp_crop_meta=[1],
                 current_joint_positions=[0.0] * 6, stop_requested=False,
                 _demo_planned_final_pose=[.010, 0., 0., 1., 0., 0., 0.],
+                _demo_depth_trace={"base_forward_axis": "+X"},
                 pose=[0., 0., 0., 1., 0., 0., 0.],
                 get_logger=lambda: Mock())
             node.get_end_effector_pose = lambda: node.pose
@@ -84,6 +85,13 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(data['desired_motion_base_m'], [.012, 0., 0.])
         self.assertAlmostEqual(data['residual_from_planned_final_base_m'][0], .002)
         self.assertEqual(data['before']['planned_final_pose'][:3], [.010, 0., 0.])
+
+    def test_depth_trace_excess_insertion_sign(self):
+        data, _ = self.run_capture()
+        trace = data['before']['depth_trace']
+        # Planned +10mm, demonstrated +12mm: nominal plan was 2mm short.
+        self.assertAlmostEqual(trace['planned_excess_forward_m'], -.002)
+        self.assertEqual(trace['operator_grasp_tcp_base_xyz_m'], [.012, 0., 0.])
 
     def test_close_without_click_does_not_save(self):
         data, images = self.run_capture(clicked=False)

@@ -3950,6 +3950,8 @@ def plan_and_execute(node):
         if goal is None:
             node.get_logger().warn("Goal queue empty during pop; skipping.")
             continue
+        _depth_seed_trace = next((dict(t) for t in reversed(list(getattr(node, '_depth_traces', [])))
+            if math.dist(t['published_goal_base_xyz_m'], goal[:3]) < 1e-6), None)
         _cycle_idx += 1
         _cycle_t0 = time.time()
         _timing = {}
@@ -5984,6 +5986,7 @@ def plan_and_execute(node):
             gx, gy = add_axis_offsets(x, y, depth=-depth_offset)
             gz = z + z_offset
         desired_grasp_xyz = [gx, gy, gz]
+        _depth_pre_mode_xyz = list(desired_grasp_xyz)
         (desired_grasp_xyz, _grasp_mode, _mode_depth_extra,
          _mode_z_extra, _mode_axis) = _apply_mode_final_adjustment(
             desired_grasp_xyz, orientation)
@@ -6098,6 +6101,7 @@ def plan_and_execute(node):
             tcp_xyz = _baseline_tcp_xyz
             closure_offset_base = _baseline_offset_base
             final_target = _baseline_final_target
+        _depth_pre_level_xyz = list(final_target[:3])
         _level_z = None
         if (is_low and not is_side_approach and bool(getattr(
                 node.cfg.planner, 'low_center_level_insertion_enabled', False))):
@@ -6116,6 +6120,35 @@ def plan_and_execute(node):
                 f'[LEVEL_INSERTION] APPROACH TCP Z={_level_z:.4f}m; '
                 f'FINAL Z {_nominal_final_z:.4f}->{_level_z:.4f}m; X/Y and orientation unchanged')
         node._level_final_z = _level_z
+        _depth_reacquired_trace = next((dict(t) for t in reversed(list(getattr(node, '_depth_traces', [])))
+            if math.dist(t['published_goal_base_xyz_m'], [x, y, z]) < 1e-6), None)
+        node._demo_depth_trace = {
+            'accepted_goal_base_xyz_m': list(goal[:3]),
+            'accepted_goal_vision': _depth_seed_trace,
+            'vision_association': 'exact_xyz_within_1um; null means unavailable, not inferred',
+            'reacquired_goal_base_xyz_m': [float(x), float(y), float(z)],
+            'reacquired_goal_vision': _depth_reacquired_trace,
+            'reacquire_result': str(getattr(node, 'reacquire_result', 'UNKNOWN')),
+            'target_geometry_source': 'tip_anchor' if _tip_anchored_final_grasp is not None else 'goal_offsets',
+            'configured_depth_offset_m': float(depth_offset),
+            'configured_z_offset_m': float(z_offset),
+            'pre_mode_grasp_base_xyz_m': _depth_pre_mode_xyz,
+            'mode': _grasp_mode,
+            'mode_depth_extra_m': float(_mode_depth_extra),
+            'mode_z_extra_m': float(_mode_z_extra),
+            'mode_axis_base': [float(v) for v in _mode_axis],
+            'post_mode_grasp_base_xyz_m': list(desired_grasp_xyz),
+            'closure_offset_tcp_m': list(closure_offset_tcp),
+            'closure_offset_base_m': list(closure_offset_base),
+            'pre_level_final_tcp_base_xyz_m': _depth_pre_level_xyz,
+            'planned_final_tcp_base_xyz_m': list(final_target[:3]),
+            'level_final_z_m': _level_z,
+            'base_forward_axis': '+X' if X_FORWARD_Y_LATERAL else '-Y',
+        }
+        node.get_logger().info(
+            '[DEPTH_TRACE] goal_Y={:.4f} pre_mode_Y={:.4f} post_mode_Y={:.4f} FINAL_Y={:.4f}m'.format(
+                y, _depth_pre_mode_xyz[1], desired_grasp_xyz[1], final_target[1]))
+
         _goal_forward = x if X_FORWARD_Y_LATERAL else -y
         _target_forward = tcp_xyz[0] if X_FORWARD_Y_LATERAL else -tcp_xyz[1]
         _forward_delta_mm = (_target_forward - _goal_forward) * 1000.0

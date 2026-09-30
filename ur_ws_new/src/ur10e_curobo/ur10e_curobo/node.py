@@ -351,6 +351,16 @@ class UR10eCuroboMoveIt(Node):
         self._latest_grasp_crop_meta = None
         self._demo_full_frame = None
         self._demo_targets = {}
+        self._depth_traces = deque(maxlen=1000)
+        def _depth_trace_cb(msg):
+            try:
+                trace = json.loads(msg.data)
+                if len(trace['published_goal_base_xyz_m']) == 3:
+                    self._depth_traces.append(trace)
+            except (ValueError, KeyError, TypeError):
+                pass
+        self.create_subscription(String, '/vision/depth_trace', _depth_trace_cb, 10)
+
         def _demo_targets_cb(msg):
             try:
                 meta = json.loads(msg.data)

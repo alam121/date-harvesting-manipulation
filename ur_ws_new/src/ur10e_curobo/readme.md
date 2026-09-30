@@ -393,3 +393,23 @@ With Demo enabled, insertion is still manual. Disable Demo to test automatic
 level insertion under supervision. Record five outcomes and remaining manual
 X/Y corrections before assessing improvement. Demo JSON records the switch
 and actual constrained height so these samples can be separated from older ones.
+
+### Depth diagnostics for new demos
+
+Restart vision and main to enable `/vision/depth_trace`. Each published goal
+has a trace of the measured camera-space surface, the surface-to-center shift
+(0.7 times estimated radius), camera-space center, cached camera-to-base transform
+when available, unsmoothed base point, and smoothed published goal. Main matches
+accepted/reacquired goals by XYZ within 1 micrometre in a bounded history; missing
+matches remain null, never silently substituted with the latest frame. This is
+coordinate matching, not a globally unique target identity.
+
+Demo `before.depth_trace` freezes that provenance and records configured offsets,
+tip-anchor versus goal-offset geometry, pre/post grasp-mode targets, closure
+compensation, pre/post level FINAL TCP, and operator endpoint. Positive
+`planned_excess_forward_m` means the nominal FINAL was farther into the fruit
+than the demonstrated endpoint (+X or -Y according to robot configuration).
+`[DEPTH_TRACE]` logs the Y stages and final excess insertion. Old demos cannot
+recover missing camera-space measurements retroactively. These diagnostics
+measure disagreement with an operator endpoint; they do not independently
+prove sensor calibration error.

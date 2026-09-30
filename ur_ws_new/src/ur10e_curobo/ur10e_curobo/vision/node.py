@@ -322,6 +322,7 @@ class VisionNode:
         self.demo_full_pub = self.node.create_publisher(
             CompressedImage, "/vision/demo_full/compressed", 1)
         self.demo_targets_pub = self.node.create_publisher(StdString, "/vision/demo_targets", 10)
+        self.depth_trace_pub = self.node.create_publisher(StdString, "/vision/depth_trace", 10)
         self._demo_full_last = 0.0
         self.raw_image_pub = self.node.create_publisher(
             ROSImage, "/vision/raw", fast_qos)
@@ -2840,6 +2841,7 @@ class VisionNode:
         # is built further down; the inputs it needs are bb, Zc and fx.
         _fruit_radius = estimate_fruit_radius(
             {"bb": (x1, y1, x2, y2), "Zc": Zc}, fx=intrinsics["fx"])
+        _surface_camera_xyz = [float(Xc), float(Yc), float(Zc)]
         if FRUIT_SURFACE_TO_CENTER_FRACTION > 0.0:
             _ray = np.array([Xc, Yc, Zc], dtype=np.float64)
             _ray_n = float(np.linalg.norm(_ray))
@@ -2905,6 +2907,15 @@ class VisionNode:
                 )
 
             return {
+                "depth_trace": {
+                    "surface_camera_xyz_m": _surface_camera_xyz,
+                    "center_camera_xyz_m": [float(Xc), float(Yc), float(Zc)],
+                    "surface_to_center_fraction": float(FRUIT_SURFACE_TO_CENTER_FRACTION),
+                    "estimated_radius_m": float(_fruit_radius),
+                    "camera_frame": self.cam_frame,
+                    "camera_to_base_rotation": self._cached_tf_base[0].tolist() if self._cached_tf_base is not None else None,
+                    "camera_to_base_translation_m": self._cached_tf_base[1].tolist() if self._cached_tf_base is not None else None,
+                },
                 "Xc": Xc, "Yc": Yc, "Zc": Zc,
                 "bb": (x1, y1, x2, y2),
                 # Live focal length, so estimate_fruit_radius() never has to
@@ -3800,6 +3811,16 @@ class VisionNode:
             goal.pose.orientation.y = q[2]
             goal.pose.orientation.z = q[3]
 
+            trace = dict(t_best.get('depth_trace', {}))
+            trace.update({
+                'fruit_id': int(t_best.get('fruit_id', -1)),
+                'source_stamp_ns': int(goal.header.stamp.sec)*1000000000 + int(goal.header.stamp.nanosec),
+                'base_unsmoothed_xyz_m': pt_vec.tolist(),
+                'published_goal_base_xyz_m': [float(pt_x), float(pt_y), float(pt_z)],
+                'smoothing_delta_base_m': (pt_smooth-pt_vec).tolist()})
+            trace_msg = StdString()
+            trace_msg.data = json.dumps(trace)
+            self.depth_trace_pub.publish(trace_msg)
             with self.pub_lock:
                 self.latest_goal_msg = goal
                 self.latest_dir_msg = dir_msg

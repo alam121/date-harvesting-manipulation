@@ -360,11 +360,12 @@ class BestTargetPublicationTests(unittest.TestCase):
     def test_tip_and_goal_preserve_acquisition_stamp(self):
         from collections import deque
         from geometry_msgs.msg import PointStamped, PoseStamped
-        from std_msgs.msg import Float32, Float32MultiArray
+        from std_msgs.msg import Float32, Float32MultiArray, String
+        import json
         tree=ast.parse((ROOT/'vision/node.py').read_text())
         owner=next(n.name for n in tree.body if isinstance(n,ast.ClassDef)
                    and any(isinstance(f,ast.FunctionDef) and f.name=='_process_best_target' for f in n.body))
-        env=dict(np=np,math=math,SHOW_FINGER_CONTACTS=False,Z_MAX=2.,
+        env=dict(np=np,math=math,StdString=String,json=json,SHOW_FINGER_CONTACTS=False,Z_MAX=2.,
                  PointStamped=PointStamped,PoseStamped=PoseStamped,Float32=Float32,
                  Float32MultiArray=Float32MultiArray,time=lambda:99.,
                  estimate_fruit_radius=lambda *args,**kwargs:.015)
@@ -372,6 +373,7 @@ class BestTargetPublicationTests(unittest.TestCase):
         for tip in (np.array([.01,.02,.03]), None, np.array([math.nan,0.,0.])):
             with self.subTest(tip=tip):
                 tips=[]
+                traces=[]
                 point=PointStamped()
                 point.header.frame_id='base_link'
                 point.header.stamp.sec=12
@@ -381,10 +383,14 @@ class BestTargetPublicationTests(unittest.TestCase):
                 vision=types.SimpleNamespace(_cached_tf_base=(np.eye(3),np.array([.2,.3,.4])),
                     date_tip_pub=types.SimpleNamespace(publish=tips.append),prev_heat_point=None,
                     best_history=deque(maxlen=5),pub_lock=threading.Lock(),
+                    depth_trace_pub=types.SimpleNamespace(publish=traces.append),
                     radius_pub=quiet,gap_info_pub=quiet,target_lock_active=False)
                 target=dict(pt_base=point,best_point_3d=tip,fruit_id=1,bb=(1,1,4,4))
                 fn(vision,[target],0,{'fx':500.})
                 self.assertEqual(vision.latest_goal_msg.header.stamp,point.header.stamp)
+                trace=json.loads(traces[0].data)
+                self.assertEqual(trace["source_stamp_ns"],12000000345)
+                self.assertEqual(trace["published_goal_base_xyz_m"],[.1,.2,.3])
                 if tip is not None and np.isfinite(tip).all():
                     self.assertEqual(len(tips),1)
                     self.assertEqual(tips[0].header.stamp,point.header.stamp)

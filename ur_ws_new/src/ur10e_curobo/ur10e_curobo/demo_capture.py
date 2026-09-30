@@ -148,6 +148,7 @@ def _capture_correction(node) -> Optional[str]:
         return None
 
     before = {
+        "depth_trace": copy.deepcopy(getattr(node, "_demo_depth_trace", None)),
         "planned_final_pose": copy.deepcopy(getattr(node, "_demo_planned_final_pose", None)),
         "target_label": target_label,
         "pose": before_pose,
@@ -238,6 +239,13 @@ def _capture_correction(node) -> Optional[str]:
     planned_final = before.get('planned_final_pose')
     residual = ([after_pose[i] - planned_final[i] for i in range(3)]
                 if planned_final else None)
+    trace = before.get('depth_trace')
+    if trace is not None and planned_final:
+        trace['operator_grasp_tcp_base_xyz_m'] = list(after_pose[:3])
+        trace['operator_residual_base_m'] = residual
+        forward_index, forward_sign = ((0, 1.0) if trace['base_forward_axis'] == '+X' else (1, -1.0))
+        trace['planned_excess_forward_m'] = forward_sign * (planned_final[forward_index] - after_pose[forward_index])
+        node.get_logger().info(f"[DEPTH_TRACE] planned excess insertion={trace['planned_excess_forward_m']*1000:+.1f}mm versus operator endpoint")
     sample = {
         "level_insertion_enabled": bool(getattr(planner, "low_center_level_insertion_enabled", False)),
         "level_final_z_m": getattr(node, "_level_final_z", None),
