@@ -6,13 +6,16 @@ from launch.actions import (
     SetEnvironmentVariable,
     UnsetEnvironmentVariable,
 )
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    fastdds_profile = DeclareLaunchArgument("fastdds_profile", default_value="")
+    _profile_given = PythonExpression(["'", LaunchConfiguration("fastdds_profile"), "' != ''"])
     discovery_server = DeclareLaunchArgument(
         "discovery_server", default_value="10.76.154.75:11811"
     )
@@ -62,6 +65,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        fastdds_profile,
         discovery_server,
         environment,
         gripper_profile,
@@ -72,7 +76,14 @@ def generate_launch_description():
         SetEnvironmentVariable(
             "ROS_DISCOVERY_SERVER", LaunchConfiguration("discovery_server")
         ),
-        UnsetEnvironmentVariable("FASTRTPS_DEFAULT_PROFILES_FILE"),
+        # A discovery-client profile that whitelists the route between the machines
+        # (bin/fastdds_client_profile); without one, unset any buffer profile, which would
+        # override the discovery-server client configuration.
+        SetEnvironmentVariable(
+            "FASTRTPS_DEFAULT_PROFILES_FILE", LaunchConfiguration("fastdds_profile"),
+            condition=IfCondition(_profile_given)),
+        UnsetEnvironmentVariable(
+            "FASTRTPS_DEFAULT_PROFILES_FILE", condition=UnlessCondition(_profile_given)),
         SetEnvironmentVariable("UR10E_ROBOT_PROFILE", "old"),
         SetEnvironmentVariable("UR10E_ENVIRONMENT", LaunchConfiguration("environment")),
         SetEnvironmentVariable(

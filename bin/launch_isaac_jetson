@@ -16,6 +16,10 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-6}"
 export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export ROS_DISCOVERY_SERVER="${ROS_DISCOVERY_SERVER:-10.76.154.75:11811}"
-unset FASTRTPS_DEFAULT_PROFILES_FILE
+# Advertise only the route to the workstation (not the Delto link-local port etc.); see
+# bin/fastdds_client_profile.
+FASTDDS_PROFILE="$("$SCRIPT_DIR/fastdds_client_profile" "$ROS_DISCOVERY_SERVER")"
+export FASTRTPS_DEFAULT_PROFILES_FILE="$FASTDDS_PROFILE"
 
-exec ros2 launch ur10e_curobo isaac_jetson_control.launch.py "$@"
+exec ros2 launch ur10e_curobo isaac_jetson_control.launch.py \
+  discovery_server:="$ROS_DISCOVERY_SERVER" fastdds_profile:="$FASTDDS_PROFILE" "$@"

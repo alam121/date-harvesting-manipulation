@@ -37,7 +37,9 @@ source "$REPO_ROOT/ur_ws_new/install/setup.bash"
 set -u
 export ROS_DOMAIN_ID=6 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export ROS_DISCOVERY_SERVER="$PC_IP:11811"
-unset FASTRTPS_DEFAULT_PROFILES_FILE
+# Advertise only the campus address (not docker0 / USB link-local); see bin/fastdds_client_profile.
+FASTDDS_PROFILE="$("$REPO_ROOT/bin/fastdds_client_profile" "$ROS_DISCOVERY_SERVER")"
+export FASTRTPS_DEFAULT_PROFILES_FILE="$FASTDDS_PROFILE"
 
 if ! ss -lun | grep -q ":11811 "; then
   fastdds discovery -i 0 -l "$PC_IP" -p 11811 > "$LOG_DIR/discovery.log" 2>&1 &
@@ -45,7 +47,7 @@ if ! ss -lun | grep -q ":11811 "; then
 fi
 
 UR10E_ENVIRONMENT=lab ros2 launch ur10e_curobo isaac_sim_mirror.launch.py \
-  discovery_server:="$PC_IP:11811" > "$LOG_DIR/bridge.log" 2>&1 &
+  discovery_server:="$PC_IP:11811" fastdds_profile:="$FASTDDS_PROFILE" > "$LOG_DIR/bridge.log" 2>&1 &
 pids+=($!)
 
 (cd "$REPO_ROOT/isaac/nurec" && exec "$HOME/nurec_data/yolo_venv/bin/python" -u sim_vision.py) \
@@ -63,4 +65,7 @@ pids+=($!)
 
 echo "[harvest-pc] logs in $LOG_DIR; on the Jetson: launch_isaac_jetson environment:=lab"
 tail -F "$LOG_DIR/isaac.log" "$LOG_DIR/vision.log" "$LOG_DIR/bridge.log" 2>/dev/null \
-  | grep --line-buffered -E "\[ISAAC BRIDGE\]|\[SIM VISION\]|\[INFO\]|\[BUNCH\]|mirror started|Traceback|Error"
+  | grep --line-buffered -E "\[ISAAC BRIDGE\]|\[SIM VISION\]|\[INFO\]|\[BUNCH\]|mirror started|Traceback|Error" &
+pids+=($!)
+# Wait on the background jobs: a foreground pipeline would hold off the cleanup trap.
+wait

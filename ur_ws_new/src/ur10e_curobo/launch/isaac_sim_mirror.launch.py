@@ -12,13 +12,15 @@ from launch.actions import (
     SetEnvironmentVariable,
     UnsetEnvironmentVariable,
 )
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
+    fastdds_profile = DeclareLaunchArgument("fastdds_profile", default_value="")
+    _profile_given = PythonExpression(["'", LaunchConfiguration("fastdds_profile"), "' != ''"])
     fruit_x = DeclareLaunchArgument("fruit_x", default_value="0.62")
     fruit_y = DeclareLaunchArgument("fruit_y", default_value="-0.04")
     fruit_z = DeclareLaunchArgument("fruit_z", default_value="0.82")
@@ -70,6 +72,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        fastdds_profile,
         discovery_server,
         SetEnvironmentVariable("ROS_DOMAIN_ID", "6"),
         SetEnvironmentVariable("ROS_LOCALHOST_ONLY", "0"),
@@ -77,7 +80,14 @@ def generate_launch_description():
         SetEnvironmentVariable(
             "ROS_DISCOVERY_SERVER", LaunchConfiguration("discovery_server")
         ),
-        UnsetEnvironmentVariable("FASTRTPS_DEFAULT_PROFILES_FILE"),
+        # A discovery-client profile that whitelists the route between the machines
+        # (bin/fastdds_client_profile); without one, unset any buffer profile, which would
+        # override the discovery-server client configuration.
+        SetEnvironmentVariable(
+            "FASTRTPS_DEFAULT_PROFILES_FILE", LaunchConfiguration("fastdds_profile"),
+            condition=IfCondition(_profile_given)),
+        UnsetEnvironmentVariable(
+            "FASTRTPS_DEFAULT_PROFILES_FILE", condition=UnlessCondition(_profile_given)),
         fruit_x,
         fruit_y,
         fruit_z,

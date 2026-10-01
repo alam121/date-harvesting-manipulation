@@ -573,6 +573,11 @@ def run(sim, scene):
             grip_art = robot.data.joint_pos[0, gripper_ids_articulation]
             grip_by_name = {name: float(grip_art[i].detach().cpu()) for i, name in enumerate(gripper_names_articulation)}
             grip_ros = [grip_by_name[name] for name in GRIPPER_NAMES_ROS]
+            # Joint torque per finger joint: the bridge reports it as the Delto motor current,
+            # which the controller's non-tactile contact check compares against its close baseline.
+            torque_art = robot.data.applied_torque[0, gripper_ids_articulation].detach().cpu().tolist()
+            torque_by_name = dict(zip(gripper_names_articulation, torque_art))
+            grip_effort = [abs(float(torque_by_name[name])) for name in GRIPPER_NAMES_ROS]
 
             net_forces = fingertips.data.net_forces_w
             if net_forces is None:
@@ -585,6 +590,7 @@ def run(sim, scene):
                 "arm_pos": arm_pos.detach().cpu().tolist(),
                 "arm_vel": arm_vel.detach().cpu().tolist(),
                 "gripper_pos": grip_ros,
+                "gripper_effort": grip_effort,
                 "forces": forces,
                 **perception,
             })
@@ -606,7 +612,10 @@ def run(sim, scene):
 
 
 def main():
-    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args_cli.device)
+    # Render every 4th physics step (30 Hz; the wrist camera samples at 10 Hz): rendering the RTX
+    # viewport every 120 Hz step ran the NuRec scene at 0.25x real time, so the arm lagged
+    # cuRobo's wall-clock trajectories.
+    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args_cli.device, render_interval=4)
     sim = sim_utils.SimulationContext(sim_cfg)
     scene_cfg = HardwareSceneCfg(num_envs=1, env_spacing=2.0)
     split_dir = Path(args_cli.nurec_dates).parent if args_cli.nurec_dates else None

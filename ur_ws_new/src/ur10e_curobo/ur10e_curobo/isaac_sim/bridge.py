@@ -73,6 +73,8 @@ JOINT_ORDER, DEFAULT_HOME_JOINTS, X_FORWARD_Y_LATERAL = _load_hardware_profile()
 GRIPPER_TARGET_TOPIC = "/gripper/target_joint"
 GRIPPER_FORCE_TOPIC = "/gripper/force"
 TRAJECTORY_TOPIC = "/scaled_joint_trajectory_controller/joint_trajectory"
+GRIPPER_JOINT_STATE_TOPIC = "/gripper/joint_states"
+DELTO_JOINT_NAMES = [f"F{finger}M{motor}" for finger in (1, 2, 3) for motor in (1, 2, 3, 4)]
 # As the real vision node: the best-target choice skips dates within 8 cm of an excluded position.
 EXCLUDE_RADIUS_M = 0.08
 
@@ -228,6 +230,7 @@ class IsaacUdpBackend:
         self.actual_joints = list(initial_joints)
         self.actual_velocities = [0.0] * len(JOINT_ORDER)
         self.actual_gripper = []
+        self.actual_gripper_effort = []
         self.actual_forces = [0.0, 0.0, 0.0]
         self.perception: Optional[dict] = None
         self.ros_arm_target: Optional[List[float]] = None
@@ -329,6 +332,7 @@ class IsaacUdpBackend:
         if len(arm_vel) == len(JOINT_ORDER):
             self.actual_velocities = [float(v) for v in arm_vel]
         self.actual_gripper = [float(v) for v in latest.get("gripper_pos", [])]
+        self.actual_gripper_effort = [float(v) for v in latest.get("gripper_effort", [])]
         forces = latest.get("forces", [])
         if len(forces) >= 3:
             self.actual_forces = [float(v) for v in forces[:3]]
@@ -342,7 +346,9 @@ class IsaacUdpBackend:
         return list(self.actual_forces)
 
     def connected(self) -> bool:
-        return time.monotonic() - self.last_state_time < 1.0
+        # Isaac pauses for a second or two when it compiles shaders or loads a scene; a 1 s
+        # limit flipped robot_program_running off mid-run.
+        return time.monotonic() - self.last_state_time < 2.5
 
     def vision_state(self) -> Optional[dict]:
         return self.perception if self.connected() else None
@@ -440,6 +446,7 @@ class IsaacHardwareMirrorNode(Node):
             Bool, "/io_and_status_controller/robot_program_running", 10
         )
         self.force_pub = self.create_publisher(Float32MultiArray, GRIPPER_FORCE_TOPIC, 10)
+        self.gripper_joint_pub = self.create_publisher(JointState, GRIPPER_JOINT_STATE_TOPIC, 10)
         self.goal_pub = self.create_publisher(PoseStamped, "/external_goal_pose", 10)
         self.all_fruits_pub = self.create_publisher(
             Float32MultiArray, "/vision/all_fruit_poses", 10
@@ -470,6 +477,13 @@ class IsaacHardwareMirrorNode(Node):
         self.create_subscription(
             Float32MultiArray, "/exclude_fruit_positions", self._exclude_cb, 10
         )
+        # GPU handoff with the control node, as the ZED vision node does: it publishes
+        # "paused:<id>" before planning and waits for the same "paused:<id>" back (else it stops
+        # the harvest). Sim vision runs on this PC's GPU, so pausing frees nothing; it only stops
+        # the detections, like the real node.
+        self.vision_mode = "full"
+        self.mode_state_pub = self.create_publisher(String, "/vision/mode_state", 10)
+        self.create_subscription(String, "/vision/mode", self._vision_mode_cb, 10)
         # Set once Isaac reports wrist-camera detections (NuRec palm scene); from then on there
         # is no fixed fallback fruit, so an empty view never sends the arm to a phantom target.
         self.wrist_vision = False
@@ -512,6 +526,13 @@ class IsaacHardwareMirrorNode(Node):
         if isinstance(self.backend, IsaacUdpBackend):
             self.backend.set_ros_joint_state(msg.name, msg.position, msg.velocity)
 
+    def _vision_mode_cb(self, msg: String) -> None:
+        mode, _, request_id = msg.data.partition(":")
+        if mode not in ("full", "reacquire", "paused"):
+            return
+        self.vision_mode = mode
+        self.mode_state_pub.publish(String(data=msg.data if mode == "paused" else mode))
+
     def _exclude_cb(self, msg: Float32MultiArray) -> None:
         data = list(msg.data)
         self.excluded_positions = [
@@ -532,13 +553,29 @@ class IsaacHardwareMirrorNode(Node):
             self._publish_joint_state()
             self.running_pub.publish(Bool(data=self.backend.connected()))
             self.force_pub.publish(Float32MultiArray(data=self.backend.gripper_force()))
+            self._publish_gripper_joint_state()
         elif isinstance(self.backend, IsaacUdpBackend):
             self._publish_joint_state(self.isaac_joint_pub)
             metrics = self.backend.joint_sync_metrics()
             if metrics is not None:
                 self.sync_error_pub.publish(Float32MultiArray(data=metrics))
-        if self.publish_fake_vision:
+        if self.publish_fake_vision and self.vision_mode != "paused":
             self._publish_vision_contract()
+
+    def _publish_gripper_joint_state(self) -> None:
+        """Delto feedback like the real driver: positions plus per-motor effort (the sim joint
+        torque, standing in for motor current) for the controller's non-tactile contact check."""
+        positions = getattr(self.backend, "actual_gripper", [])
+        efforts = getattr(self.backend, "actual_gripper_effort", [])
+        if len(positions) != len(DELTO_JOINT_NAMES) or len(efforts) != len(DELTO_JOINT_NAMES):
+            return
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(DELTO_JOINT_NAMES)
+        msg.position = list(positions)
+        msg.velocity = [0.0] * len(DELTO_JOINT_NAMES)
+        msg.effort = list(efforts)
+        self.gripper_joint_pub.publish(msg)
 
     def _publish_joint_state(self, publisher=None) -> None:
         positions, velocities = self.backend.joint_state()
