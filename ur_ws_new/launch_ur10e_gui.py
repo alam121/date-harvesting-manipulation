@@ -15,6 +15,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 WS = Path(__file__).resolve().parent
 REPO_ROOT = WS.parent
 LAUNCHER = REPO_ROOT / "bin" / "launch_ur10e"
+ISAAC_LAUNCHER = REPO_ROOT / "bin" / "launch_isaac_jetson"
+ISAAC_TWIN_LAUNCHER = REPO_ROOT / "bin" / "launch_isaac_twin"
 VISION_DIR = WS / "src" / "ur10e_curobo" / "ur10e_curobo" / "vision"
 PROFILE_DIR = VISION_DIR / "calibration_profiles"
 GRIPPER_PROFILE_SOURCE = (
@@ -352,8 +354,18 @@ class LaunchDialog(QtWidgets.QDialog):
         self.fake_radio = QtWidgets.QRadioButton("Fake hardware")
         self.real_radio.setChecked(True)
         self.hardware_group = QtWidgets.QButtonGroup(self)
+        # Isaac modes sit in the SAME group as real/fake on purpose: the twin
+        # mirror republishes /joint_states, robot_program_running and
+        # /gripper/force, so once it is up the RViz panel looks identical to a
+        # live arm. Making it a mutually exclusive hardware choice here is the
+        # one place the operator is told which it is.
+        self.isaac_radio = QtWidgets.QRadioButton("Isaac Sim only (no physical robot)")
+        self.isaac_twin_radio = QtWidgets.QRadioButton(
+            "Physical robot + Isaac digital twin")
         self.hardware_group.addButton(self.real_radio)
         self.hardware_group.addButton(self.fake_radio)
+        self.hardware_group.addButton(self.isaac_radio)
+        self.hardware_group.addButton(self.isaac_twin_radio)
 
         self.robot_profile_combo = QtWidgets.QComboBox()
         self.robot_profile_combo.addItem("Old robot", "old")
@@ -472,7 +484,9 @@ class LaunchDialog(QtWidgets.QDialog):
         close_btn = QtWidgets.QPushButton("Close")
         start_btn.setDefault(True)
 
-        hardware_box = self._group_box("Hardware", self._vbox(self.real_radio, self.fake_radio))
+        hardware_box = self._group_box("Hardware", self._vbox(
+            self.real_radio, self.fake_radio,
+            self.isaac_radio, self.isaac_twin_radio))
         profile_layout = QtWidgets.QFormLayout()
         profile_layout.addRow("Robot", self.robot_profile_combo)
         profile_layout.addRow("Environment", self.environment_combo)
@@ -806,6 +820,19 @@ class LaunchDialog(QtWidgets.QDialog):
         return args
 
     def update_command(self):
+        if self.isaac_twin_radio.isChecked():
+            self.command_edit.setText(
+                shlex.join(["launch_isaac_twin"] + self.build_args()))
+            return
+        if self.isaac_radio.isChecked():
+            enabled = "true" if self.use_gripper_cb.isChecked() else "false"
+            self.command_edit.setText(shlex.join([
+                "launch_isaac_jetson",
+                f"environment:={self.environment_combo.currentData()}",
+                f"gripper_profile:={self.gripper_profile_combo.currentData()}",
+                f"gripper_enabled:={enabled}",
+            ]))
+            return
         self.command_edit.setText(shlex.join(["launch_ur10e"] + self.build_args()))
 
     def copy_command(self):
@@ -833,7 +860,51 @@ class LaunchDialog(QtWidgets.QDialog):
         subprocess.Popen([str(LAUNCHER)] + args)
         return True
 
+    def _start_isaac(self):
+        """Launch an Isaac mode, or return False if this is not one.
+
+        Checked before the raw-YOLO validation below: that validation is about
+        the vision source for a live camera run and has nothing to say about a
+        simulated one.
+        """
+        if self.isaac_twin_radio.isChecked():
+            if not ISAAC_TWIN_LAUNCHER.exists():
+                QtWidgets.QMessageBox.critical(
+                    self, "Isaac Twin Launcher Missing",
+                    f"Could not find {ISAAC_TWIN_LAUNCHER}")
+                return True
+            args = self.build_args()
+            if not args:
+                QtWidgets.QMessageBox.warning(
+                    self, "Nothing Selected",
+                    "Select at least the main control node before launching.")
+                return True
+            self._remember_profiles()
+            self._remember_camera_mode()
+            subprocess.Popen([str(ISAAC_TWIN_LAUNCHER)] + args)
+            self.accept()
+            return True
+        if self.isaac_radio.isChecked():
+            if not ISAAC_LAUNCHER.exists():
+                QtWidgets.QMessageBox.critical(
+                    self, "Isaac Launcher Missing",
+                    f"Could not find {ISAAC_LAUNCHER}")
+                return True
+            enabled = "true" if self.use_gripper_cb.isChecked() else "false"
+            self._remember_profiles()
+            subprocess.Popen([
+                str(ISAAC_LAUNCHER),
+                f"environment:={self.environment_combo.currentData()}",
+                f"gripper_profile:={self.gripper_profile_combo.currentData()}",
+                f"gripper_enabled:={enabled}",
+            ])
+            self.accept()
+            return True
+        return False
+
     def start_system(self):
+        if self._start_isaac():
+            return
         if self.raw_yolo_cb.isChecked():
             source = self.raw_source_combo.currentData()
             if source != "live":
