@@ -61,6 +61,11 @@ def generate_launch_description():
             # enables trajectory, Delto target/force, and UR program-state I/O.
             "planner.use_fake_hardware": False,
             "perception.enabled": False,
+            # The lab profile's -0.015 m corrects the real ZED, which reads dates nearer than
+            # they are at ~1.4 m (config.py _LAB_GRASP_OFFSETS). Isaac's wrist depth is exact,
+            # so that correction left the closure in front of the date; +0.020 m (the outdoor
+            # value) puts it at the date's centre.
+            "planner.low_center_final_depth_offset": 0.020,
         }],
     )
 

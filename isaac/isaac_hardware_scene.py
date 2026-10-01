@@ -89,7 +89,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-from isaaclab.sensors import CameraCfg, ContactSensorCfg
+from isaaclab.sensors import CameraCfg, ContactSensor, ContactSensorCfg
+from pxr import UsdPhysics
 from isaaclab.sensors.camera.utils import create_pointcloud_from_depth
 from isaaclab.utils import configclass
 from isaaclab.utils.math import combine_frame_transforms, subtract_frame_transforms
@@ -114,6 +115,10 @@ WRIST_FOCAL_MM = 24.0
 # NuRec mode: newest wrist RGB-D frame + camera pose in base_link for isaac/nurec/sim_vision.py.
 WRIST_FRAME_PATH = Path("/dev/shm/isaac_wrist_frame.npz")
 VISION_STALE_S = 1.0
+# Grasp diagnosis (--debug_bridge, static dates): contact sensor on the dates, per hand link.
+HAND_LINK_PREFIXES = ("gripper", "wrist_3", "flange", "tool0", "zed", "ft_frame")
+DATE_CONTACTS = None
+DATE_CONTACT_LINKS = []
 
 ARM_NAMES = [
     "shoulder_pan_joint",
@@ -631,13 +636,19 @@ def run(sim, scene):
                 gaps = torch.linalg.norm(dates_w - root - tips_b, dim=1)
                 k = int(torch.argmin(gaps))
                 if step % 100 == 0 or float(gaps[k]) < 0.12:
+                    touching = ""
+                    if DATE_CONTACTS is not None:
+                        DATE_CONTACTS.update(sim_dt * 10, force_recompute=True)
+                        row = torch.linalg.norm(DATE_CONTACTS.data.force_matrix_w[0, k], dim=-1)  # (env, date, link, xyz)
+                        touching = " links=" + ",".join(
+                            f"{DATE_CONTACT_LINKS[j]}:{float(row[j]):.1f}N" for j in torch.nonzero(row > 0.01).flatten().tolist())
                     moved = float(torch.linalg.norm(dates_w[k] - dates_rest_w[k]))
                     tip_forces = fingertips.data.net_forces_w
                     tip_force = [round(float(v), 2) for v in torch.linalg.norm(tip_forces[0], dim=-1)] if tip_forces is not None else []
                     print(f"[ISAAC GRASP] step={step} tips_b={[round(v, 3) for v in tips_b.tolist()]} "
                           f"nearest={Path(dates_view.prim_paths[k]).name} "
                           f"date_b={[round(v, 3) for v in (dates_w[k] - root).tolist()]} gap={float(gaps[k]) * 100:.1f}cm "
-                          f"moved={moved * 100:.1f}cm tip_force={tip_force} grip_M3={[round(v, 2) for v in grip_ros[2::4]]}",
+                          f"moved={moved * 100:.1f}cm tip_force={tip_force} grip_M3={[round(v, 2) for v in grip_ros[2::4]]}{touching}",
                           flush=True)
     finally:
         link.close()
@@ -693,7 +704,6 @@ def main():
     colour_robot(sim.stage)
     if args_cli.nurec_bunch:
         from nurec_bunch import add_bunch
-        from pxr import UsdPhysics
 
         bunch = add_bunch(sim.stage, split_dir, args_cli.nurec_pose, date_mass=args_cli.date_mass,
                           break_force=args_cli.date_break_force)
@@ -712,8 +722,18 @@ def main():
             mass=args_cli.date_mass,
             break_force=args_cli.date_break_force,
             break_torque=args_cli.date_break_torque,
+            contact_report=args_cli.debug_bridge,
         )
         print(f"[INFO] {len(dates)} detachable dates (break force {args_cli.date_break_force} N)")
+    if args_cli.nurec_dates and args_cli.debug_bridge and not args_cli.nurec_bunch:
+        # Which robot link touches a date (grasp diagnosis): one row per date, one column per link.
+        global DATE_CONTACTS, DATE_CONTACT_LINKS
+        robot_root = "/World/envs/env_0/Robot"
+        DATE_CONTACT_LINKS = [p.GetName() for p in sim.stage.GetPrimAtPath(robot_root).GetChildren()
+                              if p.HasAPI(UsdPhysics.RigidBodyAPI) and p.GetName().startswith(HAND_LINK_PREFIXES)]
+        DATE_CONTACTS = ContactSensor(ContactSensorCfg(
+            prim_path="/World/Dates/date_.*", update_period=0.0, history_length=0,
+            filter_prim_paths_expr=[f"{robot_root}/{name}" for name in DATE_CONTACT_LINKS]))
     sim.set_camera_view(eye=(1.5, 1.2, 1.25), target=(0.55, 0.0, 0.75))
     sim.reset()
     print("[INFO] Isaac date-palm hardware scene setup complete")
@@ -723,5 +743,13 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        # simulation_app.close() ends the process before Python would print the traceback.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
     finally:
         simulation_app.close()

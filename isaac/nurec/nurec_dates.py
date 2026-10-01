@@ -150,6 +150,7 @@ def add_dates(
     emissive_gain: float = 1.0,
     attach: dict | None = None,
     friction: float = 1.0,
+    contact_report: bool = False,
 ) -> list[str]:
     """Spawn the dates of dates_physics.json; scene_pose is the map's --nurec_pose (x y z qw qx qy qz).
 
@@ -192,6 +193,8 @@ def add_dates(
         prim = body.GetPrim()
         UsdPhysics.RigidBodyAPI.Apply(prim)
         UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(mass)
+        if contact_report:  # for a ContactSensor on the dates (which robot link touches which date)
+            PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr(0.0)
 
         if visual_mode == "mesh":
             _add_textured_mesh(stage, f"{path}/visual", directory / date["mesh"], palette)
