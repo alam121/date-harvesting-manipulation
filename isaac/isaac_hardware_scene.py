@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import sys
 import time
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -16,12 +18,71 @@ parser.add_argument("--command_port", type=int, default=55000)
 parser.add_argument("--state_host", default="127.0.0.1")
 parser.add_argument("--state_port", type=int, default=55001)
 parser.add_argument("--debug_bridge", action="store_true")
+parser.add_argument("--nurec_usdz", default="", help="NuRec USDZ from isaac/nurec/reconstruct.sh.")
+parser.add_argument(
+    "--nurec_pose",
+    type=float,
+    nargs=7,
+    default=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    metavar=("X", "Y", "Z", "QW", "QX", "QY", "QZ"),
+    help="World pose of the reconstruction frame (first left camera, ROS body axes) when recording began.",
+)
+parser.add_argument(
+    "--wrist_stream_port",
+    type=int,
+    default=0,
+    help="Stream the simulated wrist ZED X Mini as JPEG over localhost UDP to this port (0 = off).",
+)
+parser.add_argument("--wrist_stream_hz", type=float, default=10.0)
+parser.add_argument(
+    "--wrist_camera_extrinsic",
+    type=float,
+    nargs=7,
+    default=None,
+    metavar=("X", "Y", "Z", "QW", "QX", "QY", "QZ"),
+    help="tool0 -> zed_mini_left_camera_frame (OpenCV optical axes), as printed by nurec_pose_from_bag.py.",
+)
+parser.add_argument(
+    "--nurec_dates",
+    default="",
+    help="dates_physics.json from isaac/nurec/split_dates.py: detachable photo-textured dates "
+    "(use the matching split/tree_nurec.usdz as --nurec_usdz).",
+)
+parser.add_argument("--date_break_force", type=float, default=5.0, help="Pull [N] that detaches a date.")
+parser.add_argument(
+    "--date_break_torque",
+    type=float,
+    default=1.0e6,
+    help="Joint break torque; effectively off by default (uncalibrated, see date_pull_test.py).",
+)
+parser.add_argument("--date_mass", type=float, default=0.01, help="Mass of one date [kg].")
+parser.add_argument(
+    "--nurec_bunch",
+    action="store_true",
+    help="Dynamic bunch (isaac/nurec/nurec_bunch.py) from the --nurec_dates split directory; the tree "
+    "defaults to its split/tree_nobunch_nurec.usdz.",
+)
+parser.add_argument(
+    "--home_joints",
+    type=float,
+    nargs=6,
+    default=None,
+    help="Start arm pose (default: outdoor hardware home). Must match the bridge's UR10E_ENVIRONMENT.",
+)
+parser.add_argument(
+    "--vision_port",
+    type=int,
+    default=55002,
+    help="NuRec mode: date/trunk detections from isaac/nurec/sim_vision.py arrive on this port.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+import cv2
+import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -31,15 +92,28 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg, ContactSensorCfg
 from isaaclab.sensors.camera.utils import create_pointcloud_from_depth
 from isaaclab.utils import configclass
+from isaaclab.utils.math import combine_frame_transforms, subtract_frame_transforms
 
 
-COMBINED_USD = "/home/alam/isaac_ws/IsaacLab/source/isaaclab_assets/data/Robots/UR10_Tesollo/ur10_tesollo.usd"
+# UR10e + Delto from the robot's own /robot_description (isaac/build_ur10e_delto_usd.py). The Isaac
+# Lab ur10_tesollo.usd is a UR10: its tool0 sits up to 7 cm off what cuRobo plans for the UR10e.
+COMBINED_USD = str(Path.home() / "isaac_ws/ur10e_delto/ur10e_delto.usd")
+if not Path(COMBINED_USD).exists():
+    raise SystemExit(f"{COMBINED_USD} missing: build it with isaac/build_ur10e_delto_usd.py")
 ROBOT_BASE_WORLD = (0.0, 0.0, 0.30)
 TARGET_WORLD = (0.62, -0.04, 0.82)
 TRUNK_WORLD = (0.82, -0.04, 0.62)
 CAMERA_WORLD = (0.70, 0.0, 1.20)
 CAMERA_QUAT_ROS = (0.0, 1.0, 0.0, 0.0)
 TARGET_RADIUS = 0.024
+# ZED X Mini left, rectified, streamed at 640x360 (fx 499.46 at 1280x720, /vision/nurec calibration).
+WRIST_WIDTH, WRIST_HEIGHT, WRIST_FX = 640, 360, 249.73
+# RTX mis-renders the sub-millimetre focal lengths from PinholeCameraCfg.from_intrinsic_matrix;
+# the same field of view with a 24 mm lens renders correctly.
+WRIST_FOCAL_MM = 24.0
+# NuRec mode: newest wrist RGB-D frame + camera pose in base_link for isaac/nurec/sim_vision.py.
+WRIST_FRAME_PATH = Path("/dev/shm/isaac_wrist_frame.npz")
+VISION_STALE_S = 1.0
 
 ARM_NAMES = [
     "shoulder_pan_joint",
@@ -175,6 +249,32 @@ class HardwareSceneCfg(InteractiveSceneCfg):
     )
 
 
+def _wrist_camera_cfg():
+    # Take the mount from the robot's live TF (recorded in the bag), not a calibration
+    # profile file: the Jetson's active hand-eye can differ from the copies in this repo.
+    if args_cli.wrist_camera_extrinsic is None:
+        raise SystemExit("--wrist_stream_port needs --wrist_camera_extrinsic (see isaac/nurec/nurec_pose_from_bag.py)")
+    x, y, z, qw, qx, qy, qz = args_cli.wrist_camera_extrinsic
+    return CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/tool0/WristCamera",
+        update_period=1.0 / args_cli.wrist_stream_hz,
+        height=WRIST_HEIGHT,
+        width=WRIST_WIDTH,
+        data_types=["rgb", "distance_to_image_plane"] if args_cli.nurec_dates else ["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=WRIST_FOCAL_MM,
+            horizontal_aperture=WRIST_FOCAL_MM * WRIST_WIDTH / WRIST_FX,
+            vertical_aperture=WRIST_FOCAL_MM * WRIST_HEIGHT / WRIST_FX,
+            clipping_range=(0.05, 50.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(x, y, z),
+            rot=(qw, qx, qy, qz),
+            convention="ros",
+        ),
+    )
+
+
 class UdpLink:
     def __init__(self):
         self.command_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -209,6 +309,75 @@ class UdpLink:
     def close(self):
         self.command_socket.close()
         self.state_socket.close()
+
+
+class VisionLink:
+    """Latest detections from sim_vision.py (NuRec mode)."""
+
+    def __init__(self, port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("127.0.0.1", port))
+        self.socket.setblocking(False)
+        self.latest, self.time = None, 0.0
+
+    def fresh(self):
+        while True:
+            try:
+                packet, _ = self.socket.recvfrom(65535)
+            except BlockingIOError:
+                break
+            try:
+                self.latest, self.time = json.loads(packet.decode("utf-8")), time.monotonic()
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return self.latest if time.monotonic() - self.time < VISION_STALE_S else None
+
+    def close(self):
+        self.socket.close()
+
+
+def _write_wrist_frame(camera, robot, tool, frame_id):
+    """Hand the newest wrist RGB-D frame and its base_link pose to sim_vision.py (atomic replace)."""
+    output = camera.data.output
+    if output.get("rgb") is None or output.get("distance_to_image_plane") is None:
+        return
+    # The pose from tool0 and the mount: the camera sensor's own pose under the articulation
+    # link is not populated (NaN quaternion).
+    tool_pos_b, tool_quat_b = subtract_frame_transforms(
+        robot.data.root_pos_w[:1], robot.data.root_quat_w[:1],
+        robot.data.body_pos_w[:1, tool], robot.data.body_quat_w[:1, tool],
+    )
+    mount = torch.tensor([args_cli.wrist_camera_extrinsic], device=tool_pos_b.device, dtype=torch.float32)
+    pos_b, quat_b = combine_frame_transforms(tool_pos_b, tool_quat_b, mount[:, :3], mount[:, 3:])
+    tmp = WRIST_FRAME_PATH.with_name("isaac_wrist_frame.tmp.npz")
+    np.savez(
+        tmp,
+        rgb=output["rgb"][0, ..., :3].cpu().numpy(),
+        depth=output["distance_to_image_plane"][0, ..., 0].cpu().numpy().astype(np.float32),
+        K=camera.data.intrinsic_matrices[0].cpu().numpy(),
+        cam_pos_b=pos_b[0].cpu().numpy(),
+        cam_quat_b=quat_b[0].cpu().numpy(),
+        frame_id=frame_id,
+    )
+    tmp.replace(WRIST_FRAME_PATH)
+
+
+def _skeleton_trunk_b(split_dir):
+    """Trunk point for the planner's pole obstacle: the bunch stalk root, 4 cm further back.
+
+    The wrist camera cannot range the trunk in this scene (NuRec splats write no depth).
+    """
+    path = split_dir / "bunch_skeleton.json"
+    if not path.exists():
+        return None
+    root = np.array(json.loads(path.read_text())["nodes"][0]["position"])
+    w, x, y, z = args_cli.nurec_pose[3:]
+    rotation = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+    point = rotation @ root + np.array(args_cli.nurec_pose[:3]) - np.array(ROBOT_BASE_WORLD)
+    away = np.array([point[0], point[1], 0.0])
+    return (point + 0.04 * away / np.linalg.norm(away)).tolist()
 
 
 def _detect_target(camera, target):
@@ -276,18 +445,27 @@ def _detect_target(camera, target):
 
 
 def run(sim, scene):
+    nurec_mode = bool(args_cli.nurec_dates)
     robot = scene["robot"]
-    target = scene["target"]
-    camera = scene["camera"]
+    target = None if nurec_mode else scene["target"]
+    camera = None if nurec_mode else scene["camera"]
     fingertips = scene["fingertips"]
     link = UdpLink()
+    vision = VisionLink(args_cli.vision_port) if nurec_mode else None
+    trunk_b_last = _skeleton_trunk_b(Path(args_cli.nurec_dates).parent) if nurec_mode else None
+    tool = robot.body_names.index("tool0")
+    wrist_frames = 0
+    wrist_camera = scene["wrist_camera"] if (args_cli.wrist_stream_port or nurec_mode) else None
+    wrist_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if args_cli.wrist_stream_port else None
+    wrist_every = max(1, round(1.0 / (args_cli.wrist_stream_hz * sim.get_physics_dt())))
 
     arm_ids = [robot.joint_names.index(name) for name in ARM_NAMES]
     gripper_ids_articulation = [i for i, name in enumerate(robot.joint_names) if name.startswith("gripper_")]
     gripper_names_articulation = [robot.joint_names[i] for i in gripper_ids_articulation]
     gripper_ros_to_articulation = [GRIPPER_NAMES_ROS.index(name) for name in gripper_names_articulation]
 
-    arm_target = torch.tensor(HARDWARE_HOME, device=sim.device, dtype=torch.float32).unsqueeze(0)
+    home = args_cli.home_joints or HARDWARE_HOME
+    arm_target = torch.tensor(home, device=sim.device, dtype=torch.float32).unsqueeze(0)
     arm_velocity = torch.zeros_like(arm_target)
     arm_mode = "target"
     arm_state_command_time = 0.0
@@ -305,7 +483,7 @@ def run(sim, scene):
 
     sim_dt = sim.get_physics_dt()
     step = 0
-    detection = (target.data.root_pos_w[0], [0.5] * 4, "starting", "warming camera")
+    detection = (target.data.root_pos_w[0], [0.5] * 4, "starting", "warming camera") if target is not None else None
     print("[ISAAC BRIDGE] Live PhysX backend ready")
     print("[ISAAC BRIDGE] Arm joints:", ARM_NAMES)
     print("[ISAAC BRIDGE] Gripper articulation order:", gripper_names_articulation)
@@ -347,15 +525,49 @@ def run(sim, scene):
             scene.update(sim_dt)
             step += 1
 
-            if step % 3 == 0:
+            if wrist_camera is not None and step % wrist_every == 0:
+                if nurec_mode:
+                    wrist_frames += 1
+                    _write_wrist_frame(wrist_camera, robot, tool, wrist_frames)
+                rgb = wrist_camera.data.output["rgb"]
+                if rgb is not None and wrist_socket is not None:
+                    frame = cv2.cvtColor(rgb[0, ..., :3].cpu().numpy(), cv2.COLOR_RGB2BGR)
+                    # One JPEG per UDP datagram: lower quality until the frame fits.
+                    for quality in (85, 70, 55, 40):
+                        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                        if ok and len(jpeg) < 65000:
+                            wrist_socket.sendto(jpeg.tobytes(), ("127.0.0.1", args_cli.wrist_stream_port))
+                            break
+
+            if not nurec_mode and step % 3 == 0:
                 detection = _detect_target(camera, target)
             if step % 2 != 0:
                 continue
 
-            detected_w, bbox, perception_source, perception_reason = detection
-            root_w = robot.data.root_pos_w[0]
-            fruit_b = detected_w - root_w
-            trunk_b = torch.tensor(TRUNK_WORLD, device=sim.device) - root_w
+            if nurec_mode:
+                # Detections are already in base_link (sim_vision.py used the camera's base pose).
+                seen = vision.fresh()
+                fruits = seen["fruits"] if seen else []
+                if seen and seen.get("trunk"):
+                    trunk_b_last = seen["trunk"]  # keep the last trunk fix, like the pole obstacle
+                perception = {
+                    "fruits_b": [f[:3] for f in fruits],
+                    "fruit_radius": fruits[0][4] if fruits else None,
+                    "trunk_xyz_b": trunk_b_last,
+                    "bbox": seen["bbox"] if seen else [0.5] * 4,
+                    "perception_source": "isaac-wrist-yolo",
+                    "perception_reason": seen["reason"] if seen else "sim_vision.py not running",
+                }
+            else:
+                detected_w, bbox, perception_source, perception_reason = detection
+                root_w = robot.data.root_pos_w[0]
+                perception = {
+                    "fruit_xyz_b": (detected_w - root_w).detach().cpu().tolist(),
+                    "trunk_xyz_b": (torch.tensor(TRUNK_WORLD, device=sim.device) - root_w).detach().cpu().tolist(),
+                    "bbox": bbox,
+                    "perception_source": perception_source,
+                    "perception_reason": perception_reason,
+                }
             arm_pos = robot.data.joint_pos[0, arm_ids]
             arm_vel = robot.data.joint_vel[0, arm_ids]
             grip_art = robot.data.joint_pos[0, gripper_ids_articulation]
@@ -374,11 +586,7 @@ def run(sim, scene):
                 "arm_vel": arm_vel.detach().cpu().tolist(),
                 "gripper_pos": grip_ros,
                 "forces": forces,
-                "fruit_xyz_b": fruit_b.detach().cpu().tolist(),
-                "trunk_xyz_b": trunk_b.detach().cpu().tolist(),
-                "bbox": bbox,
-                "perception_source": perception_source,
-                "perception_reason": perception_reason,
+                **perception,
             })
 
             if args_cli.debug_bridge and step % 100 == 0:
@@ -386,17 +594,81 @@ def run(sim, scene):
                 print(
                     f"[ISAAC BRIDGE] step={step} command_age={age:.2f}s "
                     f"arm_mode={arm_mode} "
-                    f"fruit_b={fruit_b.detach().cpu().tolist()} forces={forces} "
-                    f"source={perception_source} reason={perception_reason}"
+                    f"forces={[round(f, 2) for f in forces]} "
+                    f"source={perception['perception_source']} reason={perception['perception_reason']}"
                 )
     finally:
         link.close()
+        if vision is not None:
+            vision.close()
+        if wrist_socket is not None:
+            wrist_socket.close()
 
 
 def main():
     sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
-    scene = InteractiveScene(HardwareSceneCfg(num_envs=1, env_spacing=2.0))
+    scene_cfg = HardwareSceneCfg(num_envs=1, env_spacing=2.0)
+    split_dir = Path(args_cli.nurec_dates).parent if args_cli.nurec_dates else None
+    if args_cli.nurec_bunch and not args_cli.nurec_usdz:
+        args_cli.nurec_usdz = str(split_dir / "tree_nobunch_nurec.usdz")
+    if args_cli.nurec_dates:
+        # The palm replaces the red test date, its stem and the fixed perception camera: dates are
+        # found on the wrist camera by isaac/nurec/sim_vision.py, as on the robot.
+        scene_cfg.target = None
+        scene_cfg.stem = None
+        scene_cfg.camera = None
+        # The UR controller compensates gravity; plain PD joints would sag ~0.1 rad at the
+        # shoulder (~10 cm at the date). Real Delto fingertips push ~10-20 N; the arm's 1200
+        # stiffness on the fingers would crush and fling a 10 g date (date_pick_test.py).
+        scene_cfg.robot.spawn.rigid_props = sim_utils.RigidBodyPropertiesCfg(disable_gravity=True)
+        scene_cfg.robot.actuators = {
+            "arm": ImplicitActuatorCfg(joint_names_expr=ARM_NAMES, stiffness=1200.0, damping=120.0,
+                                       effort_limit_sim=10000.0, velocity_limit_sim=10.0),
+            "gripper": ImplicitActuatorCfg(joint_names_expr=["gripper_.*"], stiffness=20.0, damping=1.0,
+                                           effort_limit_sim=1.0, velocity_limit_sim=3.0),
+        }
+    if args_cli.nurec_usdz:
+        # The reconstruction supplies the visuals; the ground plane stays only as a collider.
+        scene_cfg.ground.spawn.visible = False
+        scene_cfg.nurec = AssetBaseCfg(
+            prim_path="/World/NuRec",
+            spawn=sim_utils.UsdFileCfg(usd_path=args_cli.nurec_usdz),
+            init_state=AssetBaseCfg.InitialStateCfg(
+                pos=tuple(args_cli.nurec_pose[:3]),
+                rot=tuple(args_cli.nurec_pose[3:]),
+            ),
+        )
+    if args_cli.wrist_stream_port or args_cli.nurec_dates:
+        scene_cfg.wrist_camera = _wrist_camera_cfg()
+    scene = InteractiveScene(scene_cfg)
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "nurec"))
+    from robot_looks import colour_robot
+
+    colour_robot(sim.stage)
+    if args_cli.nurec_bunch:
+        from nurec_bunch import add_bunch
+        from pxr import UsdPhysics
+
+        bunch = add_bunch(sim.stage, split_dir, args_cli.nurec_pose, date_mass=args_cli.date_mass,
+                          break_force=args_cli.date_break_force)
+        # The hand touches only dates; trapped strands dragged the cluster and flung the date.
+        hand = UsdPhysics.CollisionGroup.Define(sim.stage, "/World/RobotCollisionGroup")
+        hand.GetCollidersCollectionAPI().GetIncludesRel().AddTarget("/World/envs/env_0/Robot")
+        hand.CreateFilteredGroupsRel().AddTarget("/World/Bunch/collision_group")
+        print(f"[INFO] dynamic bunch: {len(bunch['date_segment'])} dates on swinging strands")
+    elif args_cli.nurec_dates:
+        from nurec_dates import add_dates
+
+        dates = add_dates(
+            sim.stage,
+            Path(args_cli.nurec_dates),
+            args_cli.nurec_pose,
+            mass=args_cli.date_mass,
+            break_force=args_cli.date_break_force,
+            break_torque=args_cli.date_break_torque,
+        )
+        print(f"[INFO] {len(dates)} detachable dates (break force {args_cli.date_break_force} N)")
     sim.set_camera_view(eye=(1.5, 1.2, 1.25), target=(0.55, 0.0, 0.75))
     sim.reset()
     print("[INFO] Isaac date-palm hardware scene setup complete")

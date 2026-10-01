@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# PC side of the full harvest cycle in Isaac: the NuRec palm (dynamic bunch) stands in for the
+# robot, its wrist camera and the date detector; the real cuRobo control node runs on the Jetson
+# (bin/launch_isaac_jetson environment:=lab). Starts, with logs in $LOG_DIR:
+#   1. Fast DDS discovery server on this PC (the Jetson launcher points at it)
+#   2. ROS hardware mirror (isaac_sim/bridge.py): /joint_states, trajectories, gripper, vision topics
+#   3. sim_vision.py: YOLO on the sim wrist RGB-D -> date positions in base_link
+#   4. Isaac scene (isaac/isaac_hardware_scene.py) with the palm3 reconstruction
+# Ctrl+C stops everything. Extra arguments go to the Isaac scene (e.g. --headless).
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCENE="${SCENE:-$HOME/nurec_data/scenes/palm3}"
+PC_IP="${PC_IP:-10.76.154.75}"
+LOG_DIR="${LOG_DIR:-/tmp/isaac_harvest_logs}"
+# palm3: reconstruction pose and wrist mount, from isaac/nurec/nurec_pose_from_bag.py.
+NUREC_POSE="${NUREC_POSE:-0.23216 -0.99074 0.80103 0.76723 -0.02404 -0.03442 -0.64000}"
+WRIST_EXTRINSIC="${WRIST_EXTRINSIC:-0.09045 -0.08025 0.07333 0.86356 -0.05138 -0.02443 0.50102}"
+# palm3 was recorded in the lab: start at the lab home of ur10e_curobo/config.py, which the
+# bridge (UR10E_ENVIRONMENT=lab) and the Jetson control node also use.
+LAB_HOME="-1.352599 -0.582120 1.307726 2.136123 -1.784902 -1.059150"
+
+mkdir -p "$LOG_DIR"
+pids=()
+cleanup() {
+  trap - INT TERM EXIT
+  # SIGINT first so ros2 launch takes its nodes down; Isaac ignores it, hence the SIGKILL after.
+  for pid in "${pids[@]}"; do kill -INT "$pid" 2>/dev/null || true; done
+  sleep 3
+  for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+}
+trap cleanup INT TERM EXIT
+
+set +u
+source /opt/ros/humble/setup.bash
+source "$REPO_ROOT/ur_ws_new/install/setup.bash"
+set -u
+export ROS_DOMAIN_ID=6 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_DISCOVERY_SERVER="$PC_IP:11811"
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+
+if ! ss -lun | grep -q ":11811 "; then
+  fastdds discovery -i 0 -l "$PC_IP" -p 11811 > "$LOG_DIR/discovery.log" 2>&1 &
+  pids+=($!)
+fi
+
+UR10E_ENVIRONMENT=lab ros2 launch ur10e_curobo isaac_sim_mirror.launch.py \
+  discovery_server:="$PC_IP:11811" > "$LOG_DIR/bridge.log" 2>&1 &
+pids+=($!)
+
+(cd "$REPO_ROOT/isaac/nurec" && exec "$HOME/nurec_data/yolo_venv/bin/python" -u sim_vision.py) \
+  > "$LOG_DIR/vision.log" 2>&1 &
+pids+=($!)
+
+unset CONDA_SHLVL  # a set CONDA_SHLVL makes conda activation fall back into base
+rm -f /dev/shm/isaac_wrist_frame.npz
+# shellcheck disable=SC2086
+"$HOME/miniconda3/envs/env_isaaclab/bin/python" -u "$REPO_ROOT/isaac/isaac_hardware_scene.py" \
+  --nurec_dates "$SCENE/split/dates_physics.json" --nurec_bunch \
+  --nurec_pose $NUREC_POSE --wrist_camera_extrinsic $WRIST_EXTRINSIC \
+  --home_joints $LAB_HOME --enable_cameras --debug_bridge "$@" > "$LOG_DIR/isaac.log" 2>&1 &
+pids+=($!)
+
+echo "[harvest-pc] logs in $LOG_DIR; on the Jetson: launch_isaac_jetson environment:=lab"
+tail -F "$LOG_DIR/isaac.log" "$LOG_DIR/vision.log" "$LOG_DIR/bridge.log" 2>/dev/null \
+  | grep --line-buffered -E "\[ISAAC BRIDGE\]|\[SIM VISION\]|\[INFO\]|\[BUNCH\]|mirror started|Traceback|Error"

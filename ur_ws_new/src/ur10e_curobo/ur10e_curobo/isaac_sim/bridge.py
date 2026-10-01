@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -72,6 +73,8 @@ JOINT_ORDER, DEFAULT_HOME_JOINTS, X_FORWARD_Y_LATERAL = _load_hardware_profile()
 GRIPPER_TARGET_TOPIC = "/gripper/target_joint"
 GRIPPER_FORCE_TOPIC = "/gripper/force"
 TRAJECTORY_TOPIC = "/scaled_joint_trajectory_controller/joint_trajectory"
+# As the real vision node: the best-target choice skips dates within 8 cm of an excluded position.
+EXCLUDE_RADIUS_M = 0.08
 
 LATEST_ONLY_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
@@ -463,6 +466,13 @@ class IsaacHardwareMirrorNode(Node):
 
         self.create_subscription(JointTrajectory, TRAJECTORY_TOPIC, self._traj_cb, 10)
         self.create_subscription(Float32MultiArray, GRIPPER_TARGET_TOPIC, self._gripper_cb, 10)
+        self.excluded_positions: List[List[float]] = []
+        self.create_subscription(
+            Float32MultiArray, "/exclude_fruit_positions", self._exclude_cb, 10
+        )
+        # Set once Isaac reports wrist-camera detections (NuRec palm scene); from then on there
+        # is no fixed fallback fruit, so an empty view never sends the arm to a phantom target.
+        self.wrist_vision = False
         if self.joint_state_source == "ros":
             self.create_subscription(
                 JointState,
@@ -502,6 +512,12 @@ class IsaacHardwareMirrorNode(Node):
         if isinstance(self.backend, IsaacUdpBackend):
             self.backend.set_ros_joint_state(msg.name, msg.position, msg.velocity)
 
+    def _exclude_cb(self, msg: Float32MultiArray) -> None:
+        data = list(msg.data)
+        self.excluded_positions = [
+            [float(v) for v in data[i:i + 3]] for i in range(0, len(data) - 2, 3)
+        ]
+
     def _set_io_cb(self, request, response):
         # Sim accepts suction/IO commands as successful no-ops.
         response.success = True
@@ -537,6 +553,11 @@ class IsaacHardwareMirrorNode(Node):
     def _publish_vision_contract(self) -> None:
         now = self.get_clock().now().to_msg()
         vision = self.backend.vision_state()
+        if vision is not None and "fruits_b" in vision:
+            self.wrist_vision = True
+        if self.wrist_vision:
+            self._publish_wrist_vision(vision, now)
+            return
         fruit_xyz = vision.get("fruit_xyz_b") if vision else None
         trunk_xyz = vision.get("trunk_xyz_b") if vision else None
         bbox = vision.get("bbox") if vision else None
@@ -584,6 +605,49 @@ class IsaacHardwareMirrorNode(Node):
         source = vision.get("perception_source", "sim_static") if vision else "sim_static"
         reason = vision.get("perception_reason", "kinematic fallback") if vision else "kinematic fallback"
         self.vision_score_pub.publish(String(data=f"{source} score=1.000 reason={reason}"))
+
+    def _publish_wrist_vision(self, vision: Optional[dict], now) -> None:
+        """Every date the sim wrist camera sees, in score order, like the ZED date detector."""
+        fruits = [list(map(float, f)) for f in (vision or {}).get("fruits_b", [])]
+        flat = [v for xyz in fruits for v in xyz]
+        self.all_fruits_pub.publish(Float32MultiArray(data=flat))
+
+        trunk_xyz = (vision or {}).get("trunk_xyz_b")
+        if trunk_xyz and len(trunk_xyz) == 3:
+            trunk = PointStamped()
+            trunk.header.stamp = now
+            trunk.header.frame_id = "base_link"
+            trunk.point.x, trunk.point.y, trunk.point.z = (float(v) for v in trunk_xyz)
+            self.trunk_pub.publish(trunk)
+
+        best = next((
+            xyz for xyz in fruits
+            if not any(math.dist(xyz, ex) < EXCLUDE_RADIUS_M for ex in self.excluded_positions)
+        ), None)
+        reason = (vision or {}).get("perception_reason", "Isaac not connected")
+        if best is None:
+            self.vision_score_pub.publish(String(data=f"isaac-wrist-yolo score=0.000 reason={reason}"))
+            return
+        goal = PoseStamped()
+        goal.header.stamp = now
+        goal.header.frame_id = "base_link"
+        goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = best
+        goal.pose.orientation.w = self.goal_quat[0]
+        goal.pose.orientation.x = self.goal_quat[1]
+        goal.pose.orientation.y = self.goal_quat[2]
+        goal.pose.orientation.z = self.goal_quat[3]
+        self.goal_pub.publish(goal)
+        radius = vision.get("fruit_radius") or self.fruit.radius
+        self.radius_pub.publish(Float32(data=float(radius)))
+
+        direction = Vector3Stamped()
+        direction.header.stamp = now
+        direction.header.frame_id = "base_link"
+        direction.vector.x = -1.0 if X_FORWARD_Y_LATERAL else 0.0
+        direction.vector.y = 0.0 if X_FORWARD_Y_LATERAL else 1.0
+        self.direction_pub.publish(direction)
+        self.bbox_pub.publish(Float32MultiArray(data=[float(v) for v in vision.get("bbox", [0.5] * 4)]))
+        self.vision_score_pub.publish(String(data=f"isaac-wrist-yolo score=1.000 reason={reason}"))
 
     def destroy_node(self):
         self.backend.close()
