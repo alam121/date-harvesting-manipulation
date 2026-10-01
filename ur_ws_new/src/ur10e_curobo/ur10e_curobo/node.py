@@ -11,7 +11,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from rclpy.qos import QoSProfile, qos_profile_sensor_data
+from rclpy.qos import (QoSProfile, qos_profile_sensor_data,
+                       DurabilityPolicy, HistoryPolicy, ReliabilityPolicy)
 from rclpy.node import Node
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray, String, Float32, Bool
@@ -249,9 +250,36 @@ class UR10eCuroboMoveIt(Node):
         # code will actually import.
         self._curobo_label = _curobo_version_label()
         self.get_logger().info(f"[CUROBO] {self._curobo_label}")
-        self.create_timer(2.0, lambda: self.robot_config_pub.publish(
-            String(data=f"Robot: {ROBOT_PROFILE}  |  Env: {self.active_environment}"
-                        f"  |  {self._curobo_label}")))
+
+        # Is a digital twin in the loop? The mirror republishes /joint_states,
+        # robot_program_running and /gripper/force on the real stack's topics,
+        # so the panel cannot tell simulation from hardware on its own. ISAAC
+        # means joint state is simulated and the arm will not move; MIRROR
+        # means a real arm is the authority and Isaac is only observing.
+        # Latched on the publisher side, so this arrives even when the mirror
+        # started first.
+        self._twin_status = None
+
+        def _twin_status_cb(msg):
+            value = str(msg.data).strip() or None
+            if value != self._twin_status:
+                self._twin_status = value
+                self.get_logger().warn(f"[TWIN] digital twin active: {value}")
+
+        self.create_subscription(
+            String, "/isaac/twin_status", _twin_status_cb,
+            QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                       reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
+        def _publish_robot_config():
+            text = (f"Robot: {ROBOT_PROFILE}  |  Env: {self.active_environment}"
+                    f"  |  {self._curobo_label}")
+            if self._twin_status:
+                text += f"  |  TWIN: {self._twin_status}"
+            self.robot_config_pub.publish(String(data=text))
+
+        self.create_timer(2.0, _publish_robot_config)
 
         # Timer to publish goal info periodically
         self.create_timer(0.2, self._publish_goal_info)  # 5Hz

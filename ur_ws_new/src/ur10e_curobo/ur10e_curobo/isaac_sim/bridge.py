@@ -80,6 +80,16 @@ LATEST_ONLY_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+# TRANSIENT_LOCAL so a panel or node that starts after the mirror still
+# receives the warning. RELIABLE because missing this one is the difference
+# between believing you are on hardware and knowing you are not.
+LATCHED_STATUS_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+
 
 @dataclass
 class SimFruit:
@@ -437,6 +447,20 @@ class IsaacHardwareMirrorNode(Node):
         self.bbox_pub = self.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.vision_score_pub = self.create_publisher(String, "/vision/fruit_score", 10)
 
+        # Say out loud that a mirror is running, because nothing else does.
+        # Every other topic this node publishes is deliberately
+        # indistinguishable from the real UR/Delto/ZED stack -- that is the
+        # point of a mirror -- so an operator looking at the RViz panel sees
+        # moving joints, a green robot_program_running and live gripper force
+        # whether or not a physical arm exists. Latched so a panel that starts
+        # later still learns about it.
+        #
+        # ISAAC means /joint_states is simulated; MIRROR means a real arm is
+        # the authority and Isaac is only watching. Those are very different
+        # things to be told, so they are not collapsed into one flag.
+        self.twin_status_pub = self.create_publisher(
+            String, "/isaac/twin_status", LATCHED_STATUS_QOS)
+
         self.create_subscription(JointTrajectory, TRAJECTORY_TOPIC, self._traj_cb, 10)
         self.create_subscription(Float32MultiArray, GRIPPER_TARGET_TOPIC, self._gripper_cb, 10)
         if self.joint_state_source == "ros":
@@ -449,6 +473,15 @@ class IsaacHardwareMirrorNode(Node):
 
         if SetIO is not None:
             self.create_service(SetIO, "/io_and_status_controller/set_io", self._set_io_cb)
+
+        self.twin_status = ("ISAAC" if self.joint_state_source == "isaac"
+                            else "MIRROR")
+        self.twin_status_pub.publish(String(data=self.twin_status))
+        # Republished on a slow timer as well: a subscriber that misses the
+        # latched sample (restarted node, late join on a lossy transport) must
+        # not be left believing it is on real hardware.
+        self.create_timer(
+            2.0, lambda: self.twin_status_pub.publish(String(data=self.twin_status)))
 
         rate = float(self.get_parameter("publish_rate_hz").value)
         self.create_timer(1.0 / max(rate, 1.0), self._tick)
