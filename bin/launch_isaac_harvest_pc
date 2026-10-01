@@ -13,6 +13,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCENE="${SCENE:-$HOME/nurec_data/scenes/palm3}"
 PC_IP="${PC_IP:-10.76.154.75}"
 LOG_DIR="${LOG_DIR:-/tmp/isaac_harvest_logs}"
+# 1: dates hang on the swinging strand bunch (nurec_bunch.py); 0: dates pinned by stiff 5 N stems
+# on the full tree. The sim strands are softer than real ones, so a date tends to swing away
+# from the hand during insertion.
+NUREC_BUNCH="${NUREC_BUNCH:-1}"
+# Pull [N] that breaks a date's stem. At 5 N the open hand knocked dates off during insertion,
+# before the fingers closed (the arm's position control pushes harder than that on contact).
+DATE_BREAK_FORCE="${DATE_BREAK_FORCE:-5.0}"
 # palm3: reconstruction pose and wrist mount, from isaac/nurec/nurec_pose_from_bag.py.
 NUREC_POSE="${NUREC_POSE:-0.23216 -0.99074 0.80103 0.76723 -0.02404 -0.03442 -0.64000}"
 WRIST_EXTRINSIC="${WRIST_EXTRINSIC:-0.09045 -0.08025 0.07333 0.86356 -0.05138 -0.02443 0.50102}"
@@ -58,7 +65,8 @@ unset CONDA_SHLVL  # a set CONDA_SHLVL makes conda activation fall back into bas
 rm -f /dev/shm/isaac_wrist_frame.npz
 # shellcheck disable=SC2086
 "$HOME/miniconda3/envs/env_isaaclab/bin/python" -u "$REPO_ROOT/isaac/isaac_hardware_scene.py" \
-  --nurec_dates "$SCENE/split/dates_physics.json" --nurec_bunch \
+  --nurec_dates "$SCENE/split/dates_physics.json" --date_break_force "$DATE_BREAK_FORCE" \
+  $([[ "$NUREC_BUNCH" == 1 ]] && echo --nurec_bunch || echo --nurec_usdz "$SCENE/split/tree_nurec.usdz") \
   --nurec_pose $NUREC_POSE --wrist_camera_extrinsic $WRIST_EXTRINSIC \
   --home_joints $LAB_HOME --enable_cameras --debug_bridge "$@" > "$LOG_DIR/isaac.log" 2>&1 &
 pids+=($!)

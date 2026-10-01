@@ -454,6 +454,14 @@ def run(sim, scene):
     vision = VisionLink(args_cli.vision_port) if nurec_mode else None
     trunk_b_last = _skeleton_trunk_b(Path(args_cli.nurec_dates).parent) if nurec_mode else None
     tool = robot.body_names.index("tool0")
+    tip_ids = [robot.body_names.index(f"gripper_f{f}_tip_link") for f in (1, 2, 3)]
+    dates_view = None
+    if nurec_mode and args_cli.debug_bridge:
+        from isaacsim.core.prims import RigidPrim
+
+        dates_view = RigidPrim(prim_paths_expr="/World/Dates/date_[0-9][0-9]")
+        dates_view.initialize()
+        dates_rest_w = None
     wrist_frames = 0
     wrist_camera = scene["wrist_camera"] if (args_cli.wrist_stream_port or nurec_mode) else None
     wrist_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if args_cli.wrist_stream_port else None
@@ -476,6 +484,15 @@ def run(sim, scene):
     joint_vel = robot.data.default_joint_vel.clone()
     joint_pos[:, arm_ids] = arm_target
     joint_pos[:, gripper_ids_articulation] = gripper_target
+    if nurec_mode:
+        # The real Delto's joint readings carry per-unit zero offsets: the controller's gripper
+        # profiles command M4 down to -0.68 and M3 up to 2.60 rad, past the URDF's -0.227 / 2.531
+        # limits, and the real hand follows. Clamped there, the open hand was ~1.5 cm narrower
+        # per finger and struck dates on insertion. Let the sim fingers follow the commands.
+        limits = robot.data.joint_pos_limits.clone()
+        limits[:, gripper_ids_articulation, 0] = torch.clamp(limits[:, gripper_ids_articulation, 0], max=-1.0)
+        limits[:, gripper_ids_articulation, 1] = torch.clamp(limits[:, gripper_ids_articulation, 1], min=2.8)
+        robot.write_joint_position_limit_to_sim(limits)
     robot.write_joint_state_to_sim(joint_pos, joint_vel)
     robot.set_joint_position_target(arm_target, joint_ids=arm_ids)
     robot.set_joint_position_target(gripper_target, joint_ids=gripper_ids_articulation)
@@ -603,6 +620,25 @@ def run(sim, scene):
                     f"forces={[round(f, 2) for f in forces]} "
                     f"source={perception['perception_source']} reason={perception['perception_reason']}"
                 )
+            if dates_view is not None and step % 10 == 0:
+                # Grasp diagnosis (--debug_bridge): every 10 steps while the hand is near a date,
+                # fingertip centre vs that date and how far the date has left its rest pose.
+                root = robot.data.root_pos_w[0]
+                dates_w = dates_view.get_world_poses()[0]
+                if dates_rest_w is None:
+                    dates_rest_w = dates_w.clone()
+                tips_b = (robot.data.body_pos_w[0, tip_ids] - root).mean(0)
+                gaps = torch.linalg.norm(dates_w - root - tips_b, dim=1)
+                k = int(torch.argmin(gaps))
+                if step % 100 == 0 or float(gaps[k]) < 0.12:
+                    moved = float(torch.linalg.norm(dates_w[k] - dates_rest_w[k]))
+                    tip_forces = fingertips.data.net_forces_w
+                    tip_force = [round(float(v), 2) for v in torch.linalg.norm(tip_forces[0], dim=-1)] if tip_forces is not None else []
+                    print(f"[ISAAC GRASP] step={step} tips_b={[round(v, 3) for v in tips_b.tolist()]} "
+                          f"nearest={Path(dates_view.prim_paths[k]).name} "
+                          f"date_b={[round(v, 3) for v in (dates_w[k] - root).tolist()]} gap={float(gaps[k]) * 100:.1f}cm "
+                          f"moved={moved * 100:.1f}cm tip_force={tip_force} grip_M3={[round(v, 2) for v in grip_ros[2::4]]}",
+                          flush=True)
     finally:
         link.close()
         if vision is not None:
