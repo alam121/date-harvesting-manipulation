@@ -118,6 +118,7 @@ def add_bunch(
     stalk_stiffness: float = 0.1,
     drive_frequency: float = 0.0,
     solver_iterations: int = 255,
+    contact_report: bool = False,
 ) -> dict:
     """Spawn the dynamic bunch and its dates. Returns section paths, date paths, date -> section."""
     split_dir = Path(split_dir)
@@ -281,7 +282,8 @@ def add_bunch(
         palette.save()
     attach = {date_id: (paths[i], frames[i], centre[i]) for date_id, i in date_section.items()}
     dates = add_dates(stage, split_dir / "dates_physics.json", scene_pose, mass=date_mass, break_force=break_force,
-                      visual_mode="mesh" if visual else "none", attach=attach, stalk_stiffness=stalk_stiffness)
+                      visual_mode="mesh" if visual else "none", attach=attach, stalk_stiffness=stalk_stiffness,
+                      contact_report=contact_report)
     stiffness_used = np.array(stiffness_used)
     print(f"[BUNCH] {len(sections)} sections from {len(fine)} skeleton segments "
           f"({np.linalg.norm(fb - fa, axis=1).sum():.2f} m, {total_mass*1000:.0f} g), {len(dates)} dates; "

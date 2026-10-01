@@ -138,6 +138,10 @@ def _add_textured_mesh(stage, path: str, mesh_file: Path, palette: PhotoPalette)
 
 
 GRAVITY = 9.81
+# date body path -> (holder body path or None for the world, stalk anchor in the holder's frame,
+# date centre to anchor distance). While the stalk holds, the date centre stays exactly that far
+# from the anchor (translation is locked); a larger gap means the stem broke.
+STALK_ANCHORS: dict[str, tuple[str | None, np.ndarray, float]] = {}
 
 
 def _stalk_joint(stage, joint_path, date, position, mass, r_world_scene, body_path, r_world_body, p_world_body,
@@ -159,7 +163,8 @@ def _stalk_joint(stage, joint_path, date, position, mass, r_world_scene, body_pa
     joint = UsdPhysics.Joint.Define(stage, joint_path)
     if body_path is not None:
         joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
-    joint.CreateLocalPos0Attr(Gf.Vec3f(*(r_world_body.T @ (anchor - p_world_body)).tolist()))
+    anchor_in_holder = r_world_body.T @ (anchor - p_world_body)
+    joint.CreateLocalPos0Attr(Gf.Vec3f(*anchor_in_holder.tolist()))
     joint.CreateLocalRot0Attr(Gf.Quatf(*_matrix_to_quat(r_world_body.T @ r_world_scene)))
     joint.CreateLocalPos1Attr(Gf.Vec3f(*(r_world_scene.T @ (anchor - position)).tolist()))
     joint.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
@@ -181,7 +186,7 @@ def _stalk_joint(stage, joint_path, date, position, mass, r_world_scene, body_pa
         drive.CreateTargetPositionAttr(float(np.degrees(preload_rad[k])))
         drive.CreateStiffnessAttr(float(stiffness * np.pi / 180.0))  # USD angular gains are per degree
         drive.CreateDampingAttr(float(damping * np.pi / 180.0))
-    return joint
+    return joint, anchor_in_holder, float(radii[0])
 
 
 def add_dates(
@@ -201,6 +206,8 @@ def add_dates(
     stalk_stiffness: float = 0.1,
     stalk_swing_deg: float = 60.0,
     stalk_damping_ratio: float = 1.0,
+    skin_stiffness: float = 0.0,  # e.g. 5000 N/m; tried for the pinch, did not change pick results
+    skin_damping: float = 50.0,
 ) -> list[str]:
     """Spawn the dates of dates_physics.json; scene_pose is the map's --nurec_pose (x y z qw qx qy qz).
 
@@ -230,7 +237,14 @@ def add_dates(
     grip_api.CreateStaticFrictionAttr(friction)
     grip_api.CreateDynamicFrictionAttr(0.9 * friction)
     grip_api.CreateRestitutionAttr(0.0)
-    PhysxSchema.PhysxMaterialAPI.Apply(grip.GetPrim()).CreateFrictionCombineModeAttr("max")
+    grip_physx = PhysxSchema.PhysxMaterialAPI.Apply(grip.GetPrim())
+    grip_physx.CreateFrictionCombineModeAttr("max")
+    if skin_stiffness > 0.0:
+        # Soft date flesh against rubber pads: a compliant contact spreads a fingertip's contact into a
+        # patch instead of a rigid point, so a three-finger pinch holds instead of slipping or
+        # popping the date out. ~2 mm of give at 10 N.
+        grip_physx.CreateCompliantContactStiffnessAttr(skin_stiffness)
+        grip_physx.CreateCompliantContactDampingAttr(skin_damping)
 
     bodies = []
     for date in manifest["dates"]:
@@ -276,14 +290,16 @@ def add_dates(
             date_physx = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
             date_physx.CreateSolverPositionIterationCountAttr(32)
             date_physx.CreateSolverVelocityIterationCountAttr(4)
-            joint = _stalk_joint(stage, f"{stem_root}/date_{date['id']:02d}", date, position, mass, r_world_scene,
-                                 body_path, r_world_body, p_world_body, stalk_stiffness, stalk_swing_deg,
-                                 stalk_damping_ratio)
+            joint, anchor_in_holder, stalk_length = _stalk_joint(
+                stage, f"{stem_root}/date_{date['id']:02d}", date, position, mass, r_world_scene,
+                body_path, r_world_body, p_world_body, stalk_stiffness, stalk_swing_deg, stalk_damping_ratio)
+            STALK_ANCHORS[path] = (body_path, anchor_in_holder, stalk_length)
         else:  # rigid pin at the date centre (the earlier model)
             joint = UsdPhysics.FixedJoint.Define(stage, f"{stem_root}/date_{date['id']:02d}")
             if body_path is not None:
                 joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
             local = r_world_body.T @ (position - p_world_body)
+            STALK_ANCHORS[path] = (body_path, local, 0.0)
             joint.CreateLocalPos0Attr(Gf.Vec3f(*local.tolist()))
             joint.CreateLocalRot0Attr(Gf.Quatf(*_matrix_to_quat(r_world_body.T @ r_world_scene)))
             joint.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))

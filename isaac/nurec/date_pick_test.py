@@ -40,6 +40,8 @@ parser.add_argument("--record", type=Path, default=None, help="Save overview + w
 parser.add_argument("--wrist_camera_extrinsic", type=float, nargs=7, default=None,
                     help="tool0 -> camera (OpenCV optical), as printed by nurec_pose_from_bag.py (for --record).")
 parser.add_argument("--tree", type=Path, default=None, help="Tree USDZ for --record (default: next to manifest).")
+parser.add_argument("--contact_log", action="store_true",
+                    help="Log which hand link touches which date, per phase of every pick.")
 parser.add_argument("--bunch", action="store_true",
                     help="Dynamic bunch (nurec_bunch.py): dates hang on swinging strands, tree without strands.")
 AppLauncher.add_app_launcher_args(parser)
@@ -61,7 +63,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-from isaaclab.sensors import CameraCfg, ContactSensorCfg
+from isaaclab.sensors import CameraCfg, ContactSensor, ContactSensorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply, quat_from_matrix, quat_inv, subtract_frame_transforms
 from isaacsim.core.prims import RigidPrim
@@ -69,7 +71,7 @@ from pxr import UsdPhysics
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nurec_bunch import add_bunch  # noqa: E402
-from nurec_dates import add_dates  # noqa: E402
+from nurec_dates import STALK_ANCHORS, add_dates  # noqa: E402
 from robot_looks import colour_robot  # noqa: E402
 
 # UR10e + Delto built from the robot's /robot_description (isaac/build_ur10e_delto_usd.py).
@@ -82,6 +84,7 @@ ARM_START = [-1.56780, -0.77998, 1.50989, 2.21126, -1.39554, -1.00800]
 GRIPPER_ROS = [f"gripper_f{f}m{m}_joint" for f in (1, 2, 3) for m in (1, 2, 3, 4)]
 GRIPPER_OPEN = [-0.0942, -0.1500, 1.0660, -0.5062, -1.6318, 0.1309, 1.6753, -0.4887, 0.3333, 0.2234, 1.0673, -0.4311]
 GRIPPER_CLOSED = [-0.0942, -0.1500, 2.5660, -0.5062, -1.6318, 0.1309, 2.3753, -0.4887, 0.3333, 0.2234, 2.5673, -0.4311]
+PINCH_DEPTH = 0.206  # tool0 -> closed-pad pinch point along tool z [m]
 DT = 1.0 / 120.0
 RENDER_EVERY = 4  # physics steps per recorded frame -> 30 fps sim time
 # Wrist ZED X Mini at 640x360 (as isaac_hardware_scene.py): 24 mm lens, same field of view as fx.
@@ -175,7 +178,7 @@ def main():
     bunch = None
     if args.bunch:
         bunch = add_bunch(sim.stage, args.manifest.parent, args.nurec_pose, date_mass=args.mass,
-                  break_force=args.break_force, visual=args.record is not None)
+                  break_force=args.break_force, visual=args.record is not None, contact_report=args.contact_log)
         # The hand touches only dates: closing on a date it also trapped the neighbouring strands,
         # dragged the cluster along and the date was flung out when they sprang back. The strands
         # still bend with the date they hold.
@@ -184,7 +187,16 @@ def main():
         hand.CreateFilteredGroupsRel().AddTarget("/World/Bunch/collision_group")
     else:
         add_dates(sim.stage, args.manifest, args.nurec_pose, mass=args.mass, break_force=args.break_force,
-                  visual_mode="mesh" if args.record else "none")
+                  visual_mode="mesh" if args.record else "none", contact_report=args.contact_log)
+    date_contacts, contact_links = None, []
+    if args.contact_log:
+        robot_root = "/World/envs/env_0/Robot"
+        contact_links = [p.GetName() for p in sim.stage.GetPrimAtPath(robot_root).GetChildren()
+                         if p.HasAPI(UsdPhysics.RigidBodyAPI)
+                         and p.GetName().startswith(("gripper", "wrist", "forearm", "tool0", "zed", "flange"))]
+        date_contacts = ContactSensor(ContactSensorCfg(
+            prim_path="/World/Dates/date_.*", update_period=0.0, history_length=0,
+            filter_prim_paths_expr=[f"{robot_root}/{name}" for name in contact_links]))
     sim.reset()
 
     robot, contacts = scene["robot"], scene["contacts"]
@@ -203,6 +215,13 @@ def main():
     closed_q = torch.tensor([GRIPPER_CLOSED], device=dev)
     arm_target = torch.tensor([ARM_START], device=dev)
     grip_target = open_q.clone()
+    # As in isaac_hardware_scene.py: the gripper profiles command M4 to ~-0.5 rad and M3 to 2.6 rad,
+    # past the URDF limits (the real hand's readings carry per-unit zero offsets); clamped, the open
+    # hand is ~1.5 cm narrower per finger.
+    limits = robot.data.joint_pos_limits.clone()
+    limits[:, grip_ids, 0] = torch.clamp(limits[:, grip_ids, 0], max=-1.0)
+    limits[:, grip_ids, 1] = torch.clamp(limits[:, grip_ids, 1], min=2.8)
+    robot.write_joint_position_limit_to_sim(limits)
     state = robot.data.default_joint_pos.clone()
     state[:, arm_ids], state[:, grip_ids] = arm_target, grip_target
     robot.write_joint_state_to_sim(state, torch.zeros_like(state))
@@ -252,6 +271,12 @@ def main():
             sim.step()
             scene.update(DT)
             step.count += 1
+            if date_contacts is not None:
+                date_contacts.update(DT)
+                touch = torch.linalg.norm(date_contacts.data.force_matrix_w[0], dim=-1)  # (date, link)
+                for d, l in torch.nonzero(touch > 0.2).tolist():
+                    key = (phase["name"], d, l)
+                    phase["peak"][key] = max(phase["peak"].get(key, 0.0), float(touch[d, l]))
             if args.record and step.count % RENDER_EVERY == 0:
                 update_follow_camera()
                 for camera in ("overview", "wrist"):
@@ -261,6 +286,18 @@ def main():
                 frame_count += 1
     step.count = 0
     grasp_offset = None
+    phase = {"name": "idle", "peak": {}}
+
+    def report_contacts(target_index):
+        """Peak force per (phase, date, hand link) since the last report; neighbours are flagged."""
+        by_phase = {}
+        for (name_, d, l), force in sorted(phase["peak"].items(), key=lambda kv: -kv[1]):
+            tag = "" if d == target_index else " NEIGHBOUR"
+            by_phase.setdefault(name_, []).append(f"{names[d]}{tag}<-{contact_links[l]}:{force:.1f}N")
+        for name_ in ("approach", "insert", "close", "pull", "carry"):
+            if name_ in by_phase:
+                print(f"[CONTACT] {names[target_index]} {name_}: " + ", ".join(by_phase[name_][:8]), flush=True)
+        phase["peak"] = {}
 
     def grasp_point_world():
         # Calibrated fingertip meeting point, carried by tool0.
@@ -298,35 +335,44 @@ def main():
         pos, _ = dates.get_world_poses()
         return pos.cpu().numpy()
 
-    # Calibrate the grasp point: close in free air at the start pose, average the fingertips.
+    # Grasp point: where the closed pads meet, 0.206 m out along tool0 z -- the gripper_tip of the
+    # cuRobo URDF (delto base 0.106 + 0.100), which the controller aims at the date, and what the
+    # pads measure in this asset (0.205-0.213 m). The closed fingertip-link origins used before are
+    # the last finger joints: the date was squeezed into the palm at 30-90 N. This asset's own
+    # gripper_tip (0.221 m) left only the fingertip ends grazing the date.
     step(120)
-    set_gripper(closed_q, 1.0)
-    step(120)
-    tips_w = robot.data.body_pos_w[0, tip_ids]
-    tool_pos, tool_quat = robot.data.body_pos_w[:, tool], robot.data.body_quat_w[:, tool]
-    grasp_offset = quat_apply(quat_inv(tool_quat), tips_w.mean(0, keepdim=True) - tool_pos)
-    print(f"[PICK] grasp point {grasp_offset[0].cpu().numpy().round(3)} m in tool0")
-    set_gripper(open_q, 1.0)
-    step(60)
+    grasp_offset = torch.tensor([[0.0, 0.0, PINCH_DEPTH]], device=dev)
+    print(f"[PICK] grasp point {grasp_offset[0].cpu().numpy().round(3)} m in tool0 (pad pinch)")
 
     original = date_positions()
-    # Attached = still at its stem: on the fixed tree that is "not moved"; on the dynamic bunch the
-    # date swings with its strand, so compare its distance to the strand section it hangs on.
-    if bunch:
-        sections = RigidPrim(prim_paths_expr="/World/Bunch/section_[0-9][0-9][0-9]")
-        sections.initialize()
-        holder = [sections.prim_paths.index(bunch["date_segment"][int(n.split("_")[1])]) for n in names]
+    # Attached = the stalk joint still holds: its translation is locked, so the date centre stays at
+    # the stalk length from the anchor on its holder (a strand section, or the world) however the
+    # date swings. (Comparing the date to the section centre called swinging dates knocked off.)
+    anchors = [STALK_ANCHORS[p] for p in dates.prim_paths]
+    holders = sorted({h for h, _, _ in anchors if h is not None})
+    holder_view = None
+    if holders:
+        holder_view = RigidPrim(prim_paths_expr=holders)
+        holder_view.initialize()
+        holder_index = [holder_view.prim_paths.index(h) if h is not None else -1 for h, _, _ in anchors]
+    local_anchor = np.array([a for _, a, _ in anchors])
+    stalk_length = np.array([length for _, _, length in anchors])
 
-        def stem_gaps():
-            section_pos = sections.get_world_poses()[0].cpu().numpy()[holder]
-            return np.linalg.norm(date_positions() - section_pos, axis=1)
-    else:
-        def stem_gaps():
-            return np.linalg.norm(date_positions() - original, axis=1)
-    rest_gap = stem_gaps()
+    def stem_gaps():
+        anchor_w = local_anchor.copy()
+        if holder_view is not None:
+            hp, hq = (t.cpu().numpy() for t in holder_view.get_world_poses())
+            for i, j in enumerate(holder_index):
+                if j >= 0:
+                    w, x, y, z = hq[j]
+                    r = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+                    anchor_w[i] = hp[j] + r @ local_anchor[i]
+        return np.abs(np.linalg.norm(date_positions() - anchor_w, axis=1) - stalk_length)
 
     def attached():
-        return np.abs(stem_gaps() - rest_gap) < 0.015
+        return stem_gaps() < 0.01
     order = np.argsort(np.linalg.norm(original - base, axis=1))
     if not args.harvest_all:
         wanted = args.date if args.date >= 0 else int(names[order[0]].split("_")[1])
@@ -351,6 +397,7 @@ def main():
         rotation = rotation @ np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
         log_event(f"picking {name} ({np.linalg.norm(target - base):.2f} m from the base)")
 
+        phase["name"], phase["peak"] = "approach", {}
         err = move_to(target - args.standoff * approach, rotation, seconds=4.0)
         if err > 0.03:
             results[name] = f"unreachable ({err*100:.0f} cm short)"
@@ -360,11 +407,14 @@ def main():
             # The bunch swings: let it settle, then re-read where the date is now (visual servoing).
             step(60)
             target = date_positions()[index]
+        phase["name"] = "insert"
         move_to(target, rotation, seconds=3.0)
+        phase["name"] = "close"
         set_gripper(closed_q, args.close_seconds)
         step(60)
         held_force = float(contacts.data.net_forces_w[0].norm(dim=-1).sum())
         pull_goal = target - args.pull * approach
+        phase["name"] = "pull"
         for fraction in np.linspace(0.0, 1.0, 30):
             move_to(target + (pull_goal - target) * fraction, rotation, seconds=0.2, tol=0.002)
         step(60)
@@ -382,6 +432,7 @@ def main():
             # Carry it aside and release it, then come back for the next one.
             drop = base + 0.55 * (target - base)
             drop[2] = target[2] - 0.1
+            phase["name"] = "carry"
             move_to(drop, rotation, seconds=3.0, tol=0.02)
             set_gripper(open_q, 1.0)
             step(90)
@@ -391,6 +442,8 @@ def main():
             set_gripper(open_q, 1.0)
         if knocked:
             log_event(f"{name}: knocked off {', '.join(knocked)}")
+        if date_contacts is not None:
+            report_contacts(index)
 
     print("[PICK] summary:")
     for name, result in results.items():
