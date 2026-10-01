@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-6}"
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+export ROS_DISCOVERY_SERVER="${ROS_DISCOVERY_SERVER:-10.76.154.75:11811}"
+export UR10E_ISAAC_TWIN=1
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+
+exec "$REPO_ROOT/bin/launch_ur10e" "$@"

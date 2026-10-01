@@ -11,6 +11,7 @@ setup(
         f"{package_name}.managers",
         f"{package_name}.vision",
         f"{package_name}.teleop",
+        f"{package_name}.isaac_sim",
     ],
     package_data={
         package_name: [str(p.relative_to(package_name)) for p in
@@ -27,6 +28,8 @@ setup(
         (f"share/{package_name}/launch", [
             "launch/bringup.launch.py",
             "launch/combined.launch.py",
+            "launch/isaac_sim_mirror.launch.py",
+            "launch/isaac_jetson_control.launch.py",
         ]),
         (f"share/{package_name}/meshes", [
             "meshes/Golfcart_pallet.stl",
@@ -48,6 +51,15 @@ setup(
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control
             "calibrate = ur10e_curobo.grasp_calibrate:main",  # Grasp force calibration
             "hand_eye = ur10e_curobo.vision.hand_eye_calibration:main",  # Hand-eye calibration
+            # Isaac Sim digital twin, cherry-picked from the isaac-sim branch.
+            # These modules import no cuRobo, so they are unaffected by the v2
+            # migration -- unlike the planning files on that branch, which are
+            # still on the v1 API and were deliberately left behind.
+            "isaac_mirror = ur10e_curobo.isaac_sim.bridge:main",
+            "isaac_twin_recorder = ur10e_curobo.isaac_sim.twin_recorder:main",
+            "hardware_demo_recorder = ur10e_curobo.isaac_sim.twin_recorder:hardware_demo_main",
+            "one_shot_grasp = ur10e_curobo.isaac_sim.one_shot_grasp:main",
+            "isaac_joint_relay = ur10e_curobo.isaac_sim.joint_relay:main",
             "zed_extrinsic = ur10e_curobo.vision.zed_extrinsic_calibration:main",
             "dg3fm_finger_test = ur10e_curobo.dg3fm_finger_test:main",
             "verify_grasp = ur10e_curobo.visual_grasp_verifier:main",

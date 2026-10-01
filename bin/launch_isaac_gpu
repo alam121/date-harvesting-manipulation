@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ISAACLAB_ROOT="${ISAACLAB_ROOT:-/home/alam/isaac_ws/IsaacLab}"
+CONDA_SH="${CONDA_SH:-/home/alam/miniconda3/etc/profile.d/conda.sh}"
+
+source "$CONDA_SH"
+conda activate env_isaaclab
+
+exec "$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$REPO_ROOT/isaac/isaac_hardware_scene.py" \
+  --enable_cameras "$@"
