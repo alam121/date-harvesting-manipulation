@@ -45,6 +45,8 @@ class GripperCalibrationDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Environment Gripper Calibration")
         self.resize(900, 850)
+        # Allow shrinking below the content height: the settings scroll.
+        self.setMinimumHeight(420)
         self._driver_process = None
         self.defaults = _gripper_defaults()
         self.data = json.loads(json.dumps(self.defaults))
@@ -549,14 +551,33 @@ class LaunchDialog(QtWidgets.QDialog):
         action_row.addWidget(close_btn)
         action_row.addWidget(start_btn)
 
+        # The six group boxes want 1291px; a 1080p screen has ~980 usable once
+        # the title bar and taskbar are gone. Everything still fitted when this
+        # was a flat column, so the overflow pushed the bottom row -- including
+        # Start System -- off the screen with no way to reach it.
+        #
+        # Scroll the settings, pin the command line and the buttons outside the
+        # scroll area. Start stays reachable whatever gets added to the groups
+        # later, which a one-off height tweak would not survive.
+        scroll_body = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_body)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        for box in (hardware_box, profile_box, node_box, camera_box,
+                    hand_eye_box, calibration_actions_box):
+            scroll_layout.addWidget(box)
+        scroll_layout.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(scroll_body)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Horizontal scrolling would mean the window is too narrow, which it is
+        # not -- only the height is the problem.
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(preset_row)
-        layout.addWidget(hardware_box)
-        layout.addWidget(profile_box)
-        layout.addWidget(node_box)
-        layout.addWidget(camera_box)
-        layout.addWidget(hand_eye_box)
-        layout.addWidget(calibration_actions_box)
+        layout.addWidget(scroll, 1)
         layout.addWidget(QtWidgets.QLabel("Command"))
         layout.addWidget(self.command_edit)
         layout.addLayout(action_row)
