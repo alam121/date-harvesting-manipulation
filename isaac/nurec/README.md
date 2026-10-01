@@ -238,8 +238,23 @@ S=~/nurec_data/scenes/palm3
 
 palm3 (`bunch_test.py`): 5 s of physics in 3 s wall time on the GPU. Section bodies carry 6 /s
 linear and angular damping (`body_damping`; joint damping above critical diverges, body damping does
-not): residual motion 13 -> 1.9 cm/s, a 0.5 N push swings a strand ~25 cm and it is back at rest
-within 3 s; dates come off at 5.02 N.
+not).
+
+Realism of the strands and stalks (`stalk_test.py`: rest, a held finger push on the date nearest the
+robot, and a pull, at the harvest scene's 120 Hz):
+
+| strands | stalk | drift at rest | steady push |
+|---|---|---|---|
+| sag 0.01 rad/joint, min 0.3 N m/rad, 64 iterations (before) | rigid pin at the date centre | 7.9 cm median | 62 cm/N |
+| sag 0.0005 rad, min 4 N m/rad, 255 iterations (now) | sprung ball joint at the date top | 1.7 cm | 7.6 cm/N |
+
+The give was mostly solver softness, not the springs: 4x stiffer springs at 64 position iterations
+only went from 62 to 41 cm/N, and 20x stiffer at 64 diverged (1.7 m/s jitter); 255 iterations let
+the 20x springs hold. Acceleration drives (`drive_frequency`) sagged more and are off by default. Each
+date now hangs from the top of its long axis on a 0.1 N m/rad spring (`stalk_stiffness`; 0 = the
+old rigid pin), so a finger push swings it ~0.5 cm and it still comes off at the break force.
+Scripted harvest of the whole bunch (`date_pick_test.py --bunch --harvest_all`): 8 of 11 picked
+(4 of 11 before), 3 knocked off by neighbouring picks.
 
 In `date_pick_test.py` with `--bunch` the robot does not collide with the strands, only with the
 dates: closing on a date the hand otherwise trapped neighbouring strands, dragged the cluster and

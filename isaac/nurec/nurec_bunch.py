@@ -105,8 +105,8 @@ def add_bunch(
     date_mass: float = 0.01,
     break_force: float = 5.0,
     section_length: float = 0.06,
-    sag_rad: float = 0.01,
-    min_stiffness: float = 0.3,
+    sag_rad: float = 0.0005,
+    min_stiffness: float = 4.0,
     damping_ratio: float = 1.0,
     root: str = "/World/Bunch",
     visual: bool = True,
@@ -115,6 +115,9 @@ def add_bunch(
     tip_radius: float = 0.0018,
     stalk_radius: float = 0.008,
     body_damping: float = 6.0,
+    stalk_stiffness: float = 0.1,
+    drive_frequency: float = 0.0,
+    solver_iterations: int = 255,
 ) -> dict:
     """Spawn the dynamic bunch and its dates. Returns section paths, date paths, date -> section."""
     split_dir = Path(split_dir)
@@ -193,7 +196,7 @@ def add_bunch(
         UsdPhysics.RigidBodyAPI.Apply(prim)
         physx = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
         physx.CreateDisableGravityAttr(True)
-        physx.CreateSolverPositionIterationCountAttr(64)
+        physx.CreateSolverPositionIterationCountAttr(solver_iterations)
         physx.CreateSolverVelocityIterationCountAttr(4)
         # Air/fibre drag on each body: calms the swing to a gentle sway. Unlike more joint damping
         # (which destabilises the light strand tips) this is unconditionally stable.
@@ -256,20 +259,29 @@ def add_bunch(
         # The captured shape already hangs under the dates' weight: preload each spring so it
         # balances that moment at the captured shape (target = -moment / stiffness, joint frame),
         # instead of sagging further or being made unrealistically stiff.
-        preload_rad = -(frames[i].T @ moment) / stiffness if preload else np.zeros(3)
+        if drive_frequency > 0.0:
+            # Acceleration drives scale with the joint's effective inertia, so every section rings
+            # at drive_frequency: stiff woody strands stay stable where force springs stiffer than
+            # ~1 N m/rad on these light bodies diverged.
+            omega = 2.0 * math.pi * drive_frequency
+            drive_type, gain_k, gain_d = "acceleration", omega ** 2, 2.0 * damping_ratio * omega
+            preload_rad = -(frames[i].T @ moment) / (gain_k * max(inertia, 1e-6)) if preload else np.zeros(3)
+        else:
+            drive_type, gain_k, gain_d = "force", stiffness, damping
+            preload_rad = -(frames[i].T @ moment) / stiffness if preload else np.zeros(3)
         for k_axis, axis in enumerate(("rotX", "rotY", "rotZ")):
             drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), axis)
-            drive.CreateTypeAttr("force")
+            drive.CreateTypeAttr(drive_type)
             drive.CreateTargetPositionAttr(float(math.degrees(preload_rad[k_axis])))
             # USD angular drive gains are per degree.
-            drive.CreateStiffnessAttr(float(stiffness * math.pi / 180.0))
-            drive.CreateDampingAttr(float(damping * math.pi / 180.0))
+            drive.CreateStiffnessAttr(float(gain_k * math.pi / 180.0))
+            drive.CreateDampingAttr(float(gain_d * math.pi / 180.0))
 
     if palette is not None:
         palette.save()
     attach = {date_id: (paths[i], frames[i], centre[i]) for date_id, i in date_section.items()}
     dates = add_dates(stage, split_dir / "dates_physics.json", scene_pose, mass=date_mass, break_force=break_force,
-                      visual_mode="mesh" if visual else "none", attach=attach)
+                      visual_mode="mesh" if visual else "none", attach=attach, stalk_stiffness=stalk_stiffness)
     stiffness_used = np.array(stiffness_used)
     print(f"[BUNCH] {len(sections)} sections from {len(fine)} skeleton segments "
           f"({np.linalg.norm(fb - fa, axis=1).sum():.2f} m, {total_mass*1000:.0f} g), {len(dates)} dates; "

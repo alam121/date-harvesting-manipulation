@@ -137,6 +137,53 @@ def _add_textured_mesh(stage, path: str, mesh_file: Path, palette: PhotoPalette)
     palette.apply(mesh, vertex_colours[data["faces"]].mean(1), [3] * len(data["faces"]))
 
 
+GRAVITY = 9.81
+
+
+def _stalk_joint(stage, joint_path, date, position, mass, r_world_scene, body_path, r_world_body, p_world_body,
+                 stiffness, swing_deg, damping_ratio=1.0):
+    """Date on a short flexible stalk: a ball joint at the top of the date with spring drives.
+
+    The anchor is the end of the date's long axis nearest what it hangs from (its strand section,
+    or straight up for the pinned tree), so a touch swings and twists the date about its stalk
+    instead of meeting a rigid pin at its centre. Springs are preloaded with the date's weight so
+    it rests in its captured pose. Translation is locked; the stalk breaks at the break force.
+    """
+    radii = np.array(date["collider_radii"])
+    long_axis = r_world_scene @ _quat_to_matrix(*date["collider_quat_wxyz"]) @ np.array([1.0, 0.0, 0.0])
+    towards = (p_world_body - position) if body_path is not None else np.array([0.0, 0.0, 1.0])
+    if np.dot(long_axis, towards) < 0:
+        long_axis = -long_axis
+    anchor = position + float(radii[0]) * long_axis
+
+    joint = UsdPhysics.Joint.Define(stage, joint_path)
+    if body_path is not None:
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
+    joint.CreateLocalPos0Attr(Gf.Vec3f(*(r_world_body.T @ (anchor - p_world_body)).tolist()))
+    joint.CreateLocalRot0Attr(Gf.Quatf(*_matrix_to_quat(r_world_body.T @ r_world_scene)))
+    joint.CreateLocalPos1Attr(Gf.Vec3f(*(r_world_scene.T @ (anchor - position)).tolist()))
+    joint.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    for axis in ("transX", "transY", "transZ"):
+        limit = UsdPhysics.LimitAPI.Apply(joint.GetPrim(), axis)
+        limit.CreateLowAttr(1.0)
+        limit.CreateHighAttr(-1.0)  # low > high: locked
+    lever = position - anchor
+    moment = np.cross(lever, [0.0, 0.0, -mass * GRAVITY])
+    inertia = mass * (float(lever @ lever) + 0.4 * float(np.mean(radii[1:]) ** 2))
+    damping = 2.0 * damping_ratio * np.sqrt(stiffness * inertia)
+    preload_rad = -(r_world_scene.T @ moment) / stiffness
+    for k, axis in enumerate(("rotX", "rotY", "rotZ")):
+        limit = UsdPhysics.LimitAPI.Apply(joint.GetPrim(), axis)
+        limit.CreateLowAttr(-swing_deg)
+        limit.CreateHighAttr(swing_deg)
+        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), axis)
+        drive.CreateTypeAttr("force")
+        drive.CreateTargetPositionAttr(float(np.degrees(preload_rad[k])))
+        drive.CreateStiffnessAttr(float(stiffness * np.pi / 180.0))  # USD angular gains are per degree
+        drive.CreateDampingAttr(float(damping * np.pi / 180.0))
+    return joint
+
+
 def add_dates(
     stage,
     manifest_path: Path,
@@ -151,6 +198,9 @@ def add_dates(
     attach: dict | None = None,
     friction: float = 1.0,
     contact_report: bool = False,
+    stalk_stiffness: float = 0.1,
+    stalk_swing_deg: float = 60.0,
+    stalk_damping_ratio: float = 1.0,
 ) -> list[str]:
     """Spawn the dates of dates_physics.json; scene_pose is the map's --nurec_pose (x y z qw qx qy qz).
 
@@ -216,21 +266,29 @@ def add_dates(
             grip, UsdShade.Tokens.weakerThanDescendants, "physics")
         group.GetCollidersCollectionAPI().GetIncludesRel().AddTarget(capsule.GetPath())
 
-        # Pin to the world where the date hangs; PhysX removes the joint once the pull exceeds the limits.
-        joint = UsdPhysics.FixedJoint.Define(stage, f"{stem_root}/date_{date['id']:02d}")
-        joint.CreateBody1Rel().SetTargets([Sdf.Path(path)])
+        # Hang the date from its stalk; PhysX removes the joint once the pull exceeds the limits.
         if attach and date["id"] in attach:
             body_path, r_world_body, p_world_body = attach[date["id"]]
-            joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
-            local = r_world_body.T @ (position - p_world_body)
-            r_body_date = r_world_body.T @ r_world_scene
-            joint.CreateLocalPos0Attr(Gf.Vec3f(*local.tolist()))
-            joint.CreateLocalRot0Attr(Gf.Quatf(*_matrix_to_quat(r_body_date)))
         else:
-            joint.CreateLocalPos0Attr(Gf.Vec3f(*position.tolist()))
-            joint.CreateLocalRot0Attr(Gf.Quatf(q_scene))
-        joint.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
-        joint.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            body_path, r_world_body, p_world_body = None, np.eye(3), np.zeros(3)
+        if stalk_stiffness > 0.0:
+            # A 10 g body on a locked-translation spring joint jitters at the default iterations.
+            date_physx = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+            date_physx.CreateSolverPositionIterationCountAttr(32)
+            date_physx.CreateSolverVelocityIterationCountAttr(4)
+            joint = _stalk_joint(stage, f"{stem_root}/date_{date['id']:02d}", date, position, mass, r_world_scene,
+                                 body_path, r_world_body, p_world_body, stalk_stiffness, stalk_swing_deg,
+                                 stalk_damping_ratio)
+        else:  # rigid pin at the date centre (the earlier model)
+            joint = UsdPhysics.FixedJoint.Define(stage, f"{stem_root}/date_{date['id']:02d}")
+            if body_path is not None:
+                joint.CreateBody0Rel().SetTargets([Sdf.Path(body_path)])
+            local = r_world_body.T @ (position - p_world_body)
+            joint.CreateLocalPos0Attr(Gf.Vec3f(*local.tolist()))
+            joint.CreateLocalRot0Attr(Gf.Quatf(*_matrix_to_quat(r_world_body.T @ r_world_scene)))
+            joint.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
+            joint.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(path)])
         joint.CreateBreakForceAttr(break_force)
         # PhysX trips breakTorque at pulls of ~0.2-0.5 N for 0.5 N m (not a physical lever arm;
         # see date_pull_test.py), so twist-off is effectively disabled by default.
