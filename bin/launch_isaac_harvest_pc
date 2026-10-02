@@ -20,6 +20,15 @@ NUREC_BUNCH="${NUREC_BUNCH:-1}"
 # Pull [N] that breaks a date's stem. At 5 N the open hand knocked dates off during insertion,
 # before the fingers closed (the arm's position control pushes harder than that on contact).
 DATE_BREAK_FORCE="${DATE_BREAK_FORCE:-5.0}"
+# Physics steps per render; 12 = only for the 10 Hz wrist camera (fastest, best with --headless).
+RENDER_INTERVAL="${RENDER_INTERVAL:-4}"
+# Physics device. CPU physics ran 6x faster (the stiff bunch's 255 solver iterations stay on its
+# own island) and the bunch alone behaves the same there, but in the full scene the bunch broke
+# apart at start-up on the CPU (cause not found); keep the GPU.
+ISAAC_DEVICE="${ISAAC_DEVICE:-cuda:0}"
+# Bunch solver iterations: 255 = stiffest strands (~7.6 cm/N) but ~0.02x real time on the GPU;
+# 128 = ~12 cm/N and faster. Below ~100 the strands start to shake.
+BUNCH_ITERATIONS="${BUNCH_ITERATIONS:-255}"
 # palm3: reconstruction pose and wrist mount, from isaac/nurec/nurec_pose_from_bag.py.
 NUREC_POSE="${NUREC_POSE:-0.23216 -0.99074 0.80103 0.76723 -0.02404 -0.03442 -0.64000}"
 WRIST_EXTRINSIC="${WRIST_EXTRINSIC:-0.09045 -0.08025 0.07333 0.86356 -0.05138 -0.02443 0.50102}"
@@ -66,6 +75,7 @@ rm -f /dev/shm/isaac_wrist_frame.npz
 # shellcheck disable=SC2086
 "$HOME/miniconda3/envs/env_isaaclab/bin/python" -u "$REPO_ROOT/isaac/isaac_hardware_scene.py" \
   --nurec_dates "$SCENE/split/dates_physics.json" --date_break_force "$DATE_BREAK_FORCE" \
+  --render_interval "$RENDER_INTERVAL" --device "$ISAAC_DEVICE" --bunch_iterations "$BUNCH_ITERATIONS" \
   $([[ "$NUREC_BUNCH" == 1 ]] && echo --nurec_bunch || echo --nurec_usdz "$SCENE/split/tree_nurec.usdz") \
   --nurec_pose $NUREC_POSE --wrist_camera_extrinsic $WRIST_EXTRINSIC \
   --home_joints $LAB_HOME --enable_cameras --debug_bridge "$@" > "$LOG_DIR/isaac.log" 2>&1 &

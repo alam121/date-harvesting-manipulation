@@ -70,6 +70,19 @@ parser.add_argument(
     help="Start arm pose (default: outdoor hardware home). Must match the bridge's UR10E_ENVIRONMENT.",
 )
 parser.add_argument(
+    "--bunch_iterations",
+    type=int,
+    default=255,
+    help="Solver position iterations of the bunch sections (stiffness vs speed; 128 is the lowest stable).",
+)
+parser.add_argument(
+    "--render_interval",
+    type=int,
+    default=4,
+    help="Physics steps per render. 12 renders only when the 10 Hz wrist camera needs a frame "
+    "(fastest, e.g. headless); the viewport then updates at 10 Hz of sim time.",
+)
+parser.add_argument(
     "--vision_port",
     type=int,
     default=55002,
@@ -671,7 +684,7 @@ def main():
     # Render every 4th physics step (30 Hz; the wrist camera samples at 10 Hz): rendering the RTX
     # viewport every 120 Hz step ran the NuRec scene at 0.25x real time, so the arm lagged
     # cuRobo's wall-clock trajectories.
-    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args_cli.device, render_interval=4)
+    sim_cfg = sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args_cli.device, render_interval=args_cli.render_interval)
     sim = sim_utils.SimulationContext(sim_cfg)
     scene_cfg = HardwareSceneCfg(num_envs=1, env_spacing=2.0)
     split_dir = Path(args_cli.nurec_dates).parent if args_cli.nurec_dates else None
@@ -715,7 +728,8 @@ def main():
         from nurec_bunch import add_bunch
 
         bunch = add_bunch(sim.stage, split_dir, args_cli.nurec_pose, date_mass=args_cli.date_mass,
-                          break_force=args_cli.date_break_force, contact_report=args_cli.debug_bridge)
+                          break_force=args_cli.date_break_force, contact_report=args_cli.debug_bridge,
+                          solver_iterations=args_cli.bunch_iterations)
         # The hand touches only dates; trapped strands dragged the cluster and flung the date.
         hand = UsdPhysics.CollisionGroup.Define(sim.stage, "/World/RobotCollisionGroup")
         hand.GetCollidersCollectionAPI().GetIncludesRel().AddTarget("/World/envs/env_0/Robot")
