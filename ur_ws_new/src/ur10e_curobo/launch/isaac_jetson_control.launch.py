@@ -66,6 +66,10 @@ def generate_launch_description():
             # so that correction left the closure in front of the date; +0.020 m (the outdoor
             # value) puts it at the date's centre.
             "planner.low_center_final_depth_offset": 0.020,
+            # Reacquire waits this long (wall time) for fresh, stable wrist observations before
+            # the final insertion. Isaac runs at ~0.02-0.04x real time with the stiff bunch, so a
+            # wrist frame arrives every ~2.5-5 s; 0.6 s never saw one. ~2 frames at that rate.
+            "planner.reacquire_timeout_s": 8.0,
         }],
     )
 

@@ -134,6 +134,8 @@ class ConfigManager:
         self._node.declare_parameter("planner.low_left_final_z_offset", self.cfg.planner.low_left_final_z_offset)
         self._node.declare_parameter("planner.low_right_final_z_offset", self.cfg.planner.low_right_final_z_offset)
         self._node.declare_parameter("planner.low_center_final_depth_offset", self.cfg.planner.low_center_final_depth_offset)
+        # Isaac runs slower than real time; its launch file lengthens this window to match.
+        self._node.declare_parameter("planner.reacquire_timeout_s", self.cfg.planner.reacquire_timeout_s)
         self._node.declare_parameter("planner.low_center_final_z_offset", self.cfg.planner.low_center_final_z_offset)
         self._node.declare_parameter("planner.mid_center_final_depth_offset", self.cfg.planner.mid_center_final_depth_offset)
         self._node.declare_parameter("planner.mid_center_final_z_offset", self.cfg.planner.mid_center_final_z_offset)
@@ -265,6 +267,7 @@ class ConfigManager:
         self.cfg.planner.low_left_final_z_offset = float(self._node.get_parameter("planner.low_left_final_z_offset").value)
         self.cfg.planner.low_right_final_z_offset = float(self._node.get_parameter("planner.low_right_final_z_offset").value)
         self.cfg.planner.low_center_final_depth_offset = float(self._node.get_parameter("planner.low_center_final_depth_offset").value)
+        self.cfg.planner.reacquire_timeout_s = float(self._node.get_parameter("planner.reacquire_timeout_s").value)
         self.cfg.planner.low_center_final_z_offset = float(self._node.get_parameter("planner.low_center_final_z_offset").value)
         self.cfg.planner.mid_center_final_depth_offset = float(self._node.get_parameter("planner.mid_center_final_depth_offset").value)
         self.cfg.planner.mid_center_final_z_offset = float(self._node.get_parameter("planner.mid_center_final_z_offset").value)
@@ -505,6 +508,7 @@ class ConfigManager:
             "planner.low_left_final_z_offset": (self.cfg.planner, "low_left_final_z_offset", float),
             "planner.low_right_final_z_offset": (self.cfg.planner, "low_right_final_z_offset", float),
             "planner.low_center_final_depth_offset": (self.cfg.planner, "low_center_final_depth_offset", float),
+            "planner.reacquire_timeout_s": (self.cfg.planner, "reacquire_timeout_s", float),
             "planner.low_center_final_z_offset": (self.cfg.planner, "low_center_final_z_offset", float),
             "planner.mid_center_final_depth_offset": (self.cfg.planner, "mid_center_final_depth_offset", float),
             "planner.mid_center_final_z_offset": (self.cfg.planner, "mid_center_final_z_offset", float),
