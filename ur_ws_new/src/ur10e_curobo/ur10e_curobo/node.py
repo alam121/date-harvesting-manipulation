@@ -400,7 +400,6 @@ class UR10eCuroboMoveIt(Node):
         self.create_subscription(String, '/vision/demo_targets', _demo_targets_cb, 10)
 
         from sensor_msgs.msg import CompressedImage
-        from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
         preview_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                                  reliability=ReliabilityPolicy.RELIABLE)
         self._demo_preview_pub = self.create_publisher(Image, '/demo/before_image', preview_qos)

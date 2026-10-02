@@ -91,6 +91,14 @@ def generate_launch_description():
             "FASTRTPS_DEFAULT_PROFILES_FILE", condition=UnlessCondition(_profile_given)),
         SetEnvironmentVariable("UR10E_ROBOT_PROFILE", "old"),
         SetEnvironmentVariable("UR10E_ENVIRONMENT", LaunchConfiguration("environment")),
+        # The wrist ZED X Mini as RGB-D, as launch_ur10e.py selects for the hardware: without these
+        # the node fell back to the zed_one_rgb_zedx_mini_depth seed profile (zed2 frame) and the
+        # refreshed lab hand-eye never loaded. The Isaac wrist camera uses the same extrinsic.
+        SetEnvironmentVariable("UR10E_CAMERA_MODE", "zedx_mini"),
+        SetEnvironmentVariable(
+            "UR10E_CAMERA_PROFILE", [LaunchConfiguration("environment"), "_old_zedx_mini_rgbd"]),
+        SetEnvironmentVariable("UR10E_CAM_FRAME", "zed_mini_left_camera_frame"),
+        SetEnvironmentVariable("UR10E_ZEDMINI_CAM_FRAME", "zed_mini_left_camera_frame"),
         SetEnvironmentVariable(
             "UR10E_GRIPPER_PROFILE", LaunchConfiguration("gripper_profile")
         ),
