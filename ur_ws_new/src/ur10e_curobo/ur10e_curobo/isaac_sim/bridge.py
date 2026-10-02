@@ -487,6 +487,10 @@ class IsaacHardwareMirrorNode(Node):
         # Set once Isaac reports wrist-camera detections (NuRec palm scene); from then on there
         # is no fixed fallback fruit, so an empty view never sends the arm to a phantom target.
         self.wrist_vision = False
+        # Per-frame observation packet (observations.FruitObservation): what reacquire searches.
+        self.observation_pub = self.create_publisher(String, "/vision/fruit_observation", 10)
+        self.observation_seq = 0
+        self.last_vision_frame = None
         if self.joint_state_source == "ros":
             self.create_subscription(
                 JointState,
@@ -528,7 +532,9 @@ class IsaacHardwareMirrorNode(Node):
 
     def _vision_mode_cb(self, msg: String) -> None:
         mode, _, request_id = msg.data.partition(":")
-        if mode not in ("full", "reacquire", "paused"):
+        # The same modes as the ZED node: reacquire and the FINAL in-flight monitor use
+        # reacquire_fast; ignoring it left the mirror paused and both saw no observations.
+        if mode not in ("full", "reacquire", "reacquire_fast", "paused"):
             return
         self.vision_mode = mode
         self.mode_state_pub.publish(String(data=msg.data if mode == "paused" else mode))
@@ -643,11 +649,32 @@ class IsaacHardwareMirrorNode(Node):
         reason = vision.get("perception_reason", "kinematic fallback") if vision else "kinematic fallback"
         self.vision_score_pub.publish(String(data=f"{source} score=1.000 reason={reason}"))
 
+    def _publish_observation(self, observed) -> None:
+        """One packet per processed wrist frame, like the ZED node, including empty ones.
+
+        Stamped at publication less 50 ms: Isaac runs at ~0.13x real time, so a frame that is 1-2 s
+        old in wall time shows the scene ~0.2 s ago; the controller only accepts packets 0-0.5 s
+        old by its clock, and this PC's clock runs ~20 ms ahead of the Jetson's.
+        """
+        self.observation_seq += 1
+        stamp_ns = self.get_clock().now().nanoseconds - 50_000_000
+        self.observation_pub.publish(String(data=json.dumps({
+            "frame_id": "base_link",
+            "stamp_ns": int(stamp_ns),
+            "sequence": self.observation_seq,
+            "poses": [[float(v) for v in o[:3]] for o in observed],
+            "qualities": [[float(v) for v in o[3:8]] for o in observed],
+        })))
+
     def _publish_wrist_vision(self, vision: Optional[dict], now) -> None:
         """Every date the sim wrist camera sees, in score order, like the ZED date detector."""
         fruits = [list(map(float, f)) for f in (vision or {}).get("fruits_b", [])]
         flat = [v for xyz in fruits for v in xyz]
         self.all_fruits_pub.publish(Float32MultiArray(data=flat))
+        frame = (vision or {}).get("vision_frame", -1)
+        if vision is not None and frame != -1 and frame != self.last_vision_frame:
+            self.last_vision_frame = frame
+            self._publish_observation(vision.get("observed", []))
 
         trunk_xyz = (vision or {}).get("trunk_xyz_b")
         if trunk_xyz and len(trunk_xyz) == 3:

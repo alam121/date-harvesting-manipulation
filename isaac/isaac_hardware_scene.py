@@ -93,7 +93,7 @@ from isaaclab.sensors import CameraCfg, ContactSensor, ContactSensorCfg
 from pxr import UsdPhysics
 from isaaclab.sensors.camera.utils import create_pointcloud_from_depth
 from isaaclab.utils import configclass
-from isaaclab.utils.math import combine_frame_transforms, subtract_frame_transforms
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_inv, subtract_frame_transforms
 
 
 # UR10e + Delto from the robot's own /robot_description (isaac/build_ur10e_delto_usd.py). The Isaac
@@ -115,6 +115,7 @@ WRIST_FOCAL_MM = 24.0
 # NuRec mode: newest wrist RGB-D frame + camera pose in base_link for isaac/nurec/sim_vision.py.
 WRIST_FRAME_PATH = Path("/dev/shm/isaac_wrist_frame.npz")
 VISION_STALE_S = 1.0
+PINCH_DEPTH = 0.206  # tool0 -> closed-pad pinch point (the controller's gripper_tip) [m]
 # Grasp diagnosis (--debug_bridge, static dates): contact sensor on the dates, per hand link.
 HAND_LINK_PREFIXES = ("gripper", "wrist_3", "flange", "tool0", "zed", "ft_frame")
 DATE_CONTACTS = None
@@ -574,6 +575,9 @@ def run(sim, scene):
                     trunk_b_last = seen["trunk"]  # keep the last trunk fix, like the pole obstacle
                 perception = {
                     "fruits_b": [f[:3] for f in fruits],
+                    # This frame's detections with quality, for the controller's reacquire.
+                    "observed": seen.get("observed", []) if seen else [],
+                    "vision_frame": seen.get("frame_id", -1) if seen else -1,
                     "fruit_radius": fruits[0][4] if fruits else None,
                     "trunk_xyz_b": trunk_b_last,
                     "bbox": seen["bbox"] if seen else [0.5] * 4,
@@ -632,8 +636,12 @@ def run(sim, scene):
                 dates_w = dates_view.get_world_poses()[0]
                 if dates_rest_w is None:
                     dates_rest_w = dates_w.clone()
-                tips_b = (robot.data.body_pos_w[0, tip_ids] - root).mean(0)
-                gaps = torch.linalg.norm(dates_w - root - tips_b, dim=1)
+                # The controller's pinch point: gripper_tip of its cuRobo URDF, 0.206 m along tool0 z,
+                # where the closed pads meet. Date offset from it in the tool frame: z = depth along
+                # the approach (+ = date beyond the pinch), x/y = across the hand.
+                tool_pos, tool_quat = robot.data.body_pos_w[0, tool], robot.data.body_quat_w[0, tool]
+                pinch_w = tool_pos + quat_apply(tool_quat, torch.tensor([0.0, 0.0, PINCH_DEPTH], device=tool_pos.device))
+                gaps = torch.linalg.norm(dates_w - pinch_w, dim=1)
                 k = int(torch.argmin(gaps))
                 if step % 100 == 0 or float(gaps[k]) < 0.12:
                     touching = ""
@@ -641,14 +649,15 @@ def run(sim, scene):
                         DATE_CONTACTS.update(sim_dt * 10, force_recompute=True)
                         row = torch.linalg.norm(DATE_CONTACTS.data.force_matrix_w[0, k], dim=-1)  # (env, date, link, xyz)
                         touching = " links=" + ",".join(
-                            f"{DATE_CONTACT_LINKS[j]}:{float(row[j]):.1f}N" for j in torch.nonzero(row > 0.01).flatten().tolist())
+                            f"{DATE_CONTACT_LINKS[j].replace('gripper_', '')}:{float(row[j]):.1f}N"
+                            for j in torch.nonzero(row > 0.05).flatten().tolist())
                     moved = float(torch.linalg.norm(dates_w[k] - dates_rest_w[k]))
-                    tip_forces = fingertips.data.net_forces_w
-                    tip_force = [round(float(v), 2) for v in torch.linalg.norm(tip_forces[0], dim=-1)] if tip_forces is not None else []
-                    print(f"[ISAAC GRASP] step={step} tips_b={[round(v, 3) for v in tips_b.tolist()]} "
-                          f"nearest={Path(dates_view.prim_paths[k]).name} "
-                          f"date_b={[round(v, 3) for v in (dates_w[k] - root).tolist()]} gap={float(gaps[k]) * 100:.1f}cm "
-                          f"moved={moved * 100:.1f}cm tip_force={tip_force} grip_M3={[round(v, 2) for v in grip_ros[2::4]]}{touching}",
+                    err_tool = quat_apply(quat_inv(tool_quat), dates_w[k] - pinch_w)
+                    print(f"[ISAAC GRASP] step={step} nearest={Path(dates_view.prim_paths[k]).name} "
+                          f"date_b={[round(v, 3) for v in (dates_w[k] - root).tolist()]} "
+                          f"pinch_b={[round(v, 3) for v in (pinch_w - root).tolist()]} "
+                          f"date_from_pinch_tool_mm={[round(v * 1000) for v in err_tool.tolist()]} "
+                          f"moved={moved * 100:.1f}cm grip_M3={[round(v, 2) for v in grip_ros[2::4]]}{touching}",
                           flush=True)
     finally:
         link.close()
@@ -706,7 +715,7 @@ def main():
         from nurec_bunch import add_bunch
 
         bunch = add_bunch(sim.stage, split_dir, args_cli.nurec_pose, date_mass=args_cli.date_mass,
-                          break_force=args_cli.date_break_force)
+                          break_force=args_cli.date_break_force, contact_report=args_cli.debug_bridge)
         # The hand touches only dates; trapped strands dragged the cluster and flung the date.
         hand = UsdPhysics.CollisionGroup.Define(sim.stage, "/World/RobotCollisionGroup")
         hand.GetCollidersCollectionAPI().GetIncludesRel().AddTarget("/World/envs/env_0/Robot")
@@ -725,7 +734,7 @@ def main():
             contact_report=args_cli.debug_bridge,
         )
         print(f"[INFO] {len(dates)} detachable dates (break force {args_cli.date_break_force} N)")
-    if args_cli.nurec_dates and args_cli.debug_bridge and not args_cli.nurec_bunch:
+    if args_cli.nurec_dates and args_cli.debug_bridge:
         # Which robot link touches a date (grasp diagnosis): one row per date, one column per link.
         global DATE_CONTACTS, DATE_CONTACT_LINKS
         robot_root = "/World/envs/env_0/Robot"
