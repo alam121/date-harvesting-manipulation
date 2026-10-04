@@ -908,11 +908,11 @@ class VisionNode:
                         if key in (ord("q"), 27) or window_closed:
                             self._request_exit()
                         continue
-                    stamp = self.node.get_clock().now().to_msg()
+                    stamp = self._image_stamp_msg()
                     # Preserve the full field of view before annotations; JPEG keeps
-                    # the campus link usable. Encode only when subscribed, at 3 Hz.
+                    # the campus link usable. Encode only when subscribed, up to 10 Hz.
                     if (self.demo_full_pub.get_subscription_count() and
-                            time() - self._demo_full_last >= 1.0 / 3.0):
+                            time() - self._demo_full_last >= 1.0 / 10.0):
                         from sensor_msgs.msg import CompressedImage
                         full = img_ocv[:, :, :3]
                         height, width = full.shape[:2]

@@ -420,10 +420,21 @@ class UR10eCuroboMoveIt(Node):
                                  reliability=ReliabilityPolicy.RELIABLE)
         self._demo_preview_pub = self.create_publisher(Image, '/demo/before_image', preview_qos)
 
+        from sensor_msgs.msg import JointState
+        def _demo_sequence_state_cb(msg):
+            recorder = getattr(self, '_demo_sequence', None)
+            if recorder is not None:
+                recorder.state(msg, time.time_ns())
+        self.create_subscription(JointState, self.joint_states_topic,
+                                 _demo_sequence_state_cb, qos_profile_sensor_data)
+
         def _demo_full_cb(msg):
             if not getattr(self, '_demo_capture_active', False):
                 return
             try:
+                recorder = getattr(self, '_demo_sequence', None)
+                if recorder is not None:
+                    recorder.frame(msg, time.time_ns())
                 frame = self._get_camera_bridge().compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 # One tuple assignment keeps image and timestamps paired.
                 self._demo_full_frame = (frame, time.time(),

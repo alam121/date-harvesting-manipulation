@@ -1059,8 +1059,13 @@
   <joint name="gripper_link_to_tip" type="fixed">
     <parent link="delto_base_link"/>
     <child link="gripper_tip"/>
-    <origin rpy="0 0.014 0.0" xyz="0 0 0.1"/>
-    <!-- Match the box length -->
+    <origin rpy="0 0.014 0.0" xyz="0 0 0.13"/>
+    <!-- 0.1 was the old modelled tip; +30mm is the longer fingertips now
+         fitted, found on the robot with the RViz gripper-tip slider and
+         baked here so it survives a restart. This is the cuRobo ee_link:
+         grasp goals place THIS point on the fruit, so every tuned grasp
+         offset is measured against it. Keep in step with
+         ur_macro.xacro's gripper_link_to_tip. -->
   </joint>
   <!-- Gripper tip frame -->
   <link name="gripper_tip"/>

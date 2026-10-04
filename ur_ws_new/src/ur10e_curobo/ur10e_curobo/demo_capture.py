@@ -6,11 +6,8 @@ in config.py). This captures the correction instead of hand-tuning it: the arm
 stops at its APPROACH pose, the operator jogs the teach pendant to the pose that
 would actually grasp, and the delta between the two is one training sample.
 
-Deliberately NOT a full-trajectory demo recorder. The policy being trained fixes
-a small endpoint error from a consistent start, so the sample that matters is
-(what the camera saw, how far off the pipeline was). The jog path in between is
-recorded too -- it is nearly free, and an ACT-style chunk model can use it -- but
-nothing here assumes it will be.
+Full-frame JPEGs and joint states are also recorded with source timestamps.
+Sequence quality is saved separately; endpoint data alone is not ACT-ready.
 
 The correction is recorded in the TOOL frame as well as base_link. Base-frame
 deltas are what the offsets in config.py are expressed in, but a policy reading
@@ -94,10 +91,14 @@ def capture_correction(node) -> Optional[str]:
     node._demo_target_selection = None
     node._demo_confirm = None
     node._demo_capture_ready = False
+    from ur10e_curobo.demo_sequence import DemoSequence
+    node._demo_sequence = DemoSequence(node.joint_order)
     node._demo_capture_active = True
     try:
         return _capture_correction(node)
     finally:
+        node._demo_sequence.close()
+        node._demo_sequence = None
         node._demo_capture_ready = False
         node._demo_capture_active = False
 
@@ -236,6 +237,8 @@ def _capture_correction(node) -> Optional[str]:
         node.get_logger().warn(f"[DEMO] cannot create {out}: {exc}")
         return None
 
+    sequence_quality = node._demo_sequence.save(out)
+    node.get_logger().info(f'[DEMO] sequence quality: {sequence_quality}')
     planned_final = before.get('planned_final_pose')
     residual = ([after_pose[i] - planned_final[i] for i in range(3)]
                 if planned_final else None)
@@ -249,7 +252,9 @@ def _capture_correction(node) -> Optional[str]:
     sample = {
         "level_insertion_enabled": bool(getattr(planner, "low_center_level_insertion_enabled", False)),
         "level_final_z_m": getattr(node, "_level_final_z", None),
-        "schema_version": 2,
+        "schema_version": 3,
+        "sequence_quality": sequence_quality,
+        "sequence_path": "sequence/sequence.json",
         "observation_stage": "APPROACH",
         "desired_motion_base_m": delta_base,
         "desired_motion_tool_m": delta_tool,

@@ -170,16 +170,19 @@ _OLD_OUTDOOR_JOINTS = {
 # as the joint presets above. Seeded identically for both environments for
 # now -- tune one side independently as real per-environment grasp data
 # comes in; only the keys you change take effect.
-# Zero grasp corrections for ACT demonstrations (2026-10-04).
-# Record the uncorrected target and the operator-demonstrated grasp.
+# Zeroed for ACT demonstrations (2026-10-04) so the record holds the
+# uncorrected target and the operator-demonstrated grasp. Still true of the
+# depth and TCP corrections; the two *_final_z_offset values below are now 8mm,
+# measured on the robot, so demos recorded from here on are NOT comparable with
+# the 38 already captured at 0. Re-zero them before extending that set.
 _LAB_GRASP_OFFSETS = {
     "low_side_final_depth_offset": 0.0,
     "low_left_final_z_offset": 0.0,
     "low_right_final_z_offset": 0.0,
     "low_center_final_depth_offset": 0.0,
-    "low_center_final_z_offset": 0.0,
+    "low_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
     "mid_center_final_depth_offset": 0.0,
-    "mid_center_final_z_offset": 0.0,
+    "mid_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
     "mid_center_slip_final_z_offset": 0.0,
     "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
     "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
@@ -190,9 +193,9 @@ _OUTDOOR_GRASP_OFFSETS = {
     "low_left_final_z_offset": 0.0,
     "low_right_final_z_offset": 0.0,
     "low_center_final_depth_offset": 0.0,
-    "low_center_final_z_offset": 0.0,
+    "low_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
     "mid_center_final_depth_offset": 0.0,
-    "mid_center_final_z_offset": 0.0,
+    "mid_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
     "mid_center_slip_final_z_offset": 0.0,
     "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
     "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
@@ -1360,12 +1363,12 @@ class Pollination:
     climb_before_aim_deg_threshold: float = 30.0
     climb_before_aim_fraction: float = 0.6
     # standoff_m is the distance from the GRIPPER TIP to the flower, not from
-    # the TCP. gripper_tip sits [0, 0, 0.221] in tool0 -- 22.1cm straight out
+    # the TCP. gripper_tip sits [0, 0, 0.251] in tool0 -- 25.1cm straight out
     # along the pointing axis -- so a TCP-measured standoff was wildly wrong:
     # at 15cm the tip was 7cm PAST the flower (which is why it read as too
     # close), and at 25cm it was ~3cm off it. Looked up from TF at runtime;
     # this is the fallback if the lookup fails.
-    gripper_tip_offset_m: float = 0.221
+    gripper_tip_offset_m: float = 0.251   # 0.106 tool0->delto_base + 0.145 xacro tip
     # Lateral trim on the final hold, in the TOOL frame, perpendicular to the
     # pointing axis. Positive shifts the gripper along its local +X. Use this
     # only for a bias that survives after the aim is confirmed uncapped --

@@ -943,7 +943,7 @@ class MainWindow(QtWidgets.QWidget):
         # are displayed in millimetres but sent to the motion node in metres.
         closure_group = QtWidgets.QGroupBox("Closure Center (tool frame, mm)")
         closure_layout = QtWidgets.QGridLayout(closure_group)
-        self._closure_default_mm = (-4.553, 0.100, -16.223)
+        self._closure_default_mm = (0.0, 0.0, 0.0)
         self.closure_offset_inputs = []
         for column, (axis, value) in enumerate(zip(
                 ("X", "Y", "Z"), self._closure_default_mm)):

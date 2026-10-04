@@ -27,7 +27,7 @@ class CaptureTests(unittest.TestCase):
                 _latest_grasp_crop=np.zeros((3, 3, 3), dtype=np.uint8),
                 _demo_full_frame=None, _demo_publish_preview=Mock(),
                 _latest_grasp_crop_t=0, _latest_grasp_crop_meta=[1],
-                current_joint_positions=[0.0] * 6, stop_requested=False,
+                current_joint_positions=[0.0] * 6, joint_order=[str(i) for i in range(6)], stop_requested=False,
                 _demo_planned_final_pose=[.010, 0., 0., 1., 0., 0., 0.],
                 _demo_depth_trace={"base_forward_axis": "+X"},
                 pose=[0., 0., 0., 1., 0., 0., 0.],

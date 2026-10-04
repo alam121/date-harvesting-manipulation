@@ -413,3 +413,40 @@ than the demonstrated endpoint (+X or -Y according to robot configuration).
 recover missing camera-space measurements retroactively. These diagnostics
 measure disagreement with an operator endpoint; they do not independently
 prove sensor calibration error.
+
+### Zero-correction ACT collection baseline (2026-10-04)
+
+Lab and outdoor FINAL depth/Z offsets, slip-retry Z offset, Normal/Envelop
+closure-center offsets, and mode-specific depth/Z extras default to zero.
+RViz initialization/reset values and the Isaac launch override match.
+Restart the motion node and RViz to load these defaults; existing runtime
+overrides can still change them. Older demos retain their recorded offsets
+and must not be interpreted as zero-correction demonstrations.
+
+Camera calibration, surface-to-center target estimation, physical TCP geometry,
+approach standoff, level insertion, and reactive grasp recovery remain active.
+Collect in APPROACH demo mode so the operator demonstrates the final movement;
+zero correction defaults do not mean ACT is trained or controlling the robot.
+
+### Timestamped ACT pilot recordings
+
+Each new demo includes `sequence/sequence.json` and full-frame JPEGs during the
+APPROACH hold and pendant jog. Joint states retain source and receipt timestamps
+and explicit joint order. Images use the vision capture timestamp, rather than
+post-processing publication time. The publisher caps full frames at 10 Hz; actual
+rate depends on perception throughput and the network.
+
+Nearest joint states are matched by source time within 50 ms. Unmatched frames
+remain recorded but are not assigned a fabricated state. The quality summary
+reports matching coverage, frame rate, maximum gap and write errors. `timing_ok`
+requires at least 10 frames, all matched, at least 5 Hz and no gap over 0.5 s.
+This does not verify cross-machine clock alignment or target visibility;
+`training_ready` remains false pending pilot review. Joint positions are measured
+states, not pendant command targets. Future action labels require offline
+trajectory conversion. The selected target is in sample.json's frozen-image
+coordinates, not a tracked per-frame target mask. Closing occurs after this
+sequence; this dataset initially trains positioning, not automatic closure.
+
+Restart vision and the motion node before collecting one pilot. Restore any
+operator-selected runtime offsets after restart and verify them before collecting.
+Do not mix archived demos into the fresh dataset automatically.

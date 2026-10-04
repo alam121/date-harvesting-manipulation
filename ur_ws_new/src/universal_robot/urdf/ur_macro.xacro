@@ -566,7 +566,7 @@
     <joint name="${tf_prefix}gripper_link_to_tip" type="fixed">
   		<parent link="${tf_prefix}delto_base_link"/>
   		<child link="${tf_prefix}gripper_tip"/>
-		<origin xyz="0 0 0.115" rpy="0 0 0"/> <!-- Centered at the start of the fingertip pads -->
+		<origin xyz="0 0 0.145" rpy="0 0 0"/> <!-- Start of the fingertip pads, +30mm for the longer fingertips -->
 		</joint>
 		
 
