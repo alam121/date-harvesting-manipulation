@@ -61,8 +61,10 @@ def generate_launch_description():
             # enables trajectory, Delto target/force, and UR program-state I/O.
             "planner.use_fake_hardware": False,
             "perception.enabled": False,
-            # Match the zero-correction ACT collection baseline on hardware.
+            # Preserve the current ACT collection depth baseline.
             "planner.low_center_final_depth_offset": 0.0,
+            # Isaac wrist observations arrive slowly in wall time.
+            "planner.reacquire_timeout_s": 8.0,
         }],
     )
 

@@ -92,8 +92,12 @@ def unrotate(points: np.ndarray, turn: int, w: int, h: int) -> np.ndarray:
     return points
 
 
-def front_point(mask: np.ndarray, depth: np.ndarray, K: np.ndarray):
-    """Camera-frame front-surface point of a mask, or None (too few valid depth pixels)."""
+def front_point(mask: np.ndarray, depth: np.ndarray, K: np.ndarray, stats: dict | None = None):
+    """Camera-frame front-surface point of a mask, or None (too few valid depth pixels).
+
+    stats, if given, receives the real vision node's quality inputs: vis_ratio (share of the mask
+    with valid depth) and z_std (depth scatter of the front points, metres).
+    """
     v, u = np.nonzero(mask)
     z = depth[v, u]
     valid = np.isfinite(z) & (z > 0.05) & (z < DEPTH_MAX)
@@ -103,6 +107,9 @@ def front_point(mask: np.ndarray, depth: np.ndarray, K: np.ndarray):
     front = z <= np.percentile(z, 5) + FRONT_BAND
     zc = float(np.median(z[front]))
     uc, vc = float(np.median(u[front])), float(np.median(v[front]))
+    if stats is not None:
+        stats["vis_ratio"] = float(valid.sum()) / max(len(valid), 1)
+        stats["z_std"] = float(np.std(z[front]))
     return np.array([(uc - K[0, 2]) * zc / K[0, 0], (vc - K[1, 2]) * zc / K[1, 1], zc])
 
 
@@ -140,6 +147,7 @@ def main():
         result = model.predict(image if turn < 0 else cv2.rotate(image, turn), conf=args.conf, verbose=False)[0]
 
         fruits, trunk, bunch_box, best_box = [], None, None, None
+        observed = []  # this frame only: [x, y, z, vis_ratio, z_std, confidence, score, edge_margin_norm]
         polygons = [unrotate(p, turn, w, h) for p in result.masks.xy] if result.masks is not None \
             else [None] * len(result.boxes)
         boxes = []
@@ -159,7 +167,8 @@ def main():
                 mask[y0:y1, x0:x1] = 1
             if cls == bunch_class and bunch_box is None:
                 bunch_box = box
-            point = front_point(mask > 0, depth, K) if cls in (date_class, trunk_class) else None
+            stats = {}
+            point = front_point(mask > 0, depth, K, stats) if cls in (date_class, trunk_class) else None
             if point is None:
                 continue
             base = R_bc @ point + t_bc
@@ -167,6 +176,9 @@ def main():
             if cls == date_class:
                 radius = float(np.clip(size_m / 2.0, FRUIT_RADIUS_MIN, FRUIT_RADIUS_MAX))
                 fruits.append([*base.tolist(), score, radius])
+                edge = min(box[0], box[1], w - box[2], h - box[3])
+                edge_norm = float(np.clip(edge / max(1.0, min(w, h) / 2.0), 0.0, 1.0))
+                observed.append([*base.tolist(), stats["vis_ratio"], stats["z_std"], score, score, edge_norm])
                 best_box = box if best_box is None else best_box
             elif cls == trunk_class and trunk is None:
                 # Front surface -> axis: push back by the trunk's apparent radius along the ray.
@@ -182,7 +194,7 @@ def main():
                 bbox[2:] = [float(np.clip((cx - bunch_box[0]) / bw, 0, 1)), float(np.clip((cy - bunch_box[1]) / bh, 0, 1))]
         detected = len(fruits)
         fruits = tracks.update(fruits, time.time())
-        payload = {"frame_id": frame_id, "fruits": fruits, "trunk": trunk, "bbox": [float(v) for v in bbox],
+        payload = {"frame_id": frame_id, "fruits": fruits, "observed": observed, "trunk": trunk, "bbox": [float(v) for v in bbox],
                    "reason": f"dates={len(fruits)} (in frame {detected}) trunk={'yes' if trunk else 'no'}"}
         sock.sendto(json.dumps(payload).encode(), ("127.0.0.1", args.isaac_port))
 
