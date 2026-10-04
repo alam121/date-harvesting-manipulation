@@ -304,6 +304,12 @@ private:
   QDoubleSpinBox * low_center_depth_in_, * low_center_z_in_;
   QDoubleSpinBox * mid_center_depth_in_, * mid_center_z_in_;
   QDoubleSpinBox * low_side_depth_in_, * low_left_z_in_, * low_right_z_in_;
+  // Physical fingertip length beyond the URDF, in mm. Read back from
+  // /gripper_tip_extra_state so the box never shows a value the robot
+  // is not using.
+  QDoubleSpinBox * gripper_tip_extra_in_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr gripper_tip_extra_sub_;
+  double gripper_tip_extra_mm_{0.0};
   QDoubleSpinBox * closure_x_in_, * closure_y_in_, * closure_z_in_;
   QDoubleSpinBox * envelop_closure_x_in_, * envelop_closure_y_in_, * envelop_closure_z_in_;
   QCheckBox * debug_preview_cb_;

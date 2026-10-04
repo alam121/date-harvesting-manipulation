@@ -251,6 +251,21 @@ def active_closure_offset(node):
                           node.cfg.planner.closure_center_offset_tcp_m))
     if len(offset) != 3 or not all(math.isfinite(v) for v in offset):
         raise ValueError(f"{name} must contain three finite values")
+
+    # Fingertips that are physically longer than the URDF says. cuRobo's
+    # ee_link IS gripper_tip, so it drives that frame onto the goal; if the
+    # real tip reaches further, the fruit is pushed by exactly the excess.
+    # Folding it in here rather than at each call site means the FINAL move,
+    # the corridor preflight and pollination all agree -- they already share
+    # this function, and a tip length that differed between planning and
+    # preflight would pass preflight and then miss.
+    #
+    # +Z in tool frame is the pointing axis, and closure_center_corrected_tcp
+    # subtracts the rotated offset, so a POSITIVE extra stops the commanded
+    # tip short by that much and puts the physical tip on the goal.
+    extra = float(getattr(node.cfg.planner, "gripper_tip_extra_m", 0.0) or 0.0)
+    if math.isfinite(extra) and extra != 0.0:
+        offset[2] += extra
     return offset
 
 

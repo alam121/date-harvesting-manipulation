@@ -170,71 +170,32 @@ _OLD_OUTDOOR_JOINTS = {
 # as the joint presets above. Seeded identically for both environments for
 # now -- tune one side independently as real per-environment grasp data
 # comes in; only the keys you change take effect.
+# Zero grasp corrections for ACT demonstrations (2026-10-04).
+# Record the uncorrected target and the operator-demonstrated grasp.
 _LAB_GRASP_OFFSETS = {
-    # FINAL depth offsets -> +0.020 on 2026-09-13. The LEFT and RIGHT
-    # fingertips were replaced with longer ones (the CENTER tip is unchanged,
-    # small, and does not reach the fruit), and +0.020 is what was found to
-    # work on the rig. This is the profile actually in use
-    # (UR10E_ENVIRONMENT=lab), so it is where the measurement belongs.
-    #
-    # Applied as _center_final_y = y - offset with targets at y ~ -0.9, so a
-    # larger positive value drives the TCP further from the base, i.e. deeper
-    # toward the fruit. That is the opposite of what simple geometry predicts
-    # for longer fingers, so treat it as MEASURED, not derived, and re-measure
-    # if the tips change again.
-    #
-    # All three move together: fingertip length is a property of the gripper,
-    # not of the approach direction.
-    "low_side_final_depth_offset": 0.020,
-    "low_left_final_z_offset": 0.020,
-    "low_right_final_z_offset": 0.010,
-    # 0.020 -> 0.005 -> -0.015 (2026-09-16/17). The 0.020 was measured at
-    # ~1.02 m range. At the ~1.39 m the rig now works at, 0.020 put the closure
-    # 12 mm behind the far surface of an 8.0 mm-radius date, and 0.005 still
-    # missed: a fresh REACQ observation, closure 5 mm past it, arm within
-    # 0.2 mm, 0/3 contacts, and the gripper visibly went AHEAD of the date --
-    # vision reports the date nearer than it is. Negative stops SHORT of the
-    # vision estimate. -0.015 is the first test value in that direction, not a
-    # measurement yet. Range-dependent correction points at the depth scale.
-    "low_center_final_depth_offset": -0.015,
+    "low_side_final_depth_offset": 0.0,
+    "low_left_final_z_offset": 0.0,
+    "low_right_final_z_offset": 0.0,
+    "low_center_final_depth_offset": 0.0,
     "low_center_final_z_offset": 0.0,
-    "mid_center_final_depth_offset": 0.020,
+    "mid_center_final_depth_offset": 0.0,
     "mid_center_final_z_offset": 0.0,
-    "mid_center_slip_final_z_offset": 0.020,
-    "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
-    "envelop_closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+    "mid_center_slip_final_z_offset": 0.0,
+    "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
+    "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
 }
 
 _OUTDOOR_GRASP_OFFSETS = {
-    # low/mid CENTER depth offsets: -0.010 -> +0.020 on 2026-09-13, found
-    # empirically on the rig after the LEFT and RIGHT fingertips were replaced
-    # with longer ones (the CENTER tip is unchanged, small, and does not reach
-    # the fruit).
-    #
-    # Applied as _center_final_y = y - offset, and targets sit at y ~ -0.93, so
-    # a larger positive value drives the TCP FURTHER from the base, i.e. deeper
-    # toward the fruit. That is the OPPOSITE of what simple geometry predicts:
-    # longer fingers should need the TCP to stop shorter, not deeper. So these
-    # tips do something other than extend the pinch point straight out. Treat
-    # the value as MEASURED, not derived, and re-measure if the tips change.
-    #
-    # Briefly 0.0, which was followed by a CLOSED_NOTHING; +0.020 is what works.
-    #
-    # low_side_final_depth_offset matches the centre value: the longer LEFT and
-    # RIGHT fingertips are a property of the hardware, not of the approach
-    # direction, so every FINAL depth correction moves together. It was left at
-    # 0.0 while only CENTER targets were being tested; side targets were then
-    # the only ones with no fingertip correction at all.
-    "low_side_final_depth_offset": 0.020,
-    "low_left_final_z_offset": 0.020,
-    "low_right_final_z_offset": 0.010,
-    "low_center_final_depth_offset": 0.020,
+    "low_side_final_depth_offset": 0.0,
+    "low_left_final_z_offset": 0.0,
+    "low_right_final_z_offset": 0.0,
+    "low_center_final_depth_offset": 0.0,
     "low_center_final_z_offset": 0.0,
-    "mid_center_final_depth_offset": 0.020,
+    "mid_center_final_depth_offset": 0.0,
     "mid_center_final_z_offset": 0.0,
-    "mid_center_slip_final_z_offset": 0.020,
-    "closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
-    "envelop_closure_center_offset_tcp_m": [0.0, 0.005, 0.0],
+    "mid_center_slip_final_z_offset": 0.0,
+    "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
+    "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
 }
 
 ROBOT_PROFILES = {
@@ -729,6 +690,16 @@ class Planner:
 
     # Tool-frame TCP-to-physical-closure correction. Lab vs outdoor: see
     # _LAB_GRASP_OFFSETS / _OUTDOOR_GRASP_OFFSETS above.
+    # Physical fingertip length beyond what the URDF models, in metres along
+    # the tool pointing axis. cuRobo plans gripper_tip ONTO the goal, so longer
+    # tips push the fruit by the excess; a positive value stops the commanded
+    # tip that much short. Live-tunable from the RViz gripper panel because the
+    # alternative -- editing the URDF -- costs a ~22s cuRobo rebuild per try.
+    #
+    # It does NOT move cuRobo's collision model, which still has the modelled
+    # tip length. Fine for the centimetre-scale corrections this is for; a much
+    # larger change should go in the URDF instead.
+    gripper_tip_extra_m: float = 0.0
     closure_center_offset_tcp_m: List[float] = field(
         default_factory=lambda: _profile_offset("closure_center_offset_tcp_m"))
     envelop_closure_center_offset_tcp_m: List[float] = field(
@@ -1058,8 +1029,8 @@ class Gripper:
     auto_envelop_min_axis_confidence: float = 0.30
     normal_depth_extra_m: float = 0.0
     normal_z_extra_m: float = 0.0
-    envelop_depth_extra_m: float = 0.017 # place fruit 17mm deeper than NORMAL
-    envelop_z_extra_m: float = 0.005
+    envelop_depth_extra_m: float = 0.0  # learned from demonstrations
+    envelop_z_extra_m: float = 0.0
     adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
     stop_closing_on_force: bool = False  # always command the full closed posture for now

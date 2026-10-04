@@ -14,6 +14,7 @@ from pathlib import Path
 from rclpy.qos import (QoSProfile, qos_profile_sensor_data,
                        DurabilityPolicy, HistoryPolicy, ReliabilityPolicy)
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray, String, Float32, Bool
 from sensor_msgs.msg import Image
@@ -225,6 +226,11 @@ class UR10eCuroboMoveIt(Node):
         # Metres, in the same order set_final_offsets() expects.
         self.final_offsets_pub = self.create_publisher(
             Float32MultiArray, "/final_offsets_state", 10)
+        # Live tip trim, so the panel never shows a value the robot is not
+        # using. The final-offsets spinboxes had exactly this bug: they
+        # displayed hardcoded defaults and silently overwrote tuned values.
+        self.gripper_tip_extra_pub = self.create_publisher(
+            Float32, "/gripper_tip_extra_state", 10)
 
         def _publish_final_offsets():
             p = self.cfg.planner
@@ -237,6 +243,16 @@ class UR10eCuroboMoveIt(Node):
             self.final_offsets_pub.publish(msg)
 
         self.create_timer(1.0, _publish_final_offsets)
+
+        def _publish_gripper_tip_extra():
+            self.gripper_tip_extra_pub.publish(Float32(
+                data=float(getattr(self.cfg.planner, "gripper_tip_extra_m", 0.0)
+                           or 0.0) * 1000.0))
+
+        # Bound as a method so the ui_command handler can push immediately on
+        # change rather than leaving the panel stale for up to a second.
+        self._publish_gripper_tip_extra = _publish_gripper_tip_extra
+        self.create_timer(1.0, _publish_gripper_tip_extra)
         # Active robot type + environment for the RViz panel. Republished periodically so
         # the panel shows it regardless of who started first.
         self.robot_config_pub = self.create_publisher(String, "/robot_config_info", 10)
@@ -1703,6 +1719,33 @@ class UR10eCuroboMoveIt(Node):
                 return
             self._session_record_gripper_action("CLOSE", "direct_close")
             gripper_mod.control_gripper(self, 'CLOSE')
+        elif cmd.startswith("gripper_tip_extra "):
+            # Millimetres on the wire: the panel shows mm and a float in metres
+            # round-trips badly through a string.
+            try:
+                mm = float(cmd.split()[1])
+            except (ValueError, IndexError) as exc:
+                self.get_logger().warn(f"Invalid gripper_tip_extra command: {exc}")
+                return
+            if not math.isfinite(mm) or abs(mm) > 100.0:
+                self.get_logger().warn(
+                    f"gripper_tip_extra {mm} rejected: outside +/-100mm. A tip "
+                    "that far out belongs in the URDF, not a runtime trim.")
+                return
+            self.cfg.planner.gripper_tip_extra_m = mm / 1000.0
+            try:
+                self.set_parameters([Parameter(
+                    "planner.gripper_tip_extra_m",
+                    Parameter.Type.DOUBLE, mm / 1000.0)])
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"tip extra applied in memory but the ROS parameter did "
+                    f"not update: {exc}")
+            self._publish_gripper_tip_extra()
+            self.get_logger().warn(
+                f"[GRIPPER_TIP] extra={mm:+.1f}mm -- commanded tip stops that "
+                "much short so the physical tip lands on the goal "
+                "(effective on the NEXT grasp; cuRobo collision model unchanged)")
         elif cmd.startswith("gripper_open_alpha "):
             try:
                 alpha = float(cmd.split()[1])

@@ -89,6 +89,7 @@ class ConfigManager:
         self._node.declare_parameter("planner.max_joint_velocity", self.cfg.planner.max_joint_velocity)
         self._node.declare_parameter("planner.max_joint_acceleration", self.cfg.planner.max_joint_acceleration)
         self._node.declare_parameter("planner.ramp_points", self.cfg.planner.ramp_points)
+        self._node.declare_parameter("planner.gripper_tip_extra_m", self.cfg.planner.gripper_tip_extra_m)
         self._node.declare_parameter("planner.retime_trajectories", self.cfg.planner.retime_trajectories)
         self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
         self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
@@ -238,6 +239,7 @@ class ConfigManager:
         self.cfg.planner.max_joint_velocity = float(self._node.get_parameter("planner.max_joint_velocity").value)
         self.cfg.planner.max_joint_acceleration = float(self._node.get_parameter("planner.max_joint_acceleration").value)
         self.cfg.planner.ramp_points = int(self._node.get_parameter("planner.ramp_points").value)
+        self.cfg.planner.gripper_tip_extra_m = float(self._node.get_parameter("planner.gripper_tip_extra_m").value)
         self.cfg.planner.retime_trajectories = bool(self._node.get_parameter("planner.retime_trajectories").value)
         self.cfg.planner.min_dt = float(self._node.get_parameter("planner.min_dt").value)
         self.cfg.planner.max_dt = float(self._node.get_parameter("planner.max_dt").value)
@@ -478,6 +480,7 @@ class ConfigManager:
             "planner.max_joint_velocity": (self.cfg.planner, "max_joint_velocity", float),
             "planner.max_joint_acceleration": (self.cfg.planner, "max_joint_acceleration", float),
             "planner.ramp_points": (self.cfg.planner, "ramp_points", int),
+            "planner.gripper_tip_extra_m": (self.cfg.planner, "gripper_tip_extra_m", float),
             "planner.retime_trajectories": (self.cfg.planner, "retime_trajectories", bool),
             "planner.min_dt": (self.cfg.planner, "min_dt", float),
             "planner.max_dt": (self.cfg.planner, "max_dt", float),

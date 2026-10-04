@@ -395,13 +395,13 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   // Placeholders only: these match config.py's _LAB_GRASP_OFFSETS so the panel
   // is not lying before the first /final_offsets_state message arrives, but the
   // live values from the node overwrite them within ~1s (see updateDisplay).
-  low_center_depth_in_ = make_offset_input(20.0);
+  low_center_depth_in_ = make_offset_input(0.0);
   low_center_z_in_ = make_offset_input(0.0);
-  mid_center_depth_in_ = make_offset_input(20.0);
+  mid_center_depth_in_ = make_offset_input(0.0);
   mid_center_z_in_ = make_offset_input(0.0);
-  low_side_depth_in_ = make_offset_input(20.0);
-  low_left_z_in_ = make_offset_input(20.0);
-  low_right_z_in_ = make_offset_input(10.0);
+  low_side_depth_in_ = make_offset_input(0.0);
+  low_left_z_in_ = make_offset_input(0.0);
+  low_right_z_in_ = make_offset_input(0.0);
   final_offsets_layout->addWidget(new QLabel("Target"), 0, 0);
   final_offsets_layout->addWidget(new QLabel("Depth"), 0, 1);
   final_offsets_layout->addWidget(new QLabel("Z"), 0, 2);
@@ -431,13 +431,13 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "Restore config.py defaults and apply them immediately to subsequent FINAL moves");
   connect(reset_final_offsets, &QPushButton::clicked, this, [this]() {
     // Keep in step with _LAB_GRASP_OFFSETS in ur10e_curobo/config.py.
-    low_center_depth_in_->setValue(20.0);
+    low_center_depth_in_->setValue(0.0);
     low_center_z_in_->setValue(0.0);
-    mid_center_depth_in_->setValue(20.0);
+    mid_center_depth_in_->setValue(0.0);
     mid_center_z_in_->setValue(0.0);
-    low_side_depth_in_->setValue(20.0);
-    low_left_z_in_->setValue(20.0);
-    low_right_z_in_->setValue(10.0);
+    low_side_depth_in_->setValue(0.0);
+    low_left_z_in_->setValue(0.0);
+    low_right_z_in_->setValue(0.0);
     onApplyFinalOffsets();
     status_label_->setText("Final grasp offsets reset to defaults");
   });
@@ -448,10 +448,10 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * closure_group = new QGroupBox("Closure Center Offset (tool frame, mm)");
   auto * closure_layout = new QGridLayout(closure_group);
   closure_x_in_ = make_offset_input(0.0);
-  closure_y_in_ = make_offset_input(5.0);
+  closure_y_in_ = make_offset_input(0.0);
   closure_z_in_ = make_offset_input(0.0);
   envelop_closure_x_in_ = make_offset_input(0.0);
-  envelop_closure_y_in_ = make_offset_input(5.0);
+  envelop_closure_y_in_ = make_offset_input(0.0);
   envelop_closure_z_in_ = make_offset_input(0.0);
   for (auto * input : {
       closure_x_in_, closure_y_in_, closure_z_in_,
@@ -494,10 +494,10 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * reset_closure = new QPushButton("Reset to Defaults");
   connect(reset_closure, &QPushButton::clicked, this, [this, apply_closure]() {
     closure_x_in_->setValue(0.0);
-    closure_y_in_->setValue(5.0);
+    closure_y_in_->setValue(0.0);
     closure_z_in_->setValue(0.0);
     envelop_closure_x_in_->setValue(0.0);
-    envelop_closure_y_in_->setValue(5.0);
+    envelop_closure_y_in_->setValue(0.0);
     envelop_closure_z_in_->setValue(0.0);
     apply_closure->click();
     status_label_->setText("Closure-center offset reset to defaults");
@@ -570,8 +570,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * mode_final_layout = new QGridLayout(mode_final_group);
   auto * normal_depth = make_offset_input(0.0);
   auto * normal_z = make_offset_input(0.0);
-  auto * envelop_depth = make_offset_input(17.0);
-  auto * envelop_z = make_offset_input(5.0);
+  auto * envelop_depth = make_offset_input(0.0);
+  auto * envelop_z = make_offset_input(0.0);
   mode_final_layout->addWidget(new QLabel("Mode"), 0, 0);
   mode_final_layout->addWidget(new QLabel("Depth"), 0, 1);
   mode_final_layout->addWidget(new QLabel("Z"), 0, 2);
@@ -600,8 +600,8 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     [normal_depth, normal_z, envelop_depth, envelop_z, apply_mode_final]() {
       normal_depth->setValue(0.0);
       normal_z->setValue(0.0);
-      envelop_depth->setValue(17.0);
-      envelop_z->setValue(5.0);
+      envelop_depth->setValue(0.0);
+      envelop_z->setValue(0.0);
       apply_mode_final->click();
     });
   mode_final_layout->addWidget(reset_mode_final, 3, 2);
@@ -764,8 +764,49 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   inference_controls->addWidget(apply_inference_btn, 2, 0, 1, 2);
   vision_information_layout->addLayout(inference_controls);
   camera_tab_layout->addWidget(vision_information_group);
+  // Gripper tip extension. cuRobo's ee_link IS gripper_tip, so it drives that
+  // frame onto the goal; fingertips longer than the URDF models push the fruit
+  // by the excess. A positive value here stops the commanded tip that much
+  // short so the physical tip lands on the goal.
+  //
+  // Live because the alternative, editing the URDF, costs a ~22s cuRobo
+  // rebuild per attempt. It does NOT move cuRobo's collision model, so keep it
+  // to centimetre-scale trims; anything larger belongs in the URDF.
+  auto * tip_group = new QGroupBox("Gripper Tip Extension (mm, along tool axis)");
+  auto * tip_layout = new QGridLayout(tip_group);
+  gripper_tip_extra_in_ = new QDoubleSpinBox();
+  gripper_tip_extra_in_->setRange(-100.0, 100.0);
+  gripper_tip_extra_in_->setDecimals(1);
+  gripper_tip_extra_in_->setSingleStep(1.0);
+  gripper_tip_extra_in_->setSuffix(" mm");
+  gripper_tip_extra_in_->setValue(0.0);
+  gripper_tip_extra_in_->setToolTip(
+    "How much longer the real fingertips are than the URDF says.\n"
+    "Positive stops the commanded tip short so the physical tip reaches the goal.\n"
+    "Applies to the NEXT grasp. cuRobo's collision model is unchanged.");
+  auto * tip_apply = new QPushButton("Apply Tip Extension");
+  auto * tip_reset = new QPushButton("Reset to 0");
+  tip_layout->addWidget(new QLabel("Extra length"), 0, 0);
+  tip_layout->addWidget(gripper_tip_extra_in_, 0, 1);
+  tip_layout->addWidget(tip_apply, 0, 2);
+  tip_layout->addWidget(tip_reset, 0, 3);
+  connect(tip_apply, &QPushButton::clicked, this, [this]() {
+    std::ostringstream cmd;
+    cmd << "gripper_tip_extra " << std::fixed << std::setprecision(1)
+        << gripper_tip_extra_in_->value();
+    publishCmd(cmd.str());
+    status_label_->setText(
+      QString("Gripper tip extension requested: %1 mm (next grasp)")
+        .arg(gripper_tip_extra_in_->value(), 0, 'f', 1));
+  });
+  connect(tip_reset, &QPushButton::clicked, this, [this, tip_apply]() {
+    gripper_tip_extra_in_->setValue(0.0);
+    tip_apply->click();
+  });
+
   settings_tab_layout->addWidget(final_offsets_group);
   settings_tab_layout->addWidget(closure_group);
+  settings_tab_layout->addWidget(tip_group);
   settings_tab_layout->addWidget(grasp_mode_group);
   settings_tab_layout->addWidget(mode_final_group);
 
@@ -1985,6 +2026,16 @@ void UR10ePanel::setupRos()
       have_joint_temps_ = true;
     });
 
+  // Read back the live tip extension. Without this the box would show whatever
+  // it was constructed with and quietly overwrite the running value on the
+  // next Apply -- the bug the final-offsets readback above exists to prevent.
+  gripper_tip_extra_sub_ = node_->create_subscription<std_msgs::msg::Float32>(
+    "/gripper_tip_extra_state", 10,
+    [this](std_msgs::msg::Float32::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      gripper_tip_extra_mm_ = static_cast<double>(msg->data);
+    });
+
   final_offsets_sub_ = node_->create_subscription<std_msgs::msg::Float32MultiArray>(
     "/final_offsets_state", 10,
     [this](std_msgs::msg::Float32MultiArray::SharedPtr msg) {
@@ -3143,6 +3194,16 @@ void UR10ePanel::updateDisplay()
       boxes[i]->setValue(final_offsets_m_[i] * 1000.0);
     }
     final_offsets_update_pending_ = false;
+  }
+
+  // Mirror the live tip extension, but never while the box has focus: the
+  // operator is typing into it and overwriting mid-edit is how a panel loses
+  // trust. QSignalBlocker so this does not look like a user edit.
+  if (gripper_tip_extra_in_ && !gripper_tip_extra_in_->hasFocus() &&
+    std::abs(gripper_tip_extra_in_->value() - gripper_tip_extra_mm_) > 0.05)
+  {
+    QSignalBlocker blocker(gripper_tip_extra_in_);
+    gripper_tip_extra_in_->setValue(gripper_tip_extra_mm_);
   }
 
   if (!robot_config_text_.empty()) {
