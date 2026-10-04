@@ -7129,15 +7129,24 @@ def plan_and_execute(node):
         _timing_summary = " ".join(
             f"{k}={v:.2f}s" for k, v in _timing.items()
         )
+        # Vision throughput alongside the motion timings. A cycle that slowed
+        # because YOLO lost frames and one that slowed because planning did look
+        # identical in this line otherwise.
+        _vfps = getattr(node, "latest_vision_fps", None)
+        _fps_summary = (f" yolo_fps={_vfps[0]:.1f} loop_fps={_vfps[1]:.1f}"
+                        if _vfps else " yolo_fps=NA loop_fps=NA")
         node.get_logger().info(
             f"[CYCLE {_cycle_idx}] DONE total={_cycle_total:.2f}s "
             f"force_signal={getattr(node, 'fruit_held_after_reverse', None)} "
-            f"reacq={node.reacquire_result or 'NA'} {_timing_summary}")
+            f"reacq={node.reacquire_result or 'NA'} {_timing_summary}"
+            f"{_fps_summary}")
         _append_cycle_log = getattr(node, "_append_harvest_log", None)
         if callable(_append_cycle_log):
             _append_cycle_log({
                 "event": "CYCLE_COMPLETE",
                 "cycle": _cycle_idx,
+                "yolo_fps": (round(_vfps[0], 2) if _vfps else None),
+                "loop_fps": (round(_vfps[1], 2) if _vfps else None),
                 "goal_xyz_m": [float(x), float(y), float(z)],
                 "grasp_mode": str(getattr(
                     node, "active_goal_grasp_mode", "NORMAL")),

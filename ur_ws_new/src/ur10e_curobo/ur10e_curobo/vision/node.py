@@ -280,6 +280,15 @@ class VisionNode:
         self.gap_info_pub = self.node.create_publisher(Float32MultiArray, "/datefruit_gap_info", 10)
         self.depth_diag_pub = self.node.create_publisher(
             Float32MultiArray, "/vision/depth_diagnostics", 10)
+        # [yolo_fps, loop_fps]. Both already exist for the HUD, but the HUD is
+        # not in any log file, and the one line that printed them
+        # ([VISION_PIPELINE_TIMING]) uses print() rather than the logger, fires
+        # every 30th PROFILED frame, and sits under `if fresh_detections` -- so
+        # it goes quiet exactly when detection stops, which is when the numbers
+        # matter most. Published so the motion node can put them beside its own
+        # cycle timings, and logged on a fixed cadence below.
+        self.fps_pub = self.node.create_publisher(
+            Float32MultiArray, "/vision/fps", 10)
         self.bbox_norm_pub = self.node.create_publisher(Float32MultiArray, "/fruit_image_bbox_norm", 10)
         self.fruit_observation_pub = self.node.create_publisher(
             StdString, "/vision/fruit_observation", 10)
@@ -1212,6 +1221,18 @@ class VisionNode:
                         loop_fps = ((len(_grab_times) - 1) / _grab_span
                                     if _grab_span > 0.0 else 0.0)
                 t_prev = t_now
+
+                # Fixed cadence, and deliberately NOT under `if
+                # fresh_detections`: a drop after a config change is what this
+                # exists to catch, and the existing [VISION_PIPELINE_TIMING]
+                # line goes silent exactly when detection stops.
+                if t_now - getattr(self, "_last_fps_report_t", 0.0) >= 5.0:
+                    self._last_fps_report_t = t_now
+                    _yf = float(getattr(self.yolo_thread, "net_fps", 0.0) or 0.0)
+                    _lf = float(loop_fps or 0.0)
+                    self.fps_pub.publish(Float32MultiArray(data=[_yf, _lf]))
+                    self.node.get_logger().info(
+                        f"[VISION_FPS] yolo_fps={_yf:.1f} loop_fps={_lf:.1f}")
 
                 _t0 = time()
                 # Retrieve once at display resolution — YOLO resizes internally so

@@ -455,6 +455,19 @@ class UR10eCuroboMoveIt(Node):
         self._demo_capture_active = False
         self._demo_confirm = None
 
+        # Vision's YOLO and loop rate, cached so a harvest cycle can report the
+        # throughput it actually ran at. Without this the only record was a HUD
+        # overlay, so "did that change cost us frames?" could not be answered
+        # from the logs after the fact.
+        self.latest_vision_fps = None
+
+        def _vision_fps_cb(msg):
+            if len(msg.data) >= 2:
+                self.latest_vision_fps = (float(msg.data[0]), float(msg.data[1]))
+
+        self.create_subscription(
+            Float32MultiArray, '/vision/fps', _vision_fps_cb, 10)
+
         def _demo_confirm_cb(msg):
             if self._demo_capture_active:
                 self._demo_confirm = bool(msg.data)
