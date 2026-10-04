@@ -1040,7 +1040,7 @@
   <joint name="tool0_to_zed_mini_left_camera_frame" type="fixed">
     <parent link="tool0"/>
     <child link="zed_mini_left_camera_frame"/>
-    <origin rpy="-0.206146 0.001382 -1.835627" xyz="-0.123634 0.062070 0.084893"/>
+    <origin rpy="-0.113475 0.009291 1.050907" xyz="0.090454 -0.080254 0.073331"/><!-- hand-eye DANIILIDIS, 20 samples, 2026-09-30 12:41:34, profile lab_old_zedx_mini_rgbd. Mirrors hand_eye_calibration.yaml. motion_executor rewrites this per camera profile at startup, but only when the profile carries BOTH translation and rpy; otherwise this value is used as-is, so it must stay current. It previously held the NEW robot's lab mount, 257mm from this one. -->
     <!-- hand-eye calibrated (DANIILIDIS, 2.89mm consistency error, 34 samples, 2026-07-28) -->
   </joint>
 
