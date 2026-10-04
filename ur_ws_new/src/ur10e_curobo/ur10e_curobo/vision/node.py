@@ -332,6 +332,8 @@ class VisionNode:
             CompressedImage, "/vision/demo_full/compressed", 1)
         self.demo_targets_pub = self.node.create_publisher(StdString, "/vision/demo_targets", 10)
         self.depth_trace_pub = self.node.create_publisher(StdString, "/vision/depth_trace", 10)
+        self.nearby_dates_pub = self.node.create_publisher(StdString, "/vision/nearby_dates", 1)
+        self._nearby_dates_last = 0.0
         self._demo_full_last = 0.0
         self.raw_image_pub = self.node.create_publisher(
             ROSImage, "/vision/raw", fast_qos)
@@ -909,6 +911,18 @@ class VisionNode:
                             self._request_exit()
                         continue
                     stamp = self._image_stamp_msg()
+                    if time() - self._nearby_dates_last >= 0.2:
+                        fruits = []
+                        for target in tgts:
+                            point = target['pt_base'].point
+                            fruits.append({'fruit_id': int(target.get('fruit_id', -1)),
+                                'base_xyz': [float(point.x), float(point.y), float(point.z)],
+                                'radius_m': float(estimate_fruit_radius(target))})
+                        observation = StdString()
+                        observation.data = json.dumps({'stamp_ns': int(stamp.sec)*1000000000+int(stamp.nanosec),
+                            'frame_id': 'base_link', 'fruits': fruits})
+                        self.nearby_dates_pub.publish(observation)
+                        self._nearby_dates_last = time()
                     # Preserve the full field of view before annotations; JPEG keeps
                     # the campus link usable. Encode only when subscribed, up to 10 Hz.
                     if (self.demo_full_pub.get_subscription_count() and

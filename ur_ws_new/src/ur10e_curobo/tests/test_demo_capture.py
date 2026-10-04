@@ -190,5 +190,56 @@ class DemoCommandTests(unittest.TestCase):
         self.assertIs(self.node._demo_confirm, False)
 
 
+class AttachOutcomeTests(unittest.TestCase):
+    """The outcome arrives in gripper.py, long after the record was written.
+
+    If it fails to land, the record looks complete but has no gripper verdict,
+    and that is only noticed at training time.
+    """
+
+    def setUp(self):
+        self.logger = Mock()
+        self.node = SimpleNamespace(get_logger=lambda: self.logger)
+
+    def write(self, root, sample):
+        out = Path(root) / '20261004_120000_000'
+        out.mkdir()
+        (out / 'sample.json').write_text(json.dumps(sample))
+        return str(out)
+
+    def test_outcome_is_appended_to_the_pending_record(self):
+        with TemporaryDirectory() as root:
+            out = self.write(root, {'auto_outcome': None, 'operator_label': None})
+            self.node._demo_pending_record = out
+            demo.attach_outcome(self.node, 'GRABBED', 'PROPER')
+            saved = json.loads((Path(out) / 'sample.json').read_text())
+            self.assertEqual(saved['auto_outcome'],
+                             {'outcome': 'GRABBED', 'end': 'PROPER'})
+            # Still ungraded: the operator's label is a separate step.
+            self.assertIsNone(saved['operator_label'])
+
+    def test_the_record_is_cleared_so_the_next_cycle_cannot_inherit_it(self):
+        with TemporaryDirectory() as root:
+            out = self.write(root, {})
+            self.node._demo_pending_record = out
+            demo.attach_outcome(self.node, 'NO_GRAB', 'CLOSED_NOTHING')
+            self.assertIsNone(self.node._demo_pending_record)
+            # A second call must not rewrite the previous cycle's record.
+            demo.attach_outcome(self.node, 'GRABBED', 'PROPER')
+            saved = json.loads((Path(out) / 'sample.json').read_text())
+            self.assertEqual(saved['auto_outcome']['outcome'], 'NO_GRAB')
+
+    def test_a_normal_harvest_with_no_record_is_silent(self):
+        self.node._demo_pending_record = None
+        demo.attach_outcome(self.node, 'GRABBED', 'PROPER')
+        self.logger.warn.assert_not_called()
+        self.logger.info.assert_not_called()
+
+    def test_an_unwritable_record_warns_instead_of_raising(self):
+        self.node._demo_pending_record = '/nonexistent/demo/record'
+        demo.attach_outcome(self.node, 'GRABBED', 'PROPER')
+        self.logger.warn.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

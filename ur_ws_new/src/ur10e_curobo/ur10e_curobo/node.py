@@ -395,6 +395,25 @@ class UR10eCuroboMoveIt(Node):
         self._latest_grasp_crop_meta = None
         self._demo_full_frame = None
         self._demo_targets = {}
+        from visualization_msgs.msg import MarkerArray
+        from .neighbor_diagnostics import publish_diagnostic
+        self._neighbor_marker_pub = self.create_publisher(MarkerArray, '/demo/neighbor_corridors', 1)
+        self._nearby_dates_snapshot = None
+        def _nearby_dates_cb(msg):
+            try:
+                payload = json.loads(msg.data)
+                if payload['frame_id'] == 'base_link' and isinstance(payload['fruits'], list):
+                    self._nearby_dates_snapshot = (time.monotonic(), payload)
+            except (ValueError, KeyError, TypeError):
+                pass
+        self.create_subscription(String, '/vision/nearby_dates', _nearby_dates_cb, 1)
+        def _diagnose_corridors(candidates, goal, length):
+            try:
+                publish_diagnostic(self, candidates, goal, length)
+            except Exception as exc:
+                self.get_logger().warn(f'[NEIGHBOR_DIAGNOSTIC] unavailable: {exc}')
+        self._diagnose_corridors = _diagnose_corridors
+
         self._depth_traces = deque(maxlen=1000)
         def _depth_trace_cb(msg):
             try:

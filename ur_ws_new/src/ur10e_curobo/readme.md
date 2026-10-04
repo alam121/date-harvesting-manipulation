@@ -450,3 +450,32 @@ sequence; this dataset initially trains positioning, not automatic closure.
 Restart vision and the motion node before collecting one pilot. Restore any
 operator-selected runtime offsets after restart and verify them before collecting.
 Do not mix archived demos into the fresh dataset automatically.
+
+### Neighbor-aware corridor ranking
+
+Vision publishes detected fruit centers/radii on `/vision/nearby_dates`.
+Before motion, LOW/VERY_LOW and MID/HIGH center candidates are generated using
+the production approach and final geometry, including depth/Z and mode offsets,
+closure compensation, and candidate orientation. For level insertion, preflight
+and ranking use candidate APPROACH Z; execution uses actual settled APPROACH Z.
+Thus the preview is a prediction, not a measurement of the later executed path.
+
+Candidates are ranked by summed overlap of a provisional 45 mm-radius capsule
+along each planned TCP insertion segment. Existing reachability/self/world
+preflight checks run in that order until a candidate passes. Overlap is a soft
+ranking cost, not a hard veto: a dense bunch can still yield an overlapping
+selected candidate. The model does not represent articulated fingers/palm or
+certify collision-free motion, and does not check the earlier travel to APPROACH.
+
+A fresh snapshot (source/receipt ages <=1 s) is frozen for the no-motion geometry
+comparison. Exactly one unambiguous nearest target is excluded (within 30 mm,
+with a 10 mm margin over the runner-up). Missing/stale/ambiguous observations
+retain axis-based selection and are logged explicitly. Scene movement after
+snapshot/confirmation and hidden fruit are not covered by this ranking.
+
+`[NEIGHBOR_DIAGNOSTIC]` logs and `/demo/neighbor_corridors` RViz markers show the
+planned segments and estimated overlap; `[NEIGHBOR_RANK]` gives the order and
+`[CORRIDOR_PREFLIGHT]` reports reachability results. Demo metadata retains the
+scores. Green means no proxy overlap, not guaranteed physical clearance.
+Restart the motion node and vision before a supervised test. Existing operator
+confirmation remains in place. No robot movement is initiated by installation.

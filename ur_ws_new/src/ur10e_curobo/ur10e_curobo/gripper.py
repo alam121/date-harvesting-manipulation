@@ -368,6 +368,12 @@ def on_grasp_outcome(node, outcome: str, end: str):
         record_episode(node, outcome, end)
     except Exception as _exc:
         node.get_logger().warn(f"[EPISODE] not recorded: {_exc}")
+    # Same best-effort rule: close out the demo record this cycle opened, if any.
+    try:
+        from .demo_capture import attach_outcome
+        attach_outcome(node, outcome, end)
+    except Exception as _exc:
+        node.get_logger().warn(f"[DEMO] outcome not attached: {_exc}")
     if hasattr(node, "visualizer"):
         node.visualizer.update_outcome(outcome)
 

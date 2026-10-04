@@ -171,18 +171,23 @@ _OLD_OUTDOOR_JOINTS = {
 # now -- tune one side independently as real per-environment grasp data
 # comes in; only the keys you change take effect.
 # Zeroed for ACT demonstrations (2026-10-04) so the record holds the
-# uncorrected target and the operator-demonstrated grasp. Still true of the
-# depth and TCP corrections; the two *_final_z_offset values below are now 8mm,
-# measured on the robot, so demos recorded from here on are NOT comparable with
-# the 38 already captured at 0. Re-zero them before extending that set.
+# uncorrected target and the operator-demonstrated grasp.
+#
+# The two *_final_z_offset values were briefly 8mm. Re-zeroed the same day after
+# the 11 demos at 14:47-14:56 showed the offset was both inert and unmotivated:
+# on the 7 LOW/CENTER attempts level insertion overwrote Z right after it was
+# added (pre_level_Z -> final_Z was -14.6mm every time, i.e. the 8mm was
+# discarded and replaced by the approach Z), and the operator's own Z residual
+# was +0.0mm on all 7, so height was never the axis that was wrong. If a Z trim
+# is ever needed for low/center it has to go through level insertion, not here.
 _LAB_GRASP_OFFSETS = {
     "low_side_final_depth_offset": 0.0,
     "low_left_final_z_offset": 0.0,
     "low_right_final_z_offset": 0.0,
     "low_center_final_depth_offset": 0.0,
-    "low_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
+    "low_center_final_z_offset": 0.0,
     "mid_center_final_depth_offset": 0.0,
-    "mid_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
+    "mid_center_final_z_offset": 0.0,
     "mid_center_slip_final_z_offset": 0.0,
     "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
     "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
@@ -193,9 +198,9 @@ _OUTDOOR_GRASP_OFFSETS = {
     "low_left_final_z_offset": 0.0,
     "low_right_final_z_offset": 0.0,
     "low_center_final_depth_offset": 0.0,
-    "low_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
+    "low_center_final_z_offset": 0.0,
     "mid_center_final_depth_offset": 0.0,
-    "mid_center_final_z_offset": 0.008,   # measured lift; world Z, not the tool axis
+    "mid_center_final_z_offset": 0.0,
     "mid_center_slip_final_z_offset": 0.0,
     "closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
     "envelop_closure_center_offset_tcp_m": [0.0, 0.0, 0.0],
@@ -361,11 +366,17 @@ WORLD_CONFIG = {
 }
 
 # v2 owns B-spline refinement; the v1 finetune switch no longer exists.
-PLAN_CFG_DEFAULT = PlanOptions(max_attempts=20)
-PLAN_CFG_JS = PlanOptions(max_attempts=20, graph_attempt=None)
-PLAN_CFG_JS_RETRY = PlanOptions(max_attempts=8, graph_attempt=1)
-PLAN_CFG_JS_GRAPH = PlanOptions(max_attempts=8, graph_attempt=1)
-PLAN_CFG_SCAN_PREFLIGHT = PlanOptions(max_attempts=20)
+# Each attempt is one full IK solve plus a trajectory optimization, so
+# max_attempts multiplies GPU time directly. cuRobo v2's own defaults are
+# max_attempts=5 with graph seeding from the second attempt. The previous
+# max_attempts=20 cost up to 20 solves per plan (plus wraparound/abrupt-step
+# replans on top in plan_and_send), while final-attempt seeding keeps one PRM
+# fallback so hard poses still recover.
+PLAN_CFG_DEFAULT = PlanOptions(max_attempts=5)
+PLAN_CFG_JS = PlanOptions(max_attempts=5, graph_attempt=None)
+PLAN_CFG_JS_RETRY = PlanOptions(max_attempts=5, graph_attempt=1)
+PLAN_CFG_JS_GRAPH = PlanOptions(max_attempts=5, graph_attempt=1)
+PLAN_CFG_SCAN_PREFLIGHT = PlanOptions(max_attempts=5)
 
 # ---------- Runtime parameters (override via ROS params / env) ----------
 @dataclass
@@ -763,7 +774,7 @@ class Planner:
     # per-corridor [CORRIDOR_PREFLIGHT] PASS/REJECT line (reason + branch_cost)
     # from debug to info. Set back to False once the corridor question is
     # settled -- it is several lines per goal.
-    log_corridor_candidates: bool = True
+    log_corridor_candidates: bool = False
     # Disabled 2026-09-16 after measuring the tip-anchored FINAL geometry at
     # ~1.39 m range: the detected tip sat 21.3 mm from the date centre (fruit
     # radius 8.0 mm, so the anchor is already outside the fruit), and
@@ -1004,6 +1015,21 @@ class Planner:
     # Operator-correction capture for the residual policy (demo_capture.py).
     # OFF by default: a normal harvest must not stop and wait for a human.
     demo_capture_enabled: bool = False
+    # Two capture modes, both observing the same APPROACH pose:
+    #
+    #   False (default) -- outcome. The cycle runs to the grasp untouched and the
+    #     gripper's verdict is appended; the operator grades good/edge/fail later
+    #     with demo_label.py. Seconds per sample, so a session yields a hundred.
+    #     Trains a "will this approach work" predictor; carries no endpoint.
+    #
+    #   True -- correction. Holds at APPROACH for a pendant jog to the pose that
+    #     would actually grasp, giving a demonstrated endpoint and a residual.
+    #     ~40s of operator work per sample, which capped 2026-10-04 at 11.
+    #
+    # Outcome is the default because the 11 correction demos showed aim error does
+    # not separate success from failure (grabbed 2.7-28.5mm, missed 5.9-35.1mm),
+    # so the endpoint is not where the remaining failures live.
+    demo_capture_jog_enabled: bool = False
     demo_capture_dir: str = "~/harvest_logs/demos"
     demo_capture_timeout_s: float = 0.0  # Wait for Close; positive values set a timeout.
     demo_capture_sample_hz: float = 10.0

@@ -1,21 +1,30 @@
-"""Record operator corrections to the APPROACH pose, for training a residual policy.
+"""Record what the arm saw at APPROACH, for training the last 7cm.
 
-The pipeline drives to where it thinks the date is, which is wrong by a
-range-dependent amount nobody has pinned down (see low_center_final_depth_offset
-in config.py). This captures the correction instead of hand-tuning it: the arm
-stops at its APPROACH pose, the operator jogs the teach pendant to the pose that
-would actually grasp, and the delta between the two is one training sample.
+Both modes observe the same thing -- the APPROACH crop, the full frame with every
+candidate date boxed, the depth trace, the planned final pose -- and differ only
+in what label gets attached. planner.demo_capture_jog_enabled picks:
 
-Full-frame JPEGs and joint states are also recorded with source timestamps.
-Sequence quality is saved separately; endpoint data alone is not ACT-ready.
+  capture_observation (default)
+      The cycle runs to the grasp untouched; attach_outcome() appends the
+      gripper's verdict afterwards and the operator grades good/edge/fail with
+      demo_label.py. Seconds per sample.
+
+  capture_correction
+      Holds at APPROACH, the operator jogs the teach pendant to the pose that
+      would actually grasp, and the delta is the label. Gives a demonstrated
+      endpoint and a residual against the planned final pose; costs ~40s of
+      pendant work per sample, which is why 2026-10-04 yielded 11.
 
 The correction is recorded in the TOOL frame as well as base_link. Base-frame
 deltas are what the offsets in config.py are expressed in, but a policy reading
 the wrist camera sees the error in tool axes, and the two differ by the whole
 wrist orientation.
 
-Off by default: planner.demo_capture_enabled. A normal harvest must not stop and
-wait for a human who is not there.
+Full-frame JPEGs and joint states are recorded with source timestamps. Sequence
+quality is saved separately; endpoint data alone is not ACT-ready.
+
+Both are off unless planner.demo_capture_enabled -- a normal harvest records
+episodes, not training samples.
 """
 
 import copy
@@ -103,16 +112,14 @@ def capture_correction(node) -> Optional[str]:
         node._demo_capture_active = False
 
 
-def _capture_correction(node) -> Optional[str]:
-    """Hold at APPROACH, wait for the operator's corrected pose, write one sample.
+def _observe(node):
+    """Everything seen at APPROACH, before anyone touches the robot.
 
-    Returns the directory written, or None if disabled/skipped/timed out.
-    The caller stops the attempt if recording fails.
+    Shared by both capture modes: the correction flow then holds for a pendant
+    jog, the outcome flow returns and lets the cycle finish on its own.
+    Returns (before, before_image, before_full, marked_full, target_label), or
+    None if no usable observation was available.
     """
-    planner = getattr(getattr(node, "cfg", None), "planner", None)
-    if not bool(getattr(planner, "demo_capture_enabled", False)):
-        return None
-
     # Vision has just resumed. Do not pair a stale approach image with APPROACH.
     requested_at = time.time()
     deadline = time.monotonic() + 3.0
@@ -149,6 +156,7 @@ def _capture_correction(node) -> Optional[str]:
         return None
 
     before = {
+        "neighbor_diagnostic": copy.deepcopy(getattr(node, "_last_neighbor_diagnostic", None)),
         "depth_trace": copy.deepcopy(getattr(node, "_demo_depth_trace", None)),
         "planned_final_pose": copy.deepcopy(getattr(node, "_demo_planned_final_pose", None)),
         "target_label": target_label,
@@ -165,6 +173,123 @@ def _capture_correction(node) -> Optional[str]:
         "full_frame_annotated": False,
         "fruit_radius": getattr(node, "latest_fruit_radius", None),
     }
+
+    return before, before_image, before_full, marked_full, target_label
+
+
+def capture_observation(node) -> Optional[str]:
+    """Record what APPROACH saw, then get out of the way.
+
+    No hold, no pendant jog, no target click: the cycle runs to the grasp on its
+    own and attach_outcome() appends what the gripper reported. The operator
+    grades it afterwards with demo_label.py.
+
+    This exists because the correction flow costs ~40s of pendant work per
+    attempt, which caps a session at a dozen samples. Grading is seconds, so the
+    same session yields a hundred. The trade is that a record no longer carries
+    a demonstrated endpoint -- it supports predicting whether THIS approach is
+    going to work, not regressing how far to move. Keep demo_capture_jog_enabled
+    for the sessions where the endpoint is what you need.
+
+    Returns the directory written, or None if nothing usable was observed.
+    """
+    planner = getattr(getattr(node, "cfg", None), "planner", None)
+    if not bool(getattr(planner, "demo_capture_enabled", False)):
+        return None
+    observed = _observe(node)
+    if observed is None:
+        return None
+    before, before_image, before_full, marked_full, target_label = observed
+
+    out = _make_dir(node, planner)
+    if out is None:
+        return None
+    sample = {
+        "schema_version": 3,
+        "observation_stage": "APPROACH",
+        "capture_mode": "outcome",
+        "level_insertion_enabled": bool(getattr(
+            planner, "low_center_level_insertion_enabled", False)),
+        "level_final_z_m": getattr(node, "_level_final_z", None),
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "before": before,
+        # Filled in by attach_outcome once the gripper has closed.
+        "auto_outcome": None,
+        "operator_label": None,
+        "range_m": (round(math.dist([0, 0, 0], before["goal_pose"][:3]), 4)
+                    if before.get("goal_pose") else None),
+    }
+    if not _write_sample(node, out, sample):
+        return None
+    if not (_write_crop(before_image, out, "crop_before.jpg")
+            and _write_crop(before_full, out, "full_before.jpg")
+            and _write_crop(marked_full, out, "full_before_marked.jpg")):
+        node.get_logger().warn("[DEMO] cannot save APPROACH images; discarding")
+        os.remove(os.path.join(out, "sample.json"))
+        return None
+    node.get_logger().info(f"[DEMO] observed APPROACH at {sample['range_m']}m -> {out}")
+    return out
+
+
+def attach_outcome(node, outcome: str, end: str) -> None:
+    """Append the gripper's verdict to the record this cycle opened.
+
+    Called from the one place the outcome is known (gripper.py). Silent when
+    outcome capture is not running, which is the normal harvest case.
+    """
+    out = getattr(node, "_demo_pending_record", None)
+    node._demo_pending_record = None
+    if not out:
+        return
+    path = os.path.join(out, "sample.json")
+    try:
+        with open(path) as handle:
+            sample = json.load(handle)
+        sample["auto_outcome"] = {"outcome": outcome, "end": end}
+        with open(path, "w") as handle:
+            json.dump(sample, handle, indent=1, default=str)
+    except Exception as exc:
+        node.get_logger().warn(f"[DEMO] cannot attach outcome to {out}: {exc}")
+        return
+    node.get_logger().info(f"[DEMO] {outcome}/{end} recorded; grade it with demo_label")
+
+
+def _make_dir(node, planner) -> Optional[str]:
+    root = os.path.expanduser(str(getattr(
+        planner, "demo_capture_dir", "~/harvest_logs/demos")))
+    out = os.path.join(root, datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3])
+    try:
+        os.makedirs(out, exist_ok=True)
+        return out
+    except Exception as exc:
+        node.get_logger().warn(f"[DEMO] cannot create {out}: {exc}")
+        return None
+
+
+def _write_sample(node, out, sample) -> bool:
+    try:
+        with open(os.path.join(out, "sample.json"), "w") as handle:
+            json.dump(sample, handle, indent=1, default=str)
+        return True
+    except Exception as exc:
+        node.get_logger().warn(f"[DEMO] cannot write sample.json: {exc}")
+        return False
+
+
+def _capture_correction(node) -> Optional[str]:
+    """Hold at APPROACH, wait for the operator's corrected pose, write one sample.
+
+    Returns the directory written, or None if disabled/skipped/timed out.
+    The caller stops the attempt if recording fails.
+    """
+    planner = getattr(getattr(node, "cfg", None), "planner", None)
+    if not bool(getattr(planner, "demo_capture_enabled", False)):
+        return None
+    observed = _observe(node)
+    if observed is None:
+        return None
+    before, before_image, before_full, marked_full, target_label = observed
+    before_pose = before["pose"]
 
     timeout = float(getattr(planner, "demo_capture_timeout_s", 0.0))
     hz = max(1.0, float(getattr(planner, "demo_capture_sample_hz", 10.0)))
@@ -227,14 +352,8 @@ def _capture_correction(node) -> Optional[str]:
     delta_tool = (_quat_rotate_inverse(before_pose[3:7], delta_base)
                   if len(before_pose) >= 7 else None)
 
-    root = os.path.expanduser(str(getattr(
-        planner, "demo_capture_dir", "~/harvest_logs/demos")))
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    out = os.path.join(root, stamp)
-    try:
-        os.makedirs(out, exist_ok=True)
-    except Exception as exc:
-        node.get_logger().warn(f"[DEMO] cannot create {out}: {exc}")
+    out = _make_dir(node, planner)
+    if out is None:
         return None
 
     sequence_quality = node._demo_sequence.save(out)
@@ -273,11 +392,7 @@ def _capture_correction(node) -> Optional[str]:
         "jog_path": path,
         "jog_samples": len(path),
     }
-    try:
-        with open(os.path.join(out, "sample.json"), "w") as handle:
-            json.dump(sample, handle, indent=1, default=str)
-    except Exception as exc:
-        node.get_logger().warn(f"[DEMO] cannot write sample.json: {exc}")
+    if not _write_sample(node, out, sample):
         return None
     if not (_write_crop(before_image, out, "crop_before.jpg")
             and _write_crop(before_full, out, "full_before.jpg")
@@ -290,12 +405,18 @@ def _capture_correction(node) -> Optional[str]:
     if after_frame is not None and time.time() - after_frame[1] < 1.0:
         _write_crop(after_frame[0], out, 'full_after.jpg')
 
+    # "correction" is measured from the APPROACH pose, so it is dominated by the
+    # standoff leg (~80mm) and says nothing about aim. The residual against the
+    # planned final pose is the aim error; print both or the log misleads.
     node.get_logger().warn(
-        f"[DEMO] correction {sample['correction_mm']:.1f}mm "
+        f"[DEMO] travel {sample['correction_mm']:.1f}mm "
         f"base=[{delta_base[0]*1000:+.1f},{delta_base[1]*1000:+.1f},"
         f"{delta_base[2]*1000:+.1f}]mm"
         + (f" tool=[{delta_tool[0]*1000:+.1f},{delta_tool[1]*1000:+.1f},"
            f"{delta_tool[2]*1000:+.1f}]mm" if delta_tool else "")
+        + (f" | residual vs planned {math.dist([0, 0, 0], residual)*1000:.1f}mm"
+           f"=[{residual[0]*1000:+.1f},{residual[1]*1000:+.1f},"
+           f"{residual[2]*1000:+.1f}]mm" if residual else " | residual NA")
         + f" at {sample['range_m']}m -> {out}")
     node._demo_jog_joint_path = [list(before['joints'])]
     node._demo_jog_joint_path.extend(list(item['joints']) for item in path if len(item['joints']) == 6)

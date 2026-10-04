@@ -51,6 +51,7 @@ setup(
             "teleop = ur10e_curobo.teleop:main",  # Joystick teleop control
             "calibrate = ur10e_curobo.grasp_calibrate:main",  # Grasp force calibration
             "hand_eye = ur10e_curobo.vision.hand_eye_calibration:main",  # Hand-eye calibration
+            "demo_label = ur10e_curobo.demo_label:main",  # Grade recorded approaches
             # Isaac Sim digital twin, cherry-picked from the isaac-sim branch.
             # These modules import no cuRobo, so they are unaffected by the v2
             # migration -- unlike the planning files on that branch, which are

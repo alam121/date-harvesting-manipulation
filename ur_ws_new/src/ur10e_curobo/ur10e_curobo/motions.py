@@ -7,6 +7,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .config import (PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_GRAPH,
                      PLAN_CFG_JS_RETRY)
+from .planner_v2 import plan_diagnostics
 from .utils import build_trajectory, wait_until_xyz, log_retime
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 

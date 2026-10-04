@@ -98,6 +98,7 @@ from .config import (
     LOW_Z_THRESH, LATERAL_THRESH, PLAN_CFG_DEFAULT, PLAN_CFG_SCAN_PREFLIGHT,
     X_FORWARD_Y_LATERAL,
 )
+from .planner_v2 import plan_diagnostics
 from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head, log_retime
 from . import demo_capture
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
@@ -406,7 +407,7 @@ def bounded_target_approach_direction(nominal_dir, vision_outward_dir,
 
 
 def select_mid_high_corridor_direction(node, fruit_outward_dir,
-                                       class_label="MID_HIGH"):
+                                       class_label="MID_HIGH", goal_xyz=None):
     """Choose a fixed horizontal corridor from selected-date direction only."""
     planner = node.cfg.planner
     nominal = np.array(
@@ -469,7 +470,7 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
         # curved 18.6cm one, final TCP 24mm above the date) and missed. Without
         # these numbers in the log there is no way to tell a good axis from a
         # flipped one after the fact.
-        node.get_logger().info(
+        node.get_logger().debug(
             f"[APPROACH_AXIS_SOURCE] class={class_label} "
             f"axis={axis_angle_deg:+.1f}deg applied={bounded_axis_deg:+.1f}deg "
             f"confidence={axis_confidence:.2f} stable={axis_stable} "
@@ -499,11 +500,12 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
             "label": label, "direction": direction,
             "score": score, "error_deg": error_deg})
         if bool(getattr(planner, "log_corridor_candidates", False)):
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[APPROACH_CANDIDATE] class={class_label} side={label} "
                 f"dir=[{direction[0]:+.3f},{direction[1]:+.3f},+0.000] "
                 f"direction_match={score:.3f} "
                 f"angular_error={error_deg:.1f}deg")
+    node._neighbor_candidate_labels = [item['label'] for item in sorted(evaluated, key=lambda item: -item['score'])]
     available = [item for item in evaluated if item["label"] not in excluded]
     forced_label = getattr(node, "_corridor_forced_label", None)
     if forced_label is not None:
@@ -530,6 +532,9 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
     best = (available[0] if bool(getattr(
         node, "_corridor_tip_fallback_active", False)) or forced_label is not None
         else max(available, key=lambda item: item["score"]))
+    neighbor_order = getattr(node, '_neighbor_rank_order', [])
+    if neighbor_order and forced_label is None:
+        best = min(available, key=lambda item: neighbor_order.index(item['label']) if item['label'] in neighbor_order else 999)
     # Polarity is ambiguous only when the MIRRORED corridor is genuinely
     # competitive, not merely because the axis is valid. A fitted ellipse gives
     # an undirected major axis, so LEFT/RIGHT can both be geometrically valid --
@@ -565,14 +570,14 @@ def select_mid_high_corridor_direction(node, fruit_outward_dir,
             f"({float(_mirror_item['error_deg']) - float(best['error_deg']):.1f}deg "
             f"apart, margin>={_polarity_margin_deg:.0f}deg); "
             "skipping mirror preflight")
-    node._corridor_axis_polarity_ambiguous = _polarity_ambiguous
-    node.get_logger().info(
+    node._corridor_axis_polarity_ambiguous = _polarity_ambiguous and not bool(neighbor_order)
+    node.get_logger().debug(
         f"[APPROACH_SIDE_SELECTED] class={class_label} side={best['label']} "
         f"source={direction_source} "
         f"inward=[{inward[0]:+.3f},{inward[1]:+.3f},+0.000] "
         f"direction_match={best['score']:.3f} "
         f"angular_error={best['error_deg']:.1f}deg "
-        "orientation=FIXED insertion=LEVEL neighbours=IGNORED")
+        f"orientation=FIXED neighbours={'RANKED' if neighbor_order else 'PENDING_OR_UNAVAILABLE'}")
     return best["direction"], best["label"]
 
 
@@ -3801,7 +3806,7 @@ def blend_approach_direction(node, x, y, z, vis_ratio=1.0, z_std=0.01):
             _why = ("no tip" if _tip is None
                     else (f"tip {_gap*1000:.0f}mm from goal (limit {_max_gap*1000:.0f}mm)"
                           if _gap > _max_gap else f"tip {_tip_age:.1f}s old"))
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[CORRIDOR_AXIS] vision axis not associated with this goal "
                 f"({_why}); using goal-local camera-ray direction instead")
             fruit_dir = None
@@ -4094,6 +4099,8 @@ def plan_and_execute(node):
             node._active_tool_axis_reason = "+".join(
                 _tip_reasons) if _tip_reasons else "DISABLED"
         if not _same_corridor_goal:
+            node._neighbor_geometry = None
+            node._neighbor_rank_order = []
             node._corridor_exclusions = set()
             node._corridor_roll_disabled = set()
             node._corridor_retry_goal = list(goal[:3])
@@ -4268,13 +4275,13 @@ def plan_and_execute(node):
             _midhi_final_grasp = np.array(
                 [_midhi_final_x, _midhi_final_y, z + _midhi_final_z])
             _midhi_insert_dir, _midhi_side = select_mid_high_corridor_direction(
-                node, d_blend)
+                node, d_blend, goal_xyz=[x, y, z])
             _active_corridor = _midhi_side
             # Level insertion: APPROACH follows the clearest explicit corridor.
             _midhi_approach = (
                 _midhi_final_grasp - _midhi_standoff * _midhi_insert_dir)
             ax, ay, az = _midhi_approach.tolist()
-            node.get_logger().info(
+            node.get_logger().debug(
                 f"[APPROACH_ORIGIN] class=MID_HIGH from={_midhi_side} "
                 f"origin=[{ax:.3f},{ay:.3f},{az:.3f}] "
                 f"final_grasp=[{_midhi_final_grasp[0]:.3f},"
@@ -4801,7 +4808,7 @@ def plan_and_execute(node):
                 _low_class = "VERY_LOW" if is_very_low_center else "LOW"
                 _low_horizontal_dir, _low_corridor = (
                     select_mid_high_corridor_direction(
-                        node, d_blend, class_label=_low_class))
+                        node, d_blend, class_label=_low_class, goal_xyz=[x, y, z]))
                 _active_corridor = _low_corridor
                 # Preserve LOW's calibrated upward pitch while using the
                 # selected date to choose only the horizontal corridor.
@@ -4810,7 +4817,7 @@ def plan_and_execute(node):
                     _horizontal * _low_horizontal_dir[1],
                     math.sin(_insert_pitch),
                 ], dtype=float)
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_ANGLE] class={_low_class} mode=CORRIDOR "
                     f"side={_low_corridor} pitch={math.degrees(_insert_pitch):.1f}deg "
                     f"nominal=[{_center_nominal_dir[0]:+.3f},"
@@ -4830,7 +4837,7 @@ def plan_and_execute(node):
                     z + _center_final_z - _depth_offset * _center_insert_dir[2],
                     *orientation,
                 ]
-                node.get_logger().info(
+                node.get_logger().debug(
                     f"[APPROACH_ORIGIN] class={_low_class} from={_low_corridor} "
                     f"origin=[{approach[0]:.3f},{approach[1]:.3f},"
                     f"{approach[2]:.3f}] "
@@ -5014,6 +5021,23 @@ def plan_and_execute(node):
             _pf_tcp, _ = closure_center_corrected_tcp(
                 _pf_grasp, orientation, _pf_closure_offset)
             _pf_final = [*_pf_tcp, *orientation]
+            # Predict the level FINAL using the candidate APPROACH height.
+            # Execution later substitutes the measured settled height.
+            if is_low and bool(getattr(node.cfg.planner, 'low_center_level_insertion_enabled', False)):
+                _pf_final = level_target(_pf_final, approach[2])
+            from .neighbor_diagnostics import collect_candidate
+            try:
+                _neighbor_reload = collect_candidate(node, _active_corridor, approach, _pf_final, [x,y,z])
+            except (ValueError, KeyError, TypeError) as exc:
+                node.get_logger().warn(f'[NEIGHBOR_RANK] invalid observations: {exc}; retaining axis ranking')
+                node._neighbor_geometry = {'disabled': True}
+                node._neighbor_rank_order = []
+                node._corridor_forced_label = None
+                _neighbor_reload = False
+            if _neighbor_reload:
+                node.goal_poses.insert(0, goal)
+                node._corridor_retry_keep_lock = True
+                continue
             _pf_start = _valid_joint_positions()
             _pf_ik_t0 = time.time()
             # The preflight result is a pure function of (start joints, approach
@@ -6186,12 +6210,17 @@ def plan_and_execute(node):
                 f"grasp=[{gx:.3f},{gy:.3f},{gz:.3f}] "
                 f"tcp=[{tcp_xyz[0]:.3f},{tcp_xyz[1]:.3f},{tcp_xyz[2]:.3f}] "
                 f"forward_delta={_forward_delta_mm:+.0f}mm")
-        if bool(getattr(node.cfg.planner, "demo_capture_enabled", False)):
+        _demo_on = bool(getattr(node.cfg.planner, "demo_capture_enabled", False))
+        if _demo_on:
+            node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
+            node._demo_planned_final_pose = list(final_target)
+        # Outcome mode observes APPROACH and then runs the cycle untouched, so it
+        # takes the ordinary FINAL path below; only the jog flow replaces it.
+        if _demo_on and bool(getattr(
+                node.cfg.planner, "demo_capture_jog_enabled", False)):
             # Observe before insertion. The operator performs the entire remaining
             # APPROACH-to-grasp movement; never execute the nominal FINAL afterward.
             node.motion_phase = "DEMO_APPROACH"
-            node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
-            node._demo_planned_final_pose = list(final_target)
             _vision_resume()
             _demo_t = time.time()
             try:
@@ -6214,6 +6243,14 @@ def plan_and_execute(node):
             if not _vision_pause():
                 break
         else:
+            if _demo_on:
+                # Vision is needed for a fresh APPROACH crop; the FINAL leg below
+                # wants it running anyway, so there is nothing to pause back.
+                _vision_resume()
+                node._demo_pending_record = demo_capture.capture_observation(node)
+                if not node._demo_pending_record:
+                    node.get_logger().warn(
+                        "[DEMO] nothing observed at APPROACH; continuing unrecorded")
             node.motion_phase = "FINAL"
             # Vision was historically kept "paused" through the FINAL move, on the
             # grounds that cuRobo needs the GPU. It does not: by this point planning
