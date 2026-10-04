@@ -784,6 +784,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     "How much longer the real fingertips are than the URDF says.\n"
     "Positive stops the commanded tip short so the physical tip reaches the goal.\n"
     "Applies to the NEXT grasp. cuRobo's collision model is unchanged.");
+  connect(gripper_tip_extra_in_,
+    QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+    [this](double) {gripper_tip_extra_dirty_ = true;});
   auto * tip_apply = new QPushButton("Apply Tip Extension");
   auto * tip_reset = new QPushButton("Reset to 0");
   tip_layout->addWidget(new QLabel("Extra length"), 0, 0);
@@ -795,6 +798,7 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     cmd << "gripper_tip_extra " << std::fixed << std::setprecision(1)
         << gripper_tip_extra_in_->value();
     publishCmd(cmd.str());
+    gripper_tip_extra_dirty_ = false;
     status_label_->setText(
       QString("Gripper tip extension requested: %1 mm (next grasp)")
         .arg(gripper_tip_extra_in_->value(), 0, 'f', 1));
@@ -3199,7 +3203,8 @@ void UR10ePanel::updateDisplay()
   // Mirror the live tip extension, but never while the box has focus: the
   // operator is typing into it and overwriting mid-edit is how a panel loses
   // trust. QSignalBlocker so this does not look like a user edit.
-  if (gripper_tip_extra_in_ && !gripper_tip_extra_in_->hasFocus() &&
+  if (gripper_tip_extra_in_ && !gripper_tip_extra_dirty_ &&
+    !gripper_tip_extra_in_->hasFocus() &&
     std::abs(gripper_tip_extra_in_->value() - gripper_tip_extra_mm_) > 0.05)
   {
     QSignalBlocker blocker(gripper_tip_extra_in_);

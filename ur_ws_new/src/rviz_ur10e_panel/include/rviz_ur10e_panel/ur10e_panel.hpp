@@ -310,6 +310,11 @@ private:
   QDoubleSpinBox * gripper_tip_extra_in_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr gripper_tip_extra_sub_;
   double gripper_tip_extra_mm_{0.0};
+  // Set the moment the operator edits the box, cleared on Apply/Reset.
+  // hasFocus() alone is not enough: clicking Apply moves focus off the
+  // box, and the 100ms readback then overwrites the typed value before
+  // the click handler reads it.
+  bool gripper_tip_extra_dirty_{false};
   QDoubleSpinBox * closure_x_in_, * closure_y_in_, * closure_z_in_;
   QDoubleSpinBox * envelop_closure_x_in_, * envelop_closure_y_in_, * envelop_closure_z_in_;
   QCheckBox * debug_preview_cb_;
