@@ -48,9 +48,25 @@ except ImportError:
     )
 
 # ── URDFs to update when calibration is confirmed ─────────────────────────────
+# The xacro carries one value per robot/environment and is selected at launch,
+# so it is always safe to write.
 URDF_FILES = [
     Path(__file__).resolve().parents[4] / "src/universal_robot/urdf/ur_macro.xacro",
 ]
+
+# cuRobo reads its own URDF, which holds a SINGLE tool0->camera origin with no
+# robot/environment branch. motion_executor rewrites it per camera profile at
+# startup, but only when the profile carries both translation and rpy; a
+# seed-only profile falls through to whatever is baked in. Leaving it unwritten
+# is how it came to hold the new robot's mount, 257mm from the old robot's,
+# while every other file was current (fixed in feeb1eee8).
+#
+# Written only for the old robot. It is the only one in use, and because the
+# file cannot express both, writing a new-robot solve here would silently
+# recreate exactly that bug for the robot that is actually flying.
+CUROBO_URDF = (Path(__file__).resolve().parents[1]
+               / "robot_assets/ur_description/ur10e_curobo.urdf")
+CUROBO_URDF_ROBOT_PROFILE = "old"
 
 # ── ChArUco board parameters ──────────────────────────────────────────
 # Hand-eye ChArUco board: 9 x 14 physical squares. ChArUco internal corners
@@ -1211,7 +1227,14 @@ def _update_urdfs(
         re.DOTALL,
     )
 
-    for urdf_path in URDF_FILES:
+    targets = list(URDF_FILES)
+    if robot_profile == CUROBO_URDF_ROBOT_PROFILE:
+        targets.append(CUROBO_URDF)
+    else:
+        print(f"  SKIP (cuRobo URDF is {CUROBO_URDF_ROBOT_PROFILE}-robot only; "
+              f"this solve is '{robot_profile}'): {CUROBO_URDF.name}")
+
+    for urdf_path in targets:
         if not urdf_path.exists():
             print(f"  SKIP (not found): {urdf_path}")
             continue
