@@ -29,6 +29,8 @@
 #
 # Author: Denis Stogl
 
+import os
+
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -60,9 +62,12 @@ def launch_setup(context, *args, **kwargs):
     controllers_file = LaunchConfiguration("controllers_file")
     description_package = LaunchConfiguration("description_package")
     description_file = LaunchConfiguration("description_file")
+    robot_profile = LaunchConfiguration("robot_profile")
+    environment = LaunchConfiguration("environment")
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     tf_prefix = LaunchConfiguration("tf_prefix")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    launch_gripper = LaunchConfiguration("launch_gripper")
     fake_sensor_commands = LaunchConfiguration("fake_sensor_commands")
     controller_spawner_timeout = LaunchConfiguration("controller_spawner_timeout")
     initial_joint_controller = LaunchConfiguration("initial_joint_controller")
@@ -109,6 +114,12 @@ def launch_setup(context, *args, **kwargs):
             PathJoinSubstitution([FindExecutable(name="xacro")]),
             " ",
             PathJoinSubstitution([FindPackageShare(description_package), "urdf", description_file]),
+            " ",
+            "robot_profile:=",
+            robot_profile,
+            " ",
+            "environment:=",
+            environment,
             " ",
             "robot_ip:=",
             robot_ip,
@@ -238,6 +249,7 @@ def launch_setup(context, *args, **kwargs):
     ur_control_node = Node(
         package="ur_robot_driver",
         executable="ur_ros2_control_node",
+        prefix="chrt -f 80",
         parameters=[
             robot_description,
             update_rate_config_file,
@@ -289,6 +301,7 @@ def launch_setup(context, *args, **kwargs):
     urscript_interface = Node(
         package="ur_robot_driver",
         executable="urscript_interface",
+        condition=UnlessCondition(use_fake_hardware),
         parameters=[{"robot_ip": robot_ip}],
         output="screen",
     )
@@ -346,19 +359,19 @@ def launch_setup(context, *args, **kwargs):
     )
     
     delto_launch = IncludeLaunchDescription(
-    PythonLaunchDescriptionSource(
-        PathJoinSubstitution([
-            FindPackageShare("delto_3f_driver"),
-            "launch",
-            "delto_3f_bringup.launch.py"
-        ])
-    ),
-    launch_arguments={
-        "delto_ip": "169.254.186.72",
-        "delto_port": "502",
-        "launch_rviz": "false"    # ✅ disable RViz for gripper
-    }.items(),
-)
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("delto_3f_driver"),
+                "launch",
+                "delto_3f_bringup.launch.py"
+            ])
+        ),
+        launch_arguments={
+            "delto_ip": "169.254.186.72",
+            "delto_port": "502",
+            "launch_rviz": "false"
+        }.items(),
+    )
 
 
 
@@ -420,8 +433,13 @@ def launch_setup(context, *args, **kwargs):
         robot_state_publisher_node,
         rviz_node,
         trajectory_until_node,
-        delto_launch,
     ] + controller_spawners
+
+    if (
+        use_fake_hardware.perform(context) != "true" and
+        launch_gripper.perform(context) == "true"
+    ):
+        nodes_to_start.append(delto_launch)
 
     return nodes_to_start
 
@@ -510,6 +528,22 @@ def generate_launch_description():
     )
     declared_arguments.append(
         DeclareLaunchArgument(
+            "robot_profile",
+            default_value="old",
+            choices=["old"],
+            description="Old robot camera and mount transforms.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "environment",
+            default_value=os.getenv("UR10E_ENVIRONMENT", "outdoor"),
+            choices=["lab", "outdoor"],
+            description="Selects environment-specific hand-eye calibration.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
             "kinematics_params_file",
             default_value=PathJoinSubstitution(
                 [
@@ -536,6 +570,13 @@ def generate_launch_description():
             "use_fake_hardware",
             default_value="false",
             description="Start robot with fake hardware mirroring command to its states.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "launch_gripper",
+            default_value="true",
+            description="Launch the Delto gripper driver when not using fake hardware.",
         )
     )
     declared_arguments.append(

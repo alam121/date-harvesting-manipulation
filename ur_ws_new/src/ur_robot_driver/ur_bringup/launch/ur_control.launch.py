@@ -29,6 +29,8 @@
 #
 # Author: Denis Stogl
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -73,9 +75,39 @@ def generate_launch_description():
             "robot_ip", description="IP address by which the robot can be reached."
         )
     )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "use_fake_hardware",
+            default_value="false",
+            description="Start robot with fake hardware mirroring command to its states.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument("launch_rviz", default_value="true", description="Launch RViz?")
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "robot_profile",
+            default_value="old",
+            choices=["old"],
+            description="Old robot mount transforms.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "environment",
+            default_value=os.getenv("UR10E_ENVIRONMENT", "outdoor"),
+            choices=["lab", "outdoor"],
+            description="Select environment-specific hand-eye calibration.",
+        )
+    )
 
     ur_type = LaunchConfiguration("ur_type")
     robot_ip = LaunchConfiguration("robot_ip")
+    use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    launch_rviz = LaunchConfiguration("launch_rviz")
+    robot_profile = LaunchConfiguration("robot_profile")
+    environment = LaunchConfiguration("environment")
 
     return LaunchDescription(
         declared_arguments
@@ -91,6 +123,10 @@ def generate_launch_description():
                 launch_arguments={
                     "ur_type": ur_type,
                     "robot_ip": robot_ip,
+                    "use_fake_hardware": use_fake_hardware,
+                    "launch_rviz": launch_rviz,
+                    "robot_profile": robot_profile,
+                    "environment": environment,
                 }.items(),
             )
         ]

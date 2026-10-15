@@ -1,11 +1,17 @@
 # ur10e_curobo/managers/config_manager.py
 """Configuration management for UR10e cuRobo node."""
 
+import math
 from typing import List, TYPE_CHECKING
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from ..config import AppConfig, DEFAULT_QOS, JOINT_ORDER
+from ..config import (
+    AppConfig, DEFAULT_QOS, JOINT_ORDER, ROBOT_PROFILE, ENVIRONMENT,
+    ROBOT_PROFILES,
+)
 
 if TYPE_CHECKING:
     pass
@@ -35,6 +41,10 @@ class ConfigManager:
         # Shortcut attributes (exposed for backward compatibility)
         self.speed_scale: float = 0.5
         self.home_joints: List[float] = []
+        self.home_left_joints: List[float] = []
+        self.home_left_low_joints: List[float] = []
+        self.home_right_low_joints: List[float] = []
+        self.home_right_joints: List[float] = []
         self.dropoff_joints: List[float] = []
         self.predropoff_joints: List[float] = []
         self.yoffset: float = 0.0
@@ -53,7 +63,10 @@ class ConfigManager:
         self._load_parameters()
         self._apply_env_overrides()
         self._expose_shortcuts()
-        self._node.get_logger().info("ConfigManager initialized")
+        self._node.add_on_set_parameters_callback(self._on_parameter_change)
+        self._node.get_logger().info(
+            f"ConfigManager initialized with robot profile {ROBOT_PROFILE!r} "
+            f"/ environment {ENVIRONMENT!r}")
 
     def _declare_parameters(self) -> None:
         """Declare all ROS parameters with defaults from AppConfig."""
@@ -62,7 +75,129 @@ class ConfigManager:
         self._node.declare_parameter("planner.urdf_config", self.cfg.planner.urdf_config)
         self._node.declare_parameter("planner.interpolation_dt", self.cfg.planner.interpolation_dt)
         self._node.declare_parameter("planner.pre_dropoff_z_offset", self.cfg.planner.pre_dropoff_z_offset)
+        self._node.declare_parameter("planner.pre_dropoff_depth_offset", self.cfg.planner.pre_dropoff_depth_offset)
         self._node.declare_parameter("planner.pre_dropoff_y_offset", self.cfg.planner.pre_dropoff_y_offset)
+
+        # Planner speed & smoothness params
+        self._node.declare_parameter("planner.base_dt", self.cfg.planner.base_dt)
+        self._node.declare_parameter("planner.global_speed_multiplier", self.cfg.planner.global_speed_multiplier)
+        self._node.declare_parameter("planner.speed_home", self.cfg.planner.speed_home)
+        self._node.declare_parameter("planner.speed_dropoff", self.cfg.planner.speed_dropoff)
+        self._node.declare_parameter("planner.speed_predropoff", self.cfg.planner.speed_predropoff)
+        self._node.declare_parameter("planner.speed_approach", self.cfg.planner.speed_approach)
+        self._node.declare_parameter("planner.speed_final", self.cfg.planner.speed_final)
+        self._node.declare_parameter("planner.max_joint_velocity", self.cfg.planner.max_joint_velocity)
+        self._node.declare_parameter("planner.max_joint_acceleration", self.cfg.planner.max_joint_acceleration)
+        self._node.declare_parameter("planner.dropoff_speed_fraction", self.cfg.planner.dropoff_speed_fraction)
+        self._node.declare_parameter("planner.approach_speed_fraction", self.cfg.planner.approach_speed_fraction)
+        self._node.declare_parameter("planner.home_speed_fraction", self.cfg.planner.home_speed_fraction)
+        self._node.declare_parameter("planner.ramp_points", self.cfg.planner.ramp_points)
+        self._node.declare_parameter("planner.gripper_tip_extra_m", self.cfg.planner.gripper_tip_extra_m)
+        self._node.declare_parameter("planner.retime_trajectories", self.cfg.planner.retime_trajectories)
+        self._node.declare_parameter("planner.min_dt", self.cfg.planner.min_dt)
+        self._node.declare_parameter("planner.max_dt", self.cfg.planner.max_dt)
+        # In-flight FINAL correction. Declared so apply can be toggled on the
+        # running robot: the last ~7cm was dead-reckoned, and this is the switch
+        # that closes it. Keep in step with param_map in _on_parameter_change --
+        # declaring alone is not enough, a change only reaches cfg via that map.
+        self._node.declare_parameter(
+            "planner.approach_vision_streaming", self.cfg.planner.approach_vision_streaming)
+        self._node.declare_parameter(
+            "planner.final_inflight_observe", self.cfg.planner.final_inflight_observe)
+        self._node.declare_parameter(
+            "planner.final_inflight_apply", self.cfg.planner.final_inflight_apply)
+        self._node.declare_parameter(
+            "planner.final_inflight_min_delta_m", self.cfg.planner.final_inflight_min_delta_m)
+        self._node.declare_parameter(
+            "planner.final_inflight_max_delta_m", self.cfg.planner.final_inflight_max_delta_m)
+        self._node.declare_parameter(
+            "planner.final_inflight_max_updates", self.cfg.planner.final_inflight_max_updates)
+        self._node.declare_parameter(
+            "planner.final_inflight_min_interval_s", self.cfg.planner.final_inflight_min_interval_s)
+        self._node.declare_parameter("planner.max_traj_velocity", self.cfg.planner.max_traj_velocity)
+        self._node.declare_parameter("planner.direct_branch_retry_min_dist", self.cfg.planner.direct_branch_retry_min_dist)
+        self._node.declare_parameter("planner.direct_branch_retry_seeds", self.cfg.planner.direct_branch_retry_seeds)
+        self._node.declare_parameter("planner.direct_final_cart_waypoints", self.cfg.planner.direct_final_cart_waypoints)
+        self._node.declare_parameter("planner.approach_alignment_enabled", self.cfg.planner.approach_alignment_enabled)
+        self._node.declare_parameter("planner.approach_alignment_extra_m", self.cfg.planner.approach_alignment_extra_m)
+        self._node.declare_parameter("planner.direct_approach_cart_waypoints", self.cfg.planner.direct_approach_cart_waypoints)
+        self._node.declare_parameter("planner.direct_final_joint_fallback_max_delta_deg", self.cfg.planner.direct_final_joint_fallback_max_delta_deg)
+        self._node.declare_parameter("planner.strict_final_cartesian_only", self.cfg.planner.strict_final_cartesian_only)
+        self._node.declare_parameter("planner.low_left_standoff_lateral", self.cfg.planner.low_left_standoff_lateral)
+        self._node.declare_parameter("planner.low_left_standoff_depth", self.cfg.planner.low_left_standoff_depth)
+        self._node.declare_parameter("planner.low_left_standoff_x", self.cfg.planner.low_left_standoff_x)
+        self._node.declare_parameter("planner.low_left_standoff_y", self.cfg.planner.low_left_standoff_y)
+        self._node.declare_parameter("planner.low_left_standoff_z", self.cfg.planner.low_left_standoff_z)
+        self._node.declare_parameter("planner.low_right_standoff_lateral", self.cfg.planner.low_right_standoff_lateral)
+        self._node.declare_parameter("planner.low_right_standoff_depth", self.cfg.planner.low_right_standoff_depth)
+        self._node.declare_parameter("planner.low_right_standoff_x", self.cfg.planner.low_right_standoff_x)
+        self._node.declare_parameter("planner.low_right_standoff_y", self.cfg.planner.low_right_standoff_y)
+        self._node.declare_parameter("planner.low_right_standoff_z", self.cfg.planner.low_right_standoff_z)
+        self._node.declare_parameter("planner.low_side_final_depth_offset", self.cfg.planner.low_side_final_depth_offset)
+        self._node.declare_parameter("planner.low_side_final_y_offset", self.cfg.planner.low_side_final_y_offset)
+        self._node.declare_parameter("planner.low_left_final_z_offset", self.cfg.planner.low_left_final_z_offset)
+        self._node.declare_parameter("planner.low_right_final_z_offset", self.cfg.planner.low_right_final_z_offset)
+        self._node.declare_parameter("planner.low_center_final_depth_offset", self.cfg.planner.low_center_final_depth_offset)
+        # Isaac runs slower than real time; its launch file lengthens this window to match.
+        self._node.declare_parameter("planner.reacquire_timeout_s", self.cfg.planner.reacquire_timeout_s)
+        self._node.declare_parameter("planner.low_center_final_z_offset", self.cfg.planner.low_center_final_z_offset)
+        self._node.declare_parameter("planner.mid_center_final_depth_offset", self.cfg.planner.mid_center_final_depth_offset)
+        self._node.declare_parameter("planner.mid_center_final_z_offset", self.cfg.planner.mid_center_final_z_offset)
+        self._node.declare_parameter("planner.closure_center_offset_tcp_m", self.cfg.planner.closure_center_offset_tcp_m)
+        self._node.declare_parameter("planner.envelop_closure_center_offset_tcp_m", self.cfg.planner.envelop_closure_center_offset_tcp_m)
+        self._node.declare_parameter("planner.grasp_visual_to_force_map", self.cfg.planner.grasp_visual_to_force_map)
+        self._node.declare_parameter("planner.phase4_safe_final_yaw_enabled", self.cfg.planner.phase4_safe_final_yaw_enabled)
+        self._node.declare_parameter("planner.phase4_safe_final_yaw_max_deg", self.cfg.planner.phase4_safe_final_yaw_max_deg)
+        self._node.declare_parameter("planner.phase4_candidate_target_match_m", self.cfg.planner.phase4_candidate_target_match_m)
+        self._node.declare_parameter("planner.final_approach_yaw_enabled", self.cfg.planner.final_approach_yaw_enabled)
+        self._node.declare_parameter("planner.final_approach_yaw_max_deg", self.cfg.planner.final_approach_yaw_max_deg)
+        self._node.declare_parameter("planner.approach_date_axis_enabled", self.cfg.planner.approach_date_axis_enabled)
+        self._node.declare_parameter("planner.approach_date_axis_max_deg", self.cfg.planner.approach_date_axis_max_deg)
+        self._node.declare_parameter("planner.approach_date_axis_min_confidence", self.cfg.planner.approach_date_axis_min_confidence)
+        self._node.declare_parameter("planner.approach_date_axis_stable_frames", self.cfg.planner.approach_date_axis_stable_frames)
+        self._node.declare_parameter("planner.approach_date_axis_max_spread_deg", self.cfg.planner.approach_date_axis_max_spread_deg)
+        self._node.declare_parameter("planner.final_lock_measured_approach_orientation", self.cfg.planner.final_lock_measured_approach_orientation)
+        self._node.declare_parameter("planner.target_specific_approach_enabled", self.cfg.planner.target_specific_approach_enabled)
+        self._node.declare_parameter("planner.target_specific_approach_max_deg", self.cfg.planner.target_specific_approach_max_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_approach_enabled", self.cfg.planner.mid_high_corridor_approach_enabled)
+        self._node.declare_parameter("planner.mid_high_corridor_inner_angle_deg", self.cfg.planner.mid_high_corridor_inner_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_side_angle_deg", self.cfg.planner.mid_high_corridor_side_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_wide_angle_deg", self.cfg.planner.mid_high_corridor_wide_angle_deg)
+        self._node.declare_parameter("planner.mid_high_corridor_outer_angle_deg", self.cfg.planner.mid_high_corridor_outer_angle_deg)
+        self._node.declare_parameter("planner.mid_high_direction_min_horizontal", self.cfg.planner.mid_high_direction_min_horizontal)
+        self._node.declare_parameter("planner.corridor_date_axis_enabled", self.cfg.planner.corridor_date_axis_enabled)
+        self._node.declare_parameter("planner.corridor_date_axis_min_confidence", self.cfg.planner.corridor_date_axis_min_confidence)
+        self._node.declare_parameter("planner.log_corridor_candidates", self.cfg.planner.log_corridor_candidates)
+        self._node.declare_parameter("planner.tool_axis_tip_aim_enabled", self.cfg.planner.tool_axis_tip_aim_enabled)
+        self._node.declare_parameter("planner.tool_axis_tip_max_age_s", self.cfg.planner.tool_axis_tip_max_age_s)
+        self._node.declare_parameter("planner.tool_axis_tip_max_goal_distance_m", self.cfg.planner.tool_axis_tip_max_goal_distance_m)
+        self._node.declare_parameter("planner.tool_axis_tip_max_swing_deg", self.cfg.planner.tool_axis_tip_max_swing_deg)
+        self._node.declare_parameter("planner.phase5_center_logging_enabled", self.cfg.planner.phase5_center_logging_enabled)
+        self._node.declare_parameter("planner.phase5_center_px_per_mm", self.cfg.planner.phase5_center_px_per_mm)
+        self._node.declare_parameter("planner.phase5_center_max_correction_mm", self.cfg.planner.phase5_center_max_correction_mm)
+        self._node.declare_parameter("planner.phase5_center_deadband_px", self.cfg.planner.phase5_center_deadband_px)
+        self._node.declare_parameter("planner.low_side_final_front_tilt_deg", self.cfg.planner.low_side_final_front_tilt_deg)
+        self._node.declare_parameter("planner.bunch_lower_center_band", self.cfg.planner.bunch_lower_center_band)
+        self._node.declare_parameter("planner.final_overshoot_threshold", self.cfg.planner.final_overshoot_threshold)
+        self._node.declare_parameter("planner.final_overshoot_max_backoff", self.cfg.planner.final_overshoot_max_backoff)
+        self._node.declare_parameter("planner.use_fake_hardware", self.cfg.planner.use_fake_hardware)
+        self._node.declare_parameter("planner.debug_plan_preview", self.cfg.planner.debug_plan_preview)
+        self._node.declare_parameter("planner.log_cycle_start", self.cfg.planner.log_cycle_start)
+        self._node.declare_parameter("planner.log_phase_timings", self.cfg.planner.log_phase_timings)
+        self._node.declare_parameter("planner.log_path_publish", self.cfg.planner.log_path_publish)
+        self._node.declare_parameter("planner.log_gripper_force_profile", self.cfg.planner.log_gripper_force_profile)
+        self._node.declare_parameter("planner.subscribe_goal_min_settle_s", self.cfg.planner.subscribe_goal_min_settle_s)
+        self._node.declare_parameter("planner.subscribe_goal_max_wait_s", self.cfg.planner.subscribe_goal_max_wait_s)
+        self._node.declare_parameter("planner.subscribe_goal_stable_tol", self.cfg.planner.subscribe_goal_stable_tol)
+        self._node.declare_parameter("planner.subscribe_goal_median_window", self.cfg.planner.subscribe_goal_median_window)
+
+        # Grasp learning params
+        self._node.declare_parameter("grasp.learning_enabled", self.cfg.grasp.learning_enabled)
+        self._node.declare_parameter("grasp.contact_delta_threshold", self.cfg.grasp.contact_delta_threshold)
+        self._node.declare_parameter("grasp.late_step_margin", self.cfg.grasp.late_step_margin)
+        self._node.declare_parameter("grasp.min_samples_to_learn", self.cfg.grasp.min_samples_to_learn)
+        self._node.declare_parameter("grasp.learning_rate", self.cfg.grasp.learning_rate)
+        self._node.declare_parameter("grasp.default_contact_step_threshold", self.cfg.grasp.default_contact_step_threshold)
 
         # Perception params
         self._node.declare_parameter("perception.enabled", self.cfg.perception.enabled)
@@ -81,6 +216,10 @@ class ConfigManager:
 
         # Joint preset params
         self._node.declare_parameter("joints.home", self.cfg.joints.home)
+        self._node.declare_parameter("joints.home_left", self.cfg.joints.home_left)
+        self._node.declare_parameter("joints.home_left_low", self.cfg.joints.home_left_low)
+        self._node.declare_parameter("joints.home_right", self.cfg.joints.home_right)
+        self._node.declare_parameter("joints.home_right_low", self.cfg.joints.home_right_low)
         self._node.declare_parameter("joints.dropoff", self.cfg.joints.dropoff)
         self._node.declare_parameter("joints.predropoff", self.cfg.joints.predropoff)
 
@@ -91,7 +230,143 @@ class ConfigManager:
         self.cfg.planner.urdf_config = self._node.get_parameter("planner.urdf_config").value
         self.cfg.planner.interpolation_dt = float(self._node.get_parameter("planner.interpolation_dt").value)
         self.cfg.planner.pre_dropoff_z_offset = float(self._node.get_parameter("planner.pre_dropoff_z_offset").value)
+        self.cfg.planner.pre_dropoff_depth_offset = float(self._node.get_parameter("planner.pre_dropoff_depth_offset").value)
         self.cfg.planner.pre_dropoff_y_offset = float(self._node.get_parameter("planner.pre_dropoff_y_offset").value)
+
+        # Planner speed & smoothness
+        self.cfg.planner.base_dt = float(self._node.get_parameter("planner.base_dt").value)
+        self.cfg.planner.global_speed_multiplier = float(self._node.get_parameter("planner.global_speed_multiplier").value)
+        self.cfg.planner.speed_home = float(self._node.get_parameter("planner.speed_home").value)
+        self.cfg.planner.speed_dropoff = float(self._node.get_parameter("planner.speed_dropoff").value)
+        self.cfg.planner.speed_predropoff = float(self._node.get_parameter("planner.speed_predropoff").value)
+        self.cfg.planner.speed_approach = float(self._node.get_parameter("planner.speed_approach").value)
+        self.cfg.planner.speed_final = float(self._node.get_parameter("planner.speed_final").value)
+        self.cfg.planner.max_joint_velocity = float(self._node.get_parameter("planner.max_joint_velocity").value)
+        self.cfg.planner.max_joint_acceleration = float(self._node.get_parameter("planner.max_joint_acceleration").value)
+        self.cfg.planner.dropoff_speed_fraction = float(self._node.get_parameter("planner.dropoff_speed_fraction").value)
+        self.cfg.planner.approach_speed_fraction = float(self._node.get_parameter("planner.approach_speed_fraction").value)
+        self.cfg.planner.home_speed_fraction = float(self._node.get_parameter("planner.home_speed_fraction").value)
+        self.cfg.planner.ramp_points = int(self._node.get_parameter("planner.ramp_points").value)
+        self.cfg.planner.gripper_tip_extra_m = float(self._node.get_parameter("planner.gripper_tip_extra_m").value)
+        self.cfg.planner.retime_trajectories = bool(self._node.get_parameter("planner.retime_trajectories").value)
+        self.cfg.planner.min_dt = float(self._node.get_parameter("planner.min_dt").value)
+        self.cfg.planner.max_dt = float(self._node.get_parameter("planner.max_dt").value)
+        self.cfg.planner.max_traj_velocity = float(self._node.get_parameter("planner.max_traj_velocity").value)
+        self.cfg.planner.direct_branch_retry_min_dist = float(self._node.get_parameter("planner.direct_branch_retry_min_dist").value)
+        self.cfg.planner.direct_branch_retry_seeds = int(self._node.get_parameter("planner.direct_branch_retry_seeds").value)
+        self.cfg.planner.direct_final_cart_waypoints = int(self._node.get_parameter("planner.direct_final_cart_waypoints").value)
+        self.cfg.planner.approach_alignment_enabled = bool(self._node.get_parameter("planner.approach_alignment_enabled").value)
+        self.cfg.planner.approach_alignment_extra_m = float(self._node.get_parameter("planner.approach_alignment_extra_m").value)
+        self.cfg.planner.direct_approach_cart_waypoints = int(self._node.get_parameter("planner.direct_approach_cart_waypoints").value)
+        self.cfg.planner.direct_final_joint_fallback_max_delta_deg = float(self._node.get_parameter("planner.direct_final_joint_fallback_max_delta_deg").value)
+        self.cfg.planner.strict_final_cartesian_only = bool(self._node.get_parameter("planner.strict_final_cartesian_only").value)
+        self.cfg.planner.low_left_standoff_lateral = float(self._node.get_parameter("planner.low_left_standoff_lateral").value)
+        self.cfg.planner.low_left_standoff_depth = float(self._node.get_parameter("planner.low_left_standoff_depth").value)
+        self.cfg.planner.low_left_standoff_x = float(self._node.get_parameter("planner.low_left_standoff_x").value)
+        self.cfg.planner.low_left_standoff_y = float(self._node.get_parameter("planner.low_left_standoff_y").value)
+        self.cfg.planner.low_left_standoff_z = float(self._node.get_parameter("planner.low_left_standoff_z").value)
+        self.cfg.planner.low_right_standoff_lateral = float(self._node.get_parameter("planner.low_right_standoff_lateral").value)
+        self.cfg.planner.low_right_standoff_depth = float(self._node.get_parameter("planner.low_right_standoff_depth").value)
+        self.cfg.planner.low_right_standoff_x = float(self._node.get_parameter("planner.low_right_standoff_x").value)
+        self.cfg.planner.low_right_standoff_y = float(self._node.get_parameter("planner.low_right_standoff_y").value)
+        self.cfg.planner.low_right_standoff_z = float(self._node.get_parameter("planner.low_right_standoff_z").value)
+        self.cfg.planner.low_side_final_depth_offset = float(self._node.get_parameter("planner.low_side_final_depth_offset").value)
+        self.cfg.planner.low_side_final_y_offset = float(self._node.get_parameter("planner.low_side_final_y_offset").value)
+        self.cfg.planner.low_left_final_z_offset = float(self._node.get_parameter("planner.low_left_final_z_offset").value)
+        self.cfg.planner.low_right_final_z_offset = float(self._node.get_parameter("planner.low_right_final_z_offset").value)
+        self.cfg.planner.low_center_final_depth_offset = float(self._node.get_parameter("planner.low_center_final_depth_offset").value)
+        self.cfg.planner.reacquire_timeout_s = float(self._node.get_parameter("planner.reacquire_timeout_s").value)
+        self.cfg.planner.low_center_final_z_offset = float(self._node.get_parameter("planner.low_center_final_z_offset").value)
+        self.cfg.planner.mid_center_final_depth_offset = float(self._node.get_parameter("planner.mid_center_final_depth_offset").value)
+        self.cfg.planner.mid_center_final_z_offset = float(self._node.get_parameter("planner.mid_center_final_z_offset").value)
+        self.cfg.planner.closure_center_offset_tcp_m = list(
+            self._node.get_parameter("planner.closure_center_offset_tcp_m").value)
+        self.cfg.planner.envelop_closure_center_offset_tcp_m = list(
+            self._node.get_parameter("planner.envelop_closure_center_offset_tcp_m").value)
+        self.cfg.planner.grasp_visual_to_force_map = list(
+            self._node.get_parameter("planner.grasp_visual_to_force_map").value)
+        self.cfg.planner.phase4_safe_final_yaw_enabled = bool(
+            self._node.get_parameter("planner.phase4_safe_final_yaw_enabled").value)
+        self.cfg.planner.phase4_safe_final_yaw_max_deg = float(
+            self._node.get_parameter("planner.phase4_safe_final_yaw_max_deg").value)
+        self.cfg.planner.phase4_candidate_target_match_m = float(
+            self._node.get_parameter("planner.phase4_candidate_target_match_m").value)
+        self.cfg.planner.final_approach_yaw_enabled = bool(
+            self._node.get_parameter("planner.final_approach_yaw_enabled").value)
+        self.cfg.planner.final_approach_yaw_max_deg = float(
+            self._node.get_parameter("planner.final_approach_yaw_max_deg").value)
+        self.cfg.planner.approach_date_axis_enabled = bool(
+            self._node.get_parameter("planner.approach_date_axis_enabled").value)
+        self.cfg.planner.approach_date_axis_max_deg = float(
+            self._node.get_parameter("planner.approach_date_axis_max_deg").value)
+        self.cfg.planner.approach_date_axis_min_confidence = float(
+            self._node.get_parameter("planner.approach_date_axis_min_confidence").value)
+        self.cfg.planner.approach_date_axis_stable_frames = int(
+            self._node.get_parameter("planner.approach_date_axis_stable_frames").value)
+        self.cfg.planner.approach_date_axis_max_spread_deg = float(
+            self._node.get_parameter("planner.approach_date_axis_max_spread_deg").value)
+        self.cfg.planner.final_lock_measured_approach_orientation = bool(
+            self._node.get_parameter("planner.final_lock_measured_approach_orientation").value)
+        self.cfg.planner.target_specific_approach_enabled = bool(
+            self._node.get_parameter("planner.target_specific_approach_enabled").value)
+        self.cfg.planner.target_specific_approach_max_deg = float(
+            self._node.get_parameter("planner.target_specific_approach_max_deg").value)
+        self.cfg.planner.mid_high_corridor_approach_enabled = bool(
+            self._node.get_parameter("planner.mid_high_corridor_approach_enabled").value)
+        self.cfg.planner.mid_high_corridor_inner_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_inner_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_side_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_side_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_wide_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_wide_angle_deg").value)
+        self.cfg.planner.mid_high_corridor_outer_angle_deg = float(
+            self._node.get_parameter("planner.mid_high_corridor_outer_angle_deg").value)
+        self.cfg.planner.mid_high_direction_min_horizontal = float(
+            self._node.get_parameter("planner.mid_high_direction_min_horizontal").value)
+        self.cfg.planner.corridor_date_axis_enabled = bool(
+            self._node.get_parameter("planner.corridor_date_axis_enabled").value)
+        self.cfg.planner.corridor_date_axis_min_confidence = float(
+            self._node.get_parameter("planner.corridor_date_axis_min_confidence").value)
+        self.cfg.planner.log_corridor_candidates = bool(
+            self._node.get_parameter("planner.log_corridor_candidates").value)
+        self.cfg.planner.tool_axis_tip_aim_enabled = bool(
+            self._node.get_parameter("planner.tool_axis_tip_aim_enabled").value)
+        self.cfg.planner.tool_axis_tip_max_age_s = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_age_s").value)
+        self.cfg.planner.tool_axis_tip_max_goal_distance_m = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_goal_distance_m").value)
+        self.cfg.planner.tool_axis_tip_max_swing_deg = float(
+            self._node.get_parameter("planner.tool_axis_tip_max_swing_deg").value)
+        self.cfg.planner.phase5_center_logging_enabled = bool(
+            self._node.get_parameter("planner.phase5_center_logging_enabled").value)
+        self.cfg.planner.phase5_center_px_per_mm = float(
+            self._node.get_parameter("planner.phase5_center_px_per_mm").value)
+        self.cfg.planner.phase5_center_max_correction_mm = float(
+            self._node.get_parameter("planner.phase5_center_max_correction_mm").value)
+        self.cfg.planner.phase5_center_deadband_px = float(
+            self._node.get_parameter("planner.phase5_center_deadband_px").value)
+        self.cfg.planner.low_side_final_front_tilt_deg = float(self._node.get_parameter("planner.low_side_final_front_tilt_deg").value)
+        self.cfg.planner.bunch_lower_center_band = float(self._node.get_parameter("planner.bunch_lower_center_band").value)
+        self.cfg.planner.final_overshoot_threshold = float(self._node.get_parameter("planner.final_overshoot_threshold").value)
+        self.cfg.planner.final_overshoot_max_backoff = float(self._node.get_parameter("planner.final_overshoot_max_backoff").value)
+        self.cfg.planner.use_fake_hardware = bool(self._node.get_parameter("planner.use_fake_hardware").value)
+        self.cfg.planner.debug_plan_preview = bool(self._node.get_parameter("planner.debug_plan_preview").value)
+        self.cfg.planner.log_cycle_start = bool(self._node.get_parameter("planner.log_cycle_start").value)
+        self.cfg.planner.log_phase_timings = bool(self._node.get_parameter("planner.log_phase_timings").value)
+        self.cfg.planner.log_path_publish = bool(self._node.get_parameter("planner.log_path_publish").value)
+        self.cfg.planner.log_gripper_force_profile = bool(self._node.get_parameter("planner.log_gripper_force_profile").value)
+        self.cfg.planner.subscribe_goal_min_settle_s = float(self._node.get_parameter("planner.subscribe_goal_min_settle_s").value)
+        self.cfg.planner.subscribe_goal_max_wait_s = float(self._node.get_parameter("planner.subscribe_goal_max_wait_s").value)
+        self.cfg.planner.subscribe_goal_stable_tol = float(self._node.get_parameter("planner.subscribe_goal_stable_tol").value)
+        self.cfg.planner.subscribe_goal_median_window = int(self._node.get_parameter("planner.subscribe_goal_median_window").value)
+
+        # Grasp learning
+        self.cfg.grasp.learning_enabled = bool(self._node.get_parameter("grasp.learning_enabled").value)
+        self.cfg.grasp.contact_delta_threshold = float(self._node.get_parameter("grasp.contact_delta_threshold").value)
+        self.cfg.grasp.late_step_margin = int(self._node.get_parameter("grasp.late_step_margin").value)
+        self.cfg.grasp.min_samples_to_learn = int(self._node.get_parameter("grasp.min_samples_to_learn").value)
+        self.cfg.grasp.learning_rate = float(self._node.get_parameter("grasp.learning_rate").value)
+        self.cfg.grasp.default_contact_step_threshold = int(self._node.get_parameter("grasp.default_contact_step_threshold").value)
 
         # Perception
         self.cfg.perception.enabled = bool(self._node.get_parameter("perception.enabled").value)
@@ -110,6 +385,10 @@ class ConfigManager:
 
         # Joints (arrays come back as tuples in some ROS versions)
         self.cfg.joints.home = list(self._node.get_parameter("joints.home").value)
+        self.cfg.joints.home_left = list(self._node.get_parameter("joints.home_left").value)
+        self.cfg.joints.home_left_low = list(self._node.get_parameter("joints.home_left_low").value)
+        self.cfg.joints.home_right = list(self._node.get_parameter("joints.home_right").value)
+        self.cfg.joints.home_right_low = list(self._node.get_parameter("joints.home_right_low").value)
         self.cfg.joints.dropoff = list(self._node.get_parameter("joints.dropoff").value)
         self.cfg.joints.predropoff = list(self._node.get_parameter("joints.predropoff").value)
 
@@ -121,9 +400,13 @@ class ConfigManager:
         """Expose commonly-used config values as direct attributes for convenience."""
         self.speed_scale = self.cfg.planner.speed_scale
         self.home_joints = self.cfg.joints.home
+        self.home_left_joints = self.cfg.joints.home_left
+        self.home_left_low_joints = self.cfg.joints.home_left_low
+        self.home_right_low_joints = self.cfg.joints.home_right_low
+        self.home_right_joints = self.cfg.joints.home_right
         self.dropoff_joints = self.cfg.joints.dropoff
         self.predropoff_joints = self.cfg.joints.predropoff
-        self.yoffset = self.cfg.planner.pre_dropoff_y_offset
+        self.yoffset = self.cfg.planner.pre_dropoff_depth_offset
         self.zoffset = self.cfg.planner.pre_dropoff_z_offset
         self.cam_frame = self.cfg.perception.cam_frame
 
@@ -131,3 +414,230 @@ class ConfigManager:
         self.joint_states_topic = self.cfg.topics.joint_states
         self.goal_marker_topic = self.cfg.topics.goal_marker
         self.path_marker_topic = self.cfg.topics.path_marker
+
+    def set_home_joints(self, joints: List[float]) -> None:
+        """Update active HOME joint preset for the running node."""
+        home = [float(v) for v in joints]
+        self.cfg.joints.home = home
+        self.home_joints = self.cfg.joints.home
+        try:
+            self._node.set_parameters([
+                Parameter("joints.home", Parameter.Type.DOUBLE_ARRAY, home)
+            ])
+        except Exception as exc:
+            self._node.get_logger().warn(
+                f"Updated HOME in memory, but failed to update ROS parameter joints.home: {exc}")
+
+    def set_dropoff_joints(self, joints: List[float]) -> None:
+        """Update active DROPOFF joint preset for the running node."""
+        dropoff = [float(v) for v in joints]
+        self.cfg.joints.dropoff = dropoff
+        self.dropoff_joints = self.cfg.joints.dropoff
+        try:
+            self._node.set_parameters([
+                Parameter("joints.dropoff", Parameter.Type.DOUBLE_ARRAY, dropoff)
+            ])
+        except Exception as exc:
+            self._node.get_logger().warn(
+                "Updated DROPOFF in memory, but failed to update ROS parameter "
+                f"joints.dropoff: {exc}")
+
+    def set_environment(self, environment: str) -> None:
+        """Switch every runtime joint preset to the selected environment."""
+        environment = str(environment).strip().lower()
+        environments = ROBOT_PROFILES[ROBOT_PROFILE]["environments"]
+        if environment not in environments:
+            raise ValueError(
+                f"Unknown environment {environment!r}; "
+                f"choose one of {sorted(environments)}")
+
+        presets = environments[environment]["joints"]
+        names = (
+            "home", "home_left", "home_left_low", "home_right",
+            "home_right_low", "dropoff", "predropoff",
+        )
+        updates = {}
+        for name in names:
+            joints = [float(v) for v in presets[name]]
+            if len(joints) != len(self.joint_order):
+                raise ValueError(
+                    f"{ROBOT_PROFILE}/{environment} {name} must contain "
+                    f"{len(self.joint_order)} joints, got {len(joints)}")
+            updates[name] = joints
+
+        for name, joints in updates.items():
+            setattr(self.cfg.joints, name, joints)
+            setattr(self, f"{name}_joints", joints)
+
+        self._node.set_parameters([
+            Parameter(f"joints.{name}", Parameter.Type.DOUBLE_ARRAY, joints)
+            for name, joints in updates.items()
+        ])
+
+    def _on_parameter_change(self, params) -> SetParametersResult:
+        """Handle runtime parameter changes via ros2 param set."""
+        # Map ROS param names to (config_obj, attr_name, type_cast)
+        param_map = {
+            # Planner speed & smoothness
+            "planner.base_dt": (self.cfg.planner, "base_dt", float),
+            "planner.global_speed_multiplier": (self.cfg.planner, "global_speed_multiplier", float),
+            "planner.speed_home": (self.cfg.planner, "speed_home", float),
+            "planner.speed_dropoff": (self.cfg.planner, "speed_dropoff", float),
+            "planner.speed_predropoff": (self.cfg.planner, "speed_predropoff", float),
+            "planner.speed_approach": (self.cfg.planner, "speed_approach", float),
+            "planner.speed_final": (self.cfg.planner, "speed_final", float),
+            "planner.max_joint_velocity": (self.cfg.planner, "max_joint_velocity", float),
+            "planner.max_joint_acceleration": (self.cfg.planner, "max_joint_acceleration", float),
+            "planner.dropoff_speed_fraction": (self.cfg.planner, "dropoff_speed_fraction", float),
+            "planner.approach_speed_fraction": (self.cfg.planner, "approach_speed_fraction", float),
+            "planner.home_speed_fraction": (self.cfg.planner, "home_speed_fraction", float),
+            "planner.ramp_points": (self.cfg.planner, "ramp_points", int),
+            "planner.gripper_tip_extra_m": (self.cfg.planner, "gripper_tip_extra_m", float),
+            "planner.retime_trajectories": (self.cfg.planner, "retime_trajectories", bool),
+            "planner.min_dt": (self.cfg.planner, "min_dt", float),
+            "planner.max_dt": (self.cfg.planner, "max_dt", float),
+            "planner.max_traj_velocity": (self.cfg.planner, "max_traj_velocity", float),
+            "planner.direct_branch_retry_min_dist": (self.cfg.planner, "direct_branch_retry_min_dist", float),
+            "planner.direct_branch_retry_seeds": (self.cfg.planner, "direct_branch_retry_seeds", int),
+            "planner.direct_final_cart_waypoints": (self.cfg.planner, "direct_final_cart_waypoints", int),
+            "planner.approach_alignment_enabled": (self.cfg.planner, "approach_alignment_enabled", bool),
+            "planner.approach_alignment_extra_m": (self.cfg.planner, "approach_alignment_extra_m", float),
+            "planner.direct_approach_cart_waypoints": (self.cfg.planner, "direct_approach_cart_waypoints", int),
+            "planner.direct_final_joint_fallback_max_delta_deg": (self.cfg.planner, "direct_final_joint_fallback_max_delta_deg", float),
+            "planner.strict_final_cartesian_only": (self.cfg.planner, "strict_final_cartesian_only", bool),
+            "planner.low_left_standoff_lateral": (self.cfg.planner, "low_left_standoff_lateral", float),
+            "planner.low_left_standoff_depth": (self.cfg.planner, "low_left_standoff_depth", float),
+            "planner.low_left_standoff_x": (self.cfg.planner, "low_left_standoff_x", float),
+            "planner.low_left_standoff_y": (self.cfg.planner, "low_left_standoff_y", float),
+            "planner.low_left_standoff_z": (self.cfg.planner, "low_left_standoff_z", float),
+            "planner.low_right_standoff_lateral": (self.cfg.planner, "low_right_standoff_lateral", float),
+            "planner.low_right_standoff_depth": (self.cfg.planner, "low_right_standoff_depth", float),
+            "planner.low_right_standoff_x": (self.cfg.planner, "low_right_standoff_x", float),
+            "planner.low_right_standoff_y": (self.cfg.planner, "low_right_standoff_y", float),
+            "planner.low_right_standoff_z": (self.cfg.planner, "low_right_standoff_z", float),
+            "planner.low_side_final_depth_offset": (self.cfg.planner, "low_side_final_depth_offset", float),
+            "planner.low_side_final_y_offset": (self.cfg.planner, "low_side_final_y_offset", float),
+            "planner.low_left_final_z_offset": (self.cfg.planner, "low_left_final_z_offset", float),
+            "planner.low_right_final_z_offset": (self.cfg.planner, "low_right_final_z_offset", float),
+            "planner.low_center_final_depth_offset": (self.cfg.planner, "low_center_final_depth_offset", float),
+            "planner.reacquire_timeout_s": (self.cfg.planner, "reacquire_timeout_s", float),
+            "planner.low_center_final_z_offset": (self.cfg.planner, "low_center_final_z_offset", float),
+            "planner.mid_center_final_depth_offset": (self.cfg.planner, "mid_center_final_depth_offset", float),
+            "planner.mid_center_final_z_offset": (self.cfg.planner, "mid_center_final_z_offset", float),
+            "planner.closure_center_offset_tcp_m": (self.cfg.planner, "closure_center_offset_tcp_m", list),
+            "planner.envelop_closure_center_offset_tcp_m": (self.cfg.planner, "envelop_closure_center_offset_tcp_m", list),
+            "planner.grasp_visual_to_force_map": (self.cfg.planner, "grasp_visual_to_force_map", list),
+            "planner.phase4_safe_final_yaw_enabled": (self.cfg.planner, "phase4_safe_final_yaw_enabled", bool),
+            "planner.phase4_safe_final_yaw_max_deg": (self.cfg.planner, "phase4_safe_final_yaw_max_deg", float),
+            "planner.phase4_candidate_target_match_m": (self.cfg.planner, "phase4_candidate_target_match_m", float),
+            "planner.final_approach_yaw_enabled": (self.cfg.planner, "final_approach_yaw_enabled", bool),
+            "planner.final_approach_yaw_max_deg": (self.cfg.planner, "final_approach_yaw_max_deg", float),
+            "planner.approach_date_axis_enabled": (self.cfg.planner, "approach_date_axis_enabled", bool),
+            "planner.approach_date_axis_max_deg": (self.cfg.planner, "approach_date_axis_max_deg", float),
+            "planner.approach_date_axis_min_confidence": (self.cfg.planner, "approach_date_axis_min_confidence", float),
+            "planner.approach_date_axis_stable_frames": (self.cfg.planner, "approach_date_axis_stable_frames", int),
+            "planner.approach_date_axis_max_spread_deg": (self.cfg.planner, "approach_date_axis_max_spread_deg", float),
+            "planner.final_lock_measured_approach_orientation": (self.cfg.planner, "final_lock_measured_approach_orientation", bool),
+            "planner.target_specific_approach_enabled": (self.cfg.planner, "target_specific_approach_enabled", bool),
+            "planner.target_specific_approach_max_deg": (self.cfg.planner, "target_specific_approach_max_deg", float),
+            "planner.mid_high_corridor_approach_enabled": (self.cfg.planner, "mid_high_corridor_approach_enabled", bool),
+            "planner.mid_high_corridor_inner_angle_deg": (self.cfg.planner, "mid_high_corridor_inner_angle_deg", float),
+            "planner.mid_high_corridor_side_angle_deg": (self.cfg.planner, "mid_high_corridor_side_angle_deg", float),
+            "planner.mid_high_corridor_wide_angle_deg": (self.cfg.planner, "mid_high_corridor_wide_angle_deg", float),
+            "planner.mid_high_corridor_outer_angle_deg": (self.cfg.planner, "mid_high_corridor_outer_angle_deg", float),
+            "planner.mid_high_direction_min_horizontal": (self.cfg.planner, "mid_high_direction_min_horizontal", float),
+            "planner.corridor_date_axis_enabled": (self.cfg.planner, "corridor_date_axis_enabled", bool),
+            "planner.corridor_date_axis_min_confidence": (self.cfg.planner, "corridor_date_axis_min_confidence", float),
+            "planner.log_corridor_candidates": (self.cfg.planner, "log_corridor_candidates", bool),
+            "planner.tool_axis_tip_aim_enabled": (self.cfg.planner, "tool_axis_tip_aim_enabled", bool),
+            "planner.tool_axis_tip_max_age_s": (self.cfg.planner, "tool_axis_tip_max_age_s", float),
+            "planner.tool_axis_tip_max_goal_distance_m": (self.cfg.planner, "tool_axis_tip_max_goal_distance_m", float),
+            "planner.tool_axis_tip_max_swing_deg": (self.cfg.planner, "tool_axis_tip_max_swing_deg", float),
+            "planner.phase5_center_logging_enabled": (self.cfg.planner, "phase5_center_logging_enabled", bool),
+            "planner.phase5_center_px_per_mm": (self.cfg.planner, "phase5_center_px_per_mm", float),
+            "planner.phase5_center_max_correction_mm": (self.cfg.planner, "phase5_center_max_correction_mm", float),
+            "planner.phase5_center_deadband_px": (self.cfg.planner, "phase5_center_deadband_px", float),
+            "planner.low_side_final_front_tilt_deg": (self.cfg.planner, "low_side_final_front_tilt_deg", float),
+            "planner.bunch_lower_center_band": (self.cfg.planner, "bunch_lower_center_band", float),
+            "planner.final_overshoot_threshold": (self.cfg.planner, "final_overshoot_threshold", float),
+            "planner.final_overshoot_max_backoff": (self.cfg.planner, "final_overshoot_max_backoff", float),
+            "planner.debug_plan_preview": (self.cfg.planner, "debug_plan_preview", bool),
+            "planner.log_cycle_start": (self.cfg.planner, "log_cycle_start", bool),
+            "planner.log_phase_timings": (self.cfg.planner, "log_phase_timings", bool),
+            "planner.log_path_publish": (self.cfg.planner, "log_path_publish", bool),
+            "planner.log_gripper_force_profile": (self.cfg.planner, "log_gripper_force_profile", bool),
+            "planner.subscribe_goal_min_settle_s": (self.cfg.planner, "subscribe_goal_min_settle_s", float),
+            "planner.subscribe_goal_max_wait_s": (self.cfg.planner, "subscribe_goal_max_wait_s", float),
+            "planner.subscribe_goal_stable_tol": (self.cfg.planner, "subscribe_goal_stable_tol", float),
+            "planner.subscribe_goal_median_window": (self.cfg.planner, "subscribe_goal_median_window", int),
+            "planner.speed_scale": (self.cfg.planner, "speed_scale", float),
+            # In-flight FINAL correction (see _declare_parameters)
+            "planner.approach_vision_streaming": (self.cfg.planner, "approach_vision_streaming", bool),
+            "planner.final_inflight_observe": (self.cfg.planner, "final_inflight_observe", bool),
+            "planner.final_inflight_apply": (self.cfg.planner, "final_inflight_apply", bool),
+            "planner.final_inflight_min_delta_m": (self.cfg.planner, "final_inflight_min_delta_m", float),
+            "planner.final_inflight_max_delta_m": (self.cfg.planner, "final_inflight_max_delta_m", float),
+            "planner.final_inflight_max_updates": (self.cfg.planner, "final_inflight_max_updates", int),
+            "planner.final_inflight_min_interval_s": (self.cfg.planner, "final_inflight_min_interval_s", float),
+            "planner.pre_dropoff_z_offset": (self.cfg.planner, "pre_dropoff_z_offset", float),
+            "planner.pre_dropoff_depth_offset": (self.cfg.planner, "pre_dropoff_depth_offset", float),
+            "planner.pre_dropoff_y_offset": (self.cfg.planner, "pre_dropoff_y_offset", float),
+            # Grasp learning
+            "grasp.learning_enabled": (self.cfg.grasp, "learning_enabled", bool),
+            "grasp.contact_delta_threshold": (self.cfg.grasp, "contact_delta_threshold", float),
+            "grasp.late_step_margin": (self.cfg.grasp, "late_step_margin", int),
+            "grasp.min_samples_to_learn": (self.cfg.grasp, "min_samples_to_learn", int),
+            "grasp.learning_rate": (self.cfg.grasp, "learning_rate", float),
+            "grasp.default_contact_step_threshold": (self.cfg.grasp, "default_contact_step_threshold", int),
+        }
+        for p in params:
+            if p.name in param_map:
+                obj, attr, cast = param_map[p.name]
+                setattr(obj, attr, cast(p.value))
+                self._node.get_logger().info(f"Parameter updated: {p.name} = {p.value}")
+        return SetParametersResult(successful=True)
+
+    def set_final_offsets(self, values) -> None:
+        """Apply the operator's runtime FINAL target corrections in metres."""
+        names = (
+            "low_center_final_depth_offset",
+            "low_center_final_z_offset",
+            "mid_center_final_depth_offset",
+            "mid_center_final_z_offset",
+            "low_side_final_depth_offset",
+            "low_left_final_z_offset",
+            "low_right_final_z_offset",
+        )
+        if len(values) != len(names):
+            raise ValueError(f"expected {len(names)} final offsets, got {len(values)}")
+        if any(abs(float(value)) > 0.1 for value in values):
+            raise ValueError("final offsets must be within +/-0.1 m")
+        results = self._node.set_parameters([
+            Parameter(f"planner.{name}", value=float(value))
+            for name, value in zip(names, values)
+        ])
+        rejected = [result.reason for result in results if not result.successful]
+        if rejected:
+            raise ValueError("; ".join(rejected))
+
+    def set_closure_center_offsets(self, values, mode="normal") -> None:
+        """Apply the three tool-frame closure-centre offsets in metres."""
+        if len(values) != 3:
+            raise ValueError(
+                f"expected 3 closure-center offsets, got {len(values)}")
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError("closure-center offsets must be finite")
+        if any(abs(float(value)) > 0.1 for value in values):
+            raise ValueError("closure-center offsets must be within +/-0.1 m")
+        parameter_name = (
+            "planner.envelop_closure_center_offset_tcp_m"
+            if str(mode).lower() == "envelop"
+            else "planner.closure_center_offset_tcp_m")
+        results = self._node.set_parameters([
+            Parameter(
+                parameter_name,
+                value=[float(value) for value in values])
+        ])
+        rejected = [result.reason for result in results if not result.successful]
+        if rejected:
+            raise ValueError("; ".join(rejected))

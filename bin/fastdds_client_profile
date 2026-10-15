@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Write a Fast DDS discovery-client profile that only uses this machine's route to the server.
+#
+#   PROFILE=$(bin/fastdds_client_profile 10.76.154.75:11811)
+#
+# Without it every participant also advertises its other interfaces: the Jetson's Delto link
+# (169.254.186.x), docker0, USB link-local. The other machine treats 169.254/16 as on-link, ARPs
+# for an address it can never reach, and the packets queued behind that ARP fill the socket's
+# 208 KiB send buffer, so every sendto() blocks. The Isaac mirror bridge then published
+# /joint_states at ~5 Hz instead of 50 Hz with 2-3 s gaps, and the cuRobo node saw the robot
+# program flicker off and timed out waiting for the vision-pause acknowledgement.
+set -euo pipefail
+
+SERVER="${1:?usage: fastdds_client_profile SERVER_IP:PORT}"
+SERVER_IP="${SERVER%:*}"
+SERVER_PORT="${SERVER##*:}"
+LOCAL_IP="$(ip -4 route get "$SERVER_IP" | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+if [[ -z "$LOCAL_IP" ]]; then
+  echo "fastdds_client_profile: no route to $SERVER_IP" >&2
+  exit 1
+fi
+OUT="${TMPDIR:-/tmp}/fastdds_client_${USER}_${SERVER_IP}.xml"
+cat > "$OUT" <<EOF
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>server_route_udp</transport_id>
+            <type>UDPv4</type>
+            <interfaceWhiteList>
+                <address>${LOCAL_IP}</address>
+                <address>127.0.0.1</address>
+            </interfaceWhiteList>
+        </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="discovery_client" is_default_profile="true">
+        <rtps>
+            <userTransports><transport_id>server_route_udp</transport_id></userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+            <builtin>
+                <discovery_config>
+                    <discoveryProtocol>CLIENT</discoveryProtocol>
+                    <discoveryServersList>
+                        <!-- Server id 0 (fastdds discovery -i 0) -->
+                        <RemoteServer prefix="44.53.00.5f.45.50.52.4f.53.49.4d.41">
+                            <metatrafficUnicastLocatorList>
+                                <locator><udpv4><address>${SERVER_IP}</address><port>${SERVER_PORT}</port></udpv4></locator>
+                            </metatrafficUnicastLocatorList>
+                        </RemoteServer>
+                    </discoveryServersList>
+                </discovery_config>
+            </builtin>
+        </rtps>
+    </participant>
+</profiles>
+EOF
+echo "$OUT"

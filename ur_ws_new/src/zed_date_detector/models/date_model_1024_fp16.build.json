@@ -1,0 +1,70 @@
+{
+  "created_utc": "2026-08-27T13:32:27.158462+00:00",
+  "source_model": "/home/datepalm2/manipulatorsdatepalm/bin/Kaustfarm_model_27AUg.pt",
+  "source_sha256": "7e05818ce1601a839e219a039e0491c762ae890335044dc82a94d7103de8793d",
+  "engine": "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models/date_model_1024_fp16.engine",
+  "engine_sha256": "be4d11942528782d19f8de85bfc288485a003e4e1c162fae07932c0bd31e9acb",
+  "engine_bytes": 10247173,
+  "device": "Orin",
+  "compute_capability": [
+    8,
+    7
+  ],
+  "platform": "Linux-5.15.136-tegra-aarch64-with-glibc2.35",
+  "python": "3.10.12",
+  "torch": "2.3.0",
+  "cuda": "12.2",
+  "ultralytics": "8.4.6",
+  "tensorrt": "8.6.2",
+  "nvpmodel": "NV Power Mode: MAXN\n0",
+  "export_settings": {
+    "format": "engine",
+    "device": 0,
+    "imgsz": 1248,
+    "batch": 1,
+    "dynamic": false,
+    "simplify": true,
+    "nms": false,
+    "workspace": 8.0,
+    "verbose": true,
+    "half": true,
+    "int8": false
+  },
+  "embedded_metadata": {
+    "description": "Ultralytics YOLO26-seg model trained on /home/rehmsu0a/Downloads/sam3/datasets/kaust_farm_dslr_orig_zed.v5i.yolo26/data.yaml",
+    "author": "Ultralytics",
+    "date": "2026-08-27T16:15:25.686463",
+    "version": "8.4.6",
+    "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+    "docs": "https://docs.ultralytics.com",
+    "stride": 32,
+    "task": "segment",
+    "batch": 1,
+    "imgsz": [
+      1248,
+      1248
+    ],
+    "names": {
+      "0": "date"
+    },
+    "args": {
+      "batch": 1,
+      "fraction": 1.0,
+      "half": true,
+      "int8": false,
+      "dynamic": false,
+      "simplify": true,
+      "nms": false
+    },
+    "channels": 3,
+    "end2end": true
+  },
+  "verification": {
+    "batch": true,
+    "imgsz": true,
+    "dynamic": true,
+    "half": true,
+    "int8": true,
+    "nms": true
+  }
+}

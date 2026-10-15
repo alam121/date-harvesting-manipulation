@@ -1,0 +1,372 @@
+#ifndef RVIZ_UR10E_PANEL_HPP
+#define RVIZ_UR10E_PANEL_HPP
+
+#include <QWidget>
+#include <QImage>
+#include <sensor_msgs/msg/image.hpp>
+#include <QPushButton>
+#include <QSlider>
+#include <QLabel>
+#include <QLineEdit>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QSpinBox>
+#include <QDoubleSpinBox>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QKeyEvent>
+
+#include <array>
+#include <chrono>
+#include <deque>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <string>
+
+#include <rclcpp/rclcpp.hpp>
+#include <rviz_common/panel.hpp>
+#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
+#include <ur_msgs/msg/tool_data_msg.hpp>
+
+namespace rviz_ur10e_panel
+{
+
+class UR10ePanel : public rviz_common::Panel
+{
+  Q_OBJECT
+public:
+  explicit UR10ePanel(QWidget * parent = nullptr);
+  ~UR10ePanel() override;
+
+  void onInitialize() override;
+  void save(rviz_common::Config config) const override;
+  void load(const rviz_common::Config & config) override;
+  bool eventFilter(QObject * obj, QEvent * event) override;
+
+private:
+  QLabel * demo_image_label_{nullptr};
+  QLabel * demo_click_status_{nullptr};
+  QImage demo_image_;
+  QString demo_image_token_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr demo_image_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr demo_click_pub_;
+
+private Q_SLOTS:
+  void onStop();
+  void onHome();
+  void onHomeLeft();
+  void onHomeRight();
+  void onSetHomeCurrent();
+  void onSetDropoffCurrent();
+  void onDropoff();
+  void onExecute();
+  void onExecuteMoves();
+  void onAddCurrentGoal();
+  void onReuseLastGoalQueue();
+  void onQueueGripperOpen();
+  void onQueueGripperClose();
+  void onSessionRecordStart();
+  void onSessionRecordStop();
+  void onSessionLoadLast();
+  void onSessionReplay();
+  void onRedoSelectedGoal();
+  void onClear();
+  void onCheckCalibration();
+  void onGripperOpen();
+  void onGripperClose();
+  void onDemoLabelGood();
+  void onDemoLabelEdge();
+  void onDemoLabelFail();
+  void onGripperOpenSliderChanged(int value);
+  void onGripperOpenSliderReleased();
+  void onGripperJointSliderReleased();
+  void onSetGripperOpenFromSliders();
+  void onReloadGripperJointSliders();
+  void onSendGoal();
+  void onVelocitySliderChanged(int value);
+  void onApplyVelocity();
+  void onVelocityPreset();
+  void onCapture();
+  void onCaptureStop();
+  void onSubscribe();
+  void onSubscribeMulti();
+  void onAutoHarvest();
+  void onUpdateVoxel();
+  void onExit();
+  void onRefreshMain();
+  void onRefreshCamera();
+  void onCameraPresetLab();
+  void onCameraPresetOutdoor();
+  void onCameraSnapshot();
+  void onCameraVideoStart();
+  void onCameraVideoStop();
+  void onGraspSuccess();
+  void onGraspFail();
+  void onDebugPreviewChanged(int state);
+  void onReachabilityCloudChanged(int state);
+  void onLidarScanPreviewChanged(int state);
+  void onZoneOverlayToggle();
+  void onPlanConfirm();
+  void onPlanCancel();
+  void onLidarScan();
+  void onPollinate();
+  void onSprayNow();
+  void onSpray2g();
+  void onStabilityRecord();
+  void onApplyFinalOffsets();
+  void updateDisplay();
+
+private:
+  struct StabilitySample
+  {
+    double elapsed_s = 0.0;
+    std::array<double, 6> positions{};
+    std::array<double, 6> velocities{};
+    std::array<double, 6> tracking_errors{};
+    std::array<double, 6> wrench{};
+  };
+
+  struct StabilityResult
+  {
+    double score = 0.0;
+    double velocity_rms = std::numeric_limits<double>::quiet_NaN();
+    double position_jitter_rms = std::numeric_limits<double>::quiet_NaN();
+    double tracking_error_rms = std::numeric_limits<double>::quiet_NaN();
+    double tracking_error_max = std::numeric_limits<double>::quiet_NaN();
+    double force_noise_rms = std::numeric_limits<double>::quiet_NaN();
+    double torque_noise_rms = std::numeric_limits<double>::quiet_NaN();
+    size_t sample_count = 0;
+    bool trajectory_tracking = false;
+    bool valid = false;
+  };
+
+  void publishCmd(const std::string & cmd);
+  void publishOverlayCmd(const std::string & cmd);
+  void publishStop();
+  void publishGoal(double x, double y, double z,
+                   double qw, double qx, double qy, double qz);
+  void setupRos();
+  void startStabilityRecording();
+  void stopStabilityRecording();
+  void appendStabilitySampleLocked(
+    const std::chrono::steady_clock::time_point & now);
+  void writeComputedTrajectoryLocked(
+    const trajectory_msgs::msg::JointTrajectory & msg,
+    const std::chrono::steady_clock::time_point & now);
+  void writeFollowedTrajectoryLocked(
+    const control_msgs::msg::JointTrajectoryControllerState & msg,
+    const std::chrono::steady_clock::time_point & now);
+  StabilityResult calculateStabilityLocked() const;
+
+  // ROS
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr overlay_cmd_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_target_pub_;
+
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr gripper_joint_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr force_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr running_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_info_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr vel_scale_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr calib_check_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr config_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr camera_status_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    controller_state_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr
+    trajectory_command_sub_;
+  rclcpp::Subscription<ur_msgs::msg::ToolDataMsg>::SharedPtr tool_data_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr joint_temp_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr final_offsets_sub_;
+
+  // Data
+  std::mutex data_mutex_;
+  double joint_positions_[6] = {};
+  double joint_velocities_[6] = {};
+  double joint_efforts_[6] = {};   // per-joint current (A) from /joint_states.effort — heat proxy
+  double tracking_errors_[6] = {};
+  double tcp_wrench_[6] = {};
+  double gripper_forces_[3] = {};
+  double gripper_joint_positions_[12] = {};
+  bool have_gripper_joint_positions_ = false;
+  double tool_temperature_ = 0.0;  // tool/wrist flange temperature (degC)
+  bool have_tool_temp_ = false;
+  double joint_temperatures_[6] = {};  // per-joint temperature (degC) from /joint_temperatures
+  bool have_joint_temps_ = false;
+
+  // FINAL grasp offsets as the motion node currently has them (metres, in
+  // set_final_offsets order). The spin boxes used to be hardcoded at
+  // construction and never read anything back, so they showed stale config
+  // defaults and "Apply Final Offsets" pushed those stale numbers over live
+  // tuning. Mirror the node instead. Only a CHANGE arms the widget write, so a
+  // steady 1 Hz republish of unchanged values never fights the operator typing.
+  double final_offsets_m_[7] = {};
+  bool have_final_offsets_ = false;
+  bool final_offsets_update_pending_ = false;
+  bool have_tracking_error_ = false;
+  bool have_wrench_ = false;
+  bool robot_running_ = false;
+  double velocity_scale_ = 5.0;
+  int goal_count_ = 0;
+  std::string latest_goal_;
+  std::string goal_coords_str_;
+  std::string home_joints_str_;
+  std::string goal_rejection_str_;
+  std::string calib_check_result_;
+  std::string robot_config_text_;
+  std::string camera_status_text_;
+  std::string gripper_profile_ = "--";
+  std::string gripper_state_ = "--";
+  double gripper_open_alpha_ = 0.0;
+  bool gripper_fake_ = false;
+  bool gripper_disabled_ = false;
+  bool gripper_suction_ = false;
+  bool session_recording_ = false;
+  int session_item_count_ = 0;
+  std::string session_saved_path_;
+  std::string session_loaded_path_;
+  int redo_goal_count_ = 0;
+  std::string redo_goal_display_;
+  int rendered_redo_goal_count_ = -1;
+  std::string rendered_redo_goal_display_;
+  bool plan_waiting_confirm_ = false;
+  bool debug_plan_preview_ = true;
+  bool reachability_cloud_enabled_ = false;
+  bool lidar_scan_preview_enabled_ = true;
+  std::string motion_phase_ = "IDLE";
+  std::string reacquire_result_;
+  std::string last_outcome_;
+  std::string last_end_;
+  int grab_count_ = 0;
+  int slip_count_ = 0;
+  int miss_count_ = 0;
+  std::array<double, 3> taught_closure_offsets_m_{};
+  bool taught_closure_update_pending_ = false;
+
+  // Stability recording
+  bool stability_recording_ = false;
+  std::chrono::steady_clock::time_point stability_start_time_;
+  std::deque<StabilitySample> stability_window_;
+  std::ofstream stability_csv_;
+  std::ofstream trajectory_csv_;
+  std::string stability_csv_path_;
+  std::string trajectory_csv_path_;
+  size_t stability_sample_count_ = 0;
+  size_t trajectory_id_ = 0;
+
+  // UI
+  QLabel * status_label_;
+  QLabel * robot_state_label_;
+  QLabel * config_label_;
+  QLabel * velocity_value_label_;
+  QLabel * current_velocity_label_;
+  QLabel * goal_count_label_;
+  QLabel * latest_goal_label_;
+  QLabel * goal_coords_label_;
+  QLabel * home_joints_label_;
+  QLabel * goal_rejection_label_;
+  QLabel * session_status_label_;
+  QComboBox * redo_goal_combo_;
+  QLabel * calib_result_label_;
+  QSlider * velocity_slider_;
+  QLabel * joint_labels_[6];
+  QLabel * force_labels_[3];
+  QLabel * gripper_info_label_;
+  QLabel * gripper_open_value_label_;
+  QSlider * gripper_open_slider_;
+  QSlider * gripper_joint_sliders_[12] = {};
+  QLabel * gripper_joint_value_labels_[12] = {};
+  bool gripper_joint_sliders_initialized_ = false;
+  QLabel * joint_current_labels_[6];
+  QLabel * joint_temp_labels_[6];
+  QLabel * gripper_heat_labels_[3];
+  QLabel * tool_temp_label_;
+  QLineEdit * x_in_, * y_in_, * z_in_;
+  QLineEdit * qw_in_, * qx_in_, * qy_in_, * qz_in_;
+  QSpinBox * multi_goal_count_spin_;
+  QSpinBox * auto_goal_count_spin_;
+  QCheckBox * require_final_reacquire_cb_;
+  QComboBox * demo_target_region_combo_ = nullptr;
+  QCheckBox * demo_xy_alignment_cb_ = nullptr;
+  QCheckBox * demo_capture_cb_ = nullptr;
+  bool demo_capture_enabled_ = false;
+  bool demo_capture_active_ = false;
+  bool demo_capture_jog_enabled_ = false;
+  bool demo_target_confirmed_ = false;
+  bool demo_xy_busy_ = false;
+  std::array<double, 3> demo_xy_offset_m_{{0.0, 0.0, 0.0}};
+  std::string demo_xy_error_;
+  QLabel * demo_xy_status_ = nullptr;
+  QPushButton * demo_xy_x_minus_btn_ = nullptr;
+  QPushButton * demo_xy_x_plus_btn_ = nullptr;
+  QPushButton * demo_xy_y_minus_btn_ = nullptr;
+  QPushButton * demo_xy_y_plus_btn_ = nullptr;
+  QPushButton * demo_xy_confirm_btn_ = nullptr;
+  bool demo_live_preview_ = false;
+  bool demo_capture_was_active_ = false;
+  QLabel * demo_label_status_ = nullptr;
+  QPushButton * demo_label_good_btn_ = nullptr;
+  QPushButton * demo_label_edge_btn_ = nullptr;
+  QPushButton * demo_label_fail_btn_ = nullptr;
+  int demo_label_pending_ = 0;
+  std::string demo_label_record_;
+  std::string demo_label_image_;
+  std::string rendered_demo_label_image_;
+  QDoubleSpinBox * low_center_depth_in_, * low_center_z_in_;
+  QDoubleSpinBox * mid_center_depth_in_, * mid_center_z_in_;
+  QDoubleSpinBox * low_side_depth_in_, * low_left_z_in_, * low_right_z_in_;
+  // Physical fingertip length beyond the URDF, in mm. Read back from
+  // /gripper_tip_extra_state so the box never shows a value the robot
+  // is not using.
+  QDoubleSpinBox * gripper_tip_extra_in_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr gripper_tip_extra_sub_;
+  double gripper_tip_extra_mm_{0.0};
+  // Set the moment the operator edits the box, cleared on Apply/Reset.
+  // hasFocus() alone is not enough: clicking Apply moves focus off the
+  // box, and the 100ms readback then overwrites the typed value before
+  // the click handler reads it.
+  bool gripper_tip_extra_dirty_{false};
+  QDoubleSpinBox * closure_x_in_, * closure_y_in_, * closure_z_in_;
+  QDoubleSpinBox * envelop_closure_x_in_, * envelop_closure_y_in_, * envelop_closure_z_in_;
+  QCheckBox * debug_preview_cb_;
+  QCheckBox * reachability_cloud_cb_;
+  QCheckBox * lidar_scan_preview_cb_;
+  QComboBox * camera_model_combo_;
+  QLabel * vision_inference_info_label_;
+  QDoubleSpinBox * vision_confidence_spin_;
+  QSpinBox * vision_max_detections_spin_;
+  QLabel * camera_profile_label_;
+  QLabel * camera_status_label_;
+  QPushButton * zone_overlay_btn_;
+  QPushButton * plan_confirm_btn_;
+  QPushButton * plan_cancel_btn_;
+  QTimer * update_timer_;
+  QLabel * phase_label_;
+  QLabel * reacq_label_;
+  QLabel * harvest_banner_;
+  QLabel * grab_count_label_;
+  QLabel * slip_count_label_;
+  QLabel * miss_count_label_;
+  QLabel * total_count_label_;
+  QPushButton * stability_record_btn_;
+  QLabel * stability_result_label_;
+};
+
+}  // namespace rviz_ur10e_panel
+
+#endif

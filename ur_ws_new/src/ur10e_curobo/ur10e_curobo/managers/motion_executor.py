@@ -1,21 +1,25 @@
 # ur10e_curobo/managers/motion_executor.py
 """Motion planning and execution for UR10e cuRobo node."""
 
+import copy
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
+import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
+from ..planner_v2 import PlannerV2, load_robot_config
 
-from ..config import WORLD_CONFIG
+from ..config import ROBOT_PROFILE, WORLD_CONFIG, STATIC_OBSTACLES, ENVIRONMENT
 from ..dynamic_obstacle import DynamicObstacleManager
-from ..voxel_obstacle import VoxelObstacleManager
 from .. import static_obstacles
 from .. import fk as fk_mod
+from ..vision.calibration_profiles import load_camera_profile
 
 if TYPE_CHECKING:
     from .config_manager import ConfigManager
@@ -31,20 +35,21 @@ class MotionExecutor:
         self._state = state
 
         # cuRobo planner
-        self.motion_gen_config: Optional[MotionGenConfig] = None
-        self.motion_gen: Optional[MotionGen] = None
+        self.motion_gen_config: Optional[object] = None
+        self.motion_gen: Optional[PlannerV2] = None
 
         # Obstacles
         self.obstacles: Optional[DynamicObstacleManager] = None
-        self.voxel_obstacles: Optional[VoxelObstacleManager] = None
         self.static_obstacles: List = []
 
         # Publishers
         self.trajectory_pub = None
         self.env_marker_pub = None
+        self.golfcart_pallet_marker_pub = None
 
         # Motion lock (prevents concurrent motions)
         self._motion_lock = threading.Lock()
+        self._last_ee_pose: Optional[List[float]] = None
 
         # Teleop state
         self.teleop_enabled: bool = True
@@ -60,6 +65,11 @@ class MotionExecutor:
 
     def initialize(self) -> None:
         """Initialize cuRobo planner, obstacles, and motion infrastructure."""
+        # ConfigManager has already applied ROS parameter overrides before the
+        # motion manager is initialized.  Keep voxel subscriptions/timers in
+        # step with perception.enabled, including external-vision deployments.
+        vision_enabled = bool(self._config.cfg.perception.enabled)
+
         # Publishers
         self.trajectory_pub = self._node.create_publisher(
             JointTrajectory,
@@ -71,21 +81,42 @@ class MotionExecutor:
             "/env_marker",
             10
         )
-
-        # Static obstacles
-        self.static_obstacles = list(static_obstacles.DEFAULT_STATIC_OBSTACLES)
-
-        # cuRobo setup
-        self._node.get_logger().info("Loading cuRobo configuration...")
-        self.motion_gen_config = MotionGenConfig.load_from_robot_config(
-            self._config.cfg.planner.urdf_config,
-            WORLD_CONFIG,
-            interpolation_dt=self._config.cfg.planner.interpolation_dt
+        self.golfcart_pallet_marker_pub = self._node.create_publisher(
+            Marker,
+            "/golfcart_pallet_marker",
+            10
         )
 
-        self.motion_gen = MotionGen(self.motion_gen_config)
+        # Static planning geometry is ready immediately. Trunk perception is
+        # not part of motion-node initialization and cannot delay startup.
+        world_config = copy.deepcopy(WORLD_CONFIG)
+        self._node.get_logger().info(
+            "Static planning world loaded; trunk detection is not required"
+        )
+
+        # Rebuild static obstacle specs from (now-updated) STATIC_OBSTACLES for RViz
+        from ..static_obstacles import _obs_to_spec
+        self.static_obstacles = [_obs_to_spec(i, obs) for i, obs in enumerate(STATIC_OBSTACLES)]
+
+        # cuRobo setup
+        robot_config = self._profile_curobo_config()
+        self._node.get_logger().info(
+            f"Loading cuRobo configuration for robot profile {ROBOT_PROFILE!r}...")
+        self.motion_gen = PlannerV2(
+            robot_config, world_config,
+            interpolation_dt=self._config.cfg.planner.interpolation_dt,
+            num_trajopt_seeds=self._config.cfg.planner.num_trajopt_seeds)
+        self.motion_gen_config = self.motion_gen.config
+
+        # Initialize isolated FK model BEFORE warmup so its GPU allocation
+        # is included in CUDA graph capture (avoids 20s+ delay on first plan)
+        fk_mod.init_fk_model(self._create_fk_facade())
+
         self.motion_gen.warmup()
         self._node.get_logger().info("cuRobo warmup done")
+
+        # Wire the RViz safe-zone box to keep-out walls in cuRobo's world (whole-arm bound).
+        self._node._safe_zone_on_change = self._update_safe_zone_walls
 
         # Dynamic obstacle manager
         self.obstacles = DynamicObstacleManager(
@@ -95,12 +126,6 @@ class MotionExecutor:
         )
         self.obstacles.add_sphere("dyn_sphere", radius=0.1)
         self.obstacles.add_sphere("fruit_obstacle", radius=0.06)
-
-        # Voxel obstacle manager for depth-based collision avoidance
-        self.voxel_obstacles = VoxelObstacleManager(
-            node=self._node,
-            motion_gen=self.motion_gen
-        )
 
         # Teleop subscription
         self._node.create_subscription(
@@ -113,14 +138,98 @@ class MotionExecutor:
         # Timers
         self._node.create_timer(0.025, self._teleop_servo_tick)  # 40 Hz
         self._node.create_timer(1.0, self._publish_static_obstacles)
+        self._node.create_timer(1.0, self._publish_golfcart_pallet_marker)
 
         self._node.get_logger().info("MotionExecutor initialized")
+
+    def _profile_curobo_config(self):
+        """Return a cuRobo config matching the robot and camera profile."""
+        config_name = self._config.cfg.planner.urdf_config
+        robot_config = load_robot_config(config_name)
+        kinematics = robot_config["robot_cfg"]["kinematics"]
+        source_urdf = Path(kinematics["urdf_path"])
+        text = source_urdf.read_text(encoding="utf-8")
+
+        camera_profile = load_camera_profile()
+        profile_robot = str(camera_profile.get("robot_profile", "")).lower()
+        profile_environment = str(camera_profile.get("environment", "")).lower()
+        if profile_robot and profile_robot != ROBOT_PROFILE:
+            raise RuntimeError(
+                "Camera calibration robot-profile mismatch: selected "
+                f"{camera_profile.get('camera_profile', '-')!r} is for "
+                f"{profile_robot!r}, but the active robot is {ROBOT_PROFILE!r}")
+        if profile_environment and profile_environment != ENVIRONMENT:
+            raise RuntimeError(
+                "Camera calibration environment mismatch: selected "
+                f"{camera_profile.get('camera_profile', '-')!r} is for "
+                f"{profile_environment!r}, but the active environment is "
+                f"{ENVIRONMENT!r}")
+
+        hand_eye = camera_profile.get("hand_eye", {})
+        translation = hand_eye.get("translation", {})
+        rpy = hand_eye.get("rpy", {})
+        child_frame = str(hand_eye.get(
+            "child_frame",
+            camera_profile.get("rgb_frame", "zed_mini_left_camera_frame"),
+        ))
+        required_translation = all(axis in translation for axis in "xyz")
+        required_rpy = all(axis in rpy for axis in ("roll", "pitch", "yaw"))
+        if required_translation and required_rpy:
+            xyz_str = " ".join(
+                f"{float(translation[axis]):.6f}" for axis in "xyz")
+            rpy_str = " ".join(
+                f"{float(rpy[axis]):.6f}"
+                for axis in ("roll", "pitch", "yaw"))
+            joint_pattern = re.compile(
+                rf'(<joint\s+name="tool0_to_{re.escape(child_frame)}"'
+                rf'.*?</joint>)',
+                re.DOTALL,
+            )
+            joint_match = joint_pattern.search(text)
+            if not joint_match:
+                raise RuntimeError(
+                    "Camera joint for active calibration profile was not "
+                    f"found: tool0_to_{child_frame}")
+            joint_text = joint_match.group(1)
+            updated_joint, count = re.subn(
+                r'<origin\b[^>]*/>',
+                f'<origin rpy="{rpy_str}" xyz="{xyz_str}"/>',
+                joint_text,
+                count=1,
+            )
+            if count != 1:
+                raise RuntimeError(
+                    f"Camera origin was not found in tool0_to_{child_frame}")
+            text = (
+                text[:joint_match.start(1)] + updated_joint
+                + text[joint_match.end(1):]
+            )
+        else:
+            self._node.get_logger().warning(
+                "Active camera profile has no hand-eye transform; cuRobo "
+                "will use the transform embedded in its source URDF: "
+                f"{camera_profile.get('profile_path', '-')}")
+
+        profile_urdf = Path(
+            f"/tmp/ur10e_curobo_{ROBOT_PROFILE}_{ENVIRONMENT}.urdf")
+        profile_urdf.write_text(text, encoding="utf-8")
+        kinematics["urdf_path"] = str(profile_urdf)
+        self._node.get_logger().info(
+            "Generated contextual cuRobo URDF: "
+            f"{profile_urdf} (calibration="
+            f"{camera_profile.get('camera_profile', '-')})")
+        return robot_config
 
     # ============ Public Methods ============
 
     def get_end_effector_pose(self) -> Optional[List[float]]:
         """Compute FK for current joint state."""
-        return fk_mod.get_end_effector_pose(self._create_fk_facade())
+        facade = self._create_fk_facade()
+        facade._last_ee_pose = self._last_ee_pose
+        pose = fk_mod.get_end_effector_pose(facade)
+        if pose is not None:
+            self._last_ee_pose = list(pose)
+        return pose
 
     def acquire_motion_lock(self, blocking: bool = False) -> bool:
         """Acquire motion lock for exclusive motion control."""
@@ -214,7 +323,9 @@ class MotionExecutor:
         facade.current_joint_positions = self._state.current_joint_positions
         facade.joint_order = self._config.joint_order
         facade.motion_gen = self.motion_gen
+        facade._fk_cache_owner = self._node
         facade.get_logger = self._node.get_logger
+        facade._planning_lock = getattr(self._node, '_planning_lock', None)
         return facade
 
     def _teleop_cb(self, msg: Twist) -> None:
@@ -375,6 +486,66 @@ class MotionExecutor:
             self._node.get_logger().warn(f"Trajectory publish exception: {e}")
             return
 
+
+    def _safe_zone_wall_cuboids(self, lo, hi):
+        """Four VERTICAL (lateral) panels fencing the box's back/front/sides — the blind
+        directions the camera can't see. Floor and ceiling are intentionally omitted: a
+        floor panel intersects the robot's own base/shoulder links (the arm reaches in from
+        its base, which sits below the work box) and would put the start state in collision,
+        bricking all planning. So this bounds the arm horizontally while leaving the base
+        region unobstructed. Panels are centered on each face (thickness T), oversized in z
+        by V so they fence tall reaches, and by M laterally to seal corners. Any panel that
+        still contains the base origin is skipped."""
+        from curobo.scene import Cuboid
+        T, M, V = 0.10, 0.10, 0.40
+        sx, sy, sz = hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+        cx, cy, cz = (lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0
+        q = [1.0, 0.0, 0.0, 0.0]
+        specs = [
+            ("xmin", (lo[0] - T / 2, cy, cz), (T, sy + M, sz + V)),
+            ("xmax", (hi[0] + T / 2, cy, cz), (T, sy + M, sz + V)),
+            ("ymin", (cx, lo[1] - T / 2, cz), (sx + M, T, sz + V)),
+            ("ymax", (cx, hi[1] + T / 2, cz), (sx + M, T, sz + V)),
+            # Floor just below the box bottom. Only safe when the box bottom is at/below the
+            # ground (below the base) — otherwise it slices the base and is auto-skipped.
+            ("zmin", (cx, cy, lo[2] - T / 2), (sx + M, sy + M, T)),
+            # Roof just above the box top. Drag the top high enough to clear the arm or it
+            # will clip the upper links (start-collision).
+            ("zmax", (cx, cy, hi[2] + T / 2), (sx + M, sy + M, T)),
+        ]
+        walls = []
+        for nm, c, d in specs:
+            if abs(c[0]) <= d[0] / 2 and abs(c[1]) <= d[1] / 2 and abs(c[2]) <= d[2] / 2:
+                self._node.get_logger().warn(
+                    f"safezone_{nm} panel overlaps the base origin — skipped "
+                    f"(move that side of the box away from the robot base).")
+                continue
+            walls.append(Cuboid(name=f"safezone_{nm}", pose=[*c, *q], dims=list(d)))
+        return walls
+
+    def _update_safe_zone_walls(self) -> None:
+        """(Re)apply keep-out walls to cuRobo's world from node.safe_zone_*, or clear them
+        when the zone is disabled. Persists across voxel updates (those only touch the voxel
+        list, not cuboids)."""
+        if self.motion_gen is None:
+            return
+        node = self._node
+        try:
+            wm = self.motion_gen.world_model
+            wm.cuboid = [c for c in (wm.cuboid or [])
+                         if not c.name.startswith("safezone_")]
+            enabled = bool(getattr(node, "safe_zone_enabled", False))
+            if enabled:
+                lo = [min(a, b) for a, b in zip(node.safe_zone_min, node.safe_zone_max)]
+                hi = [max(a, b) for a, b in zip(node.safe_zone_min, node.safe_zone_max)]
+                wm.cuboid.extend(self._safe_zone_wall_cuboids(lo, hi))
+            self.motion_gen.update_world(wm)
+            n = len([c for c in wm.cuboid if c.name.startswith("safezone_")])
+            node.get_logger().info(
+                f"Safe-zone walls {'applied' if enabled else 'cleared'} ({n} panels).")
+        except Exception as e:
+            node.get_logger().warn(f"Safe-zone wall update failed: {e}")
+
     def _publish_static_obstacles(self) -> None:
         """Publish static obstacles for visualization."""
         static_obstacles.publish_static_obstacles(
@@ -383,6 +554,116 @@ class MotionExecutor:
             frame_id="base_link",
             specs=self.static_obstacles,
         )
+        stamp = self._node.get_clock().now().to_msg()
+        for marker_id in range(len(self.static_obstacles), 10):
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = "environment"
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            self.env_marker_pub.publish(marker)
+
+    def _publish_golfcart_pallet_marker(self) -> None:
+        """Publish the pallet STL as a standalone RViz marker (lab + outdoor)."""
+        if self.golfcart_pallet_marker_pub is None:
+            return
+
+        stamp = self._node.get_clock().now().to_msg()
+
+        # Clear previous experimental marker namespaces if RViz still has them cached.
+        stale_markers = (
+            (0, "golfcart_pallet_stl"),
+            (10, "golfcart_pallet_base"),
+            (11, "golfcart_robot_mount"),
+            (20, "golfcart_robot_screws"),
+            (21, "golfcart_robot_screws"),
+            (22, "golfcart_robot_screws"),
+            (23, "golfcart_robot_screws"),
+        )
+        for marker_id, ns in stale_markers:
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = ns
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            self.golfcart_pallet_marker_pub.publish(marker)
+
+        pallet_z = -0.140
+        meshes = (
+            (
+                0,
+                "golfcart_pallet_front",
+                "package://ur10e_curobo/meshes/Golfcart_pallet_front.stl",
+                (0.34, 0.55, 0.72, 0.45),
+                (-0.500, 0.670, pallet_z),  # rotated -90° about base_link Z: (x,y)->(y,-x)
+            ),
+            (
+                1,
+                "golfcart_pallet_mount",
+                "package://ur10e_curobo/meshes/Golfcart_pallet_mount.stl",
+                (0.45, 0.72, 0.95, 0.78),
+                (-1.920, 0.670, pallet_z),  # rotated -90° about base_link Z: (x,y)->(y,-x)
+            ),
+        )
+        for marker_id, ns, resource, color, xyz in meshes:
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = ns
+            marker.id = marker_id
+            marker.type = Marker.MESH_RESOURCE
+            marker.action = Marker.ADD
+            marker.mesh_resource = resource
+            marker.mesh_use_embedded_materials = False
+            marker.pose.position.x = xyz[0]
+            marker.pose.position.y = xyz[1]
+            marker.pose.position.z = xyz[2]
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            # Rotated -90 degrees about base_link Z (yaw). To flip direction to
+            # +90, set z = +0.70710678 and use (x,y)->(-y,x) for the positions.
+            marker.pose.orientation.z = -0.70710678
+            marker.pose.orientation.w = 0.70710678
+            marker.scale.x = 0.001
+            marker.scale.y = 0.001
+            marker.scale.z = 0.001
+            marker.color.r = color[0]
+            marker.color.g = color[1]
+            marker.color.b = color[2]
+            marker.color.a = color[3]
+            self.golfcart_pallet_marker_pub.publish(marker)
+
+        screw_z = pallet_z + 0.350 + 0.004
+        for i, (x, y) in enumerate(
+            (
+                (0.0601040764, -0.0601040764),
+                (-0.0601040764, 0.0601040764),
+                (-0.0601040764, -0.0601040764),
+                (0.0601040764, 0.0601040764),
+            ),
+            start=1,
+        ):
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = "golfcart_robot_screws"
+            marker.id = i
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.position.z = screw_z
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.030
+            marker.scale.y = 0.030
+            marker.scale.z = 0.008
+            marker.color.r = 1.0
+            marker.color.g = 0.82
+            marker.color.b = 0.12
+            marker.color.a = 1.0
+            self.golfcart_pallet_marker_pub.publish(marker)
 
     def shutdown(self) -> None:
         """Clean shutdown of motion executor."""

@@ -1,0 +1,55 @@
+camera_profile: lab_old_zedx_mini_rgbd
+mode: zedx_mini
+description: ZED X Mini used as both RGB camera and native stereo depth camera.
+parent_frame: tool0
+rgb_frame: zed_mini_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed_mini_left_camera_frame
+  translation:
+    x: 0.09045367817643059
+    y: -0.08025369270823693
+    z: 0.0733305526768863
+  quaternion:
+    x: -0.05138315256011152
+    y: -0.02443174340038332
+    z: 0.501020523802351
+    w: 0.8635631397160373
+  rpy:
+    roll: -0.11347506242969518
+    pitch: 0.009291455631184276
+    yaw: 1.050906536051228
+  matrix:
+  - - 0.4967630492864714
+    - -0.8628149531969608
+    - -0.09368473409970954
+    - 0.09045367817643059
+  - - 0.8678364731907663
+    - 0.4926764127236043
+    - 0.06426358335490671
+    - -0.08025369270823693
+  - - -0.009291321941423184
+    - -0.11322680285836544
+    - 0.9935257230948042
+    - 0.0733305526768863
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: DANIILIDIS
+  mean_error_m: 0.00147422340184296
+  num_samples: 20
+  stationary_board_validation:
+    translation_median_m: 0.0005618499372800356
+    translation_p95_m: 0.0011804756344977244
+    translation_max_m: 0.001823489539846038
+    rotation_median_deg: 0.0839868695113723
+    rotation_p95_deg: 0.19060012096414733
+    rotation_max_deg: 0.3253937430573319
+    rejected_samples: 0
+    converged: true
+  calibrated_at: '2026-09-30 12:41:34'
+profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/lab_old_zedx_mini_rgbd.yaml
+robot_profile: old
+environment: lab

@@ -1,0 +1,70 @@
+{
+  "created_utc": "2026-08-30T10:09:23.176331+00:00",
+  "source_model": "/home/datepalm2/Downloads/30_Aug_26_kaust_farm.pt",
+  "source_sha256": "6cd374121aaced3db0be3c8ce29330a4e69d04af2e1406b7c54dbc6110f8f970",
+  "engine": "/home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/zed_date_detector/models/30_Aug_26_kaust_farm_1024_fp16.engine",
+  "engine_sha256": "3ce6602b8d8bb5bd2a53eb77c2ce001a38d6b584193c95b0fa6ee29aec693462",
+  "engine_bytes": 26329560,
+  "device": "Orin",
+  "compute_capability": [
+    8,
+    7
+  ],
+  "platform": "Linux-5.15.136-tegra-aarch64-with-glibc2.35",
+  "python": "3.10.12",
+  "torch": "2.3.0",
+  "cuda": "12.2",
+  "ultralytics": "8.4.6",
+  "tensorrt": "8.6.2",
+  "nvpmodel": "NV Power Mode: MAXN\n0",
+  "export_settings": {
+    "format": "engine",
+    "device": 0,
+    "imgsz": 1024,
+    "batch": 1,
+    "dynamic": false,
+    "simplify": true,
+    "nms": false,
+    "workspace": 8.0,
+    "verbose": true,
+    "half": true,
+    "int8": false
+  },
+  "embedded_metadata": {
+    "description": "Ultralytics YOLO26s-seg model trained on /train/cache/dataset/data.yaml",
+    "author": "Ultralytics",
+    "date": "2026-08-30T12:53:40.207613",
+    "version": "8.4.6",
+    "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+    "docs": "https://docs.ultralytics.com",
+    "stride": 32,
+    "task": "segment",
+    "batch": 1,
+    "imgsz": [
+      1024,
+      1024
+    ],
+    "names": {
+      "0": "date"
+    },
+    "args": {
+      "batch": 1,
+      "fraction": 1.0,
+      "half": true,
+      "int8": false,
+      "dynamic": false,
+      "simplify": true,
+      "nms": false
+    },
+    "channels": 3,
+    "end2end": true
+  },
+  "verification": {
+    "batch": true,
+    "imgsz": true,
+    "dynamic": true,
+    "half": true,
+    "int8": true,
+    "nms": true
+  }
+}

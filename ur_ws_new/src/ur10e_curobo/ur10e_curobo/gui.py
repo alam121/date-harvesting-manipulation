@@ -1,7 +1,7 @@
 import sys
 import threading
 import json
-from typing import Optional, List
+from typing import Optional
 from collections import deque
 import math
 from enum import Enum
@@ -29,6 +29,227 @@ except ImportError:
     PYQTGRAPH_AVAILABLE = False
     print("[WARN] pyqtgraph not installed. Install with: pip install pyqtgraph")
     print("[WARN] Graphs will be disabled.")
+
+
+# ==================== SCORE BAR WIDGET ====================
+
+class ScoreBarWidget(QtWidgets.QWidget):
+    """Horizontal bar chart for fruit detection score components."""
+
+    LABELS = [
+        ("distance",     "Distance",    "#ef5350"),
+        ("visibility",   "Visibility",  "#42a5f5"),
+        ("depth_quality","Depth",       "#66bb6a"),
+        ("confidence",   "Confidence",  "#ffa726"),
+        ("ellipse",      "Shape",       "#ab47bc"),
+        ("center_bias",  "Center",      "#26c6da"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.scores: dict = {}
+        self.setMinimumHeight(115)
+        self.setMaximumHeight(140)
+
+    def update_scores(self, components: dict):
+        self.scores = components
+        self.update()
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        w = self.width()
+        h = self.height()
+
+        if not self.scores:
+            p.setPen(QtGui.QColor("#888"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No detection")
+            return
+
+        n = len(self.LABELS)
+        margin = 3
+        label_w = 62
+        bar_area = w - label_w - margin * 3
+        row_h = max(10, (h - margin * (n + 1)) // n)
+
+        fm = QtGui.QFontMetrics(p.font())
+
+        for i, (key, name, color) in enumerate(self.LABELS):
+            y = margin + i * (row_h + margin)
+            val = float(self.scores.get(key, 0.0))
+            val = max(0.0, min(1.0, val))
+            bar_w = int(bar_area * val)
+
+            # Label
+            p.setPen(QtGui.QColor("#333"))
+            p.drawText(margin, y, label_w, row_h, Qt.AlignVCenter | Qt.AlignLeft, name)
+
+            # Background track
+            bg = QtCore.QRect(label_w + margin, y, bar_area, row_h)
+            p.fillRect(bg, QtGui.QColor("#e0e0e0"))
+
+            # Filled bar
+            if bar_w > 0:
+                p.fillRect(QtCore.QRect(label_w + margin, y, bar_w, row_h), QtGui.QColor(color))
+
+            # Value text
+            val_str = f"{val:.2f}"
+            text_x = label_w + margin + max(bar_w - fm.horizontalAdvance(val_str) - 2, 2)
+            p.setPen(QtGui.QColor("#fff") if bar_w > 30 else QtGui.QColor("#555"))
+            p.drawText(text_x, y, bar_area - (text_x - label_w - margin), row_h,
+                       Qt.AlignVCenter | Qt.AlignLeft, val_str)
+
+
+# ==================== HARVEST RESULT WIDGET ====================
+
+class HarvestResultWidget(QtWidgets.QWidget):
+    """
+    Large banner showing SUCCESS / PARTIAL / SLIPPED / FAIL for the last
+    harvest cycle, plus a session tally bar (grabbed / slipped / miss).
+    """
+
+    RESULT_MAP = {
+        # (outcome, end) -> (label, bg, fg)
+        ("GRABBED", "PROPER"):  ("SUCCESS",  "#2e7d32", "#e8f5e9"),
+        ("GRABBED", "WEAK"):    ("PARTIAL",  "#e65100", "#fff3e0"),
+        ("SLIPPED", "WEAK"):    ("SLIPPED",  "#f57f17", "#fffde7"),
+        ("SLIPPED", ""):        ("SLIPPED",  "#f57f17", "#fffde7"),
+        ("NO_GRAB", ""):        ("FAIL",     "#b71c1c", "#ffebee"),
+    }
+    DEFAULT = ("—",        "#455a64", "#eceff1")
+
+    def __init__(self):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Large result banner
+        self.banner = QtWidgets.QLabel("—")
+        self.banner.setAlignment(Qt.AlignCenter)
+        self.banner.setFont(QtGui.QFont("Helvetica", 20, QtGui.QFont.Bold))
+        self.banner.setFixedHeight(52)
+        self.banner.setStyleSheet(
+            "background: #455a64; color: #eceff1; border-radius: 8px; letter-spacing: 3px;")
+        layout.addWidget(self.banner)
+
+        # Tally row: grabbed | slipped | miss | total
+        tally_row = QtWidgets.QHBoxLayout()
+        tally_row.setSpacing(6)
+
+        self._tally_labels = {}
+        for key, label, color in [
+            ("grabbed", "Grabbed", "#4caf50"),
+            ("slipped", "Slipped", "#ff9800"),
+            ("miss",    "Miss",    "#f44336"),
+            ("total",   "Total",   "#90a4ae"),
+        ]:
+            cell = QtWidgets.QWidget()
+            cell_layout = QtWidgets.QVBoxLayout(cell)
+            cell_layout.setSpacing(1)
+            cell_layout.setContentsMargins(2, 2, 2, 2)
+
+            count = QtWidgets.QLabel("0")
+            count.setAlignment(Qt.AlignCenter)
+            count.setFont(QtGui.QFont("Courier", 14, QtGui.QFont.Bold))
+            count.setStyleSheet(f"color: {color};")
+            cell_layout.addWidget(count)
+
+            name = QtWidgets.QLabel(label)
+            name.setAlignment(Qt.AlignCenter)
+            name.setStyleSheet("font-size: 8pt; color: #666;")
+            cell_layout.addWidget(name)
+
+            tally_row.addWidget(cell)
+            self._tally_labels[key] = count
+
+        layout.addLayout(tally_row)
+
+    def update_result(self, history: list):
+        """Update banner from last entry and recount session tallies."""
+        if not history:
+            self.banner.setText("—")
+            self.banner.setStyleSheet(
+                "background: #455a64; color: #eceff1; border-radius: 8px; letter-spacing: 3px;")
+            for k in self._tally_labels:
+                self._tally_labels[k].setText("0")
+            return
+
+        # Last grasp
+        last = history[-1]
+        outcome = last.get("outcome", "")
+        end = last.get("end", "")
+        key = (outcome, end)
+        if key not in self.RESULT_MAP:
+            key = (outcome, "")  # try without end
+        label, bg, fg = self.RESULT_MAP.get(key, self.DEFAULT)
+        self.banner.setText(label)
+        self.banner.setStyleSheet(
+            f"background: {bg}; color: {fg}; border-radius: 8px; letter-spacing: 3px;")
+
+        # Tally
+        grabbed = slipped = miss = 0
+        for item in history:
+            o = item.get("outcome", "")
+            if o == "GRABBED":
+                grabbed += 1
+            elif o == "SLIPPED":
+                slipped += 1
+            elif o == "NO_GRAB":
+                miss += 1
+        total = grabbed + slipped + miss
+        self._tally_labels["grabbed"].setText(str(grabbed))
+        self._tally_labels["slipped"].setText(str(slipped))
+        self._tally_labels["miss"].setText(str(miss))
+        self._tally_labels["total"].setText(str(total))
+
+
+# ==================== GRASP OUTCOME DOTS ====================
+
+class GraspOutcomeWidget(QtWidgets.QWidget):
+    """Row of coloured circles showing last N grasp outcomes."""
+
+    COLORS = {
+        ("GRABBED", "PROPER"):  "#4caf50",  # green
+        ("GRABBED", "WEAK"):    "#ffeb3b",  # yellow
+        ("SLIPPED", ""):        "#ff9800",  # orange
+        ("NO_GRAB", ""):        "#f44336",  # red
+    }
+    DEFAULT_COLOR = "#9e9e9e"
+
+    def __init__(self):
+        super().__init__()
+        self.outcomes: list = []
+        self.setFixedHeight(28)
+
+    def update_outcomes(self, outcomes: list):
+        self.outcomes = outcomes[-15:]
+        self.update()
+
+    def _color(self, item):
+        outcome = item.get("outcome", "")
+        end = item.get("end", "")
+        for (o, e), c in self.COLORS.items():
+            if outcome == o and (e == "" or end == e):
+                return c
+        return self.DEFAULT_COLOR
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        if not self.outcomes:
+            p.setPen(QtGui.QColor("#aaa"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No grasps yet")
+            return
+        r = 10
+        gap = 4
+        x = gap
+        for item in self.outcomes:
+            color = QtGui.QColor(self._color(item))
+            p.setBrush(color)
+            p.setPen(QtGui.QColor("#555"))
+            p.drawEllipse(x, (self.height() - r * 2) // 2, r * 2, r * 2)
+            x += r * 2 + gap
 
 
 class UiBridge(Node):
@@ -99,6 +320,24 @@ class UiBridge(Node):
             10
         )
 
+        # Calibration check result
+        self.calib_check_result: Optional[str] = None
+        self.create_subscription(
+            String,
+            "/calib_check_result",
+            self._calib_check_cb,
+            10
+        )
+
+        # Fruit score components from vision node
+        self.fruit_score_data: dict = {}
+        self.create_subscription(
+            String,
+            "/vision/fruit_score",
+            self._fruit_score_cb,
+            10
+        )
+
     def _joint_state_cb(self, msg: JointState):
         self.joint_state_data = msg
 
@@ -145,6 +384,15 @@ class UiBridge(Node):
 
     def _velocity_scale_cb(self, msg: Float32):
         self.velocity_scale = msg.data
+
+    def _calib_check_cb(self, msg: String):
+        self.calib_check_result = msg.data
+
+    def _fruit_score_cb(self, msg: String):
+        try:
+            self.fruit_score_data = json.loads(msg.data)
+        except Exception:
+            pass
 
     def publish_velocity_scale(self, scale: float):
         """Send velocity scale command to node."""
@@ -586,10 +834,12 @@ class MainWindow(QtWidgets.QWidget):
 
         # Keyboard window reference
         self.kbd_window = None
+        self._environment_synced = False
 
         # Data storage for graphs
         self.force_history = [deque(maxlen=200), deque(maxlen=200), deque(maxlen=200)]
-        self.joint_history = [deque(maxlen=200) for _ in range(6)]
+        self.joint_history  = [deque(maxlen=200) for _ in range(6)]
+        self.joint_vel_history = [deque(maxlen=200) for _ in range(6)]
         self.time_data = deque(maxlen=200)
         self.elapsed_time = 0.0
 
@@ -648,6 +898,85 @@ class MainWindow(QtWidgets.QWidget):
         self.robot_state_label.setStyleSheet("font-size: 11pt; padding: 4px;")
         layout.addWidget(self.robot_state_label)
 
+        # Tabbed controls — keeps the panel short. Status stays above the tabs and the
+        # EMERGENCY STOP stays below them, so both are visible from every tab.
+        tabs = QtWidgets.QTabWidget()
+        motion_tab = QtWidgets.QWidget()
+        motion_tab_layout = QtWidgets.QVBoxLayout(motion_tab)
+        motion_tab_layout.setSpacing(6)
+        goal_tab = QtWidgets.QWidget()
+        goal_tab_layout = QtWidgets.QVBoxLayout(goal_tab)
+        goal_tab_layout.setSpacing(6)
+        settings_tab = QtWidgets.QWidget()
+        settings_tab_layout = QtWidgets.QVBoxLayout(settings_tab)
+        settings_tab_layout.setSpacing(6)
+        tabs.addTab(motion_tab, "Motion")
+        tabs.addTab(goal_tab, "Goal")
+        tabs.addTab(settings_tab, "Settings")
+        layout.addWidget(tabs, stretch=1)
+
+        # Runtime environment selects the complete HOME/DROPOFF preset family.
+        environment_group = QtWidgets.QGroupBox("Robot Environment")
+        environment_layout = QtWidgets.QGridLayout(environment_group)
+        self.environment_combo = QtWidgets.QComboBox()
+        self.environment_combo.addItem("Lab", "lab")
+        self.environment_combo.addItem("Outdoor / Field", "outdoor")
+        environment_layout.addWidget(QtWidgets.QLabel("Preset:"), 0, 0)
+        environment_layout.addWidget(self.environment_combo, 0, 1)
+
+        environment_apply = QtWidgets.QPushButton("Apply Environment")
+        environment_apply.setStyleSheet(
+            "background-color: #00695c; color: white; font-weight: bold;")
+        environment_apply.setToolTip(
+            "Switch HOME, DROPOFF, PREDROPOFF and side-home joint presets. "
+            "The robot does not move when this is pressed.")
+        environment_apply.clicked.connect(self._apply_environment)
+        environment_layout.addWidget(environment_apply, 1, 0, 1, 2)
+
+        self.environment_active_label = QtWidgets.QLabel("Active: waiting for robot…")
+        self.environment_active_label.setStyleSheet(
+            "font-size: 9pt; color: #455a64; padding: 3px;")
+        environment_layout.addWidget(self.environment_active_label, 2, 0, 1, 2)
+        settings_tab_layout.addWidget(environment_group)
+
+        # Physical closure-centre calibration in the gripper/tool frame. Values
+        # are displayed in millimetres but sent to the motion node in metres.
+        closure_group = QtWidgets.QGroupBox("Closure Center (tool frame, mm)")
+        closure_layout = QtWidgets.QGridLayout(closure_group)
+        self._closure_default_mm = (0.0, 0.0, 0.0)
+        self.closure_offset_inputs = []
+        for column, (axis, value) in enumerate(zip(
+                ("X", "Y", "Z"), self._closure_default_mm)):
+            closure_layout.addWidget(QtWidgets.QLabel(axis), 0, column)
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-100.0, 100.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" mm")
+            spin.setValue(value)
+            spin.setToolTip(
+                f"Closure-centre offset along tool-local {axis}. "
+                "Takes effect on the next grasp; does not move the robot now.")
+            closure_layout.addWidget(spin, 1, column)
+            self.closure_offset_inputs.append(spin)
+
+        closure_apply = QtWidgets.QPushButton("Apply Runtime")
+        closure_apply.setStyleSheet(
+            "background-color: #1976d2; color: white; font-weight: bold;")
+        closure_apply.clicked.connect(self._apply_closure_center_offsets)
+        closure_layout.addWidget(closure_apply, 2, 0, 1, 2)
+
+        closure_reset = QtWidgets.QPushButton("Reset Default")
+        closure_reset.clicked.connect(self._reset_closure_center_offsets)
+        closure_layout.addWidget(closure_reset, 2, 2)
+
+        closure_note = QtWidgets.QLabel(
+            "Runtime only. Apply while IDLE; used by the next FINAL grasp.")
+        closure_note.setWordWrap(True)
+        closure_note.setStyleSheet("font-size: 8pt; color: #546e7a;")
+        closure_layout.addWidget(closure_note, 3, 0, 1, 3)
+        settings_tab_layout.addWidget(closure_group)
+
         # Velocity Scale
         vel_group = QtWidgets.QGroupBox("Velocity Scale")
         vel_layout = QtWidgets.QVBoxLayout(vel_group)
@@ -678,7 +1007,7 @@ class MainWindow(QtWidgets.QWidget):
         apply_btn.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
         apply_btn.clicked.connect(self._apply_velocity_scale)
         vel_layout.addWidget(apply_btn)
-        layout.addWidget(vel_group)
+        settings_tab_layout.addWidget(vel_group)
 
         # Manual Goal (compact)
         goal_group = QtWidgets.QGroupBox("Manual Goal")
@@ -711,7 +1040,7 @@ class MainWindow(QtWidgets.QWidget):
         send_btn.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
         send_btn.clicked.connect(self._handle_send_goal)
         goal_layout.addWidget(send_btn, 4, 0, 1, 4)
-        layout.addWidget(goal_group)
+        goal_tab_layout.addWidget(goal_group)
 
         # Motion Commands
         motion_group = QtWidgets.QGroupBox("Motion")
@@ -737,20 +1066,84 @@ class MainWindow(QtWidgets.QWidget):
         clear_btn.setStyleSheet("background-color: #9e9e9e; color: white;")
         clear_btn.clicked.connect(lambda: self._send_cmd("clear"))
         motion_layout.addWidget(clear_btn, 1, 1)
-        layout.addWidget(motion_group)
+
+        # Manual side-home moves — test/calibrate home_left/home_right per robot profile
+        home_left_btn = QtWidgets.QPushButton("Home Left")
+        home_left_btn.setStyleSheet("background-color: #00897b; color: white; font-weight: bold;")
+        home_left_btn.setToolTip("Move to the stored home_left joint config (active robot profile)")
+        home_left_btn.clicked.connect(lambda: self._send_cmd("home_left"))
+        motion_layout.addWidget(home_left_btn, 2, 0)
+
+        home_right_btn = QtWidgets.QPushButton("Home Right")
+        home_right_btn.setStyleSheet("background-color: #00897b; color: white; font-weight: bold;")
+        home_right_btn.setToolTip("Move to the stored home_right joint config (active robot profile)")
+        home_right_btn.clicked.connect(lambda: self._send_cmd("home_right"))
+        motion_layout.addWidget(home_right_btn, 2, 1)
+
+        check_calib_btn = QtWidgets.QPushButton("Check Calibration (trunk)")
+        check_calib_btn.setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;")
+        check_calib_btn.setToolTip("Check hand-eye calibration using the detected trunk as the reference")
+        check_calib_btn.clicked.connect(lambda: self._send_cmd("check_calibration"))
+        motion_layout.addWidget(check_calib_btn, 3, 0, 1, 2)
+
+        self.calib_result_label = QtWidgets.QLabel("—")
+        self.calib_result_label.setWordWrap(True)
+        self.calib_result_label.setStyleSheet(
+            "font-size: 9pt; padding: 3px; background: #f3e5f5; border-radius: 4px;")
+        motion_layout.addWidget(self.calib_result_label, 4, 0, 1, 2)
+
+        self.debug_preview_cb = QtWidgets.QCheckBox("Debug Plan Preview")
+        self.debug_preview_cb.setChecked(True)
+        self.debug_preview_cb.setToolTip("Show full plan in RViz before executing")
+        self.debug_preview_cb.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 4px;")
+        self.debug_preview_cb.stateChanged.connect(self._on_debug_preview_changed)
+        motion_layout.addWidget(self.debug_preview_cb, 5, 0, 1, 2)
+
+        # Plan confirm/cancel buttons (shown when plan preview is waiting)
+        self.plan_confirm_btn = QtWidgets.QPushButton("Confirm Plan")
+        self.plan_confirm_btn.setStyleSheet("background-color: #4caf50; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
+        self.plan_confirm_btn.clicked.connect(lambda: self._send_cmd("plan_confirm"))
+        self.plan_confirm_btn.setVisible(False)
+        motion_layout.addWidget(self.plan_confirm_btn, 6, 0)
+
+        self.plan_cancel_btn = QtWidgets.QPushButton("Cancel Plan")
+        self.plan_cancel_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 11pt; padding: 8px;")
+        self.plan_cancel_btn.clicked.connect(lambda: self._send_cmd("plan_cancel"))
+        self.plan_cancel_btn.setVisible(False)
+        motion_layout.addWidget(self.plan_cancel_btn, 6, 1)
+        motion_tab_layout.addWidget(motion_group)
 
         # Gripper
         gripper_group = QtWidgets.QGroupBox("Gripper")
-        gripper_layout = QtWidgets.QHBoxLayout(gripper_group)
+        gripper_layout = QtWidgets.QGridLayout(gripper_group)
 
         open_btn = QtWidgets.QPushButton("Open")
         open_btn.clicked.connect(lambda: self._send_cmd("open"))
-        gripper_layout.addWidget(open_btn)
+        gripper_layout.addWidget(open_btn, 0, 0)
 
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(lambda: self._send_cmd("close"))
-        gripper_layout.addWidget(close_btn)
-        layout.addWidget(gripper_group)
+        gripper_layout.addWidget(close_btn, 0, 1)
+
+        gripper_layout.addWidget(QtWidgets.QLabel("Grasp mode:"), 1, 0)
+        self.grasp_mode_combo = QtWidgets.QComboBox()
+        self.grasp_mode_combo.addItem("Auto (from date angle)", "AUTO")
+        self.grasp_mode_combo.addItem("Normal", "NORMAL")
+        self.grasp_mode_combo.addItem("Envelop (experimental)", "ENVELOP")
+        self.grasp_mode_combo.setToolTip(
+            "ENVELOP uses the measured 12-joint open/closed postures and "
+            "places the closure center slightly deeper. Applied while IDLE.")
+        gripper_layout.addWidget(self.grasp_mode_combo, 1, 1)
+
+        grasp_mode_apply = QtWidgets.QPushButton("Apply Mode")
+        grasp_mode_apply.clicked.connect(self._apply_grasp_mode)
+        gripper_layout.addWidget(grasp_mode_apply, 2, 0)
+        self.grasp_mode_active_label = QtWidgets.QLabel("Active: waiting…")
+        self.grasp_mode_active_label.setStyleSheet(
+            "font-size: 9pt; color: #455a64;")
+        gripper_layout.addWidget(self.grasp_mode_active_label, 2, 1)
+        self._grasp_mode_synced = False
+        motion_tab_layout.addWidget(gripper_group)
 
         # Keyboard Mode Button (opens separate window)
         kbd_btn = QtWidgets.QPushButton("Open Keyboard Control Window")
@@ -768,7 +1161,7 @@ class MainWindow(QtWidgets.QWidget):
             }
         """)
         kbd_btn.clicked.connect(self._open_keyboard_window)
-        layout.addWidget(kbd_btn)
+        settings_tab_layout.addWidget(kbd_btn)
 
         # Capture
         capture_group = QtWidgets.QGroupBox("Capture")
@@ -781,21 +1174,50 @@ class MainWindow(QtWidgets.QWidget):
         cap_stop = QtWidgets.QPushButton("Stop")
         cap_stop.clicked.connect(lambda: self._send_cmd("capture_stop"))
         capture_layout.addWidget(cap_stop)
-        layout.addWidget(capture_group)
+        goal_tab_layout.addWidget(capture_group)
 
-        # Emergency Stop
+        # Push each tab's groups to the top so they don't stretch vertically.
+        motion_tab_layout.addStretch(1)
+        goal_tab_layout.addStretch(1)
+        settings_tab_layout.addStretch(1)
+
+        # Emergency Stop — always visible, below the tabs
         stop_btn = QtWidgets.QPushButton("EMERGENCY STOP")
         stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 12pt; padding: 12px;")
         stop_btn.clicked.connect(self._handle_stop)
         layout.addWidget(stop_btn)
 
-        layout.addStretch(1)
         return panel
 
     def _build_monitor_panel(self):
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setSpacing(6)
+
+        # Motion phase + reacquire result (side by side)
+        phase_row = QtWidgets.QHBoxLayout()
+
+        phase_group = QtWidgets.QGroupBox("Motion Phase")
+        phase_inner = QtWidgets.QVBoxLayout(phase_group)
+        self.phase_label = QtWidgets.QLabel("IDLE")
+        self.phase_label.setAlignment(Qt.AlignCenter)
+        self.phase_label.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        self.phase_label.setStyleSheet(
+            "background: #455a64; color: #eceff1; padding: 8px; border-radius: 6px; letter-spacing: 2px;")
+        phase_inner.addWidget(self.phase_label)
+        phase_row.addWidget(phase_group, stretch=3)
+
+        reacq_group = QtWidgets.QGroupBox("Reacquire")
+        reacq_inner = QtWidgets.QVBoxLayout(reacq_group)
+        self.reacq_label = QtWidgets.QLabel("—")
+        self.reacq_label.setAlignment(Qt.AlignCenter)
+        self.reacq_label.setFont(QtGui.QFont("Helvetica", 14, QtGui.QFont.Bold))
+        self.reacq_label.setStyleSheet(
+            "background: #455a64; color: #eceff1; padding: 8px; border-radius: 6px;")
+        reacq_inner.addWidget(self.reacq_label)
+        phase_row.addWidget(reacq_group, stretch=2)
+
+        layout.addLayout(phase_row)
 
         # Gripper forces (compact)
         gripper_group = QtWidgets.QGroupBox("Gripper Forces")
@@ -865,6 +1287,40 @@ class MainWindow(QtWidgets.QWidget):
         goals_layout.addWidget(self.current_velocity_label)
         layout.addWidget(goals_group)
 
+        # Fruit score bar chart
+        score_group = QtWidgets.QGroupBox("Fruit Score Components")
+        score_layout = QtWidgets.QVBoxLayout(score_group)
+        score_layout.setContentsMargins(4, 4, 4, 4)
+        self.score_bar = ScoreBarWidget()
+        score_layout.addWidget(self.score_bar)
+        layout.addWidget(score_group)
+
+        # Harvest result banner + session tally
+        result_group = QtWidgets.QGroupBox("Last Harvest Result")
+        result_layout = QtWidgets.QVBoxLayout(result_group)
+        result_layout.setContentsMargins(4, 4, 4, 4)
+        self.harvest_result = HarvestResultWidget()
+        result_layout.addWidget(self.harvest_result)
+        layout.addWidget(result_group)
+
+        # Grasp history dots
+        grasp_group = QtWidgets.QGroupBox("Grasp History (last 15)")
+        grasp_layout = QtWidgets.QVBoxLayout(grasp_group)
+        grasp_layout.setContentsMargins(4, 4, 4, 4)
+        legend_row = QtWidgets.QHBoxLayout()
+        for ltext, lcolor in [("Proper", "#4caf50"), ("Weak", "#ffeb3b"), ("Slipped", "#ff9800"), ("No-grab", "#f44336")]:
+            dot = QtWidgets.QLabel("●")
+            dot.setStyleSheet(f"color: {lcolor}; font-size: 14pt;")
+            legend_row.addWidget(dot)
+            lbl = QtWidgets.QLabel(ltext)
+            lbl.setStyleSheet("font-size: 8pt;")
+            legend_row.addWidget(lbl)
+        legend_row.addStretch()
+        grasp_layout.addLayout(legend_row)
+        self.grasp_dots = GraspOutcomeWidget()
+        grasp_layout.addWidget(self.grasp_dots)
+        layout.addWidget(grasp_group)
+
         # Graphs
         if PYQTGRAPH_AVAILABLE:
             force_graph_group = QtWidgets.QGroupBox("Force History")
@@ -894,6 +1350,24 @@ class MainWindow(QtWidgets.QWidget):
             self.joint_curves = [self.joint_plot.plot(pen=mkPen(color=c, width=1.5)) for c in jcolors]
             joint_graph_layout.addWidget(self.joint_plot)
             layout.addWidget(joint_graph_group)
+
+            jvel_graph_group = QtWidgets.QGroupBox("Joint Velocity History (rad/s)")
+            jvel_graph_layout = QtWidgets.QVBoxLayout(jvel_graph_group)
+
+            self.joint_vel_plot = PlotWidget()
+            self.joint_vel_plot.setBackground('w')
+            self.joint_vel_plot.setLabel('left', 'Vel (rad/s)')
+            self.joint_vel_plot.showGrid(x=True, y=True, alpha=0.3)
+            self.joint_vel_plot.setMaximumHeight(150)
+            self.joint_vel_plot.addLegend(offset=(5, 5))
+
+            jnames = ["Pan", "Lift", "Elbow", "W1", "W2", "W3"]
+            self.joint_vel_curves = [
+                self.joint_vel_plot.plot(pen=mkPen(color=c, width=1.5), name=n)
+                for c, n in zip(jcolors, jnames)
+            ]
+            jvel_graph_layout.addWidget(self.joint_vel_plot)
+            layout.addWidget(jvel_graph_group)
 
         layout.addStretch(1)
         return panel
@@ -930,8 +1404,70 @@ class MainWindow(QtWidgets.QWidget):
             for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
                 self.joint_labels[i].setText(f"{pos:.3f}")
 
-        # Goals
+        # Motion phase badge
         goal_info = self.ros.goal_info_data
+        if goal_info:
+            active_environment = str(goal_info.get("environment", "")).lower()
+            active_profile = str(goal_info.get("robot_profile", "unknown"))
+            if active_environment in ("lab", "outdoor"):
+                if not self._environment_synced:
+                    index = self.environment_combo.findData(active_environment)
+                    if index >= 0:
+                        self.environment_combo.setCurrentIndex(index)
+                    self._environment_synced = True
+                self.environment_active_label.setText(
+                    f"Active: {active_profile} / {active_environment}")
+            active_grasp_mode = str(
+                goal_info.get("grasp_mode", "NORMAL")).upper()
+            if active_grasp_mode in ("AUTO", "NORMAL", "ENVELOP"):
+                if not self._grasp_mode_synced:
+                    index = self.grasp_mode_combo.findData(active_grasp_mode)
+                    if index >= 0:
+                        self.grasp_mode_combo.setCurrentIndex(index)
+                    self._grasp_mode_synced = True
+                self.grasp_mode_active_label.setText(
+                    f"Active: {active_grasp_mode}")
+        phase = goal_info.get("motion_phase", "IDLE") if goal_info else "IDLE"
+        phase_colors = {
+            "IDLE":      ("#455a64", "#eceff1"),
+            "APPROACH":  ("#1565c0", "#e3f2fd"),
+            "REACQUIRE": ("#6a1b9a", "#f3e5f5"),
+            "FINAL":     ("#e65100", "#fff3e0"),
+            "REVERSING": ("#558b2f", "#f1f8e9"),
+            "DROPOFF":   ("#00838f", "#e0f7fa"),
+            "HOME":      ("#2e7d32", "#e8f5e9"),
+        }
+        bg, fg = phase_colors.get(phase, ("#455a64", "#eceff1"))
+        self.phase_label.setText(phase)
+        self.phase_label.setStyleSheet(
+            f"background: {bg}; color: {fg}; padding: 8px; border-radius: 6px; "
+            f"letter-spacing: 2px; font-size: 14pt; font-weight: bold;")
+
+        # Reacquire result badge
+        reacq = goal_info.get("reacquire_result", "") if goal_info else ""
+        reacq_style = {
+            "OK":    ("OK",    "#1b5e20", "#e8f5e9"),
+            "NUDGE": ("NUDGE", "#e65100", "#fff3e0"),
+            "FAIL":  ("FAIL",  "#b71c1c", "#ffebee"),
+            "":      ("—",     "#455a64", "#eceff1"),
+        }
+        r_text, r_bg, r_fg = reacq_style.get(reacq, reacq_style[""])
+        self.reacq_label.setText(r_text)
+        self.reacq_label.setStyleSheet(
+            f"background: {r_bg}; color: {r_fg}; padding: 8px; border-radius: 6px; "
+            f"font-size: 14pt; font-weight: bold;")
+
+        # Fruit score bar chart
+        self.score_bar.update_scores(self.ros.fruit_score_data)
+
+        # Harvest result + session tally
+        grasp_history = goal_info.get("grasp_history", []) if goal_info else []
+        self.harvest_result.update_result(grasp_history)
+
+        # Grasp history dots
+        self.grasp_dots.update_outcomes(grasp_history)
+
+        # Goals
         if goal_info:
             self.goal_count_label.setText(f"Goals: {goal_info.get('goal_count', 0)}")
             if goal_info.get("capture_active"):
@@ -950,6 +1486,32 @@ class MainWindow(QtWidgets.QWidget):
 
             self.current_velocity_label.setText(f"Velocity: {goal_info.get('velocity_scale', 5.0):.1f}x")
 
+            if "debug_plan_preview" in goal_info:
+                self.debug_preview_cb.blockSignals(True)
+                self.debug_preview_cb.setChecked(goal_info["debug_plan_preview"])
+                self.debug_preview_cb.blockSignals(False)
+
+            waiting = goal_info.get("plan_waiting_confirm", False)
+            self.plan_confirm_btn.setVisible(waiting)
+            self.plan_cancel_btn.setVisible(waiting)
+
+        # Calibration check result
+        calib = self.ros.calib_check_result
+        if calib is not None:
+            self.calib_result_label.setText(calib)
+            if calib.startswith("GOOD"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #e8f5e9; color: #2e7d32; border-radius: 4px;")
+            elif calib.startswith("ACCEPTABLE"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #fff8e1; color: #e65100; border-radius: 4px;")
+            elif calib.startswith("POOR") or calib.startswith("FAIL"):
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #ffebee; color: #c62828; border-radius: 4px;")
+            else:
+                self.calib_result_label.setStyleSheet(
+                    "font-size: 10pt; padding: 4px; background: #f3e5f5; border-radius: 4px;")
+
         # Graphs
         if PYQTGRAPH_AVAILABLE:
             self.elapsed_time += 0.05
@@ -961,10 +1523,16 @@ class MainWindow(QtWidgets.QWidget):
                     self.force_curves[i].setData(list(self.time_data)[-len(self.force_history[i]):], list(self.force_history[i]))
 
             if self.ros.joint_state_data and len(self.ros.joint_state_data.position) >= 6:
+                vels = list(self.ros.joint_state_data.velocity) if self.ros.joint_state_data.velocity else [0.0] * 6
                 for i, pos in enumerate(self.ros.joint_state_data.position[:6]):
                     self.joint_history[i].append(pos)
                     if self.time_data and self.joint_history[i]:
                         self.joint_curves[i].setData(list(self.time_data)[-len(self.joint_history[i]):], list(self.joint_history[i]))
+                for i in range(6):
+                    v = vels[i] if i < len(vels) else 0.0
+                    self.joint_vel_history[i].append(v)
+                    if self.time_data and self.joint_vel_history[i]:
+                        self.joint_vel_curves[i].setData(list(self.time_data)[-len(self.joint_vel_history[i]):], list(self.joint_vel_history[i]))
 
     def _handle_send_goal(self):
         try:
@@ -995,6 +1563,45 @@ class MainWindow(QtWidgets.QWidget):
         scale = self.velocity_slider.value() / 10.0
         self.ros.publish_velocity_scale(scale)
         self.status_update.emit(f"Velocity: {scale:.1f}x", False)
+
+    def _apply_environment(self):
+        environment = self.environment_combo.currentData()
+        if environment not in ("lab", "outdoor"):
+            self.status_update.emit("Invalid environment selection", True)
+            return
+        self.ros.publish_cmd(f"set_environment {environment}")
+        self.status_update.emit(
+            f"Requested environment: {environment}", False)
+
+    def _apply_grasp_mode(self):
+        mode = str(self.grasp_mode_combo.currentData()).upper()
+        if mode not in ("AUTO", "NORMAL", "ENVELOP"):
+            self.status_update.emit("Invalid grasp mode", True)
+            return
+        self.ros.publish_cmd(f"set_grasp_mode {mode}")
+        self.status_update.emit(
+            f"Requested grasp mode: {mode} (next grasp)", False)
+
+    def _apply_closure_center_offsets(self):
+        values_mm = [spin.value() for spin in self.closure_offset_inputs]
+        values_m = [value / 1000.0 for value in values_mm]
+        payload = " ".join(f"{value:.6f}" for value in values_m)
+        self.ros.publish_cmd(f"set_closure_center_offsets {payload}")
+        self.status_update.emit(
+            "Closure center requested: "
+            + ", ".join(f"{axis}={value:+.1f}mm" for axis, value in zip(
+                ("X", "Y", "Z"), values_mm)), False)
+
+    def _reset_closure_center_offsets(self):
+        for spin, value in zip(
+                self.closure_offset_inputs, self._closure_default_mm):
+            spin.setValue(value)
+        self._apply_closure_center_offsets()
+
+    def _on_debug_preview_changed(self, state):
+        enabled = "true" if state == Qt.Checked else "false"
+        self.ros.publish_cmd(f"set_debug_preview {enabled}")
+        self.status_update.emit(f"Debug preview: {enabled}", False)
 
     def _set_status_slot(self, text: str, error: bool):
         if not self._status:

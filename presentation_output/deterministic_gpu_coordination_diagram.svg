@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c1b2d"/>
+      <stop offset="1" stop-color="#123b59"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-opacity=".22"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#39c2cc"/>
+    </marker>
+    <style>
+      .title{font:700 50px Arial,sans-serif;fill:#fff}
+      .subtitle{font:400 24px Arial,sans-serif;fill:#b8d1df}
+      .section{font:700 25px Arial,sans-serif;letter-spacing:2px;fill:#39c2cc}
+      .boxTitle{font:700 25px Arial,sans-serif;fill:#fff}
+      .boxText{font:400 19px Arial,sans-serif;fill:#dceaf0}
+      .metric{font:700 46px Arial,sans-serif}
+      .metricLabel{font:700 16px Arial,sans-serif;letter-spacing:1px;fill:#657d8d}
+      .small{font:400 17px Arial,sans-serif;fill:#9cb3c1}
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="80" y="82" class="title">Faster Perception. Deterministic GPU Coordination.</text>
+  <text x="82" y="125" class="subtitle">Vision stays responsive while motion planning receives exclusive GPU access only when it is safe.</text>
+
+  <text x="80" y="188" class="section">1  DETERMINISTIC VISION → PLANNING HANDSHAKE</text>
+  <rect x="80" y="215" width="1440" height="280" rx="28" fill="#132f48" stroke="#31546b" stroke-width="2" filter="url(#shadow)"/>
+
+  <rect x="120" y="282" width="250" height="118" rx="18" fill="#1595a3"/>
+  <text x="245" y="329" text-anchor="middle" class="boxTitle">Perception loop</text>
+  <text x="245" y="363" text-anchor="middle" class="boxText">ZED + YOLO inference</text>
+
+  <line x1="370" y1="341" x2="474" y2="341" stroke="#39c2cc" stroke-width="7" marker-end="url(#arrow)"/>
+  <text x="422" y="316" text-anchor="middle" class="small">pause request</text>
+
+  <rect x="495" y="282" width="250" height="118" rx="18" fill="#e58a3a"/>
+  <text x="620" y="329" text-anchor="middle" class="boxTitle">Drain GPU work</text>
+  <text x="620" y="363" text-anchor="middle" class="boxText">Finish active inference</text>
+
+  <line x1="745" y1="341" x2="849" y2="341" stroke="#39c2cc" stroke-width="7" marker-end="url(#arrow)"/>
+  <text x="797" y="316" text-anchor="middle" class="small">ACK: GPU free</text>
+
+  <rect x="870" y="282" width="250" height="118" rx="18" fill="#246da0"/>
+  <text x="995" y="329" text-anchor="middle" class="boxTitle">cuRobo planning</text>
+  <text x="995" y="363" text-anchor="middle" class="boxText">Exclusive GPU window</text>
+
+  <line x1="1120" y1="341" x2="1224" y2="341" stroke="#39c2cc" stroke-width="7" marker-end="url(#arrow)"/>
+  <text x="1172" y="316" text-anchor="middle" class="small">resume</text>
+
+  <rect x="1245" y="282" width="235" height="118" rx="18" fill="#38a46a"/>
+  <text x="1363" y="329" text-anchor="middle" class="boxTitle">Perception resumes</text>
+  <text x="1363" y="363" text-anchor="middle" class="boxText">Next camera frame</text>
+
+  <rect x="260" y="427" width="1080" height="42" rx="21" fill="#0b2336"/>
+  <text x="800" y="455" text-anchor="middle" class="boxText">No fixed delay • No simultaneous YOLO/cuRobo GPU access • Planning starts after explicit acknowledgement</text>
+
+  <text x="80" y="565" class="section">2  MEASURED PERCEPTION-LOOP IMPROVEMENT</text>
+
+  <rect x="80" y="595" width="420" height="220" rx="24" fill="#f4f6f1" filter="url(#shadow)"/>
+  <text x="290" y="660" text-anchor="middle" class="metric" fill="#7b8c97">15 FPS</text>
+  <text x="290" y="695" text-anchor="middle" class="metricLabel">PREVIOUS LOOP LIMIT</text>
+  <rect x="145" y="735" width="290" height="18" rx="9" fill="#dce2e5"/>
+  <rect x="145" y="735" width="121" height="18" rx="9" fill="#7b8c97"/>
+  <text x="290" y="787" text-anchor="middle" class="small" fill="#657d8d">Baseline before frame-rate tuning</text>
+
+  <rect x="590" y="595" width="420" height="220" rx="24" fill="#f4f6f1" filter="url(#shadow)"/>
+  <text x="800" y="660" text-anchor="middle" class="metric" fill="#38a46a">35.9 FPS</text>
+  <text x="800" y="695" text-anchor="middle" class="metricLabel">GPU FREE</text>
+  <rect x="655" y="735" width="290" height="18" rx="9" fill="#dce2e5"/>
+  <rect x="655" y="735" width="290" height="18" rx="9" fill="#38a46a"/>
+  <text x="800" y="787" text-anchor="middle" class="small" fill="#657d8d">+139% versus the previous limit</text>
+
+  <rect x="1100" y="595" width="420" height="220" rx="24" fill="#f4f6f1" filter="url(#shadow)"/>
+  <text x="1310" y="660" text-anchor="middle" class="metric" fill="#e58a3a">28.5 FPS</text>
+  <text x="1310" y="695" text-anchor="middle" class="metricLabel">UNDER GPU LOAD</text>
+  <rect x="1165" y="735" width="290" height="18" rx="9" fill="#dce2e5"/>
+  <rect x="1165" y="735" width="230" height="18" rx="9" fill="#e58a3a"/>
+  <text x="1310" y="787" text-anchor="middle" class="small" fill="#657d8d">+90% versus the previous limit</text>
+
+  <text x="800" y="862" text-anchor="middle" class="subtitle">Result: higher perception throughput with conflict-free, deterministic GPU handoff to motion planning.</text>
+</svg>

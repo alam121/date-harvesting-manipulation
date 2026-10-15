@@ -4,23 +4,250 @@ import sys
 import subprocess
 import os
 import re
+import ast
+import shlex
+from pathlib import Path
 
-WS = "/home/datepalm2/manipulatorsdatepalm/ur_ws_new"
-SOURCE = f"source {WS}/install/setup.bash"
+WS = str(Path(__file__).resolve().parent)
+REPO_ROOT = str(Path(WS).parent)
+ROS_DOMAIN_ID = os.environ.get("ROS_DOMAIN_ID", "6")
+ROS_DOMAIN_CMD = f"export ROS_DOMAIN_ID={ROS_DOMAIN_ID}"
+FASTDDS_CFG = f"export FASTRTPS_DEFAULT_PROFILES_FILE={WS}/fastdds_config.xml"
+SOURCE = f"{ROS_DOMAIN_CMD} && {FASTDDS_CFG} && source {WS}/install/setup.bash"
 CONFIG_PATH = os.path.expanduser("~/.config/terminator/config")
-UNET_SCRIPT = "/home/datepalm2/manipulatorsdatepalm/bin/unet.sh"
+TERMINATOR_PID_PATH = "/tmp/ur10e_dynamic_terminator.pid"
+UNET_SCRIPT = str(Path(REPO_ROOT) / "bin" / "unet.sh")
+ROBOT_IP = "192.168.1.190"
+ROBOT_PC_IP = "192.168.1.101"
+SCRIPT_SENDER_PORT = "50002"
+ROBOT_CONFIG_SOURCE = (
+    Path(WS) / "src" / "ur10e_curobo" / "ur10e_curobo" / "config.py"
+)
+CAMERA_PROFILE_DIR = (
+    Path(WS) / "src" / "ur10e_curobo" / "ur10e_curobo"
+    / "vision" / "calibration_profiles"
+)
+GRIPPER_CALIBRATION_FILE = Path(os.environ.get(
+    "UR10E_GRIPPER_CALIBRATION_FILE",
+    "~/.config/datepalm/gripper_calibration.json",
+)).expanduser()
+MODEL_DIR = Path(WS) / "src" / "zed_date_detector" / "models"
+PRESETS = {
+    "harvest": ["main", "vision", "zedx_mini"],
+    "field": ["main", "vision", "zedx_mini"],
+}
 
-def get_commands(fake_hardware=False):
+
+def expand_presets(args):
+    expanded = []
+    for arg in args:
+        preset = PRESETS.get(arg)
+        if preset is None:
+            expanded.append(arg)
+            continue
+        for item in preset:
+            if item not in expanded:
+                expanded.append(item)
+    return expanded
+
+
+def load_robot_profile() -> str:
+    """Read ROBOT_PROFILE without importing config.py and initializing CUDA."""
+    tree = ast.parse(ROBOT_CONFIG_SOURCE.read_text(), filename=str(ROBOT_CONFIG_SOURCE))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "ROBOT_PROFILE"
+               for target in node.targets):
+            try:
+                profile = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                profile = os.environ.get("UR10E_ROBOT_PROFILE", "old")
+            if profile != "old":
+                raise ValueError(f"ROBOT_PROFILE must be 'old', got {profile!r}")
+            return profile
+    raise RuntimeError(f"ROBOT_PROFILE not found in {ROBOT_CONFIG_SOURCE}")
+
+
+DEFAULT_ROBOT_PROFILE = load_robot_profile()
+DEFAULT_ENVIRONMENT = os.environ.get(
+    "UR10E_ENVIRONMENT", "outdoor").strip().lower()
+if DEFAULT_ENVIRONMENT not in ("lab", "outdoor"):
+    DEFAULT_ENVIRONMENT = "outdoor"
+
+
+def kinematics_file_for(robot_profile: str) -> Path:
+    return (
+        Path(WS) / "install" / "ur_description" / "share" / "ur_description"
+        / "config" / "ur10e"
+        / "old_kinematics.yaml"
+    )
+
+RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
+MAIN_START_DELAY_SECONDS = 15
+# Keep ZED/TensorRT startup out of cuRobo's CUDA-graph warmup window.
+VISION_START_DELAY_SECONDS = 60
+
+
+def camera_mode_for(use_lidar=False, use_zed_mini=False, use_zedx_mini_only=False):
+    if use_zedx_mini_only:
+        return "zedx_mini"
+    if use_zed_mini:
+        return "zed_mini"
+    if use_lidar:
+        return "lidar"
+    return "stereo"
+
+
+def camera_profile_env(
+    camera_mode: str,
+    robot_profile: str,
+    environment: str,
+) -> str:
+    profiles = {
+        "zedx_mini": (
+            "zedx_mini_rgbd",
+            "zed_mini_left_camera_frame",
+            "zed_mini_left_camera_frame",
+        ),
+        "zed_mini": (
+            "zed_one_rgb_zedx_mini_depth",
+            "zed2_left_camera_frame",
+            "zed_mini_left_camera_frame",
+        ),
+        "lidar": (
+            "zed_one_rgb_zedx_mini_depth",
+            "zed2_left_camera_frame",
+            "zed_mini_left_camera_frame",
+        ),
+        "stereo": (
+            "zed_one_rgb_zedx_mini_depth",
+            "zed2_left_camera_frame",
+            "zed_mini_left_camera_frame",
+        ),
+    }
+    base_profile, rgb_frame, depth_frame = profiles.get(
+        camera_mode, profiles["zedx_mini"])
+    contextual_profile = f"{environment}_{robot_profile}_{base_profile}"
+    contextual_path = CAMERA_PROFILE_DIR / f"{contextual_profile}.yaml"
+    profile = contextual_profile if contextual_path.exists() else base_profile
+    profile_path = CAMERA_PROFILE_DIR / f"{profile}.yaml"
+    return (
+        f"export UR10E_CAMERA_MODE={camera_mode} && "
+        f"export UR10E_CAMERA_PROFILE={profile} && "
+        f"export UR10E_CAMERA_PROFILE_PATH={profile_path} && "
+        f"export UR10E_CAM_FRAME={rgb_frame} && "
+        f"export UR10E_ZEDMINI_CAM_FRAME={depth_frame}"
+    )
+
+def get_commands(
+    fake_hardware=False,
+    use_panel=False,
+    use_lidar=False,
+    use_zed_mini=False,
+    use_zedx_mini_only=False,
+    use_vision=False,
+    hand_eye_target="charuco",
+    hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    environment=None,
+    gripper_profile="new",
+    gripper_enabled=True,
+):
+    robot_profile = robot_profile or DEFAULT_ROBOT_PROFILE
+    environment = environment or DEFAULT_ENVIRONMENT
+    kinematics_file = kinematics_file_for(robot_profile)
+    camera_mode = camera_mode_for(use_lidar, use_zed_mini, use_zedx_mini_only)
+    camera_env = camera_profile_env(camera_mode, robot_profile, environment)
+    source_with_camera = (
+        f"{SOURCE} && export UR10E_ROBOT_PROFILE={robot_profile} "
+        f"&& export UR10E_ENVIRONMENT={environment} && {camera_env}"
+    )
+    profile_source = (
+        f"{source_with_camera} "
+        f"&& export UR10E_GRIPPER_PROFILE={gripper_profile} "
+        f"&& export UR10E_GRIPPER_CALIBRATION_FILE={GRIPPER_CALIBRATION_FILE} "
+        f"&& export UR10E_GRIPPER_ENABLED={'true' if gripper_enabled else 'false'}"
+    )
     hw = "true" if fake_hardware else "false"
+    vision = "true" if use_vision else "false"
     # Skip unet.sh for fake hardware since no real robot
     ur_prefix = "" if fake_hardware else f"{UNET_SCRIPT} && "
-    return {
-        "ur": f'{ur_prefix}{SOURCE} && ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:={hw} launch_rviz:=true',
-        "main": f'sleep 5 && {SOURCE} && ros2 run ur10e_curobo main',
-        "vision": f'sleep 7 && {SOURCE} && ros2 run ur10e_curobo vision',
-        "teleop": f'sleep 6 && {SOURCE} && ros2 run ur10e_curobo teleop',
-        "gui": f'sleep 8 && {SOURCE} && ros2 run ur10e_curobo gui',
+    # When panel is used, disable default rviz and launch rviz with our panel config
+    launch_rviz = "false" if use_panel else "true"
+    if use_zedx_mini_only:
+        vision_flags = " --use_zedx_mini_only"
+    elif use_zed_mini:
+        vision_flags = " --use_zed_mini"
+    elif use_lidar:
+        vision_flags = " --use_lidar"
+    else:
+        vision_flags = ""
+    if os.environ.get("UR10E_RAW_YOLO_VIEW", "0") == "1":
+        vision_flags += " --raw_yolo_view"
+    yolo_weights = os.environ.get("UR10E_YOLO_WEIGHTS", "").strip()
+    if yolo_weights:
+        vision_flags += f" --weights {shlex.quote(yolo_weights)}"
+    yolo_confidence = os.environ.get("UR10E_YOLO_CONFIDENCE", "").strip()
+    if yolo_confidence:
+        vision_flags += f" --conf_thres {shlex.quote(yolo_confidence)}"
+    yolo_max_detections = os.environ.get("UR10E_YOLO_MAX_DETECTIONS", "").strip()
+    if yolo_max_detections:
+        vision_flags += f" --max_det {shlex.quote(yolo_max_detections)}"
+    svo_path = os.environ.get("UR10E_RAW_YOLO_SVO", "").strip()
+    video_path = os.environ.get("UR10E_RAW_YOLO_VIDEO", "").strip()
+    if svo_path:
+        vision_flags += f" --svo {shlex.quote(svo_path)}"
+    if video_path:
+        vision_flags += f" --video {shlex.quote(video_path)}"
+    cmds = {
+        "ur": (
+            f'{ur_prefix}{profile_source} && ros2 launch ur_bringup ur_control.launch.py '
+            f'ur_type:=ur10e robot_ip:={ROBOT_IP} reverse_ip:={ROBOT_PC_IP} '
+            f'script_sender_port:={SCRIPT_SENDER_PORT} '
+            f'robot_profile:={robot_profile} '
+            f'environment:={environment} '
+            f'kinematics_params_file:={kinematics_file} '
+            f'use_fake_hardware:={hw} launch_gripper:={"true" if gripper_enabled else "false"} '
+            f'launch_rviz:={launch_rviz}'
+        ),
+        "main": (
+            f'sleep {MAIN_START_DELAY_SECONDS} && {profile_source} && ros2 run ur10e_curobo main --ros-args '
+            f'-p planner.use_fake_hardware:={hw} '
+            f'-p perception.enabled:={vision}'
+        ),
+        "vision": (
+            f'sleep {VISION_START_DELAY_SECONDS} && {source_with_camera} '
+            f'&& ros2 run ur10e_curobo vision{vision_flags}'
+        ),
+        "teleop": f'sleep 6 && {source_with_camera} && ros2 run ur10e_curobo teleop',
+        "gui": f'sleep 8 && {profile_source} && ros2 run ur10e_curobo gui',
+        "rqt": f'sleep 8 && {source_with_camera} && rqt --force-discover --standalone rqt_ur10e_panel',
+        "calibrate": f'sleep 6 && {profile_source} && ros2 run ur10e_curobo calibrate',
+        "hand_eye": (
+            f'sleep 4 && {profile_source} && '
+            f'ros2 run ur10e_curobo hand_eye '
+            f'--target {hand_eye_target} --resolution {hand_eye_resolution} '
+            f'--camera-mode {camera_mode} --robot-profile {robot_profile}'
+        ),
+        "extrinsic": (
+            f'sleep 4 && {SOURCE} && '
+            f'{camera_profile_env("zed_mini", robot_profile, environment)} && '
+            f'ros2 run ur10e_curobo zed_extrinsic'
+        ),
+        "lidar": (
+            f'sleep 8 && {source_with_camera} && '
+            # Static TF: zed2_left_camera_frame (parent) → livox_frame (child)
+            f'ros2 run tf2_ros static_transform_publisher '
+            f'--x -0.667081 --y -0.305516 --z -0.177982 '
+            f'--qx 0.495951 --qy -0.468885 --qz 0.427989 --qw 0.592457 '
+            f'--frame-id zed2_left_camera_frame --child-frame-id livox_frame & '
+            f'ros2 launch livox_ros2_driver livox_lidar_launch.py'
+        ),
     }
+    if use_panel:
+        cmds["rviz_panel"] = f'sleep 5 && {source_with_camera} && rviz2 -d {RVIZ_CONFIG}'
+    return cmds
 
 TITLES = {
     "ur": "UR Bringup",
@@ -28,13 +255,37 @@ TITLES = {
     "vision": "Vision",
     "teleop": "Teleop",
     "gui": "GUI",
+    "rqt": "RQT Panel",
+    "rviz_panel": "RViz+Panel",
+    "calibrate": "Calibrate",
+    "hand_eye": "Hand-Eye",
+    "extrinsic": "ZED Extrinsic",
+    "lidar": "LiDAR",
 }
 
 def make_command(cmd):
     return f'bash -c "{cmd}; exec bash"'
 
-def build_layout(nodes, fake_hardware=False):
-    COMMANDS = get_commands(fake_hardware)
+def build_layout(
+    nodes,
+    fake_hardware=False,
+    use_panel=False,
+    use_lidar=False,
+    use_zed_mini=False,
+    use_zedx_mini_only=False,
+    use_vision=False,
+    hand_eye_target="charuco",
+    hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    environment=None,
+    gripper_profile="new",
+    gripper_enabled=True,
+):
+    COMMANDS = get_commands(
+        fake_hardware, use_panel, use_lidar, use_zed_mini, use_zedx_mini_only, use_vision,
+        hand_eye_target, hand_eye_resolution, robot_profile, environment, gripper_profile,
+        gripper_enabled,
+    )
     """Build the dynamic layout section."""
     all_nodes = ["ur"] + nodes
     n = len(all_nodes)
@@ -227,7 +478,21 @@ def build_layout(nodes, fake_hardware=False):
 
     return '\n'.join(lines)
 
-def update_config(nodes, fake_hardware=False):
+def update_config(
+    nodes,
+    fake_hardware=False,
+    use_panel=False,
+    use_lidar=False,
+    use_zed_mini=False,
+    use_zedx_mini_only=False,
+    use_vision=False,
+    hand_eye_target="charuco",
+    hand_eye_resolution="qhdplus",
+    robot_profile=None,
+    environment=None,
+    gripper_profile="new",
+    gripper_enabled=True,
+):
     """Update terminator config with dynamic layout."""
     with open(CONFIG_PATH, 'r') as f:
         lines = f.readlines()
@@ -250,7 +515,11 @@ def update_config(nodes, fake_hardware=False):
         new_lines.append(line)
 
     # Build new layout
-    new_layout = build_layout(nodes, fake_hardware)
+    new_layout = build_layout(
+        nodes, fake_hardware, use_panel, use_lidar, use_zed_mini, use_zedx_mini_only, use_vision,
+        hand_eye_target, hand_eye_resolution, robot_profile, environment, gripper_profile,
+        gripper_enabled,
+    )
 
     # Find [plugins] and insert before it
     final_lines = []
@@ -263,46 +532,240 @@ def update_config(nodes, fake_hardware=False):
         f.writelines(final_lines)
 
 def main():
-    valid = ["main", "vision", "teleop", "gui"]
-    args = sys.argv[1:]
+    valid = ["bringup", "ur", "main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye", "extrinsic"]
+    args = expand_presets(sys.argv[1:])
 
-    # Check for fake hardware flag
+    # Extract modifier flags
     fake_hardware = "fake" in args
-    args = [a for a in args if a != "fake"]
+    robot_profile = "old"
+    environment = DEFAULT_ENVIRONMENT
+    if "lab" in args:
+        environment = "lab"
+    elif any(a in args for a in ("outdoor", "field_env")):
+        environment = "outdoor"
+    gripper_profile = "new"
+    if any(a in args for a in ("gripper_new", "new_gripper")):
+        gripper_profile = "new"
+    elif any(a in args for a in ("gripper_old", "old_gripper")):
+        gripper_profile = "old"
+    gripper_enabled = not any(a in args for a in ("gripper_off", "no_gripper", "without_gripper"))
+    if any(a in args for a in ("gripper_on", "use_gripper", "with_gripper")):
+        gripper_enabled = True
+    use_lidar     = "lidar" in args
+    use_zed_mini  = "zed_mini" in args
+    use_zedx_mini_only = "zedx_mini" in args
+    raw_yolo_view = "raw_yolo" in args
+    os.environ["UR10E_RAW_YOLO_VIEW"] = "1" if raw_yolo_view else "0"
+    model_tokens = [a.split("=", 1)[1] for a in args if a.startswith("model=")]
+    if model_tokens:
+        model_name = Path(model_tokens[-1]).name
+        model_path = MODEL_DIR / model_name
+        if model_path.suffix != ".engine" or not model_path.is_file():
+            print(f"YOLO engine not found: {model_path}", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_WEIGHTS"] = str(model_path)
+    confidence_tokens = [a.split("=", 1)[1] for a in args if a.startswith("conf=")]
+    if confidence_tokens:
+        try:
+            confidence = float(confidence_tokens[-1])
+        except ValueError:
+            print(f"Invalid YOLO confidence: {confidence_tokens[-1]!r}", file=sys.stderr)
+            sys.exit(2)
+        if not 0.0 < confidence <= 1.0:
+            print("YOLO confidence must be greater than 0 and at most 1", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_CONFIDENCE"] = f"{confidence:.6g}"
+    max_detection_tokens = [
+        a.split("=", 1)[1] for a in args if a.startswith("max_det=")]
+    if max_detection_tokens:
+        try:
+            max_detections = int(max_detection_tokens[-1])
+        except ValueError:
+            print(
+                f"Invalid maximum detections: {max_detection_tokens[-1]!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not 1 <= max_detections <= 100:
+            print("Maximum detections must be between 1 and 100", file=sys.stderr)
+            sys.exit(2)
+        os.environ["UR10E_YOLO_MAX_DETECTIONS"] = str(max_detections)
+    for token_prefix, env_name, allowed_suffixes in (
+        ("svo=", "UR10E_RAW_YOLO_SVO", {".svo", ".svo2"}),
+        ("video=", "UR10E_RAW_YOLO_VIDEO", {".mp4", ".avi", ".mov", ".mkv", ".m4v"}),
+    ):
+        source_tokens = [a.split("=", 1)[1] for a in args if a.startswith(token_prefix)]
+        if not source_tokens:
+            continue
+        source_path = Path(source_tokens[-1]).expanduser().resolve()
+        if not source_path.is_file() or source_path.suffix.lower() not in allowed_suffixes:
+            print(f"Raw YOLO input file is invalid: {source_path}", file=sys.stderr)
+            sys.exit(2)
+        os.environ[env_name] = str(source_path)
+    hand_eye_target = "chessboard" if "chessboard" in args else "charuco"
+    if any(a in args for a in ("hd1080", "1080", "1080p")):
+        hand_eye_resolution = "hd1080"
+    elif "4k" in args:
+        hand_eye_resolution = "4k"
+    else:
+        hand_eye_resolution = "qhdplus"
+    args = [
+        a for a in args
+        if not a.startswith("model=") and not a.startswith("conf=")
+        and not a.startswith("max_det=") and not a.startswith("svo=")
+        and not a.startswith("video=") and a not in (
+            "fake", "lidar", "zed_mini", "zedx_mini", "raw_yolo", "charuco", "aruco", "chessboard",
+            "qhdplus", "qhd+", "4k", "hd1080", "1080", "1080p",
+            "robot_old", "old_robot",
+            "lab", "outdoor", "field_env",
+            "gripper_old", "gripper_new", "old_gripper", "new_gripper",
+            "gripper_on", "gripper_off", "use_gripper", "no_gripper",
+            "with_gripper", "without_gripper",
+        )
+    ]
 
-    nodes = [arg for arg in args if arg in valid]
+    bringup_only = any(arg in ("bringup", "ur") for arg in args)
+    nodes = [arg for arg in args if arg in valid and arg not in ("bringup", "ur")]
 
-    if not nodes:
-        print("Usage: launch_ur10e [fake] [main] [vision] [teleop] [gui]")
+    if not nodes and not bringup_only:
+        print("Usage: launch_ur10e [fake] [lab|outdoor] [gripper_old|gripper_new] [gripper_on|gripper_off] [harvest|field] [lidar|zed_mini|zedx_mini] [charuco|chessboard] [qhdplus|4k|hd1080] [bringup|main] [vision] [teleop] [gui] [calibrate] [hand_eye] [extrinsic]")
+        print()
+        print("Presets:")
+        print("  harvest  - Real robot + main + vision with ZED X Mini RGBD")
+        print("  field    - Alias for harvest")
         print()
         print("Options:")
-        print("  fake   - Use fake/simulated hardware (no real robot)")
-        print("  main   - Main control node")
-        print("  vision - Vision node")
-        print("  teleop - Teleop node")
-        print("  gui    - GUI node")
+        print("  fake      - Use fake/simulated hardware (no real robot)")
+        print("  robot_old - Old UR10e profile (the only supported robot)")
+        print("  lab       - Use the lab hand-eye calibration and joint presets")
+        print("  outdoor   - Use the outdoor hand-eye calibration and joint presets")
+        print("  gripper_old - Use old calibrated gripper open/close postures")
+        print("  gripper_new - Use DG-3F-M native paired-motor open/close postures")
+        print("  gripper_off - Do not launch/control the Delto gripper")
+        print("  lidar     - Use Livox Mid-70 LiDAR for depth (adds LiDAR pane, passes --use_lidar to vision)")
+        print("  zed_mini  - Use ZED X Mini for depth + ZED One Mono for detection (passes --use_zed_mini to vision)")
+        print("  zedx_mini - Use ZED X Mini for both RGB detection and depth")
+        print("  charuco   - Use ChArUco target for hand-eye calibration (default)")
+        print("  chessboard- Use plain chessboard target for hand-eye calibration")
+        print("  qhdplus   - Hand-eye camera at QHD+ with HDR (default)")
+        print("  4k        - Hand-eye camera at HD4K without HDR")
+        print("  hd1080    - Hand-eye camera at HD1080 (required for ZED X Mini)")
+        print("  bringup   - UR driver bringup only")
+        print("  main      - Main control node (RViz includes control panel)")
+        print("  vision    - Vision node")
+        print("  teleop    - Teleop node")
+        print("  gui       - GUI node (standalone PyQt)")
+        print("  rqt       - RQT UR10e panel (auto-added with main)")
+        print("  calibrate - Grasp force calibration tool")
+        print("  hand_eye  - ChArUco hand-eye camera calibration")
+        print("              Uses the selected camera mode: zedx_mini updates Mini RGBD profile; zed_mini updates ZED One RGB profile")
+        print("  extrinsic - Calibrate ZED X Mini depth frame to ZED X One RGB frame")
         print()
         print("Examples:")
-        print("  launch_ur10e main              # Real robot + main")
-        print("  launch_ur10e fake main         # Fake hardware + main")
-        print("  launch_ur10e main teleop       # Real robot + main + teleop")
-        print("  launch_ur10e fake main vision  # Fake hardware + main + vision")
+        print("  launch_ur10e_gui                     # Dialog launcher for robot/camera/depth choices")
+        print("  launch_ur10e bringup                 # Real robot bringup only")
+        print("  launch_ur10e main                    # Real robot + main + RViz with panel")
+        print("  launch_ur10e main vision             # Real robot + main + vision (ZED stereo)")
+        print("  launch_ur10e main vision zed_mini    # Real robot + main + vision (ZED Mini depth)")
+        print("  launch_ur10e main vision zedx_mini   # Real robot + main + vision (ZED X Mini RGBD)")
+        print("  launch_ur10e harvest                 # Same as: main vision zedx_mini")
+        print("  launch_harvest                       # Short wrapper for the harvest preset")
+        print("  launch_ur10e main vision lidar       # Real robot + main + vision + LiDAR depth")
+        print("  launch_ur10e fake main               # Fake hardware + main")
+        print("  launch_ur10e gripper_new fake main  # Old robot with new gripper in fake mode")
+        print("  launch_ur10e gripper_off main       # Robot control without Delto gripper")
+        print("  launch_ur10e main teleop             # Real robot + main + teleop")
+        print("  launch_ur10e calibrate               # Grasp force calibration only")
+        print("  launch_ur10e hand_eye                # Hand-eye calibration")
+        print("  launch_ur10e main hand_eye           # Main + RViz + ChArUco hand-eye")
+        print("  launch_ur10e main hand_eye chessboard # Main + RViz + chessboard hand-eye")
+        print("  launch_ur10e main hand_eye charuco 4k # ChArUco hand-eye at 4K")
+        print("  launch_ur10e zedx_mini main hand_eye hd1080 # ZED X Mini hand-eye at 1080p")
+        print("  launch_ur10e extrinsic               # ZED One ↔ ZED X Mini extrinsic calibration")
         sys.exit(1)
 
-    # Reorder to: main, vision, teleop, gui
+    # When main is specified, use panel-integrated RViz
+    use_panel = "main" in nodes
+    use_vision = "vision" in nodes
+
+    if raw_yolo_view:
+        if not use_vision:
+            print("raw_yolo requires the vision node", file=sys.stderr)
+            sys.exit(2)
+        command = get_commands(
+            fake_hardware=False,
+            use_panel=False,
+            use_lidar=use_lidar,
+            use_zed_mini=use_zed_mini,
+            use_zedx_mini_only=use_zedx_mini_only,
+            use_vision=True,
+            hand_eye_target=hand_eye_target,
+            hand_eye_resolution=hand_eye_resolution,
+            robot_profile=robot_profile,
+            environment=environment,
+            gripper_profile=gripper_profile,
+            gripper_enabled=False,
+        )["vision"].removeprefix(f"sleep {VISION_START_DELAY_SECONDS} && ")
+        print("Launching standalone Raw YOLO view (no UR bringup, cuRobo, or RViz)")
+        os.execl("/bin/bash", "bash", "-lc", command)
+
+    # Reorder: main, vision, teleop, gui, rqt, calibrate, hand_eye, extrinsic
     ordered = []
-    for n in ["main", "vision", "teleop", "gui"]:
+    for n in ["main", "vision", "teleop", "gui", "rqt", "calibrate", "hand_eye", "extrinsic"]:
         if n in nodes:
             ordered.append(n)
 
+    # LiDAR pane comes before vision (driver must be up first)
+    if use_lidar and "vision" in ordered:
+        ordered.insert(ordered.index("vision"), "lidar")
+
+    # Add rviz_panel pane (separate RViz with integrated control panel)
+    if use_panel:
+        ordered.append("rviz_panel")
+
     hw_mode = "FAKE hardware" if fake_hardware else "REAL robot"
-    print(f"Launching {len(ordered) + 1} panes ({hw_mode}): ur_bringup + {', '.join(ordered)}")
+    depth_note = (
+        " +ZedXMiniRGBD" if use_zedx_mini_only else
+        " +ZedMini" if use_zed_mini else
+        " +LiDAR" if use_lidar else
+        ""
+    )
+    panel_note = " (RViz with control panel)" if use_panel else ""
+    print(
+        f"Launching {len(ordered) + 1} panes "
+        f"(robot={robot_profile}, environment={environment}, "
+        f"gripper={gripper_profile}, "
+        f"gripper_enabled={gripper_enabled}, {hw_mode}{depth_note}): "
+        f"ur_bringup + {', '.join(ordered)}{panel_note}")
 
     # Update config with dynamic layout
-    update_config(ordered, fake_hardware)
+    update_config(
+        ordered,
+        fake_hardware,
+        use_panel,
+        use_lidar,
+        use_zed_mini,
+        use_zedx_mini_only,
+        use_vision,
+        hand_eye_target,
+        hand_eye_resolution,
+        robot_profile,
+        environment,
+        gripper_profile,
+        gripper_enabled,
+    )
 
-    # Launch terminator with the layout
-    subprocess.Popen(["terminator", "-l", "dynamic"])
+    # Launch Terminator in a dedicated process group.  The RViz Exit button
+    # reads this PID and terminates the whole group, including every pane.
+    terminator_process = subprocess.Popen(
+        ["terminator", "-l", "dynamic"],
+        start_new_session=True,
+    )
+    try:
+        with open(TERMINATOR_PID_PATH, "w", encoding="utf-8") as pid_file:
+            pid_file.write(f"{terminator_process.pid}\n")
+    except OSError as exc:
+        print(f"Warning: could not save Terminator PID: {exc}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

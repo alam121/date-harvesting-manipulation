@@ -1,0 +1,43 @@
+hand_eye_calibration:
+  calibrated_at: '2026-10-14 15:56:19'
+  camera_mode: zedx_mini
+  camera_profile: outdoor_old_zedx_mini_rgbd
+  child_frame: zed_mini_left_camera_frame
+  matrix:
+  - - 0.9999447659869295
+    - -0.0032192551015043404
+    - 0.010005067312929428
+    - -0.02378384203859212
+  - - 0.0021485153163085966
+    - 0.9944441151720707
+    - 0.10524393417947137
+    - -0.11774704196540936
+  - - -0.010288287383252763
+    - -0.10521662509427276
+    - 0.9943961046517081
+    - 0.07309316017110636
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: DANIILIDIS
+  num_samples: 20
+  parent_frame: tool0
+  quaternion:
+    w: 0.9985971392171505
+    x: -0.052689055227700364
+    y: 0.005080465860359652
+    z: 0.0013438278077836764
+  stationary_board_validation:
+    converged: true
+    rejected_samples: 0
+    rotation_max_deg: 0.15980217858803344
+    rotation_median_deg: 0.09296470937159526
+    rotation_p95_deg: 0.1255618905155248
+    translation_max_m: 0.002059516932467221
+    translation_median_m: 0.0005181331302180621
+    translation_p95_m: 0.0009858074003046325
+  translation:
+    x: -0.02378384203859212
+    y: -0.11774704196540936
+    z: 0.07309316017110636

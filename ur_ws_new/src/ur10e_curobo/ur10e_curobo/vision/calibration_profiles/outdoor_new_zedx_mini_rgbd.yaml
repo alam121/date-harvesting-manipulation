@@ -1,0 +1,47 @@
+camera_profile: outdoor_new_zedx_mini_rgbd
+robot_profile: new
+environment: outdoor
+mode: zedx_mini
+description: ZED X Mini RGBD hand-eye calibration used with the new robot outdoors;
+  preserved from the July 28 calibration.
+parent_frame: tool0
+rgb_frame: zed_mini_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed_mini_left_camera_frame
+  translation:
+    x: -0.0778825528147239
+    y: -0.0904776429477891
+    z: 0.07815519797639284
+  quaternion:
+    x: -0.09597360542535632
+    y: 0.03259884285004293
+    z: -0.24398882060202537
+    w: 0.9644666079899961
+  rpy:
+    roll: -0.20243997385257298
+    pitch: 0.016048706093818366
+    yaw: -0.4971890632944662
+  matrix:
+  - - 0.8788135417321417
+    - 0.4643808834250037
+    - 0.10971396436927341
+    - -0.0778825528147239
+  - - -0.4768953973490568
+    - 0.8625170449657813
+    - 0.16921916892238192
+    - -0.0904776429477891
+  - - -0.016048017182645962
+    - -0.20103418180227292
+    - 0.9794527650129926
+    - 0.07815519797639284
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  method: PARK
+  mean_error_m: 0.0009536029112854236
+  num_samples: 20
+  calibrated_at: '1970-01-01 03:07:41'
+profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/outdoor_new_zedx_mini_rgbd.yaml

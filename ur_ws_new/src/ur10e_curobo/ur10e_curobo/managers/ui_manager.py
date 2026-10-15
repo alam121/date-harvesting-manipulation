@@ -82,6 +82,7 @@ class UIManager:
                 self._node.get_logger().warn("Motion already in progress, ignoring HOME command")
                 return
             try:
+                self._node.stop_requested = False  # clear any prior stop before homing
                 motions_mod.move_to_home_position(self._node)
             finally:
                 self._motion._motion_lock.release()
@@ -135,6 +136,35 @@ class UIManager:
             self._handle_set_speeds(cmd)
         elif cmd.startswith("set_velocity_scale "):
             self._handle_set_velocity_scale(cmd)
+        elif cmd == "subscribe":
+            goals_mod.subscribe_to_goal_pose(self._node)
+            self._node.goal_capture_active = False
+            self._node.get_logger().info("Subscribed to /external_goal_pose (via GUI)")
+        elif cmd == "plan_confirm":
+            self._state.plan_confirmed = True
+            self._state.plan_confirm_event.set()
+        elif cmd == "plan_cancel":
+            self._state.plan_confirmed = False
+            self._state.plan_confirm_event.set()
+        elif cmd.startswith("set_debug_preview "):
+            self._handle_set_debug_preview(cmd)
+        elif cmd == "set_home_current":
+            self._node._set_current_as_home()
+        elif cmd == "set_dropoff_current":
+            self._node._set_current_as_dropoff()
+        elif cmd in (
+            "grasp_success", "grasp_fail", "exit", "refresh_main", "refresh_camera",
+            "camera_preset_lab", "camera_preset_outdoor",
+        ):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("camera_settings "):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("camera_model "):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("camera_inference "):
+            pass  # handled by node.py's _ui_command_cb
+        elif cmd.startswith("safe_zone_"):
+            pass  # handled by node.py's _ui_command_cb
         elif cmd == "debug_world":
             self._motion.debug_print_world()
         else:
@@ -155,6 +185,13 @@ class UIManager:
             )
         except (ValueError, IndexError) as e:
             self._node.get_logger().warn(f"Invalid set_speeds format: {e}")
+
+    def _handle_set_debug_preview(self, cmd: str) -> None:
+        """Handle set_debug_preview command."""
+        val = cmd.split()[1].lower()
+        enabled = val in ("true", "1", "yes")
+        self._config.cfg.planner.debug_plan_preview = enabled
+        self._node.get_logger().info(f"Debug plan preview set to {enabled}")
 
     def _handle_set_velocity_scale(self, cmd: str) -> None:
         """Handle set_velocity_scale command."""
@@ -209,6 +246,8 @@ class UIManager:
             "speed_dropoff": self._config.cfg.planner.speed_dropoff,
             "speed_approach": self._config.cfg.planner.speed_approach,
             "speed_predropoff": self._config.cfg.planner.speed_predropoff,
+            "debug_plan_preview": self._config.cfg.planner.debug_plan_preview,
+            "plan_waiting_confirm": self._state.plan_waiting,
         }
         msg = String()
         msg.data = json.dumps(msg_data)
@@ -231,6 +270,19 @@ class UIManager:
                 continue
 
             print(f"[{ts()}] key='{key}'")
+
+            # Plan preview confirmation intercept
+            if self._state.plan_waiting:
+                if key in ('\r', '\n', ''):
+                    print(f"[{ts()}] Plan CONFIRMED (ENTER)")
+                    self._state.plan_confirmed = True
+                    self._state.plan_confirm_event.set()
+                    continue
+                elif key == 'k':
+                    print(f"[{ts()}] Plan CANCELLED (k)")
+                    self._state.plan_confirmed = False
+                    self._state.plan_confirm_event.set()
+                    continue
 
             if key == 'y':
                 self._handle_key_save_marker(ts)

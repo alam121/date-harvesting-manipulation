@@ -1,0 +1,14 @@
+<library path="src">
+  <class name="UR10ePanel"
+         type="rqt_ur10e_panel.ur10e_panel.UR10ePanel"
+         base_class_type="rqt_gui_py::Plugin">
+    <description>Control panel for UR10e date harvesting robot.</description>
+    <qtgui>
+      <group>
+        <label>Robot Tools</label>
+      </group>
+      <label>UR10e Control Panel</label>
+      <statustip>Motion, gripper, and monitoring controls for UR10e.</statustip>
+    </qtgui>
+  </class>
+</library>

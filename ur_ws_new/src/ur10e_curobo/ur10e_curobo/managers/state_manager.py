@@ -1,12 +1,15 @@
 # ur10e_curobo/managers/state_manager.py
 """Robot state management for UR10e cuRobo node."""
 
+import math
+import time
 import threading
 from typing import Optional, List, Tuple, TYPE_CHECKING
 from rclpy.node import Node
 from sensor_msgs.msg import JointState as ROSJointState
-from std_msgs.msg import Bool
-from geometry_msgs.msg import Vector3Stamped
+from std_msgs.msg import Bool, String
+from geometry_msgs.msg import Vector3Stamped, PointStamped
+from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import InteractiveMarkerFeedback
 from tf2_ros import Buffer, TransformListener
 
@@ -23,8 +26,12 @@ class StateManager:
 
         # Joint state (thread-safe access)
         self._state_lock = threading.Lock()
+        # (names, arm joint indices) cache for the 500Hz
+        # /joint_states callback; rebuilt only if the name list changes.
+        self._js_index_cache = None
         self._current_joint_positions: Optional[List[float]] = None
         self._current_joint_velocities: Optional[List[float]] = None
+
 
         # TF
         self.tf_buffer: Buffer = Buffer()
@@ -33,7 +40,13 @@ class StateManager:
         # Control flags
         self._running: bool = True
         self._stop_requested: bool = False
-        self._robot_running: bool = False
+        # With fake hardware, the GPIO "program_running" state interface stays at its
+        # initial value (0) forever, so the io_and_status_controller never publishes
+        # /io_and_status_controller/robot_program_running. Default to True in that case
+        # so wait_until_xyz() doesn't sit forever in the "Robot program OFF" branch.
+        self._robot_running: bool = bool(
+            self._config.cfg.planner.use_fake_hardware
+        )
 
         # TF status flags (for logging suppression)
         self.tf_warning_printed: bool = False
@@ -47,6 +60,43 @@ class StateManager:
 
         # Direction tracking (for pre-grasp bias)
         self.fruit_direction: Optional[Tuple[float, float, float]] = None
+        self.date_tip_point: Optional[Tuple[float, float, float]] = None
+        self.date_tip_time: float = 0.0
+        self.date_tip_stable: bool = False
+        self._date_tip_history: List[Tuple[float, float, float]] = []
+
+        # Branch gap detection (for 2-finger mode)
+        self.fruit_between_branches: bool = False
+        self.fruit_gap_angle: float = 0.0
+        self.fruit_contact_roll_valid: bool = False
+        self.fruit_contact_roll: float = 0.0
+        self.fruit_contact_roll_score: float = 0.0
+        self.fruit_contact_roll_stable: bool = False
+        self.fruit_contact_roll_samples: int = 0
+        self.fruit_contact_roll_spread_deg: float = float("inf")
+        self._fruit_contact_roll_history: List[float] = []
+        self.safe_grasp_candidate = None
+        self.fruit_major_axis_angle: float = 0.0
+        self.fruit_major_axis_confidence: float = 0.0
+        self.fruit_major_axis_stable: bool = False
+        self.fruit_major_axis_samples: int = 0
+        self.fruit_major_axis_spread_deg: float = float("inf")
+        self._fruit_major_axis_history: List[float] = []
+
+        # Normalised image-space bounding-box centre of best fruit [cx_norm, cy_norm]
+        # cx_norm: 0=left, 1=right  |  cy_norm: 0=top, 1=bottom
+        self.fruit_image_norm: Optional[Tuple[float, float]] = None
+        self.fruit_bunch_rel_x: Optional[float] = None
+        self.fruit_bunch_rel_y: Optional[float] = None
+
+        # Trunk position from vision (updated continuously)
+        self._trunk_x: Optional[float] = None
+        self._trunk_xyz: Optional[Tuple[float, float, float]] = None  # full XYZ in base_link
+
+        # Plan preview confirmation (set by keyboard thread or GUI)
+        self.plan_waiting: bool = False  # True when plan preview is awaiting user input
+        self.plan_confirm_event = threading.Event()
+        self.plan_confirmed: Optional[bool] = None  # True=execute, False=cancel
 
         # Timer reference for cleanup
         self._timer_wait_js = None
@@ -93,6 +143,52 @@ class StateManager:
             Vector3Stamped,
             "/datefruit_direction",
             self._direction_cb,
+            10
+        )
+        self._node.create_subscription(
+            PointStamped,
+            "/datefruit_tip_point",
+            self._date_tip_cb,
+            10
+        )
+
+        # Branch gap info for 2-finger mode
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/datefruit_gap_info",
+            self._gap_info_cb,
+            10
+        )
+
+        # Evaluation-only ranked three-finger rotations from the vision node.
+        # Forward these through the main motion-node logger so field runs need
+        # only one captured log. This callback never changes motion state.
+        self._node.create_subscription(
+            String,
+            "/vision/grasp_candidates",
+            self._grasp_candidates_cb,
+            10
+        )
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/vision/grasp_candidate_selection",
+            self._grasp_candidate_selection_cb,
+            10
+        )
+
+        # Normalised image bbox centre from vision (for image-based classification)
+        self._node.create_subscription(
+            Float32MultiArray,
+            "/fruit_image_bbox_norm",
+            self._fruit_image_norm_cb,
+            10
+        )
+
+        # Trunk position from vision (continuous updates)
+        self._node.create_subscription(
+            PointStamped,
+            "/trunk_position",
+            self._trunk_position_cb,
             10
         )
 
@@ -147,23 +243,60 @@ class StateManager:
     def robot_running(self, value: bool):
         self._robot_running = value
 
+    @property
+    def trunk_x(self) -> Optional[float]:
+        return self._trunk_x
+
+    @property
+    def trunk_xyz(self) -> Optional[Tuple[float, float, float]]:
+        return self._trunk_xyz
+
     # ============ Callbacks ============
 
     def _joint_state_cb(self, msg: ROSJointState) -> None:
-        """Update joint positions and velocities from /joint_states."""
-        jm = dict(zip(msg.name, msg.position))
-        vm = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        """Update joint positions and velocities from /joint_states.
 
+        This is the hottest Python path in the node: the UR driver publishes at
+        500Hz and the gripper publishes to this topic too. It used to build two
+        dicts and two comprehensions per message, and all of that needs the GIL
+        -- which is what starves the planning thread (measured: 25ms of solver
+        CPU stretched over 230ms of wall clock). The joint name list is
+        identical every message, so resolve the index mapping once and reuse it.
+
+        Accept only complete, finite arm samples. Finger-only and partial
+        messages must not replace a valid arm state. Missing velocity is unknown.
+        """
+        names = tuple(msg.name)
+        cached = self._js_index_cache
+        if cached is None or cached[0] != names:
+            order = self._config.joint_order
+            if not all(names.count(j) == 1 for j in order):
+                return
+            cached = (names, [names.index(j) for j in order])
+            self._js_index_cache = cached
+        _, indices = cached
+        if any(i >= len(msg.position) for i in indices):
+            return
+        positions = [msg.position[i] for i in indices]
+        if not all(math.isfinite(v) for v in positions):
+            return
+        velocities = None
+        if all(i < len(msg.velocity) for i in indices):
+            values = [msg.velocity[i] for i in indices]
+            if all(math.isfinite(v) for v in values):
+                velocities = values
         with self._state_lock:
-            self._current_joint_positions = [
-                jm[j] for j in self._config.joint_order if j in jm
-            ]
-            self._current_joint_velocities = [
-                vm.get(j, 0.0) for j in self._config.joint_order
-            ]
+            self._current_joint_positions = positions
+            self._current_joint_velocities = velocities
+            self._joint_state_received_at = time.monotonic()
 
     def _robot_running_cb(self, msg: Bool) -> None:
         """Track robot program running state."""
+        if self._config.cfg.planner.use_fake_hardware:
+            # Mock hardware has no UR program, so its GPIO controller reports
+            # false even while the trajectory controller is active.
+            self._robot_running = True
+            return
         self._robot_running = msg.data
         if msg.data:
             self._node.get_logger().info("Robot program is running.")
@@ -176,7 +309,20 @@ class StateManager:
             return
         self._node.get_logger().warn("Emergency stop!")
         self._stop_requested = True
-        # Note: The main node or MotionExecutor should call publish_stop_trajectory
+        # Latch a separate abort flag for batch runs. stop_requested is CONSUMED
+        # by the first handler that sees it (plan_and_execute's _check_stop
+        # clears both flags after halting), so by the time control returns to the
+        # AUTO-HARVEST loop the flag reads False again and the loop would happily
+        # discover the next goal and carry on -- an emergency stop would abort
+        # only the current goal, not the run. This latch is cleared solely when a
+        # new batch is deliberately started.
+        self._node._auto_harvest_abort = True
+        # Immediately publish stop trajectory to halt the robot
+        try:
+            from ..motions import publish_stop_trajectory
+            publish_stop_trajectory(self._node)
+        except Exception:
+            pass
 
     def _marker_cb(self, msg: InteractiveMarkerFeedback) -> None:
         """Store last clicked RViz interactive marker pose."""
@@ -185,6 +331,178 @@ class StateManager:
     def _direction_cb(self, msg: Vector3Stamped) -> None:
         """Store fruit direction for pre-grasp bias."""
         self.fruit_direction = (msg.vector.x, msg.vector.y, msg.vector.z)
+
+    def _date_tip_cb(self, msg: PointStamped) -> None:
+        stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        age_s = (self._node.get_clock().now().nanoseconds - stamp_ns) / 1e9
+        if (msg.header.frame_id != "base_link" or not 0 <= age_s <= 0.5
+                or stamp_ns <= getattr(self, "_date_tip_sample_ns", 0)):
+            return
+        point = (float(msg.point.x), float(msg.point.y), float(msg.point.z))
+        if not all(math.isfinite(v) for v in point):
+            return
+        self._date_tip_sample_ns = stamp_ns
+        history = self._date_tip_history
+        if history and math.dist(history[-1], point) > 0.02:
+            history.clear()
+        history.append(point)
+        del history[:-5]
+        mean = tuple(sum(p[i] for p in history) / len(history) for i in range(3))
+        spread = max(math.dist(point_i, mean) for point_i in history)
+        self.date_tip_point = mean
+        self.date_tip_time = time.time() - age_s
+        self.date_tip_stable = len(history) >= 3 and spread <= 0.012
+
+    def _gap_info_cb(self, msg: Float32MultiArray) -> None:
+        """Store branch-gap and vision-selected three-finger roll results."""
+        if len(msg.data) >= 2:
+            self.fruit_between_branches = msg.data[0] > 0.5
+            self.fruit_gap_angle = float(msg.data[1])
+        if len(msg.data) >= 5:
+            self.fruit_contact_roll_valid = msg.data[2] > 0.5
+            self.fruit_contact_roll_score = float(msg.data[4])
+            if self.fruit_contact_roll_valid:
+                raw_roll = float(msg.data[3])
+                period = 2.0 * math.pi / 3.0  # three-finger symmetry
+                history = self._fruit_contact_roll_history
+                if history:
+                    reference = sum(history) / len(history)
+                    unwrapped = reference + (
+                        (raw_roll - reference + period / 2.0) % period
+                        - period / 2.0)
+                    reset_jump = math.radians(float(getattr(
+                        self._config.cfg.planner,
+                        "low_center_tool_roll_reset_jump_deg", 25.0)))
+                    if abs(unwrapped - reference) > reset_jump:
+                        history.clear()
+                        unwrapped = raw_roll
+                else:
+                    unwrapped = raw_roll
+                history.append(unwrapped)
+                stable_frames = max(2, int(getattr(
+                    self._config.cfg.planner,
+                    "low_center_tool_roll_stable_frames", 4)))
+                del history[:-max(stable_frames + 3, 7)]
+                recent = history[-stable_frames:]
+                spread = max(recent) - min(recent) if len(recent) > 1 else float("inf")
+                max_spread = math.radians(float(getattr(
+                    self._config.cfg.planner,
+                    "low_center_tool_roll_max_spread_deg", 8.0)))
+                self.fruit_contact_roll_stable = (
+                    len(recent) >= stable_frames and spread <= max_spread)
+                self.fruit_contact_roll_samples = len(recent)
+                self.fruit_contact_roll_spread_deg = math.degrees(spread)
+                self.fruit_contact_roll = sum(recent) / len(recent)
+            else:
+                self._fruit_contact_roll_history.clear()
+                self.fruit_contact_roll_stable = False
+                self.fruit_contact_roll_samples = 0
+                self.fruit_contact_roll_spread_deg = float("inf")
+        else:
+            self.fruit_contact_roll_valid = False
+            self.fruit_contact_roll_score = 0.0
+            self._fruit_contact_roll_history.clear()
+            self.fruit_contact_roll_stable = False
+            self.fruit_contact_roll_samples = 0
+            self.fruit_contact_roll_spread_deg = float("inf")
+        if len(msg.data) >= 7:
+            self.fruit_major_axis_confidence = float(msg.data[6])
+            raw_axis = float(msg.data[5])
+            # Axial data repeats every pi. Unwrap each observation about the
+            # recent estimate so +89/-89 degrees remain only 2 degrees apart.
+            history = self._fruit_major_axis_history
+            if history:
+                reference = sum(history) / len(history)
+                unwrapped = reference + (
+                    (raw_axis - reference + math.pi / 2.0) % math.pi
+                    - math.pi / 2.0)
+            else:
+                unwrapped = raw_axis
+            history.append(unwrapped)
+            stable_frames = max(2, int(getattr(
+                self._config.cfg.planner,
+                "approach_date_axis_stable_frames", 5)))
+            del history[:-max(stable_frames + 3, 8)]
+            recent = history[-stable_frames:]
+            spread = max(recent) - min(recent) if len(recent) > 1 else float("inf")
+            max_spread = math.radians(float(getattr(
+                self._config.cfg.planner,
+                "approach_date_axis_max_spread_deg", 8.0)))
+            # Unwrapping exists so the MEAN is computed correctly across the
+            # +/-90deg seam, but the unwrapped values were exported as-is and
+            # nothing ever wrapped them back. They ratchet: each new sample is
+            # unwrapped about the drifting mean, so the mean walks out of the
+            # valid axial range and never returns. Observed in the field as
+            # "axis=+209.7deg" -- meaningless for an undirected major axis --
+            # which np.clip(angle, -45, +45) in the corridor code then saturated
+            # to exactly +45deg, pinning the approach to the extreme corridor.
+            # It read as stable because the drifted samples agree with EACH
+            # OTHER, so the spread gate never fired.
+            _mean_unwrapped = sum(recent) / len(recent)
+            _mean_wrapped = (
+                (_mean_unwrapped + math.pi / 2.0) % math.pi - math.pi / 2.0)
+            # Re-anchor the stored history by the same whole-pi shift. Spread is
+            # a difference so it is unchanged, but the values stay bounded
+            # instead of growing without limit.
+            _shift = _mean_wrapped - _mean_unwrapped
+            if _shift:
+                for _i in range(len(history)):
+                    history[_i] += _shift
+            self.fruit_major_axis_angle = _mean_wrapped
+            self.fruit_major_axis_samples = len(recent)
+            self.fruit_major_axis_spread_deg = math.degrees(spread)
+            self.fruit_major_axis_stable = (
+                len(recent) >= stable_frames and spread <= max_spread)
+        else:
+            self._fruit_major_axis_history.clear()
+            self.fruit_major_axis_angle = 0.0
+            self.fruit_major_axis_confidence = 0.0
+            self.fruit_major_axis_stable = False
+            self.fruit_major_axis_samples = 0
+            self.fruit_major_axis_spread_deg = float("inf")
+
+    def _grasp_candidates_cb(self, msg: String) -> None:
+        """Mirror Phase-3 evaluation results into the main application log."""
+        if msg.data:
+            self._node.get_logger().debug(msg.data)
+            mapping = list(getattr(
+                self._config.cfg.planner, "grasp_visual_to_force_map", [0, 1, 2]))
+            if len(mapping) == 3:
+                self._node.get_logger().debug(
+                    "[GRASP_CHANNEL_MAP] "
+                    f"visual_F1->force{int(mapping[0]) + 1} "
+                    f"visual_F2->force{int(mapping[1]) + 1} "
+                    f"visual_F3->force{int(mapping[2]) + 1} "
+                    "status=UNVALIDATED")
+
+    def _grasp_candidate_selection_cb(self, msg: Float32MultiArray) -> None:
+        """Store the frozen, validated Phase-4 candidate handoff."""
+        if len(msg.data) < 9:
+            return
+        self.safe_grasp_candidate = {
+            "available": bool(msg.data[0] > 0.5),
+            "delta_deg": float(msg.data[1]),
+            "psi_deg": float(msg.data[2]),
+            "score": float(msg.data[3]),
+            "minimum_score": float(msg.data[4]),
+            "score_loss": float(msg.data[5]),
+            "target_xyz": [float(v) for v in msg.data[6:9]],
+        }
+
+    def _fruit_image_norm_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) >= 2:
+            self.fruit_image_norm = (float(msg.data[0]), float(msg.data[1]))
+        if len(msg.data) >= 3:
+            rel_x = float(msg.data[2])
+            self.fruit_bunch_rel_x = rel_x if 0.0 <= rel_x <= 1.0 else None
+        if len(msg.data) >= 4:
+            rel_y = float(msg.data[3])
+            self.fruit_bunch_rel_y = rel_y if 0.0 <= rel_y <= 1.0 else None
+
+    def _trunk_position_cb(self, msg: PointStamped) -> None:
+        """Update trunk position from vision."""
+        self._trunk_x = msg.point.x
+        self._trunk_xyz = (msg.point.x, msg.point.y, msg.point.z)
 
     def _check_joint_states(self) -> None:
         """Check if initial joint states have been received."""

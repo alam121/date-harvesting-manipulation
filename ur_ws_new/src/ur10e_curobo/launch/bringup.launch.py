@@ -9,6 +9,7 @@ def generate_launch_description():
         executable="main",              # your control entry point
         name="ur10e_control",
         output="screen",
+        parameters=[{"perception.enabled": True}],
         # env vars to keep memory low; change as you like
         env={
             "UR10E_DISABLE_PERCEPTION": "1" # make sure control doesn't spawn its own perception
@@ -35,4 +36,3 @@ def generate_launch_description():
         control_node,
         delayed_perception,
     ])
-

@@ -1,0 +1,7 @@
+# Pinned upstream v2 revision. Install in a system-site-packages venv to reuse
+# the Jetson's NVIDIA PyTorch build and ROS Humble Python extensions.
+nvidia-curobo @ git+https://github.com/NVlabs/curobo.git@78fd485fa82d9b9a063fb4985e371814587e666a
+cuda-core[cu12]==1.2.1
+warp-lang==1.17.0
+numpy<2
+setuptools>=77,<80

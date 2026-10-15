@@ -2,7 +2,8 @@
 # Launch UR10e nodes in tmux with panes
 # Usage: launch_ur10e_tmux [main] [vision] [teleop] [gui]
 
-WS="/home/datepalm2/manipulatorsdatepalm/ur_ws_new"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS="$SCRIPT_DIR"
 SOURCE_CMD="source $WS/install/setup.bash"
 SESSION="ur10e"
 

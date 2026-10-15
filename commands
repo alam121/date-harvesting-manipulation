@@ -76,6 +76,24 @@ confirm in rviz that red dot, goals are showing
 
 Extra: o: open gripper and c for close gripper
 
+
+# Speed tuning (takes effect on next motion)
+ros2 param set /ur10e_curobo planner.speed_approach 2.0
+ros2 param set /ur10e_curobo planner.speed_predropoff 0.15
+ros2 param set /ur10e_curobo planner.global_speed_multiplier 3.0
+ros2 param set /ur10e_curobo planner.ramp_points 20
+
+# Smoothness
+ros2 param set /ur10e_curobo planner.max_joint_acceleration 1.0
+ros2 param set /ur10e_curobo planner.max_traj_velocity 0.5
+
+# Grasp learning
+ros2 param set /ur10e_curobo grasp.learning_enabled true
+ros2 param set /ur10e_curobo grasp.contact_delta_threshold 0.8
+
+# View all current values
+ros2 param list /ur10e_curobo
+ros2 param dump /ur10e_curobo
 ------------------------------------------------------------------------------------------------------------------
 
 

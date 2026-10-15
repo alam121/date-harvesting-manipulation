@@ -1,109 +1,453 @@
+# Date Harvesting Manipulation
 
-# ManipulatorsDatePalm 
-## Current Latest 
-- Branch ```Humble_Refactor6.1_labdatesrealbunch```
-- Visioncode ```date_v1.2.py```
-- Manipulator ```python3 -m ur10e_curobo.main```
-
-## Overview
-
-This system provides a complete ROS 2 Foxy-based control stack for the UR10e robot arm integrated with:
-
-1. cuRobo for GPU-accelerated motion planning
-2. MoveIt! for trajectory management
-3. Delto 3-Finger Suction Gripper for grasp control
-4. ZED 2i Camera + YOLOv8-Segmentation for 3D visual detection and goal generation
-5. RViz + Matplotlib for live visualization and debugging
+On `curobo-v2`, follow the [cuRobo v2 setup guide](ur_ws_new/src/ur10e_curobo/CUROBO_V2.md) before launching the motion node.
 
 
+Professional ROS 2 workspace for selective date-palm harvesting with a UR10e
+manipulator, cuRobo motion planning, ZED vision, LiDAR-assisted scene capture,
+and a Delto 3-finger gripper.
 
-## Dependencies 
-1. Install ```ros2 humble``` via debian package
-2. Install [Curobo](https://curobo.org/get_started/5_docker_development.html#docker-dev) in docker for native usage on jetson
-3. Install the following dependencies:
+This repository is the integration point for field-ready harvesting experiments:
+goal localization, safe motion planning, operator supervision in RViz, gripper
+control, grasp/slip feedback, and data collection workflows used during KAUST
+farm testing.
+
+> Field videos and experiment evidence are kept as KAUST GitLab work-item
+> uploads rather than committed as large binary files.
+
+## System Snapshot
+
+| Layer | What it provides |
+| --- | --- |
+| Manipulator | UR10e control through ROS 2 control and the Universal Robots driver. |
+| Planning | cuRobo GPU planning, safe-zone constraints, reachability clouds, and short-path regrip motions. |
+| Perception | ZED date localization, trunk detection, depth fusion, gap analysis, and camera calibration profiles. |
+| End effector | Delto gripper integration with grasp commands, force feedback, grip checks, and slip analysis. |
+| Operator UI | RViz panel for launch workflow, goals, monitoring, camera capture, heat/current status, LiDAR scan, and safe-zone controls. |
+| Field data | Videos, screenshots, bags, camera recordings, and stability logs for harvesting validation. |
+
+## Field Results
+
+Recent KAUST outdoor tests focused on making the harvesting workflow practical
+outside the lab: selecting reachable goals, moving safely near real bunches,
+checking grip quality, and documenting success, weak-grip, and slip cases.
+
+| Experiment | Evidence | Result / takeaway |
+| --- | --- | --- |
+| KAUST Field Test, 2 July 2026 | [Work item #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_88034) | Safety-envelope and range-of-motion testing around selected trees. |
+| Farm experiment attempts | [Videos in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_88849) | Six labeled harvesting attempts: three success labels, one weak-grip case, and two slipped cases for gripper tuning. |
+| 16 July 2026 field experiment | [Video in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_89123) | Additional outdoor motion evidence for gripper motion planning and harvesting workflow review. |
+| 22 July 2026 field experiment | [Video in #74](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/74#note_89252) | Additional 720p field video for approach behavior, grip alignment, and workflow validation. |
+| Date harvesting development | [Technique update #17](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/17#note_89254) | Consolidates field videos for regrip logic, proper grip checks, slip detection, and harvesting reliability. |
+| Y2 field testing | [Data-collection update #15](https://gitlab.kaust.edu.sa/dsa-kaust/projects/date-palm-automation/-/issues/15#note_89253) | Tracks the field videos as part of Y2 outdoor testing and data collection. |
+
+## Harvesting Pipeline
+
+```mermaid
+flowchart LR
+    A[ZED / LiDAR sensing] --> B[Date and trunk localization]
+    B --> C[Goal scoring and gap analysis]
+    C --> D[Reachability and safe-zone check]
+    D --> E[cuRobo motion planning]
+    E --> F[UR10e execution]
+    F --> G[Delto grip and slip feedback]
+    G --> H[Field logs, videos, and results]
 ```
-sudo apt install ros-humble-ur-msgs
-sudo apt install ros-humble-ur-client-library
-sudo apt install ros-humble-moveit
-sudo apt install ros-humble-moveit-servo
-sudo apt install ros-humble-moveit-visual-tools
-sudo apt install ros-humble-moveit-resources
-sudo apt install ros-humble-moveit-planners-ompl
-sudo apt install ros-humble-moveit-ros-perception
-sudo apt install ros-humble-ros2-control
-sudo apt install ros-humble-ros2-controllers
-sudo apt install ros-humble-controller-interface
-sudo apt install ros-humble-controller-manager
-sudo apt install ros-humble-control-toolbox
-sudo apt install ros-humble-realtime-tools
-sudo apt install ros-humble-rviz2
-sudo apt install ros-humble-rviz-visual-tools
-sudo apt install ros-humble-ackermann-msgs
-pip install warp-lang==1.0.0
 
+## What This System Can Do
+
+- Localize date targets and trunk obstacles from RGB/depth sensing.
+- Score candidate fruit goals and expose selected targets to the operator.
+- Visualize reachability clouds and safe-zone boxes before motion execution.
+- Plan bounded UR10e motions with cuRobo for outdoor harvesting.
+- Execute gripper approach, grasp, regrip, and dropoff workflows.
+- Record field evidence through RViz camera capture, logs, videos, and issue-linked results.
+- Compare successful grasps against weak-grip and slipped cases to improve harvesting reliability.
+
+## Start Here
+
+For day-to-day robot operation, use the operator guide:
+
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md)
+
+For package-level launch and configuration details:
+
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md)
+
+For common install/runtime problems:
+
+- [Troubleshooting Guide](troubleshoot.md)
+
+## Documentation Map
+
+Core system docs:
+
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md) - RViz workflow, reachability goals, safe zone, LiDAR scan, camera recording, troubleshooting.
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md) - launch commands, manual launch, UR pendant instructions, keyboard controls.
+- [Codebase Architecture](ur_ws_new/src/ur10e_curobo/CODEBASE_ARCHITECTURE.md) - high-level package architecture.
+- [Goals Architecture](ur_ws_new/src/ur10e_curobo/GOALS_ARCHITECTURE.md) - goal and harvesting pipeline organization.
+- [Motion Control / Collision Avoidance](ur_ws_new/src/ur10e_curobo/C1_4_MOTION_CONTROL_COLLISION_AVOIDANCE_UPDATED.md) - planning and collision behavior.
+- [Latency Analysis](ur_ws_new/src/ur10e_curobo/C1_5_LATENCY_ANALYSIS.md) - timing notes.
+- [Harvesting Strategy](ur_ws_new/src/ur10e_curobo/E1_4_PROGRAMMED_HARVESTING_STRATEGY_UPDATED.md) - programmed harvesting approach.
+
+Related package docs:
+
+- [ZED Date Detector README](ur_ws_new/src/zed_date_detector/README.md)
+- [UR Robot Driver README](ur_ws_new/src/ur_robot_driver/README.md)
+- [UR Driver ROS Interface](ur_ws_new/src/ur_robot_driver/ur_robot_driver/doc/ROS_INTERFACE.md)
+- [Delto ROS 2 README](ur_ws_new/src/DELTO_ROS2/README.md)
+- [cuRobo README](curobo/README.md)
+
+## Repository Layout
+
+```text
+.
+├── bin/                         # Repo-managed launch/setup helper commands
+├── curobo/                      # cuRobo source/vendor tree
+├── ur_ws_new/                   # Main ROS 2 Humble workspace
+│   ├── fastdds_config.xml       # FastDDS buffer profile
+│   └── src/
+│       ├── ur10e_curobo/        # Main UR10e/cuRobo harvesting package
+│       ├── rviz_ur10e_panel/    # RViz operator panel plugin
+│       ├── ur_robot_driver/     # UR driver source with local changes
+│       ├── DELTO_ROS2/          # Delto gripper driver
+│       └── zed_date_detector/   # ZED/date detector package
+├── troubleshoot.md              # Runtime/build troubleshooting guide
+└── README.md                    # This file
 ```
-## Install workspace 
 
-1. Clone the repository ```git clone https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm.git```
-2. Move to ```cd manipulatordateplam/ur_ws_new/src``` and run ```colcon build --symlink-install```
+## Main Capabilities
 
-## Setup UR10 Connections 
+- UR10e control through ROS 2 control and the UR robot driver.
+- cuRobo GPU motion planning for joint-space and Cartesian motions.
+- RViz operator panel with tabs for motion, goals, monitoring, camera, heat, and settings.
+- Reachability cloud for clicking known-good goals from the current posture.
+- Safe-zone walls and path validation for bounded in-zone work.
+- LiDAR scan workflow with scan preview, preflight validation, and bag recording.
+- Camera feed snapshot/video recording from `/vision/display`.
+- ZED/YOLO vision pipeline for date/trunk perception.
+- Delto 3-finger gripper control and force-profile grasp feedback.
+- Stability/tracking recorder for joint, wrench, and trajectory comparison logs.
+
+## Quick Start
+
+One-time shell setup:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm
+./bin/install_shell.sh
+source ~/.bashrc
 ```
+
+Build:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --symlink-install
+source install/setup.bash
+```
+
+Open the launch dialog:
+
+```bash
+launch_ur10e_gui
+```
+
+Or launch the normal outdoor/harvest stack directly:
+
+```bash
+launch_harvest
+```
+
+This is the same as `launch_ur10e harvest`, which expands to `launch_ur10e main vision zedx_mini`.
+
+Launch fake hardware for testing:
+
+```bash
+launch_ur10e fake harvest
+```
+
+## Common Launch Options
+
+```bash
+launch_ur10e [fake] [harvest|field] [main] [vision] [zed_mini|zedx_mini|lidar] [teleop] [gui]
+```
+
+Options:
+
+| Option | Description |
+| --- | --- |
+| `launch_ur10e_gui` | Opens a dialog for real/fake robot, camera/depth, and optional panes. |
+| `harvest` | Preset for `main vision zedx_mini`. |
+| `field` | Alias for `harvest`. |
+| `fake` | Use fake/simulated hardware. |
+| `main` | Start the main `ur10e_curobo` control node. |
+| `vision` | Start the ZED/YOLO vision node. |
+| `zed_mini` | Use ZED X Mini depth with ZED X One detection. |
+| `zedx_mini` | Use ZED X Mini for both RGB detection and native stereo depth. |
+| `lidar` | Use Livox LiDAR depth with ZED X One detection. |
+| `teleop` | Start joystick teleop. |
+| `gui` | Start the desktop GUI panel. |
+
+## Camera Calibration Profiles
+
+Camera mode selects the matching calibration profile automatically:
+
+| Mode | Command | Calibration profile |
+| --- | --- | --- |
+| ZED X Mini RGBD | `launch_ur10e main vision zedx_mini` | `zedx_mini_rgbd.yaml` |
+| ZED X One RGB + ZED X Mini depth | `launch_ur10e main vision zed_mini` | `zed_one_rgb_zedx_mini_depth.yaml` |
+
+Run hand-eye for the active mode:
+
+```bash
+launch_ur10e main hand_eye zedx_mini
+launch_ur10e main hand_eye zed_mini
+```
+
+Run dual-camera extrinsic calibration for ZED X One RGB + ZED X Mini depth:
+
+```bash
+launch_ur10e extrinsic
+```
+
+In `launch_ur10e_gui`, select **ZED One ↔ ZED Mini extrinsic calibration**.
+
+After launch, confirm the active profile:
+
+```bash
+ros2 topic echo /camera_status --once
+```
+
+For detailed launch and manual terminal commands, see:
+
+- [UR10e cuRobo Package README](ur_ws_new/src/ur10e_curobo/readme.md)
+
+## YOLO TensorRT Engine Export
+
+Build every production TensorRT engine on the exact Jetson that will run the
+harvesting system. TensorRT selects device-specific kernels while building the
+engine; copying an engine from another Jetson model can reduce performance and
+produces a device-model compatibility warning at runtime.
+
+The repository exporter is [bin/quantinze.py](bin/quantinze.py). Despite its
+historical filename, its default operation is FP16 TensorRT export, not INT8
+quantization. The exporter uses a fixed input shape and batch size, verifies the
+embedded engine metadata, prevents accidental overwrites, and writes a
+`.build.json` manifest containing the source/engine hashes and build-device
+versions.
+
+Before exporting, enable the target Jetson's production performance mode:
+
+```bash
+sudo nvpmodel -m 0
+sudo jetson_clocks
+
+nvpmodel -q
+sudo jetson_clocks --show
+```
+
+Recommended accuracy-first FP16 export and benchmark:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm
+
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1248 \
+  --name date_model_1248_fp16 \
+  --benchmark-image /path/to/representative_zed_frame.png \
+  --runs 100
+```
+
+For a faster candidate, export a separate 1024 engine rather than attempting
+to change the size of an existing fixed-shape engine:
+
+```bash
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1024 \
+  --name date_model_1024_fp16 \
+  --benchmark-image /path/to/representative_zed_frame.png \
+  --runs 100
+```
+
+Do not select an engine using filename or file size alone. Compare engines on
+the same recorded ZED frames and check detection count, confidence, mask IoU,
+centroid stability, small/distant-date recall, fingertip false positives, and
+direct-decoder timing. Then validate the candidate with the live raw model view.
+
+```bash
+source /opt/ros/humble/setup.bash
+source ur_ws_new/install/setup.bash
+
+ros2 run ur10e_curobo vision \
+  --use_zedx_mini_only \
+  --raw_yolo_view \
+  --weights /path/to/candidate.engine
+```
+
+FP16 is the production baseline. INT8 is experimental because calibration can
+degrade small-date masks and target centroids. An INT8 build requires an
+explicit representative dataset containing lab/outdoor lighting, partial and
+distant dates, empty scenes, and red fingertips as hard negatives:
+
+```bash
+./bin/quantinze.py /path/to/best.pt \
+  --imgsz 1024 \
+  --int8 \
+  --data /path/to/data.yaml \
+  --name date_model_1024_int8 \
+  --benchmark-image /path/to/representative_zed_frame.png
+```
+
+Reject or rebuild an engine if TensorRT reports:
+
+```text
+Using an engine plan file across different models of devices is not recommended
+```
+
+The runtime uses the direct TensorRT segmentation decoder by default. Set
+`UR10E_DIRECT_TRT_DECODER=0` only when comparing against the slower Ultralytics
+fallback. The engine is fixed at export time, so runtime `img_size` cannot make
+a 1248 engine execute as a 1024 engine.
+
+## RViz Operator Workflow
+
+The RViz panel is the primary operator surface.
+
+Important tabs:
+
+- Motion: HOME, dropoff, execute, gripper, plan confirmation.
+- Goal: manual goals, goal capture, LiDAR scan, reachability/scan preview.
+- Monitor: harvest results, stability recorder, joints, forces.
+- Camera: save images and record videos from `/vision/display`.
+- Heat: joint/tool temperature monitoring.
+- Settings: velocity and process refresh controls.
+
+Detailed operator instructions:
+
+- [UR10e Operator Guide](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md)
+
+## Output Directories
+
+Runtime logs and recordings are saved under the user home directory:
+
+| Output | Directory |
+| --- | --- |
+| LiDAR scan bags | `~/lidar_scans` |
+| Camera snapshots/videos | `~/camera_recordings` |
+| Stability/tracking CSVs | `~/ur10e_stability` |
+| Grasp learning data | `~/grasp_learning_data` |
+
+Collected golf-cart stability validation data is summarized in
+[UR10e Golf Cart Stability Validation](docs/GOLFCART_STABILITY_VALIDATION.md).
+
+## Hardware Notes
+
+UR10e robot:
+
+- Robot IP: `192.168.1.190`
+- Control PC interface commonly uses `192.168.1.101/24`
+
+Network setup:
+
+```bash
 sudo ip addr flush dev eth0
 sudo ip addr add 192.168.1.101/24 dev eth0
 sudo ip addr add 169.254.186.100/24 dev eth0
 sudo ip link set eth0 up
-ip a | grep eth0
-```
-Output should look like this:
-```
-eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 169.254.186.100/24 scope global eth0
-    inet 192.168.1.101/24 scope global eth0
 ```
 
-## Run Curobo 
+UR pendant:
+
+1. Power on the robot.
+2. Release brakes.
+3. Load the external control program.
+4. Press Start.
+
+If you see reverse-interface disconnects, restart the UR program and press
+Start again.
+
+## Build Notes
+
+Build everything:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --symlink-install
+source install/setup.bash
 ```
-sudo docker run -it --rm --network host \
-  --runtime=nvidia \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  -v ~/curobo_ws:/root/curobo_ws \
-  curobo_docker:aarch64
+
+Build only the RViz panel after C++ panel edits:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --packages-select rviz_ur10e_panel
+source install/setup.bash
 ```
 
-## YOLOv8 
-1. NOTE: [Yolov8 Segmentation](https://github.com/marcoslucianops/DeepStream-Yolo-Seg/tree/master) (yet to try out)
-2. Install YOLOv8 in vitual environment
-```pip install ultralytics```
-3. Download the labelled data from roboflow 
-Train the nextwork
-```yolo task=segment mode=train model=yolov8n-seg.pt data=/home/datepalm-ws/Documents/date_detection_maskrcnn/dateopalm_tree.v4i.yolov8-obb/data.yaml epochs=50 imgsz=720 batch=8```
+Python-only edits in `ur10e_curobo` usually only require restarting the Python
+node when using `--symlink-install`.
 
-4. ### Trained Model to ONNX 
-```yolo export model=best.pt format=onnx opset=12 imgsz=640 dynamic=False```
+## Key Configuration
 
-5. ### Saving ONNX model to TRT Engine
-```/usr/src/tensorrt/bin/trtexec --onnx=best.onnx --saveEngine=best.trt --explicitBatch --fp16```
+Primary config file:
 
-6. Install [ZED-GSTREAMER](https://github.com/stereolabs/zed-gstreamer)
-7. Consult [this](https://github.com/valdivj/gstream_Deep?tab=readme-ov-file)
+```text
+ur_ws_new/src/ur10e_curobo/ur10e_curobo/config.py
+```
 
+Important sections:
 
-## Run UR10 launch file
-```ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.190 use_fake_hardware:=false launch_rviz:=true```
+- `ROBOT_PROFILE`
+- `ENVIRONMENT`
+- stored HOME / side-home / dropoff joint presets
+- `Planner`
+- `LidarScan`
+- safe-zone and reachability settings
+- gripper settings
 
-## Run Delto gripper launch file
-```ros2 launch delto_3f_driver delto_3f_bringup.launch.py delto_ip:=169.254.186.72 delto_port:=502 ```
+## Troubleshooting
 
-## Setting Headless machine 
-1. ```ssh -X username@remote_ip```
-2. ```sudo nano /etc/ssh/sshd_config```
-3. make sure following lines exit and are uncommented 
-```X11Forwarding yes X11DisplayOffset 10 X11UseLocalhost yes```
-4. ```sudo systemctl restart ssh```
-5. ```sudo apt install xauth```
+Start with:
 
+- [Troubleshooting Guide](troubleshoot.md)
+- [UR10e Operator Guide - Troubleshooting](ur_ws_new/src/ur10e_curobo/OPERATOR_GUIDE.md#10-troubleshooting)
 
-For frequent issues please go [here](https://gitlab.kaust.edu.sa/risc/manipulatorsdatepalm/-/blob/dev2/troubleshoot.md)
+Quick checks:
+
+```bash
+ros2 node list
+ros2 topic hz /vision/display
+ros2 topic echo /joint_states --once
+ros2 control list_controllers
+```
+
+Common issues:
+
+- Robot program is not running on the UR pendant.
+- Workspace was not sourced after rebuild.
+- Safe-zone box rejects a path that leaves the work area.
+- Goal is Cartesian-close but on a bad IK branch.
+- Camera recording has no frames because `/vision/display` is not publishing.
+
+## Development Notes
+
+Before pushing code changes:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm
+python3 -m py_compile \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/node.py \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/lidar_scan.py \
+  ur_ws_new/src/ur10e_curobo/ur10e_curobo/config.py
+git diff --check
+```
+
+For RViz panel changes:
+
+```bash
+cd /home/datepalm2/manipulatorsdatepalm/ur_ws_new
+colcon build --packages-select rviz_ur10e_panel
+```
+
+Do not commit generated `__pycache__` files.

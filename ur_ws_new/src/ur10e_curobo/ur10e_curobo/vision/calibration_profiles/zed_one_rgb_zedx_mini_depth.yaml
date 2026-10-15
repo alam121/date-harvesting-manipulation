@@ -1,0 +1,19 @@
+camera_profile: zed_one_rgb_zedx_mini_depth
+mode: zed_mini
+description: ZED X One Mono provides RGB detection; ZED X Mini provides depth warped into the RGB image.
+parent_frame: tool0
+rgb_frame: zed2_left_camera_frame
+depth_frame: zed_mini_left_camera_frame
+hand_eye:
+  parent_frame: tool0
+  child_frame: zed2_left_camera_frame
+  note: Seeded from the current URDF. Replace by running hand-eye with camera mode zed_mini.
+depth_to_rgb:
+  parent_frame: zed2_left_camera_frame
+  child_frame: zed_mini_left_camera_frame
+  convention: camera_from_depth
+  matrix:
+  - [0.99997176, -0.00567234, -0.00492976, -0.02432635]
+  - [0.00516021, 0.99514099, -0.09832485, 0.03795027]
+  - [0.00546354, 0.09829664, 0.99514216, -0.01018928]
+  - [0.0, 0.0, 0.0, 1.0]

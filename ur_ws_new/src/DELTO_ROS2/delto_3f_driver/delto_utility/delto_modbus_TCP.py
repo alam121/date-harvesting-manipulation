@@ -5,6 +5,7 @@ import sys
 import os
 import threading
 import struct
+import math
 from typing import List
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,13 +29,31 @@ class Communication:
         self.client = None
         self.slaveID = 0
         self.dummy = dummy
-        self.lock = threading.Lock()
+        # A complete holding-force command consists of several Modbus writes.
+        # RLock lets the driver keep that sequence atomic while reusing the
+        # individually locked register helpers below.
+        self.lock = threading.RLock()
+        # DG-3F-M register map from tesollodelto/dg3f_m_ros2.
+        # The old DG-3F-B map used current position at input register 2 and
+        # target position at holding register 72. DG-3F-M reads at 6 and
+        # commands at 7, with the same deg*10 integer scale.
+        self.control_start_register = 0
+        self.current_position_register = 6
+        self.target_position_register = 7
+        self.current_register = 26
+        self.velocity_register = 46
+        # DG-3F-M holding-register map from the TESOLLO Control Manual v2.0.0.
+        # Unit is 0.1 N; valid values are 0..200.
+        self.grasp_force_register = 296
+        self.grasp_action_register = 292
+        self.grasp_mode_register = 295
+        self.grasp_hold_position_register = 299
 
     def __del__(self):
         self.disconnect()
 
     def write_registers(self, address, values):
-        self.client.write_registers(
+        return self.client.write_registers(
             address=address, values=values, slave=self.slaveID)
 
     def connect(self, ip, port, slaveID=1):
@@ -51,7 +70,14 @@ class Communication:
             return
 
         self.client = ModbusTcpClient(host=ip, port=port)
-        return self.client.connect()
+        connected = self.client.connect()
+        if connected:
+            # DG-3F-M requires this before target position commands execute.
+            return self.client.write_register(
+                address=self.control_start_register,
+                value=1,
+                slave=self.slaveID)
+        return connected
 
     def disconnect(self):
         '''
@@ -76,10 +102,14 @@ class Communication:
             return status
 
         # status = []
-        status = self.client.read_input_registers(
-            address=Delto3FInputRegisters.MOTOR1_CURRENT_POSITION.value,
-            count=Delto3F.MOTOR_NUM.value,
-            slave=self.slaveID).registers
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=self.current_position_register,
+                count=Delto3F.MOTOR_NUM.value,
+                slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid position response: {response}")
+        status = response.registers
 
         for i in range(Delto3F.MOTOR_NUM.value):
             # stats = self.client.read_input_registers(
@@ -93,6 +123,77 @@ class Communication:
             # status.append(struct.unpack('h', struct.pack('H', stats[0]))[0]/10)
             # status.append(stats)
         return status
+
+    def _read_signed_input_registers(self, address, count):
+        if self.dummy:
+            return [0] * count
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=address,
+                count=count,
+                slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid input-register response: {response}")
+        values = response.registers
+        return [value if value < 32768 else value - 65536 for value in values]
+
+    def get_state(self):
+        """Read position, current and velocity in ONE Modbus transaction.
+
+        The three blocks are contiguous on the DG-3F-M (position 6..17,
+        current 26..37, velocity 46..57), so a single read of 52 registers
+        covers all of them -- well inside Modbus's 125-register limit. The
+        unused gaps at 18..25 and 38..45 are read and discarded.
+
+        This replaces three separate round trips per feedback tick. The point is
+        not only the 3x saving: the three quantities are now sampled at the SAME
+        instant. Read separately, the current was one round trip newer than the
+        position it was attributed to, which is exactly the inconsistency that
+        matters when deriving contact from motor current.
+
+        Returns (position_deg, current_raw, velocity_rad_s), each MOTOR_NUM long.
+        """
+        n = Delto3F.MOTOR_NUM.value
+        if self.dummy:
+            return [0.0] * n, [0] * n, [0.0] * n
+
+        first = self.current_position_register
+        count = (self.velocity_register + n) - first
+        with self.lock:
+            response = self.client.read_input_registers(
+                address=first, count=count, slave=self.slaveID)
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid state response: {response}")
+        regs = response.registers
+        if len(regs) < count:
+            raise RuntimeError(
+                f"short state response: got {len(regs)} registers, want {count}")
+
+        def _signed(block):
+            return [v if v < 32768 else v - 65536 for v in block]
+
+        def _slice(reg_addr):
+            off = reg_addr - first
+            return _signed(regs[off:off + n])
+
+        position = [v / 10.0 for v in _slice(self.current_position_register)]
+        current = _slice(self.current_register)
+        velocity = [v * (math.pi / 30.0) for v in _slice(self.velocity_register)]
+        return position, current, velocity
+
+    def get_current_raw(self):
+        return self._read_signed_input_registers(
+            self.current_register,
+            Delto3F.MOTOR_NUM.value)
+
+    def get_current(self):
+        return [value * 0.001 for value in self.get_current_raw()]
+
+    def get_velocity(self):
+        velocity_values = self._read_signed_input_registers(
+            self.velocity_register,
+            Delto3F.MOTOR_NUM.value)
+        return [value * (math.pi / 30.0) for value in velocity_values]
 
     def get_high_force(self):
 
@@ -130,8 +231,62 @@ class Communication:
 
             intPosion = list(map(lambda x: struct.unpack(
                 'H', struct.pack('h', int((x*10))))[0], position))
-            self.client.write_registers(
-                address=72, values=intPosion, slave=self.slaveID)
+            return self.client.write_registers(
+                address=self.target_position_register,
+                values=intPosion,
+                slave=self.slaveID)
+
+    def start_control(self):
+        if self.dummy:
+            return
+        return self.client.write_register(
+            address=self.control_start_register,
+            value=1,
+            slave=self.slaveID)
+
+    def set_grasp_force(self, value: int):
+        value = max(0, min(200, int(value)))
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_force_register,
+                value=value,
+                slave=self.slaveID)
+
+    def get_grasp_force(self):
+        with self.lock:
+            response = self.client.read_holding_registers(
+                address=self.grasp_force_register,
+                count=1,
+                slave=self.slaveID)
+        if hasattr(response, "isError") and response.isError():
+            raise RuntimeError(f"grasp-force read failed: {response}")
+        if not hasattr(response, "registers") or not response.registers:
+            raise RuntimeError(f"invalid grasp-force response: {response}")
+        return int(response.registers[0])
+
+    def set_grasp_action(self, enabled: bool):
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_action_register,
+                value=1 if enabled else 0,
+                slave=self.slaveID)
+
+    def set_grasp_mode(self, mode: int):
+        with self.lock:
+            return self.client.write_register(
+                address=self.grasp_mode_register,
+                value=int(mode),
+                slave=self.slaveID)
+
+    def set_grasp_hold_positions(self, hold_mask: List[int]):
+        if len(hold_mask) != 12:
+            raise ValueError("DG-3F-M grasp hold mask must contain 12 values")
+        values = [1 if int(value) else 0 for value in hold_mask]
+        with self.lock:
+            return self.client.write_registers(
+                address=self.grasp_hold_position_register,
+                values=values,
+                slave=self.slaveID)
 
     def get_pgain(self):
         if self.dummy:
@@ -182,10 +337,7 @@ class Communication:
         if (mode == 0):
             self.grasp(False)
         else:
-            self.client.write_register(address=Delto3FHoldingRegisters.GRASP_MODE.value,
-                                       value=mode,
-                                       slave=self.slaveID)
-
+            self.set_grasp_mode(mode)
             self.grasp(True)
 
     def get_grasp_mode(self):
@@ -198,11 +350,7 @@ class Communication:
         return mode
 
     def grasp(self, isGrasp: bool):
-        with self.lock:
-            print("Grasp", isGrasp)
-            self.client.write_coil(address=Delto3FCoils.GRASP.value,
-                                   value=isGrasp,
-                                   slave=self.slaveID)
+        return self.set_grasp_action(isGrasp)
 
     def set_step(self, step):
 

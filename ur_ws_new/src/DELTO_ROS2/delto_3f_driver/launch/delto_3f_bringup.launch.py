@@ -10,6 +10,11 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+
+def _as_bool(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def launch_setup(context, *args, **kwargs):
     description_package = FindPackageShare('delto_description')
     delto_driver_package = FindPackageShare('delto_3f_driver')
@@ -83,7 +88,7 @@ def launch_setup(context, *args, **kwargs):
             {'ip': delto_ip.perform(context)},
             {'port': int(delto_port.perform(context))},
             {'slaveID': int(delto_id.perform(context))},
-            {'dummy': bool(fake_mode.perform(context))}    
+            {'dummy': _as_bool(fake_mode.perform(context))}
 
         ],
     )
