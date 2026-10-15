@@ -28,6 +28,7 @@ from . import motions as motions_mod
 from . import goals as goals_mod
 from . import goal_marker as goal_marker_mod
 from . import safe_zone as safe_zone_mod
+from . import demo_capture
 from .goals import ThreadSafeGoalList
 from . import gripper as gripper_mod
 from ur_msgs.srv import SetIO
@@ -119,6 +120,21 @@ class UR10eCuroboMoveIt(Node):
         # ========= PHASE 1: ConfigManager =========
         self._config_mgr = ConfigManager(self)
         self._config_mgr.initialize()
+        _restore_demo_capture = os.environ.pop(
+            "UR10E_RESTORE_DEMO_CAPTURE", None)
+        _restore_demo_jog = os.environ.pop("UR10E_RESTORE_DEMO_JOG", None)
+        _restore_demo_region = os.environ.pop(
+            "UR10E_RESTORE_DEMO_REGION", None)
+        if _restore_demo_capture is not None:
+            self.cfg.planner.demo_capture_enabled = (
+                _restore_demo_capture == "1")
+        if _restore_demo_jog is not None:
+            self.cfg.planner.demo_capture_jog_enabled = (
+                _restore_demo_jog == "1")
+            if self.cfg.planner.demo_capture_jog_enabled:
+                self.cfg.planner.demo_capture_enabled = True
+        if _restore_demo_region in ("default", "left", "center", "right"):
+            self.cfg.planner.demo_target_region = _restore_demo_region
         self.active_environment = ENVIRONMENT
 
         # ========= PHASE 2: StateManager =========
@@ -424,15 +440,22 @@ class UR10eCuroboMoveIt(Node):
                 pass
         self.create_subscription(String, '/vision/depth_trace', _depth_trace_cb, 10)
 
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+        # Independent groups keep UI/image decoding from starving recorded states.
+        self._demo_state_group = MutuallyExclusiveCallbackGroup()
+        self._demo_image_group = MutuallyExclusiveCallbackGroup()
+        self._demo_meta_group = MutuallyExclusiveCallbackGroup()
+        state_qos = QoSProfile(depth=200, reliability=ReliabilityPolicy.BEST_EFFORT)
+        image_qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT)
         def _demo_targets_cb(msg):
             try:
                 meta = json.loads(msg.data)
                 self._demo_targets[meta['stamp_ns']] = meta
-                while len(self._demo_targets) > 20:
+                while len(self._demo_targets) > 200:
                     self._demo_targets.pop(next(iter(self._demo_targets)))
             except (ValueError, KeyError):
                 pass
-        self.create_subscription(String, '/vision/demo_targets', _demo_targets_cb, 10)
+        self.create_subscription(String, '/vision/demo_targets', _demo_targets_cb, 50, callback_group=self._demo_meta_group)
 
         from sensor_msgs.msg import CompressedImage
         preview_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -444,16 +467,32 @@ class UR10eCuroboMoveIt(Node):
             recorder = getattr(self, '_demo_sequence', None)
             if recorder is not None:
                 recorder.state(msg, time.time_ns())
+                recorder.gripper_state(msg, time.time_ns())
         self.create_subscription(JointState, self.joint_states_topic,
-                                 _demo_sequence_state_cb, qos_profile_sensor_data)
+                                 _demo_sequence_state_cb, state_qos, callback_group=self._demo_state_group)
+
+        self._demo_recording_pub = self.create_publisher(Bool, '/demo/recording_active', 10)
+        def _demo_imitation_cb(msg):
+            recorder = getattr(self, '_demo_sequence', None)
+            if recorder is not None:
+                recorder.frame(msg, time.time_ns())
+        def _demo_gripper_cb(msg):
+            recorder = getattr(self, '_demo_sequence', None)
+            if recorder is not None:
+                recorder.gripper_state(msg, time.time_ns())
+        self.create_subscription(CompressedImage, '/vision/imitation_full/compressed',
+                                 _demo_imitation_cb, image_qos, callback_group=self._demo_image_group)
+        self.create_subscription(JointState, '/gripper/joint_states',
+                                 _demo_gripper_cb, state_qos, callback_group=self._demo_state_group)
+        # Refresh the gate so a restarted vision node also receives it.
+        self.create_timer(0.5, lambda: self._demo_recording_pub.publish(
+            Bool(data=getattr(self, '_demo_sequence', None) is not None)),
+            callback_group=self._demo_meta_group)
 
         def _demo_full_cb(msg):
             if not getattr(self, '_demo_capture_active', False):
                 return
             try:
-                recorder = getattr(self, '_demo_sequence', None)
-                if recorder is not None:
-                    recorder.frame(msg, time.time_ns())
                 frame = self._get_camera_bridge().compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 # One tuple assignment keeps image and timestamps paired.
                 self._demo_full_frame = (frame, time.time(),
@@ -467,8 +506,15 @@ class UR10eCuroboMoveIt(Node):
 
         self._demo_target_selection = None
         self._demo_preview_token = None
+        self._demo_xy_pending_step_tool_m = None
+        self._demo_xy_offset_tool_m = [0.0, 0.0, 0.0]
+        self._demo_xy_offset_base_m = [0.0, 0.0, 0.0]
+        self._demo_xy_busy = False
+        self._demo_xy_error = ""
         def _demo_select_cb(msg):
             if not getattr(self, '_demo_capture_ready', False):
+                return
+            if getattr(self, '_demo_target_selection', None) is not None:
                 return
             try:
                 selection = json.loads(msg.data)
@@ -478,9 +524,16 @@ class UR10eCuroboMoveIt(Node):
                 height, width = self._demo_preview_shape[:2]
                 if not (0 <= x < width and 0 <= y < height):
                     return
-                self._demo_target_selection = {'pixel_xy': [x, y], 'source': 'operator_click',
-                                               'preview_token': self._demo_preview_token}
-                self.get_logger().info(f'[DEMO] Target click accepted at ({x:.0f}, {y:.0f}); Close can now save.')
+                self._demo_target_selection = {
+                    'pixel_xy': [x, y], 'source': 'operator_click',
+                    'preview_token': self._demo_preview_token,
+                    'selected_at': datetime.now().isoformat(timespec='milliseconds')}
+                next_step = ("align with Tool X/Y, then press XY Aligned"
+                             if bool(getattr(
+                                 self.cfg.planner, 'demo_capture_jog_enabled', False))
+                             else "continuing to automatic FINAL")
+                self.get_logger().info(
+                    f'[DEMO] Target click accepted at ({x:.0f}, {y:.0f}); {next_step}.')
             except (ValueError, KeyError, TypeError):
                 return
         self.create_subscription(String, '/demo/select_target', _demo_select_cb, 10)
@@ -500,6 +553,11 @@ class UR10eCuroboMoveIt(Node):
         # there, not here.
         self._demo_capture_active = False
         self._demo_confirm = None
+        # Keep exact sample paths so an RViz grade can never land on the wrong
+        # attempt. Also recover unlabelled records from an earlier run.
+        self._demo_label_queue = []
+        self._demo_last_operator_label = None
+        demo_capture.refresh_label_queue(self)
 
         # Vision's YOLO and loop rate, cached so a harvest cycle can report the
         # throughput it actually ran at. Without this the only record was a HUD
@@ -627,6 +685,13 @@ class UR10eCuroboMoveIt(Node):
         if self.harvest_log_path is not None:
             self.get_logger().info(
                 f"Persistent harvest log: {self.harvest_log_path}")
+        if os.environ.pop("UR10E_RESUME_VISION_AFTER_MAIN_REFRESH", "0") == "1":
+            # The old process paused and drained vision before exec(). Resume
+            # only after the new process has completed cuRobo CUDA warmup. Use
+            # a few timer publications so DDS discovery cannot lose the resume.
+            self._refresh_vision_resume_attempts = 0
+            self._refresh_vision_resume_timer = self.create_timer(
+                0.5, self._resume_vision_after_main_refresh)
 
         # Note: Perception is handled by external date_v1.9.py node
         # Voxel obstacles subscribe to /zed_depth_pointcloud from that node
@@ -723,6 +788,36 @@ class UR10eCuroboMoveIt(Node):
         if ev is None:
             return False
         return ev.wait(timeout=timeout)
+
+    def _restart_main_after_vision_pause(self):
+        """Drain vision GPU work before replacing this process via exec()."""
+        self.set_vision_mode("paused")
+        if not self.wait_for_vision_paused(timeout=3.0):
+            self.get_logger().error(
+                "Refresh cancelled: vision did not confirm GPU pause")
+            self.set_vision_mode("full")
+            self._refresh_main_pending = False
+            return
+        self.get_logger().info(
+            "Vision GPU work drained — restarting main node")
+        os.environ["UR10E_RESTORE_DEMO_CAPTURE"] = (
+            "1" if self.cfg.planner.demo_capture_enabled else "0")
+        os.environ["UR10E_RESTORE_DEMO_JOG"] = (
+            "1" if self.cfg.planner.demo_capture_jog_enabled else "0")
+        os.environ["UR10E_RESTORE_DEMO_REGION"] = str(getattr(
+            self.cfg.planner, "demo_target_region", "default"))
+        os.environ["UR10E_RESUME_VISION_AFTER_MAIN_REFRESH"] = "1"
+        import sys
+        os.execvp(sys.executable, [sys.executable] + sys.argv)
+
+    def _resume_vision_after_main_refresh(self):
+        """Resume vision after the replacement process finishes CUDA warmup."""
+        self.set_vision_mode("full")
+        self._refresh_vision_resume_attempts += 1
+        if self._refresh_vision_resume_attempts >= 3:
+            self._refresh_vision_resume_timer.cancel()
+            self.get_logger().info(
+                "Main refresh complete — vision resumed after CUDA warmup")
 
     def _reachability_offsets(self, samples: int, cap_rad: float):
         """Deterministic joint-offset samples around zero, scaled by max joint delta."""
@@ -1745,7 +1840,13 @@ class UR10eCuroboMoveIt(Node):
                     self.get_logger().warn('[DEMO] Click the intended date in the Motion panel image before Close')
                     return
                 self._demo_confirm = True
-                self.get_logger().info("[DEMO] Close accepted; saving correction before grasp")
+                if bool(getattr(
+                        self.cfg.planner, 'demo_capture_jog_enabled', False)):
+                    self.get_logger().info(
+                        "[DEMO_XY] Close accepted as XY Aligned; continuing to FINAL")
+                else:
+                    self.get_logger().info(
+                        "[DEMO] Close accepted; saving correction before grasp")
                 return
             self._session_record_gripper_action("CLOSE", "direct_close")
             gripper_mod.control_gripper(self, 'CLOSE')
@@ -1823,6 +1924,8 @@ class UR10eCuroboMoveIt(Node):
         elif cmd == "stop":
             self.stop_requested = True
             motions_mod.publish_stop_trajectory(self)
+            if not self._demo_capture_active:
+                demo_capture.finish_sequence(self)
             self.goal_poses.clear()
             getattr(self, "_reachability_goal_metadata", {}).clear()
             markers_mod.clear_goal_markers(self)
@@ -2258,9 +2361,16 @@ class UR10eCuroboMoveIt(Node):
             _time.sleep(0.5)
             os.kill(os.getpid(), signal.SIGKILL)
         elif cmd == "refresh_main":
-            self.get_logger().info("Refresh requested — restarting main node")
-            import os, sys
-            os.execvp(sys.executable, [sys.executable] + sys.argv)
+            if getattr(self, "_refresh_main_pending", False):
+                self.get_logger().warn("Main refresh is already in progress")
+            else:
+                self._refresh_main_pending = True
+                self.get_logger().info(
+                    "Refresh requested — pausing vision before main restart")
+                threading.Thread(
+                    target=self._restart_main_after_vision_pause,
+                    daemon=True,
+                ).start()
         elif cmd == "refresh_camera":
             self._refresh_camera_pub.publish(String(data="refresh"))
             self.get_logger().info("Camera refresh requested")
@@ -2279,6 +2389,9 @@ class UR10eCuroboMoveIt(Node):
         elif cmd.startswith("camera_inference "):
             self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
             self.get_logger().info(f"Camera inference settings requested: {cmd}")
+        elif cmd.startswith("camera_nurec "):
+            self._refresh_camera_pub.publish(String(data=cmd.replace("camera_", "", 1)))
+            self.get_logger().info(f"NuRec requested: {cmd}")
         elif cmd == "camera_snapshot":
             # The wait for a fresh frame must not occupy the default ROS
             # callback group; /vision/raw is received by that same group.
@@ -2303,13 +2416,112 @@ class UR10eCuroboMoveIt(Node):
             enabled = cmd.split()[1].lower() in ('true', '1', 'yes', 'on')
             self.cfg.planner.low_center_level_insertion_enabled = enabled
             self.get_logger().info(f'[LEVEL_INSERTION] enabled={enabled}; applies at next FINAL target calculation')
+        elif cmd.startswith("demo_xy_step "):
+            if not (self._demo_capture_active
+                    and bool(getattr(
+                        self.cfg.planner, 'demo_capture_jog_enabled', False))
+                    and self._demo_capture_ready
+                    and getattr(self, '_demo_target_selection', None)):
+                self.get_logger().warn(
+                    '[DEMO_XY] Step rejected: wait for APPROACH and click the target')
+                return
+            if not self.robot_running:
+                self.get_logger().warn(
+                    '[DEMO_XY] Step rejected: robot External Control is not running')
+                return
+            if (getattr(self, '_demo_xy_busy', False)
+                    or getattr(self, '_demo_xy_pending_step_tool_m', None) is not None):
+                self.get_logger().warn('[DEMO_XY] Step rejected: previous move still pending')
+                return
+            parts = cmd.split()
+            try:
+                axis = parts[1].lower()
+                direction = int(parts[2])
+            except (IndexError, ValueError):
+                self.get_logger().warn(f'[DEMO_XY] Invalid step command: {cmd!r}')
+                return
+            if axis not in ('x', 'y') or direction not in (-1, 1):
+                self.get_logger().warn(f'[DEMO_XY] Invalid step command: {cmd!r}')
+                return
+            step = float(getattr(self.cfg.planner, 'demo_xy_step_m', 0.005))
+            self._demo_xy_pending_step_tool_m = (
+                [direction * step, 0.0]
+                if axis == 'x' else [0.0, direction * step])
+            self.get_logger().info(
+                f'[DEMO_XY] queued Tool {axis.upper()} {direction*step*1000:+.0f}mm')
+        elif cmd == "demo_xy_confirm":
+            if not (self._demo_capture_active
+                    and bool(getattr(
+                        self.cfg.planner, 'demo_capture_jog_enabled', False))
+                    and self._demo_capture_ready
+                    and getattr(self, '_demo_target_selection', None)):
+                self.get_logger().warn(
+                    '[DEMO_XY] Confirm rejected: wait for APPROACH and click the target')
+                return
+            if not self.robot_running:
+                self.get_logger().warn(
+                    '[DEMO_XY] Confirm rejected: robot External Control is not running')
+                return
+            if (getattr(self, '_demo_xy_busy', False)
+                    or getattr(self, '_demo_xy_pending_step_tool_m', None) is not None):
+                self.get_logger().warn(
+                    '[DEMO_XY] Confirm rejected: wait for the current step to finish')
+                return
+            self._demo_confirm = True
+            self.get_logger().info('[DEMO_XY] XY alignment confirmed; continuing to FINAL')
+        elif cmd.startswith("set_demo_jog "):
+            if self._motion_lock.locked() or self._demo_capture_active:
+                self.get_logger().warn('[DEMO] Change recording mode only while idle')
+                return
+            enabled = cmd.split()[1].lower() in ('true', '1', 'yes', 'on')
+            self.cfg.planner.demo_capture_jog_enabled = enabled
+            if enabled and not self.cfg.planner.demo_capture_enabled:
+                self.cfg.planner.demo_capture_enabled = True
+                region = getattr(
+                    self.cfg.planner, "demo_target_region", "default")
+                self._refresh_camera_pub.publish(String(
+                    data=f"demo_region {region} enabled=1"))
+                demo_capture.refresh_label_queue(self)
+            self.get_logger().info(
+                f'[DEMO] approach XY alignment mode='
+                f'{self.cfg.planner.demo_capture_jog_enabled} '
+                f'capture={self.cfg.planner.demo_capture_enabled}')
+            getattr(self, "_publish_goal_info", lambda: None)()
+        elif cmd.startswith("set_demo_region "):
+            parts = cmd.split()
+            region = parts[1].lower() if len(parts) > 1 else ""
+            if region not in ("default", "left", "center", "right"):
+                self.get_logger().warn(
+                    f"[DEMO] Invalid target region '{region}'; use default, left, center, or right")
+                return
+            self.cfg.planner.demo_target_region = region
+            enabled = bool(self.cfg.planner.demo_capture_enabled)
+            self._refresh_camera_pub.publish(String(
+                data=f"demo_region {region} enabled={int(enabled)}"))
+            self.get_logger().info(f"[DEMO] Target region set to {region}")
         elif cmd.startswith("set_demo_capture "):
             enabled = cmd.split()[1].lower() in ("true", "1", "yes", "on")
             self.cfg.planner.demo_capture_enabled = enabled
+            if not enabled:
+                self.cfg.planner.demo_capture_jog_enabled = False
+            region = getattr(self.cfg.planner, "demo_target_region", "default")
+            self._refresh_camera_pub.publish(String(
+                data=f"demo_region {region} enabled={int(enabled)}"))
             if not enabled and self._demo_capture_active:
                 self._demo_confirm = False
+            if enabled:
+                demo_capture.refresh_label_queue(self)
+            mode = ("click target, align Tool X/Y, press XY Aligned, then grade"
+                    if bool(getattr(
+                        self.cfg.planner, "demo_capture_jog_enabled", False))
+                    else "click target, continue the automatic grasp, then grade")
             self.get_logger().info(
-                f"[DEMO] {'ENABLED: hold at APPROACH, then press Close' if enabled else 'DISABLED'}")
+                f"[DEMO] {'ENABLED: ' + mode if enabled else 'DISABLED'}")
+            getattr(self, "_publish_goal_info", lambda: None)()
+        elif cmd.startswith("label_demo "):
+            parts = cmd.split()
+            label = parts[1].lower() if len(parts) > 1 else ""
+            demo_capture.apply_operator_label(self, label, parts[2] if len(parts)>2 else None)
         elif cmd.startswith("set_final_reacquire "):
             val = cmd.split()[1].lower()
             enabled = val in ("true", "1", "yes", "on")
@@ -2733,9 +2945,23 @@ class UR10eCuroboMoveIt(Node):
         self._home_joints_display = f"rad=[{home_rad_str}] deg=[{home_deg_str}]"
 
         gripper = getattr(self, 'gripper_controller', None)
+        demo_label = demo_capture.label_status(self)
         msg_data = {
             "demo_capture_enabled": bool(self.cfg.planner.demo_capture_enabled),
             "demo_capture_active": bool(self._demo_capture_active),
+            "demo_capture_jog_enabled": bool(getattr(
+                self.cfg.planner, "demo_capture_jog_enabled", False)),
+            "demo_target_confirmed": bool(getattr(
+                self, "_demo_target_selection", None)),
+            "demo_xy_busy": bool(getattr(self, "_demo_xy_busy", False)),
+            "demo_xy_offset_tool_m": list(getattr(
+                self, "_demo_xy_offset_tool_m", [0.0, 0.0, 0.0])),
+            "demo_xy_error": str(getattr(self, "_demo_xy_error", "")),
+            "demo_target_region": str(getattr(
+                self.cfg.planner, "demo_target_region", "default")),
+            "demo_label_pending": demo_label["pending"],
+            "demo_label_record": demo_label["record"],
+            "demo_label_image": demo_label["image"],
             "goal_count": len(safe_goals),
             "goals": goal_summary,
             "goal_display": "\n".join(goal_display_lines),

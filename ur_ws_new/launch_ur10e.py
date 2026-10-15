@@ -84,6 +84,9 @@ def kinematics_file_for(robot_profile: str) -> Path:
     )
 
 RVIZ_CONFIG = str(Path(WS) / "install" / "rviz_ur10e_panel" / "share" / "rviz_ur10e_panel" / "rviz" / "view_robot.rviz")
+MAIN_START_DELAY_SECONDS = 15
+# Keep ZED/TensorRT startup out of cuRobo's CUDA-graph warmup window.
+VISION_START_DELAY_SECONDS = 60
 
 
 def camera_mode_for(use_lidar=False, use_zed_mini=False, use_zedx_mini_only=False):
@@ -209,11 +212,14 @@ def get_commands(
             f'launch_rviz:={launch_rviz}'
         ),
         "main": (
-            f'sleep 15 && {profile_source} && ros2 run ur10e_curobo main --ros-args '
+            f'sleep {MAIN_START_DELAY_SECONDS} && {profile_source} && ros2 run ur10e_curobo main --ros-args '
             f'-p planner.use_fake_hardware:={hw} '
             f'-p perception.enabled:={vision}'
         ),
-        "vision": f'sleep 12 && {source_with_camera} && ros2 run ur10e_curobo vision{vision_flags}',
+        "vision": (
+            f'sleep {VISION_START_DELAY_SECONDS} && {source_with_camera} '
+            f'&& ros2 run ur10e_curobo vision{vision_flags}'
+        ),
         "teleop": f'sleep 6 && {source_with_camera} && ros2 run ur10e_curobo teleop',
         "gui": f'sleep 8 && {profile_source} && ros2 run ur10e_curobo gui',
         "rqt": f'sleep 8 && {source_with_camera} && rqt --force-discover --standalone rqt_ur10e_panel',
@@ -699,7 +705,7 @@ def main():
             environment=environment,
             gripper_profile=gripper_profile,
             gripper_enabled=False,
-        )["vision"].removeprefix("sleep 12 && ")
+        )["vision"].removeprefix(f"sleep {VISION_START_DELAY_SECONDS} && ")
         print("Launching standalone Raw YOLO view (no UR bringup, cuRobo, or RViz)")
         os.execl("/bin/bash", "bash", "-lc", command)
 

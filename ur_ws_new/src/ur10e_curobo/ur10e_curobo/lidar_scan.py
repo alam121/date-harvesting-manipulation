@@ -6,6 +6,7 @@ from . import fk as fk_mod
 from . import markers as markers_mod
 from . import motions as motions_mod
 from .config import PLAN_CFG_SCAN_PREFLIGHT
+from .planner_options import PlanOptions
 from .goals import bounded_yaw_align_local_axis, _log_forearm_flange_clearance
 
 def _current_tcp_pose(node, *, attempts: int = 3, sleep_s: float = 0.05):
@@ -125,7 +126,7 @@ def _scan_basis_and_angles(node, center, cur, n: int, arc: float):
 
 
 def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = True,
-                            stop_check=None, center_override=None):
+                            stop_check=None, center_override=None, discovery_rows=False):
     """Build the arc. `center_override` puts the centre somewhere other than
     the TCP -- pollination orbits the detected flower rather than the arm.
 
@@ -157,7 +158,7 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     arc = math.radians(float(getattr(cfg, "semicircle_arc_deg", 180.0)))
     local_axis = tuple(getattr(cfg, "semicircle_local_axis", [0.0, 0.0, 1.0]))
     radial, tangent, angles, angle_mode = _scan_basis_and_angles(node, center, cur, n, arc)
-    if bool(getattr(cfg, "semicircle_use_reachability", True)):
+    if not discovery_rows and bool(getattr(cfg, "semicircle_use_reachability", True)):
         poses = _semicircle_from_reachability(
             node, center, ref_quat, source, n, radius, arc, local_axis,
             radial, tangent, angles,
@@ -175,7 +176,7 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
                 "Lidar scan: no usable validated reachability samples for scan arc; "
                 "trying generated horizontal semicircle with path validation.")
 
-    if log and bool(getattr(cfg, "local_close_first", True)):
+    if not discovery_rows and log and bool(getattr(cfg, "local_close_first", True)):
         poses = _local_close_scan_fallback(node, cur, log=log)
         if len(poses) >= int(getattr(cfg, "semicircle_min_points", 3)):
             if publish_preview:
@@ -253,6 +254,15 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
             [r for r, _yaw in specs],
             [yaw for _r, yaw in specs],
         )
+    if discovery_rows:
+        # Fine angular steps preserve continuation without planning bridges ahead.
+        step = max(1.0, float(getattr(cfg, "semicircle_joint_bridge_step_deg", 10.0)))
+        count = max(2, int(math.ceil(abs(math.degrees(float(angles[-1] - angles[0]))) / step)) + 1)
+        search_angles = np.linspace(float(angles[0]), float(angles[-1]), count)
+        if getattr(cfg, "semicircle_preflight_direction", "reverse") != "forward":
+            search_angles = search_angles[::-1]
+        return [candidate_row_for_angle(math.degrees(float(a)))[0] for a in search_angles]
+
     if log and bool(getattr(cfg, "semicircle_adaptive_scan", True)):
         node.get_logger().info(
             "Lidar scan: adaptive radius candidates close-first="
@@ -450,9 +460,9 @@ def _local_close_scan_fallback(node, cur_pose, *, log: bool = True):
 
 def _cartesian_scan_candidate(node, prev_joints, pose, label: str,
                               *, require_horizontal: bool,
-                              log_rejection: bool):
+                              log_rejection: bool, plan_cfg=None):
     plan = motions_mod._plan_cartesian_states_from_joints(
-        node, prev_joints, pose, label, plan_cfg=PLAN_CFG_SCAN_PREFLIGHT)
+        node, prev_joints, pose, label, plan_cfg=plan_cfg or PLAN_CFG_SCAN_PREFLIGHT)
     if plan is None:
         return None, "PLAN_OR_IK_FAIL"
     states, curobo_dt = plan
@@ -1104,6 +1114,124 @@ def _execute_scan_joint(node, joints, label, speed_factor):
     )
 
 
+def _run_discovery_scan(node, goal_available):
+    """Plan and execute one checked viewpoint at a time, from measured joints."""
+    cfg = node.cfg.lidar_scan
+    rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
+    budget = max(0.1, float(getattr(cfg, "discovery_plan_budget_s", 5.0)))
+    deadline = time.monotonic() + budget
+    moved = False
+    attempts = 0
+    for row in rows:
+        for pose in row:
+            if goal_available():
+                return True
+            if node.stop_requested or getattr(node, "_cuda_faulted", False):
+                return False
+            if time.monotonic() >= deadline:
+                node.get_logger().warn(
+                    f"[LIDAR_DISCOVERY] planning budget exhausted after {attempts} candidates")
+                return False
+            if node.current_joint_positions is None:
+                return False
+            attempts += 1
+            candidate, reason = _cartesian_scan_candidate(
+                node, list(node.current_joint_positions), pose,
+                f"SCAN_DISCOVERY_{attempts}", require_horizontal=moved,
+                log_rejection=False, plan_cfg=PlanOptions(max_attempts=1))
+            # Detection/stop can arrive while the non-interruptible planner runs.
+            if goal_available():
+                return True
+            if node.stop_requested or getattr(node, "_cuda_faulted", False):
+                return False
+            if candidate is None:
+                continue
+            node.get_logger().info(
+                f"[LIDAR_DISCOVERY] executing checked viewpoint after {attempts} candidates")
+            ok = _execute_scan_target(
+                node, candidate, "SCAN_DISCOVERY", cfg.speed_factor,
+                require_horizontal=moved)
+            if goal_available():
+                return True
+            if not ok or node.stop_requested:
+                return False
+            moved = True
+            time.sleep(0.3)
+            deadline = time.monotonic() + budget
+            attempts = 0
+            break
+        else:
+            if moved:
+                # Do not skip across an unreachable arc boundary.
+                return False
+    return goal_available()
+
+
+def _run_section_scan(node):
+    """Validate at most two consecutive viewpoints before each section."""
+    cfg = node.cfg.lidar_scan
+    rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
+    budget = max(0.1, float(getattr(cfg, "scan_section_plan_budget_s", 5.0)))
+    completed = 0
+    index = 0
+    reason = "COMPLETE"
+    while index < len(rows):
+        if node.stop_requested or getattr(node, "_cuda_faulted", False):
+            reason = "STOPPED"
+            break
+        if node.current_joint_positions is None:
+            reason = "NO_JOINT_STATE"
+            break
+        deadline = time.monotonic() + budget
+        start = list(node.current_joint_positions)
+        section = []
+        boundary = False
+        for _ in range(min(2, len(rows) - index)):
+            candidate = None
+            # One fallback per viewpoint; do not exhaust six radius/yaw variants.
+            for pose in rows[index][:2]:
+                if node.stop_requested or getattr(node, "_cuda_faulted", False):
+                    reason = "STOPPED"
+                    break
+                if time.monotonic() >= deadline:
+                    reason = "PLAN_BUDGET"
+                    break
+                candidate, rejection = _cartesian_scan_candidate(
+                    node, start, pose, f"SCAN_SECTION_PLAN_{index}",
+                    require_horizontal=bool(completed or section),
+                    log_rejection=False, plan_cfg=PlanOptions(max_attempts=1))
+                if candidate is not None:
+                    break
+                reason = rejection
+            if node.stop_requested or getattr(node, "_cuda_faulted", False):
+                return
+            if candidate is None:
+                boundary = True
+                break
+            section.append(candidate)
+            start = list(candidate["end_joints"])
+            index += 1
+        for target in section:
+            if node.stop_requested or getattr(node, "_cuda_faulted", False):
+                return
+            node.get_logger().info(
+                f"[LIDAR_SECTION] moving to viewpoint {completed + 1}")
+            if not _execute_scan_target(
+                    node, target, f"SCAN_SECTION_{completed}", cfg.speed_factor,
+                    require_horizontal=bool(completed)):
+                reason = "MOVE_FAILED"
+                boundary = True
+                break
+            completed += 1
+            time.sleep(0.3)
+        if boundary:
+            break
+        reason = "COMPLETE"
+    node.get_logger().info(
+        f"[LIDAR_SECTION] {'complete' if index == len(rows) and reason == 'COMPLETE' else 'partial'} "
+        f"coverage={completed}/{len(rows)} viewpoints reason={reason}")
+
+
 def run_lidar_scan(node, *, stop_when_goal_found: bool = False,
                    return_home: bool = True):
     """
@@ -1120,6 +1248,19 @@ def run_lidar_scan(node, *, stop_when_goal_found: bool = False,
     def _goal_available():
         return bool(stop_when_goal_found and len(node.goal_poses) > 0)
     use_semicircle = bool(getattr(cfg, "use_semicircle", True))
+    if use_semicircle:
+        node.motion_phase = "LIDAR_SCAN"
+        try:
+            if stop_when_goal_found:
+                goal_found = _run_discovery_scan(node, _goal_available)
+            else:
+                _run_section_scan(node)
+            return goal_found
+        finally:
+            if not node.stop_requested and return_home and not goal_found:
+                node.motion_phase = "LIDAR_SCAN_HOME"
+                motions_mod.move_to_home_position(node)
+            node.motion_phase = "IDLE"
     targets = _cached_scan_targets(node) if use_semicircle else None
     if targets:
         node.get_logger().info(

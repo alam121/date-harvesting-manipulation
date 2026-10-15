@@ -451,6 +451,26 @@ Restart vision and the motion node before collecting one pilot. Restore any
 operator-selected runtime offsets after restart and verify them before collecting.
 Do not mix archived demos into the fresh dataset automatically.
 
+### Click-confirmed outcome labels
+
+The default demo mode now stops at APPROACH for one required operator action:
+click the intended date in the frozen Motion-panel image. A valid click stores
+the pixel, preview token, selection time, and a fruit ID only when exactly one
+detector box contains that point. The robot then continues through FINAL and
+grasp automatically; no pendant jog or Close press is used. Missing, timed-out,
+or cancelled confirmation stops the attempt before FINAL rather than writing an
+unverified sample. These records use schema 5 and
+`capture_mode: click_confirmed_outcome`.
+
+After the grasp attempt completes, RViz enables Good / Edge / Fail for the exact
+queued record. The operator grade is the only policy label; the automatic gripper
+verdict is neither recorded nor used. Existing unlabelled records are recovered
+oldest-first. This mode produces target-confirmed outcome data, not an imitation
+trajectory. For ACT or another action-sequence learner, retain
+`demo_capture_jog_enabled=true` sessions with `sequence/sequence.json`; action
+conversion and dataset-level timing/visual review are still required before
+training.
+
 ### Neighbor-aware corridor ranking
 
 Vision publishes detected fruit centers/radii on `/vision/nearby_dates`.

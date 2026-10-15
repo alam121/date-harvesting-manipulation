@@ -569,9 +569,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   auto * mode_final_group = new QGroupBox("Mode Final Grasp Adjustments (mm)");
   auto * mode_final_layout = new QGridLayout(mode_final_group);
   auto * normal_depth = make_offset_input(0.0);
-  auto * normal_z = make_offset_input(0.0);
+  auto * normal_z = make_offset_input(12.0);
   auto * envelop_depth = make_offset_input(0.0);
-  auto * envelop_z = make_offset_input(0.0);
+  auto * envelop_z = make_offset_input(12.0);
   mode_final_layout->addWidget(new QLabel("Mode"), 0, 0);
   mode_final_layout->addWidget(new QLabel("Depth"), 0, 1);
   mode_final_layout->addWidget(new QLabel("Z"), 0, 2);
@@ -599,9 +599,9 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(reset_mode_final, &QPushButton::clicked, this,
     [normal_depth, normal_z, envelop_depth, envelop_z, apply_mode_final]() {
       normal_depth->setValue(0.0);
-      normal_z->setValue(0.0);
+      normal_z->setValue(12.0);
       envelop_depth->setValue(0.0);
-      envelop_z->setValue(0.0);
+      envelop_z->setValue(12.0);
       apply_mode_final->click();
     });
   mode_final_layout->addWidget(reset_mode_final, 3, 2);
@@ -808,11 +808,59 @@ UR10ePanel::UR10ePanel(QWidget * parent)
     tip_apply->click();
   });
 
+  auto * demo_target_group = new QGroupBox("Demo Target Area Priority");
+  auto * demo_target_layout = new QGridLayout(demo_target_group);
+  demo_target_region_combo_ = new QComboBox();
+  demo_target_region_combo_->addItem("Default (normal ranking)", QString("default"));
+  demo_target_region_combo_->addItem("Left third", QString("left"));
+  demo_target_region_combo_->addItem("Center third", QString("center"));
+  demo_target_region_combo_->addItem("Right third", QString("right"));
+  demo_target_region_combo_->setCurrentIndex(0);
+  demo_target_region_combo_->setToolTip(
+    "Use Default for normal ranking, or prefer valid dates in one image third. "
+    "If none are available, normal target ranking is used.");
+  demo_target_layout->addWidget(new QLabel("Highest weight"), 0, 0);
+  demo_target_layout->addWidget(demo_target_region_combo_, 0, 1);
+  auto * demo_target_note = new QLabel(
+    "Demo only. Left/Center/Right outrank distance; Default adds no area bias.");
+  demo_target_note->setWordWrap(true);
+  demo_target_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  demo_target_layout->addWidget(demo_target_note, 1, 0, 1, 2);
+  connect(
+    demo_target_region_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+    this, [this](int) {
+      const QString region = demo_target_region_combo_->currentData().toString();
+      publishCmd("set_demo_region " + region.toStdString());
+      status_label_->setText("Demo target area: " + region);
+    });
+
+  auto * demo_alignment_group = new QGroupBox("Demo Correction Mode");
+  auto * demo_alignment_layout = new QVBoxLayout(demo_alignment_group);
+  demo_xy_alignment_cb_ = new QCheckBox(
+    "Approach XY alignment (5 mm, depth locked)");
+  demo_xy_alignment_cb_->setToolTip(
+    "At APPROACH, enable four guarded tool-X/tool-Y controls. Tool Z is locked, "
+    "each axis is limited to +/-20 mm, and the same correction is applied to FINAL.");
+  connect(demo_xy_alignment_cb_, &QCheckBox::toggled, this, [this](bool enabled) {
+    publishCmd(enabled ? "set_demo_jog true" : "set_demo_jog false");
+    status_label_->setText(enabled
+      ? "Demo XY alignment requested"
+      : "Demo automatic-FINAL mode requested");
+  });
+  demo_alignment_layout->addWidget(demo_xy_alignment_cb_);
+  auto * demo_alignment_note = new QLabel(
+    "Tool X/Y only; tool Z/depth cannot be commanded from these controls.");
+  demo_alignment_note->setWordWrap(true);
+  demo_alignment_note->setStyleSheet("font-size: 9pt; color: #546e7a;");
+  demo_alignment_layout->addWidget(demo_alignment_note);
+
   settings_tab_layout->addWidget(final_offsets_group);
   settings_tab_layout->addWidget(closure_group);
   settings_tab_layout->addWidget(tip_group);
   settings_tab_layout->addWidget(grasp_mode_group);
   settings_tab_layout->addWidget(mode_final_group);
+  settings_tab_layout->addWidget(demo_target_group);
+  settings_tab_layout->addWidget(demo_alignment_group);
 
   auto * gripper_joint_help = new QLabel(
     "M1–M12 calibration. Release a slider to preview the full posture. "
@@ -1071,15 +1119,20 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   plan_cancel_btn_->setVisible(false);
   motion_layout->addWidget(plan_cancel_btn_, 12, 1);
 
-  demo_capture_cb_ = new QCheckBox("Demo: jog APPROACH to grasp, then Close");
+  demo_capture_cb_ = new QCheckBox("Demo labels: click target, grasp, then grade");
   demo_capture_cb_->setToolTip(
-    "Hold before grasping. Jog the pendant to the correct pose, restore ROS control, "
-    "then press Close to save the image and correction and continue harvesting. "
-    "Uncheck during a hold to discard and stop the attempt.");
+    "Enable target-confirmed labelled demo collection. Automatic mode holds at APPROACH "
+    "for a click on the intended date, then grasps automatically and enables Good / Edge / Fail. "
+    "XY mode enables bounded tool-X/tool-Y alignment before the automatic FINAL move.");
   connect(demo_capture_cb_, &QCheckBox::toggled, this, [this](bool enabled) {
+    if (enabled && demo_target_region_combo_) {
+      publishCmd(
+        "set_demo_region " +
+        demo_target_region_combo_->currentData().toString().toStdString());
+    }
     publishCmd(enabled ? "set_demo_capture true" : "set_demo_capture false");
     status_label_->setText(enabled
-      ? "Demo enabled: at APPROACH, select date, jog then Close"
+      ? "Demo labels enabled: click the intended date at APPROACH"
       : "Demo disabled");
   });
   motion_layout->addWidget(demo_capture_cb_, 13, 0, 1, 2);
@@ -1088,10 +1141,76 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   demo_image_label_->setAlignment(Qt::AlignCenter);
   demo_image_label_->setCursor(Qt::CrossCursor);
   demo_image_label_->installEventFilter(this);
-  demo_image_label_->setToolTip("Click the intended date in this frozen pre-jog image before Close.");
+  demo_image_label_->setToolTip(
+    "Click the intended date in the initial APPROACH image before XY alignment.");
   motion_layout->addWidget(demo_image_label_, 14, 0, 1, 2);
-  demo_click_status_ = new QLabel("Click the intended date before Close");
+  demo_click_status_ = new QLabel("At APPROACH, click the intended date to continue");
   motion_layout->addWidget(demo_click_status_, 15, 0, 1, 2);
+
+  auto * demo_xy_group = new QGroupBox("Approach XY Alignment");
+  auto * demo_xy_layout = new QGridLayout(demo_xy_group);
+  demo_xy_x_minus_btn_ = new QPushButton("Tool X -5 mm");
+  demo_xy_x_plus_btn_ = new QPushButton("Tool X +5 mm");
+  demo_xy_y_minus_btn_ = new QPushButton("Tool Y -5 mm");
+  demo_xy_y_plus_btn_ = new QPushButton("Tool Y +5 mm");
+  demo_xy_confirm_btn_ = new QPushButton("XY Aligned — Continue");
+  demo_xy_confirm_btn_->setStyleSheet(
+    "background-color: #2e7d32; color: white; font-weight: bold;");
+  demo_xy_x_minus_btn_->setEnabled(false);
+  demo_xy_x_plus_btn_->setEnabled(false);
+  demo_xy_y_minus_btn_->setEnabled(false);
+  demo_xy_y_plus_btn_->setEnabled(false);
+  demo_xy_confirm_btn_->setEnabled(false);
+  demo_xy_status_ = new QLabel("Depth locked (Tool Z); limit +/-20 mm per axis");
+  demo_xy_status_->setWordWrap(true);
+  demo_xy_status_->setStyleSheet("font-size: 9pt; color: #455a64;");
+  connect(demo_xy_x_minus_btn_, &QPushButton::clicked, this,
+    [this]() {publishCmd("demo_xy_step x -1");});
+  connect(demo_xy_x_plus_btn_, &QPushButton::clicked, this,
+    [this]() {publishCmd("demo_xy_step x 1");});
+  connect(demo_xy_y_minus_btn_, &QPushButton::clicked, this,
+    [this]() {publishCmd("demo_xy_step y -1");});
+  connect(demo_xy_y_plus_btn_, &QPushButton::clicked, this,
+    [this]() {publishCmd("demo_xy_step y 1");});
+  connect(demo_xy_confirm_btn_, &QPushButton::clicked, this,
+    [this]() {publishCmd("demo_xy_confirm");});
+  demo_xy_layout->addWidget(demo_xy_x_minus_btn_, 0, 0);
+  demo_xy_layout->addWidget(demo_xy_x_plus_btn_, 0, 1);
+  demo_xy_layout->addWidget(demo_xy_y_minus_btn_, 1, 0);
+  demo_xy_layout->addWidget(demo_xy_y_plus_btn_, 1, 1);
+  demo_xy_layout->addWidget(demo_xy_status_, 2, 0, 1, 2);
+  demo_xy_layout->addWidget(demo_xy_confirm_btn_, 3, 0, 1, 2);
+  motion_layout->addWidget(demo_xy_group, 16, 0, 1, 2);
+
+  auto * demo_label_group = new QGroupBox("Operator label for recorded attempt");
+  auto * demo_label_layout = new QVBoxLayout(demo_label_group);
+  demo_label_status_ = new QLabel("No recorded attempt is waiting for a label");
+  demo_label_status_->setWordWrap(true);
+  demo_label_layout->addWidget(demo_label_status_);
+  auto * demo_label_buttons = new QHBoxLayout();
+  demo_label_good_btn_ = new QPushButton("Good");
+  demo_label_good_btn_->setStyleSheet(
+    "background-color: #2e7d32; color: white; font-weight: bold;");
+  connect(demo_label_good_btn_, &QPushButton::clicked,
+    this, &UR10ePanel::onDemoLabelGood);
+  demo_label_buttons->addWidget(demo_label_good_btn_);
+  demo_label_edge_btn_ = new QPushButton("Edge");
+  demo_label_edge_btn_->setStyleSheet(
+    "background-color: #ef6c00; color: white; font-weight: bold;");
+  connect(demo_label_edge_btn_, &QPushButton::clicked,
+    this, &UR10ePanel::onDemoLabelEdge);
+  demo_label_buttons->addWidget(demo_label_edge_btn_);
+  demo_label_fail_btn_ = new QPushButton("Fail");
+  demo_label_fail_btn_->setStyleSheet(
+    "background-color: #b71c1c; color: white; font-weight: bold;");
+  connect(demo_label_fail_btn_, &QPushButton::clicked,
+    this, &UR10ePanel::onDemoLabelFail);
+  demo_label_buttons->addWidget(demo_label_fail_btn_);
+  demo_label_layout->addLayout(demo_label_buttons);
+  demo_label_good_btn_->setEnabled(false);
+  demo_label_edge_btn_->setEnabled(false);
+  demo_label_fail_btn_->setEnabled(false);
+  motion_layout->addWidget(demo_label_group, 17, 0, 1, 2);
 
 
   motion_tab_layout->addWidget(motion_group);
@@ -1521,10 +1640,27 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   connect(video_stop_btn, &QPushButton::clicked, this, &UR10ePanel::onCameraVideoStop);
   camera_layout->addWidget(video_stop_btn, 10, 1);
 
+  // NuRec stereo bag, recorded on this machine by the vision node (no network).
+  auto * nurec_start_btn = new QPushButton("Start NuRec Bag");
+  nurec_start_btn->setStyleSheet("background-color: #6a1b9a; color: white; font-weight: bold;");
+  nurec_start_btn->setToolTip(
+    "Turn on NuRec stereo and record it locally to ~/nurec_data/bags "
+    "(needs --use_zedx_mini_only). Status shows below.");
+  connect(nurec_start_btn, &QPushButton::clicked, this,
+    [this]() {publishCmd("camera_nurec record");});
+  camera_layout->addWidget(nurec_start_btn, 11, 0);
+
+  auto * nurec_stop_btn = new QPushButton("Stop NuRec Bag");
+  nurec_stop_btn->setStyleSheet("background-color: #c62828; color: white; font-weight: bold;");
+  nurec_stop_btn->setToolTip("Stop the NuRec bag and the NuRec stereo stream");
+  connect(nurec_stop_btn, &QPushButton::clicked, this,
+    [this]() {publishCmd("camera_nurec stop");});
+  camera_layout->addWidget(nurec_stop_btn, 11, 1);
+
   auto * camera_refresh_btn = new QPushButton("Refresh Camera");
   camera_refresh_btn->setStyleSheet("background-color: #607d8b; color: white;");
   connect(camera_refresh_btn, &QPushButton::clicked, this, &UR10ePanel::onRefreshCamera);
-  camera_layout->addWidget(camera_refresh_btn, 11, 0, 1, 2);
+  camera_layout->addWidget(camera_refresh_btn, 12, 0, 1, 2);
 
   camera_status_label_ = new QLabel("Camera: waiting for /camera_status");
   camera_status_label_->setWordWrap(true);
@@ -1532,12 +1668,12 @@ UR10ePanel::UR10ePanel(QWidget * parent)
   camera_status_label_->setStyleSheet(
     "font-size: 9pt; color: #263238; background: #eceff1; padding: 6px; "
     "border-radius: 4px;");
-  camera_layout->addWidget(camera_status_label_, 12, 0, 1, 2);
+  camera_layout->addWidget(camera_status_label_, 13, 0, 1, 2);
 
-  auto * camera_note = new QLabel("Saved to ~/camera_recordings");
+  auto * camera_note = new QLabel("Saved to ~/camera_recordings (NuRec: ~/nurec_data/bags)");
   camera_note->setStyleSheet("font-size: 9pt; color: #455a64; padding: 3px;");
   camera_note->setAlignment(Qt::AlignCenter);
-  camera_layout->addWidget(camera_note, 13, 0, 1, 2);
+  camera_layout->addWidget(camera_note, 14, 0, 1, 2);
 
   camera_tab_layout->addWidget(camera_group);
   camera_tab_layout->addStretch(1);
@@ -1881,7 +2017,9 @@ void UR10ePanel::onInitialize()
 
 bool UR10ePanel::eventFilter(QObject * obj, QEvent * event)
 {
-  if (obj == demo_image_label_ && event->type() == QEvent::MouseButtonPress && !demo_image_.isNull()) {
+  if (obj == demo_image_label_ && event->type() == QEvent::MouseButtonPress &&
+    !demo_image_.isNull() && !demo_image_token_.isEmpty())
+  {
     auto * mouse = static_cast<QMouseEvent *>(event);
     if (mouse->button() != Qt::LeftButton || !demo_click_pub_) return false;
     const QSize size = demo_image_.size().scaled(demo_image_label_->size(), Qt::KeepAspectRatio);
@@ -1960,9 +2098,19 @@ void UR10ePanel::setupRos()
       const auto owned = image.copy();
       const QString token = QString::number(msg->header.stamp.sec) + ":" + QString::number(msg->header.stamp.nanosec);
       QMetaObject::invokeMethod(this, [this, owned, token]() {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         demo_image_ = owned; demo_image_token_ = token;
+        demo_live_preview_ = true;
+        // A live capture temporarily replaces any queued record preview. Force
+        // that exact queued image to be restored when the capture ends.
+        rendered_demo_label_image_.clear();
         demo_image_label_->setPixmap(QPixmap::fromImage(owned).scaled(demo_image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        demo_click_status_->setText("Click the intended date before Close");
+        demo_click_status_->setText(
+          demo_capture_jog_enabled_ && demo_target_confirmed_
+          ? "Use Tool X/Y controls, then press XY Aligned"
+          : demo_capture_jog_enabled_
+          ? "Click the intended date before XY alignment"
+          : "Click the intended date to continue to automatic FINAL");
       }, Qt::QueuedConnection);
     });
   joint_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
@@ -2125,7 +2273,29 @@ void UR10ePanel::setupRos()
       gripper_open_alpha_ = std::max(-0.10, std::min(1.0, gripper_open_alpha_));
       gripper_fake_ = jsonBoolValue(data, "gripper_fake", gripper_fake_);
       demo_capture_enabled_ = jsonBoolValue(data, "demo_capture_enabled", false);
-      demo_capture_active_ = jsonBoolValue(data, "demo_capture_active", false);
+      const bool demo_active = jsonBoolValue(
+        data, "demo_capture_active", demo_capture_active_);
+      if (demo_active) {
+        demo_capture_was_active_ = true;
+      } else if (demo_capture_was_active_) {
+        demo_live_preview_ = false;
+        demo_capture_was_active_ = false;
+      }
+      demo_capture_active_ = demo_active;
+      demo_capture_jog_enabled_ = jsonBoolValue(
+        data, "demo_capture_jog_enabled", demo_capture_jog_enabled_);
+      demo_target_confirmed_ = jsonBoolValue(
+        data, "demo_target_confirmed", demo_target_confirmed_);
+      demo_xy_busy_ = jsonBoolValue(data, "demo_xy_busy", demo_xy_busy_);
+      std::array<double, 3> demo_xy_offset{};
+      if (jsonTripleValue(data, "demo_xy_offset_tool_m", demo_xy_offset)) {
+        demo_xy_offset_m_ = demo_xy_offset;
+      }
+      demo_xy_error_ = jsonStringValue(data, "demo_xy_error");
+      demo_label_pending_ = static_cast<int>(
+        jsonNumberValue(data, "demo_label_pending", demo_label_pending_));
+      demo_label_record_ = jsonStringValue(data, "demo_label_record");
+      demo_label_image_ = jsonStringValue(data, "demo_label_image");
       gripper_disabled_ = jsonBoolValue(data, "gripper_disabled", gripper_disabled_);
       gripper_suction_ = jsonBoolValue(data, "gripper_suction", gripper_suction_);
       std::array<double, 3> taught_offsets{};
@@ -2446,6 +2616,24 @@ void UR10ePanel::onClear() { publishCmd("clear"); }
 void UR10ePanel::onCheckCalibration() { publishCmd("check_calibration"); }
 void UR10ePanel::onGripperOpen() { publishCmd("open"); }
 void UR10ePanel::onGripperClose() { publishCmd("close"); }
+void UR10ePanel::onDemoLabelGood()
+{
+  if (demo_label_record_.empty()) return;
+  publishCmd("label_demo good " + demo_label_record_);
+  status_label_->setText("Saving GOOD label for the displayed demo");
+}
+void UR10ePanel::onDemoLabelEdge()
+{
+  if (demo_label_record_.empty()) return;
+  publishCmd("label_demo edge " + demo_label_record_);
+  status_label_->setText("Saving EDGE label for the displayed demo");
+}
+void UR10ePanel::onDemoLabelFail()
+{
+  if (demo_label_record_.empty()) return;
+  publishCmd("label_demo fail " + demo_label_record_);
+  status_label_->setText("Saving FAIL label for the displayed demo");
+}
 void UR10ePanel::onGripperOpenSliderChanged(int value)
 {
   if (gripper_open_value_label_) {
@@ -3307,10 +3495,75 @@ void UR10ePanel::updateDisplay()
   if (demo_capture_cb_) {
     demo_capture_cb_->blockSignals(true);
     demo_capture_cb_->setChecked(demo_capture_enabled_);
-    demo_capture_cb_->setText(demo_capture_active_
-      ? "Demo holding: jog, then press Close"
-      : "Demo: jog APPROACH to grasp, then Close");
+    if (demo_capture_active_ && demo_capture_jog_enabled_) {
+      demo_capture_cb_->setText("Demo holding: click, align XY, continue, then grade");
+    } else if (demo_capture_active_) {
+      demo_capture_cb_->setText("Demo waiting: click target to continue");
+    } else if (demo_capture_jog_enabled_) {
+      demo_capture_cb_->setText("Demo labels: approach XY alignment, then grade");
+    } else {
+      demo_capture_cb_->setText("Demo labels: click target, automatic grasp, then grade");
+    }
     demo_capture_cb_->blockSignals(false);
+  }
+  if (demo_xy_alignment_cb_) {
+    demo_xy_alignment_cb_->blockSignals(true);
+    demo_xy_alignment_cb_->setChecked(demo_capture_jog_enabled_);
+    demo_xy_alignment_cb_->setEnabled(!demo_capture_active_);
+    demo_xy_alignment_cb_->blockSignals(false);
+  }
+  const bool demo_xy_controls_ready =
+    demo_capture_active_ && demo_capture_jog_enabled_ &&
+    demo_target_confirmed_ && !demo_xy_busy_;
+  if (demo_xy_x_minus_btn_) demo_xy_x_minus_btn_->setEnabled(demo_xy_controls_ready);
+  if (demo_xy_x_plus_btn_) demo_xy_x_plus_btn_->setEnabled(demo_xy_controls_ready);
+  if (demo_xy_y_minus_btn_) demo_xy_y_minus_btn_->setEnabled(demo_xy_controls_ready);
+  if (demo_xy_y_plus_btn_) demo_xy_y_plus_btn_->setEnabled(demo_xy_controls_ready);
+  if (demo_xy_confirm_btn_) demo_xy_confirm_btn_->setEnabled(demo_xy_controls_ready);
+  if (demo_xy_status_) {
+    const QString offset = QString("Tool offset: X %1 mm, Y %2 mm; Z locked")
+      .arg(demo_xy_offset_m_[0] * 1000.0, 0, 'f', 0)
+      .arg(demo_xy_offset_m_[1] * 1000.0, 0, 'f', 0);
+    if (!demo_xy_error_.empty()) {
+      demo_xy_status_->setText(
+        offset + "\n" + QString::fromStdString(demo_xy_error_));
+      demo_xy_status_->setStyleSheet("font-size: 9pt; color: #b71c1c;");
+    } else {
+      demo_xy_status_->setText(
+        demo_xy_busy_ ? offset + " — moving…" : offset + " (limit +/-20 mm)");
+      demo_xy_status_->setStyleSheet("font-size: 9pt; color: #455a64;");
+    }
+  }
+  if (demo_click_status_ && demo_capture_active_ && demo_capture_jog_enabled_) {
+    demo_click_status_->setText(demo_target_confirmed_
+      ? "Target confirmed — align Tool X/Y, then press XY Aligned"
+      : "Click the intended date before XY alignment");
+  }
+  const bool demo_label_ready = demo_label_pending_ > 0 && !demo_label_record_.empty();
+  if (demo_label_status_) {
+    demo_label_status_->setText(demo_label_ready
+      ? QString("Label %1  (%2 pending)")
+        .arg(QString::fromStdString(demo_label_record_))
+        .arg(demo_label_pending_)
+      : "No recorded attempt is waiting for a label");
+  }
+  if (demo_label_good_btn_) demo_label_good_btn_->setEnabled(demo_label_ready);
+  if (demo_label_edge_btn_) demo_label_edge_btn_->setEnabled(demo_label_ready);
+  if (demo_label_fail_btn_) demo_label_fail_btn_->setEnabled(demo_label_ready);
+  if (demo_label_ready && !demo_capture_active_ && !demo_live_preview_ &&
+    !demo_label_image_.empty() && demo_label_image_ != rendered_demo_label_image_)
+  {
+    const QImage recorded(QString::fromStdString(demo_label_image_));
+    rendered_demo_label_image_ = demo_label_image_;
+    if (!recorded.isNull()) {
+      demo_image_ = recorded;
+      demo_image_token_.clear();
+      demo_image_label_->setPixmap(QPixmap::fromImage(recorded).scaled(
+        demo_image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+      demo_click_status_->setText("Review the recorded target, then choose Good / Edge / Fail");
+    }
+  } else if (!demo_capture_active_ && !demo_label_ready && demo_click_status_) {
+    demo_click_status_->setText("At APPROACH, click the intended date to continue");
   }
 
   // Robot state
@@ -3537,6 +3790,10 @@ void UR10ePanel::save(rviz_common::Config config) const
   config.mapSetValue("velocity_slider", velocity_slider_->value());
   config.mapSetValue("reachability_cloud", reachability_cloud_cb_->isChecked() ? 1 : 0);
   config.mapSetValue("lidar_scan_preview", lidar_scan_preview_cb_->isChecked() ? 1 : 0);
+  if (demo_target_region_combo_) {
+    config.mapSetValue(
+      "demo_target_region", demo_target_region_combo_->currentData().toString());
+  }
 }
 
 void UR10ePanel::load(const rviz_common::Config & config)
@@ -3558,6 +3815,15 @@ void UR10ePanel::load(const rviz_common::Config & config)
     lidar_scan_preview_enabled_ = (val != 0);
     if (lidar_scan_preview_cb_) {
       lidar_scan_preview_cb_->setChecked(lidar_scan_preview_enabled_);
+    }
+  }
+  QString demo_region;
+  if (demo_target_region_combo_ &&
+    config.mapGetString("demo_target_region", &demo_region))
+  {
+    const int index = demo_target_region_combo_->findData(demo_region);
+    if (index >= 0) {
+      demo_target_region_combo_->setCurrentIndex(index);
     }
   }
 }

@@ -103,6 +103,61 @@ def ease_in_head(states: List[List[float]], head_count: int) -> List[List[float]
     return out
 
 
+def speed_up_cubic_trajectory(traj, requested_scale, max_vel, max_acc):
+    """Time-scale an existing cubic path only within its derivative margins.
+
+    Positions and the interpolated geometric path are preserved. Trajectories
+    containing acceleration fields use quintics and are deliberately excluded.
+    """
+    import copy
+    if (len(traj.points) < 2 or not all(math.isfinite(x) and x > 0
+            for x in (requested_scale, max_vel, max_acc))):
+        return traj, 1.0
+    points = traj.points
+    if any(p.accelerations or len(p.velocities) != len(p.positions) for p in points):
+        return traj, 1.0
+    q = np.asarray([p.positions for p in points], dtype=float)
+    v = np.asarray([p.velocities for p in points], dtype=float)
+    times = np.asarray([p.time_from_start.sec + p.time_from_start.nanosec / 1e9
+                        for p in points])
+    h = np.diff(times)[:, None]
+    if not (np.isfinite(q).all() and np.isfinite(v).all()
+            and np.isfinite(times).all() and (h > 0).all()):
+        return traj, 1.0
+    delta = q[1:] - q[:-1]
+    c2 = 3 * delta - h * (2 * v[:-1] + v[1:])
+    c3 = -2 * delta + h * (v[:-1] + v[1:])
+    u = np.zeros_like(c2)
+    np.divide(-c2, 3 * c3, out=u, where=np.abs(c3) > 1e-15)
+    u = np.clip(u, 0., 1.)
+    interior = v[:-1] + (2*c2*u + 3*c3*u*u) / h
+    peak_v = max(float(np.abs(v).max()), float(np.abs(interior).max()))
+    peak_a = float((np.maximum(np.abs(2*c2), np.abs(2*c2+6*c3)) / (h*h)).max())
+    # Small margin covers timestamp rounding; never slow an existing path here.
+    scale = min(requested_scale, .99 * max_vel / max(peak_v, 1e-12),
+                math.sqrt(.99 * max_acc / max(peak_a, 1e-12)))
+    if scale <= 1.001:
+        return traj, 1.0
+    result = copy.deepcopy(traj)
+    for p in result.points:
+        ns = round((p.time_from_start.sec * 10**9 + p.time_from_start.nanosec) / scale)
+        p.time_from_start.sec, p.time_from_start.nanosec = divmod(ns, 10**9)
+        p.velocities = [float(x * scale) for x in p.velocities]
+    return result, scale
+
+
+def subsample_states(states, want):
+    """Evenly pick `want` of `states` (first and last always kept); the path
+    is unchanged, only the sample spacing -- i.e. the speed at a fixed dt."""
+    if want >= len(states) or len(states) <= 2:
+        return list(states)
+    src = len(states) - 1
+    idx = sorted({round(i * src / (want - 1)) for i in range(max(2, want))})
+    if idx[-1] != src:
+        idx.append(src)
+    return [states[i] for i in idx]
+
+
 def build_trajectory(joint_names: List[str], states: Iterable[List[float]], vel: float = 0.1, dt: float = 0.02,
                      stop_flag: Optional[Callable[[], bool]] = None,
                      max_vel: float = 1.5, max_acc: float = 2.0, ramp_points: int = 8,

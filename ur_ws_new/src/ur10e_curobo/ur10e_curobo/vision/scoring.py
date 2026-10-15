@@ -149,6 +149,23 @@ def compute_fruit_score(
     return {"total_score": total, "components": components}
 
 
+def compute_demo_region_score(
+    target: Dict[str, Any], preferred_region: str
+) -> float:
+    """Return 1 when the target center lies in the preferred image third."""
+    if preferred_region not in ("left", "center", "right"):
+        return 0.0
+    bb = target.get("bb")
+    img_w = target.get("img_width", 0)
+    if bb is None or not img_w or img_w <= 0:
+        return 0.0
+    bbox_cx = (bb[0] + bb[2]) / 2.0
+    third = bbox_cx / float(img_w)
+    target_region = "left" if third < (1.0 / 3.0) else (
+        "center" if third < (2.0 / 3.0) else "right")
+    return 1.0 if target_region == preferred_region else 0.0
+
+
 def compute_collision_free_direction(
     best_target: Dict[str, Any],
     all_targets: List[Dict[str, Any]],

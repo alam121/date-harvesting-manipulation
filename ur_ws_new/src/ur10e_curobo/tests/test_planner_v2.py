@@ -2,12 +2,12 @@
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from curobo.types import JointState
 from ur10e_curobo.planner_options import PlanOptions
-from ur10e_curobo.planner_v2 import PlanResult, PlannerV2, load_robot_config
+from ur10e_curobo.planner_v2 import PlanResult, PlannerV2, load_robot_config, scene_replay_snapshot, gpu_activity_snapshot
 
 
 class V2ResultTests(unittest.TestCase):
@@ -58,6 +58,9 @@ class V2PolicyTests(unittest.TestCase):
                     p = object.__new__(PlannerV2)
                     p.planner = Mock()
                     p.interpolation_dt = .004
+                    p._replay_world = scene_replay_snapshot(SimpleNamespace())
+                    p._world_revision = 0
+                    p._world_updated_at = 0.
                     p._goal = lambda goal: goal
                     native = p.planner.plan_cspace if kind == 'joint' else p.planner.plan_pose
                     native.return_value = None
@@ -79,3 +82,21 @@ class V2PolicyTests(unittest.TestCase):
         self.assertEqual(k['self_collision_buffer']['forearm_link'], .035)
         self.assertEqual(len(k['cspace']['default_joint_position']), 6)
         self.assertNotIn('retract_config', k['cspace'])
+
+class ReplayLoggingTests(unittest.TestCase):
+    def test_snapshot_is_detached_and_marks_missing_geometry(self):
+        box = SimpleNamespace(name="box", pose=[0, 0, 0, 1, 0, 0, 0], dims=[1, 2, 3])
+        world = SimpleNamespace(cuboid=[box], sphere=[], mesh=[object()])
+        snapshot = scene_replay_snapshot(world)
+        box.pose[0] = 9
+        box.dims[0] = 9
+        self.assertEqual(snapshot["world_config"]["cuboid"]["box"]["pose"][0], 0)
+        self.assertEqual(snapshot["world_config"]["cuboid"]["box"]["dims"][0], 1)
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(snapshot["unsupported_types"], ["mesh"])
+
+    def test_gpu_counters_unavailable_does_not_break_planning(self):
+        with patch.object(Path, "read_text", side_effect=OSError):
+            snapshot = gpu_activity_snapshot()
+        self.assertIsNone(snapshot["load_percent"])
+        self.assertIsNone(snapshot["frequency_hz"])

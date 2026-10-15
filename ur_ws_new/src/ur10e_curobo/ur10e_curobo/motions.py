@@ -8,8 +8,23 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from .config import (PLAN_CFG_DEFAULT, PLAN_CFG_JS, PLAN_CFG_JS_GRAPH,
                      PLAN_CFG_JS_RETRY)
 from .planner_v2 import plan_diagnostics
-from .utils import build_trajectory, wait_until_xyz, log_retime
+from .utils import build_trajectory, wait_until_xyz, log_retime, speed_up_cubic_trajectory, subsample_states
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
+
+
+def _speed_up_dropoff(node, traj):
+    cfg = node.cfg.planner
+    old = traj.points[-1].time_from_start if traj.points else None
+    traj, scale = speed_up_cubic_trajectory(
+        traj, float(getattr(cfg, 'dropoff_time_scale', 1.20)),
+        float(cfg.max_joint_velocity), float(cfg.max_joint_acceleration))
+    if old is not None:
+        end = traj.points[-1].time_from_start
+        node.get_logger().info(
+            f"[DROPOFF_SPEED] applied={scale:.3f}x "
+            f"duration={old.sec + old.nanosec/1e9:.3f}->"
+            f"{end.sec + end.nanosec/1e9:.3f}s (joint-limit bounded)")
+    return traj
 
 
 def interpolated_positions(result):
@@ -1753,6 +1768,8 @@ def plan_execute_js(
         enforce_limits=getattr(planner, "retime_trajectories", False),
     )
     log_retime(node, "plan_execute_js")
+    if motion_type == "dropoff":
+        traj = _speed_up_dropoff(node, traj)
 
     if getattr(node.cfg.planner, "log_phase_timings", False):
         node.get_logger().info(f"Moving to {label} (dt={dt:.3f})")
@@ -1953,6 +1970,35 @@ def _prepend_measured_start_bridge(states, measured_start, label,
     return bridge + states
 
 
+_SPEED_FRACTION_KNOBS = {
+    "dropoff": "dropoff_speed_fraction",
+    "home": "home_speed_fraction",
+    "alignment": "approach_speed_fraction",
+}
+
+
+def speed_fraction_count(node, n_states, curobo_dt, dt, motion_type):
+    """Sample count that replays a cuRobo plan at its configured speed fraction.
+
+    cuRobo's states are its time-optimal plan at curobo_dt under the URDF
+    hardware limits. The min_dt floor replays them at curobo_dt/dt of that
+    speed (4ms/10ms = 0.4). Returns the count to subsample to so it plays at
+    the motion's *_speed_fraction instead (path unchanged; accelerations scale
+    with fraction^2), or None to leave it alone.
+    """
+    knob = _SPEED_FRACTION_KNOBS.get(motion_type)
+    frac = float(getattr(node.cfg.planner, knob, 0.0)) if knob else 0.0
+    if frac <= 0.0 or n_states <= 2:
+        return None
+    want = max(8, int(round(n_states * curobo_dt / (frac * dt))))
+    if want >= n_states:
+        return None
+    node.get_logger().info(
+        f"[{motion_type.upper()}_SPEED] {frac:.2f}x hardware-optimal: {n_states} -> "
+        f"{want} states ({n_states * dt:.2f}s -> {want * dt:.2f}s)")
+    return want
+
+
 def preplan_js(node, target_joints: List[float], start_joints: List[float],
                label: str = "PREPLAN", motion_type: str = "default"):
     """Plan a joint-space trajectory without executing it.
@@ -2025,6 +2071,9 @@ def preplan_js(node, target_joints: List[float], start_joints: List[float],
     scale = speed_map.get(motion_type, 1.0) * planner.global_speed_multiplier
     dt = curobo_dt / max(scale, 1e-6)
     dt = min(max(dt, planner.min_dt), planner.max_dt)
+    _want = speed_fraction_count(node, len(states), curobo_dt, dt, motion_type)
+    if _want:
+        states = subsample_states(states, _want)
     traj = build_trajectory(
         node.joint_order, states, dt=dt,
         stop_flag=lambda: node.stop_requested,
@@ -2065,6 +2114,8 @@ def execute_preplan(node, traj, states, label: str) -> bool:
         ramp_points=getattr(node.cfg.planner, "ramp_points", 15),
         enforce_limits=getattr(node.cfg.planner, "retime_trajectories", False))
     log_retime(node, "execute_preplan")
+    if label.upper() in ("DROPOFF", "DROP-OFF"):
+        traj = _speed_up_dropoff(node, traj)
     latest = node.current_joint_positions
     if (not traj.points or node.stop_requested or latest is None
             or len(latest) != len(current)

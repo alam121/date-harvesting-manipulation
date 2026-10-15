@@ -317,6 +317,80 @@ class TipFreshnessTests(unittest.TestCase):
         self.assertFalse(state._date_tip_history)
 
 
+class FinalAttemptBudgetTests(unittest.TestCase):
+    def run_monitor(self, candidate, *, step=1.0, frames=6, live=True):
+        clock = [10.0]
+        calls = []
+        planner = types.SimpleNamespace(final_inflight_apply=True,
+            final_inflight_max_attempts=2, final_inflight_min_interval_s=.25)
+        observation = types.SimpleNamespace(poses=[candidate], fresh=lambda stamp: True)
+        node = types.SimpleNamespace(cfg=types.SimpleNamespace(planner=planner),
+            all_fruits_seq=0, _fruit_observation=observation, _level_final_z=0.,
+            _final_live_wait_xyz=[0., 0., 0.] if live else None,
+            get_clock=lambda: types.SimpleNamespace(now=lambda: types.SimpleNamespace(nanoseconds=1)))
+        class Stop:
+            count = 0
+            def is_set(self): return self.count > frames
+            def wait(self, timeout):
+                self.count += 1
+                clock[0] += step
+                node.all_fruits_seq += 1
+                return self.is_set()
+        report = dict(frames=0, rejected=0, no_candidate=0, matched=0,
+                      below_min=0, above_max=0, usable=0, applied=0,
+                      last_apply_t=0., applied_total=0.)
+        def apply(*args):
+            calls.append(clock[0])
+            return False
+        fn = load('goals.py', '_final_inflight_monitor', dict(math=math,
+            time=types.SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0],
+                                       perf_counter=lambda: clock[0]),
+            _reacquire_quality_ok=lambda *args: (True, ''),
+            _apply_final_inflight_correction=apply))
+        fn(node, [0., 0., 0.], Stop(), report)
+        return calls, report
+
+    def test_height_projection_skips_negligible_executable_delta(self):
+        calls, report = self.run_monitor([.001, 0., .01])
+        self.assertEqual(calls, [])
+        self.assertEqual(report['below_min_projected'], 6)
+
+    def test_failed_plans_consume_attempt_budget(self):
+        calls, report = self.run_monitor([.006, 0., 0.])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(report['attempts'], 2)
+        self.assertEqual(report['applied'], 0)
+
+    def test_failed_attempts_are_spaced_and_nonlive_target_is_skipped(self):
+        calls, _ = self.run_monitor([.006, 0., 0.], step=.05, frames=10)
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(calls[1] - calls[0], .25)
+        calls, _ = self.run_monitor([.006, 0., 0.], live=False)
+        self.assertEqual(calls, [])
+
+
+class GripperOpenFeedbackTests(unittest.TestCase):
+    def test_open_requires_fresh_complete_matching_feedback(self):
+        fn = load('delto_gripper_controller.py', 'is_at_open_position',
+                  dict(math=math, time=types.SimpleNamespace(time=lambda: 10.0)),
+                  owner='DeltoGripperController')
+        obj = types.SimpleNamespace(open_position=[0.] * 12,
+                                    actual_joint_position=[0.] * 12,
+                                    actual_joint_stamp=9.9)
+        self.assertTrue(fn(obj))
+        obj.actual_joint_stamp = 9.0
+        self.assertFalse(fn(obj))
+        obj.actual_joint_stamp = 9.9
+        obj.actual_joint_position[0] = .1
+        self.assertFalse(fn(obj))
+        obj.actual_joint_position = [0.] * 11
+        self.assertFalse(fn(obj))
+        obj.actual_joint_position = [float('nan')] * 12
+        self.assertFalse(fn(obj))
+        obj.actual_joint_position = None
+        self.assertFalse(fn(obj))
+
+
 class SpeedRegressionTests(unittest.TestCase):
     def test_cubic_uses_exact_peak_instead_of_control_polygon_bound(self):
         class Trajectory:
@@ -429,4 +503,194 @@ class DetectionDisplayTests(unittest.TestCase):
         self.assertEqual(len(self.frames),3)
 
 
+class SpliceOntoMeasuredTest(unittest.TestCase):
+    # In-flight retarget: the arm keeps moving while the leg is planned.
+    def setUp(self):
+        self.splice = load('goals.py', '_splice_onto_measured', {})
+        self.states = [[0.01 * i, 0.0] for i in range(10)]
+
+    def test_starts_at_measured_and_drops_passed_states(self):
+        out, why = self.splice(self.states, [0.032, 0.001])
+        self.assertIsNone(why)
+        self.assertEqual(out[0], [0.032, 0.001])
+        self.assertEqual(out[1], [0.04, 0.0])   # nearest was index 3; resume after it
+        self.assertEqual(out[-1], self.states[-1])
+
+    def test_rejects_jump_off_planned_line(self):
+        self.assertEqual(self.splice(self.states, [0.03, 0.02])[1], "ARM_MOVED_DURING_BUILD")
+
+    def test_rejects_when_nearly_done(self):
+        self.assertEqual(self.splice(self.states, [0.08, 0.0])[1], "FINAL_NEARLY_DONE")
+
+    def test_stored_path_is_the_one_flown(self):
+        # Reverse replays this; after a retarget it must follow the new leg,
+        # not jump back to the original line (2.21deg gap, 2026-10-08).
+        join = load('goals.py', '_join_at', {})
+        tail = [[0.032, 0.001], [0.04, 0.01], [0.05, 0.02]]
+        flown = join(self.states, tail)
+        self.assertEqual(flown, self.states[:3] + tail)
+
+
+class CubicSpeedupTests(unittest.TestCase):
+    def trajectory(self):
+        def point(t, q):
+            return types.SimpleNamespace(positions=[q], velocities=[0.], accelerations=[],
+                time_from_start=types.SimpleNamespace(sec=t, nanosec=0))
+        return types.SimpleNamespace(points=[point(1, 0.), point(3, .2)])
+
+    def test_speedup_preserves_positions_and_obeys_cubic_acceleration(self):
+        fn = load('utils.py', 'speed_up_cubic_trajectory', dict(np=np, math=math))
+        original = self.trajectory()
+        faster, scale = fn(original, 1.2, 1.5, 1.5)
+        self.assertAlmostEqual(scale, 1.2)
+        self.assertEqual([p.positions for p in faster.points], [[0.], [.2]])
+        self.assertEqual(original.points[-1].time_from_start.sec, 3)
+        def stamp(p): return p.time_from_start.sec + p.time_from_start.nanosec / 1e9
+        h = stamp(faster.points[1]) - stamp(faster.points[0])
+        self.assertLessEqual(6 * .2 / h**2, 1.5)
+        # With acceleration near its original peak, only a bounded gain is legal.
+        limited, scale = fn(original, 2., 1.5, .31)
+        self.assertGreater(scale, 1.)
+        self.assertLess(scale, 1.02)
+        h = stamp(limited.points[1]) - stamp(limited.points[0])
+        self.assertLessEqual(6 * .2 / h**2, .31)
+
+    def test_no_margin_or_quintic_keeps_original(self):
+        fn = load('utils.py', 'speed_up_cubic_trajectory', dict(np=np, math=math))
+        original = self.trajectory()
+        self.assertIs(fn(original, 1.2, .1, .1)[0], original)
+        original.points[0].accelerations = [0.]
+        self.assertIs(fn(original, 1.2, 10., 10.)[0], original)
+
+
+class SubsampleStatesTest(unittest.TestCase):
+    # Drives drop-off speed and reverse duration: fewer samples at fixed dt.
+    def test_keeps_ends_and_count(self):
+        sub = load('utils.py', 'subsample_states', {})
+        states = [[float(i)] for i in range(281)]
+        out = sub(states, 187)
+        self.assertEqual(out[0], [0.0])
+        self.assertEqual(out[-1], [280.0])
+        self.assertEqual(len(out), 187)
+        self.assertEqual(out, sorted(out))
+        self.assertEqual(sub(states, 400), states)   # never adds samples
+
+
+class NoLocalTorchImportTest(unittest.TestCase):
+    # A function-local `import torch` makes torch local to the whole function, so
+    # any earlier use raises UnboundLocalError (plan_and_send, 2026-10-08).
+    def test_goals_has_no_function_local_torch_import(self):
+        tree = ast.parse((ROOT / 'goals.py').read_text())
+        bad = [(f.name, n.lineno) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+               for n in ast.walk(f) if isinstance(n, ast.Import)
+               and any((a.asname or a.name) == 'torch' for a in n.names)]
+        self.assertEqual(bad, [])
+
+
 if __name__=='__main__': unittest.main()
+
+class IncrementalDiscoveryTests(unittest.TestCase):
+    def setup_scan(self, plan, execute, found=lambda: False):
+        clock = Clock()
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(lidar_scan=types.SimpleNamespace(
+                discovery_plan_budget_s=5., speed_factor=.08)),
+            current_joint_positions=[0.] * 6, stop_requested=False,
+            get_logger=lambda: types.SimpleNamespace(info=lambda msg: None, warn=lambda msg: None))
+        env = dict(time=clock, PlanOptions=lambda **kw: types.SimpleNamespace(**kw),
+                   _semicircle_scan_poses=lambda *a, **kw: [[1, 2], [3]],
+                   _cartesian_scan_candidate=plan, _execute_scan_target=execute)
+        run = load('lidar_scan.py', '_run_discovery_scan', env)
+        return run, node, clock
+
+    def test_detected_during_move_skips_remaining_plans(self):
+        calls, found = [], [False]
+        def plan(node, joints, pose, label, **kw):
+            calls.append(pose)
+            self.assertEqual(kw['plan_cfg'].max_attempts, 1)
+            return {'pose': pose}, 'OK'
+        def execute(*a, **kw):
+            found[0] = True
+            return True
+        run, node, _ = self.setup_scan(plan, execute)
+        self.assertTrue(run(node, lambda: found[0]))
+        self.assertEqual(calls, [1])
+
+    def test_detection_during_planning_prevents_movement(self):
+        found = [False]
+        def plan(*a, **kw):
+            found[0] = True
+            return {}, 'OK'
+        run, node, _ = self.setup_scan(
+            plan, lambda *a, **kw: self.fail('must not move'))
+        self.assertTrue(run(node, lambda: found[0]))
+
+    def test_budget_stops_rejected_candidate_search(self):
+        calls = []
+        def plan(*a, **kw):
+            calls.append(1)
+            clock.t += 6.
+            return None, 'PLAN_OR_IK_FAIL'
+        run, node, clock = self.setup_scan(
+            plan, lambda *a, **kw: self.fail('must not move'))
+        self.assertFalse(run(node, lambda: False))
+        self.assertEqual(len(calls), 1)
+
+    def test_next_viewpoint_uses_measured_start_and_horizontal_guard(self):
+        starts = []
+        def plan(node, joints, pose, label, **kw):
+            starts.append((list(joints), kw['require_horizontal']))
+            return {'pose': pose}, 'OK'
+        def execute(node, *a, **kw):
+            node.current_joint_positions = [1.] * 6
+            return True
+        run, node, _ = self.setup_scan(plan, execute)
+        self.assertFalse(run(node, lambda: False))
+        self.assertEqual(starts, [([0.] * 6, False), ([1.] * 6, True)])
+
+class SectionScanTests(unittest.TestCase):
+    def run_scan(self, reject=None, plan_seconds=0):
+        clock = Clock()
+        events = []
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(lidar_scan=types.SimpleNamespace(
+                scan_section_plan_budget_s=5., speed_factor=.08)),
+            current_joint_positions=[0], stop_requested=False,
+            get_logger=lambda: types.SimpleNamespace(info=lambda msg: events.append(msg)))
+        def plan(node, start, pose, label, **kw):
+            events.append(('plan', pose, list(start), kw['require_horizontal']))
+            self.assertEqual(kw['plan_cfg'].max_attempts, 1)
+            clock.t += plan_seconds
+            if pose == reject:
+                return None, 'JOINT_DELTA'
+            return dict(pose=pose, end_joints=[pose]), 'OK'
+        def execute(node, target, *args, **kw):
+            events.append(('move', target['pose']))
+            node.current_joint_positions = [target['pose'] + .01]
+            return True
+        run = load('lidar_scan.py', '_run_section_scan', dict(
+            time=clock, PlanOptions=lambda **kw: types.SimpleNamespace(**kw),
+            _semicircle_scan_poses=lambda *a, **kw: [[1], [2], [3], [4]],
+            _cartesian_scan_candidate=plan, _execute_scan_target=execute))
+        run(node)
+        return events
+
+    def test_sections_start_from_measured_joints(self):
+        e = self.run_scan()
+        actions = [x for x in e if isinstance(x, tuple)]
+        self.assertEqual([x[0] for x in actions],
+                         ['plan', 'plan', 'move', 'move', 'plan', 'plan', 'move', 'move'])
+        self.assertEqual(actions[4][2], [2.01])
+        self.assertFalse(actions[0][3])
+        self.assertTrue(actions[1][3])
+
+    def test_boundary_executes_valid_prefix_then_stops(self):
+        e = self.run_scan(reject=2)
+        self.assertEqual([x for x in e if isinstance(x, tuple) and x[0] == 'move'],
+                         [('move', 1)])
+        self.assertIn('partial coverage=1/4', e[-1])
+
+    def test_budget_does_not_start_another_plan(self):
+        e = self.run_scan(plan_seconds=6)
+        self.assertEqual(len([x for x in e if isinstance(x, tuple) and x[0] == 'plan']), 1)
+        self.assertIn('reason=PLAN_BUDGET', e[-1])

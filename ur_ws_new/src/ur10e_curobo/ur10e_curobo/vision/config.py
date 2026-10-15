@@ -42,6 +42,10 @@ SCORE_WEIGHTS = {
     "center_bias": 0.05,    # prefer fruits near frame center (better depth data)
 }
 
+# Larger than the maximum normal score (1.30 + sticky bonus), so a valid fruit
+# in the selected demo image third ranks ahead of fruits in other thirds.
+DEMO_REGION_WEIGHT = 2.0
+
 # Distance scoring parameters
 DIST_MIN = 0.10  # best possible distance (m)
 DIST_MAX = 0.60  # tighter range so small differences (e.g. 0.28 vs 0.31) matter more

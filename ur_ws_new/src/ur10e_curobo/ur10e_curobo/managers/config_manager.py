@@ -88,6 +88,9 @@ class ConfigManager:
         self._node.declare_parameter("planner.speed_final", self.cfg.planner.speed_final)
         self._node.declare_parameter("planner.max_joint_velocity", self.cfg.planner.max_joint_velocity)
         self._node.declare_parameter("planner.max_joint_acceleration", self.cfg.planner.max_joint_acceleration)
+        self._node.declare_parameter("planner.dropoff_speed_fraction", self.cfg.planner.dropoff_speed_fraction)
+        self._node.declare_parameter("planner.approach_speed_fraction", self.cfg.planner.approach_speed_fraction)
+        self._node.declare_parameter("planner.home_speed_fraction", self.cfg.planner.home_speed_fraction)
         self._node.declare_parameter("planner.ramp_points", self.cfg.planner.ramp_points)
         self._node.declare_parameter("planner.gripper_tip_extra_m", self.cfg.planner.gripper_tip_extra_m)
         self._node.declare_parameter("planner.retime_trajectories", self.cfg.planner.retime_trajectories)
@@ -240,6 +243,9 @@ class ConfigManager:
         self.cfg.planner.speed_final = float(self._node.get_parameter("planner.speed_final").value)
         self.cfg.planner.max_joint_velocity = float(self._node.get_parameter("planner.max_joint_velocity").value)
         self.cfg.planner.max_joint_acceleration = float(self._node.get_parameter("planner.max_joint_acceleration").value)
+        self.cfg.planner.dropoff_speed_fraction = float(self._node.get_parameter("planner.dropoff_speed_fraction").value)
+        self.cfg.planner.approach_speed_fraction = float(self._node.get_parameter("planner.approach_speed_fraction").value)
+        self.cfg.planner.home_speed_fraction = float(self._node.get_parameter("planner.home_speed_fraction").value)
         self.cfg.planner.ramp_points = int(self._node.get_parameter("planner.ramp_points").value)
         self.cfg.planner.gripper_tip_extra_m = float(self._node.get_parameter("planner.gripper_tip_extra_m").value)
         self.cfg.planner.retime_trajectories = bool(self._node.get_parameter("planner.retime_trajectories").value)
@@ -482,6 +488,9 @@ class ConfigManager:
             "planner.speed_final": (self.cfg.planner, "speed_final", float),
             "planner.max_joint_velocity": (self.cfg.planner, "max_joint_velocity", float),
             "planner.max_joint_acceleration": (self.cfg.planner, "max_joint_acceleration", float),
+            "planner.dropoff_speed_fraction": (self.cfg.planner, "dropoff_speed_fraction", float),
+            "planner.approach_speed_fraction": (self.cfg.planner, "approach_speed_fraction", float),
+            "planner.home_speed_fraction": (self.cfg.planner, "home_speed_fraction", float),
             "planner.ramp_points": (self.cfg.planner, "ramp_points", int),
             "planner.gripper_tip_extra_m": (self.cfg.planner, "gripper_tip_extra_m", float),
             "planner.retime_trajectories": (self.cfg.planner, "retime_trajectories", bool),

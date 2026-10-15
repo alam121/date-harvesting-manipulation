@@ -99,12 +99,12 @@ from .config import (
     X_FORWARD_Y_LATERAL,
 )
 from .planner_v2 import plan_diagnostics
-from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head, log_retime
+from .utils import build_trajectory, wait_until_xyz, ease_out_tail, ease_in_head, log_retime, subsample_states
 from . import demo_capture
 from .markers import publish_goal_marker, publish_planned_path, clear_path_markers
 from .motions import interpolated_positions, get_curobo_dt
 from .motions import move_to_dropoff_position, move_to_home_position
-from .motions import blend_motion, preplan_js, execute_preplan, plan_execute_js, nearest_joint_config
+from .motions import blend_motion, preplan_js, execute_preplan, plan_execute_js, nearest_joint_config, speed_fraction_count
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 from .grasp_learner import GraspRecord
@@ -601,7 +601,7 @@ def image_lateral_side(node, cx_norm, cy_norm, *, force_very_low_center=False):
     """Classify fruit side from bunch-relative position when available, else image position."""
     if not bool(getattr(node.cfg.planner, "side_approach_enabled", False)):
         return "CENTER"
-    is_low = cy_norm > 0.60
+    is_low = cy_norm > float(getattr(node.cfg.planner, "low_image_cy_thresh", 0.60))
     rel_y = getattr(node, "fruit_bunch_rel_y", None)
     lower_band = getattr(node.cfg.planner, "bunch_lower_center_band", 0.80)
     if rel_y is not None and rel_y >= lower_band:
@@ -926,7 +926,7 @@ def _jacobian_ik(node, target_xyz, start_js, max_iters=10, tol=0.003):
 
 def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
                     store_trajectory=True, num_steps=None, goal_js_override=None,
-                    require_cartesian=False):
+                    require_cartesian=False, endpoint_tolerance=None):
     """Use Jacobian IK to find goal joints, then interpolate directly.
     Bypasses trajectory optimization — goes straight to the IK solution."""
     _direct_t0 = time.perf_counter()
@@ -1294,9 +1294,9 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     traj = build_trajectory(node.joint_order, states, vel=vel, dt=dt,
                             stop_flag=lambda: node.stop_requested,
                             max_vel=planner.max_joint_velocity * 0.5,
-                            max_acc=planner.max_joint_acceleration * 0.3,
+                            max_acc=planner.max_joint_acceleration * float(getattr(planner, "direct_ik_acceleration_scale", 0.3)),
                             ramp_points=getattr(planner, "ramp_points", 15),
-        enforce_limits=getattr(planner, "retime_trajectories", False), include_acc=False)
+        enforce_limits=(motion_type == "final" or getattr(planner, "retime_trajectories", False)), include_acc=False)
     log_retime(node, "_direct_ik_move")
     if node.stop_requested:
         return False
@@ -1360,6 +1360,8 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
         return False
     _duration = traj.points[-1].time_from_start
     _duration_s = _duration.sec + _duration.nanosec / 1e9
+    if _is_final and _target_dist and _duration_s > 0:
+        node._final_leg_speed_mps = _target_dist / _duration_s  # retarget matches this
     node._planned_cartesian_path = cart_path  # keep PATH_DEV in sync with this motion
     publish_planned_path(node, states, label, cartesian_points=cart_path)
     node.trajectory_pub.publish(traj)
@@ -1370,7 +1372,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
             result="SUCCESS",
             planning_ms=round((time.perf_counter() - _direct_t0) * 1000.0, 1),
             trajectory_samples=len(states), dt_s=round(float(dt), 5),
-            trajectory_duration_s=round(float(dt) * max(len(states) - 1, 0), 3),
+            trajectory_duration_s=round(_duration_s, 3),
             max_joint_delta_deg=round(math.degrees(float(best_delta)), 2),
             cartesian_waypoints=int(_N_CART if _states_built else 0),
             lateral_deviation_mm=round(_lateral_deviation_m * 1000.0, 1),
@@ -1387,6 +1389,7 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     # touching that function. _final_inflight_apply uses it.
     _wait_xyz = list(target_pose_list[:3])
     if _is_final:
+        node._final_retarget_states = None  # before the target goes live
         node._final_live_wait_xyz = _wait_xyz
         node._final_retarget_xyz = None
     if _this_traj_truncated:
@@ -1401,9 +1404,9 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     # Wait for motion to finish (with orientation + velocity checks), then blend
     target_quat = target_pose_list[3:] if len(target_pose_list) > 3 else None
     _endpoint_tol = (
+        float(endpoint_tolerance) if endpoint_tolerance is not None else
         float(getattr(planner, "final_endpoint_tolerance", 0.004))
-        if _is_final else 0.008
-    )
+        if _is_final else 0.008)
     while True:
         with node._final_command_lock:
             _wait_generation = node._final_retarget_generation
@@ -1474,7 +1477,8 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     if store_trajectory:
         if not hasattr(node, 'stored_trajectory_states'):
             node.stored_trajectory_states = []
-        node.stored_trajectory_states.extend(states)
+        _flown = getattr(node, "_final_retarget_states", None) if _is_final else None
+        node.stored_trajectory_states.extend(_join_at(states, _flown) if _flown else states)
 
     if callable(_record_motion):
         _endpoint_error = None
@@ -2110,7 +2114,7 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
 
 def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
                                     target_pose_list, dt, label="ENTRY",
-                                    duration_s=None, match_joint_step=None):
+                                    duration_s=None, match_joint_step=None, stop_evt=None):
     """Joint states for a straight-line Cartesian entry, for appending to a plan.
 
     Same construction _direct_ik_move() uses for its required-Cartesian leg:
@@ -2138,6 +2142,8 @@ def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
     wp_js = [list(start_js)]
     prev_js = list(start_js)
     for k in range(1, n_wp + 2):        # intermediate points, then the endpoint
+        if stop_evt is not None and stop_evt.is_set():
+            return None
         a = k / (n_wp + 1)
         wp_xyz = [start_xyz[i] + a * (target_pose_list[i] - start_xyz[i])
                   for i in range(3)]
@@ -2202,8 +2208,11 @@ def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
     return out
 
 
-def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False, extend_fn=None) -> bool:
+def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: str = "default", goal_xyz: list = None, store_trajectory: bool = False, extend_fn=None, before_publish=None) -> bool:
     """Plan to goal_pose and publish it as one trajectory.
+
+    before_publish, when given, is called after planning and right before the
+    publish; returning False (e.g. the user cancelled the preview) aborts.
 
     extend_fn, when given, is called as extend_fn(last_planned_js, dt) after
     planning and returns extra joint states to append into the SAME trajectory,
@@ -2218,28 +2227,42 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     lock = getattr(node, '_planning_lock', None)
     _yolo = getattr(node, 'yolo_thread', None)
     _yolo_lock = getattr(_yolo, 'inference_lock', None)
+    _planner_name = "curobo.v2.plan_pose"
     _plan_t0 = time.perf_counter()
     if _yolo_lock: _yolo_lock.acquire()
     if lock: lock.acquire()
+    _locks_ready = time.perf_counter()
     try:
+        # Not plan_joint to the preflight's alignment IK: tried 2026-10-08, v2
+        # plan_cspace measured 1.4-1.7s here vs ~0.86s for plan_pose.
         res = node.motion_gen.plan_pose(start_state, goal_pose, plan_cfg)
     finally:
         if lock: lock.release()
         if _yolo_lock: _yolo_lock.release()
     _planning_ms = (time.perf_counter() - _plan_t0) * 1000.0
     _record_motion = getattr(node, "_record_motion_plan_event", None)
+    _replay_inputs = {}
+    if callable(_record_motion):
+        _replay_inputs = {
+            "start_joint_positions_rad": start_state.position.detach().reshape(-1).cpu().tolist(),
+            "goal_position_m": goal_pose.position.detach().reshape(-1).cpu().tolist(),
+            "goal_quaternion_wxyz": goal_pose.quaternion.detach().reshape(-1).cpu().tolist(),
+            "joint_names": list(node.joint_order),
+            "max_attempts": plan_cfg.max_attempts,
+            "graph_attempt_index": plan_cfg.enable_graph_attempt(),
+        }
     if not res.success:
         status = getattr(res, 'status', 'unknown')
         if callable(_record_motion):
             _record_motion(
                 stage="PLAN", label=label, motion_type=motion_type,
-                planner="curobo.v2.plan_pose", result="FAILED",
-                status=str(status), planning_ms=round(_planning_ms, 1),
+                planner=_planner_name, result="FAILED",
+                status=str(status), planning_ms=round(_planning_ms, 1), replay_inputs=_replay_inputs,
+                runtime_diagnostics=getattr(res, "runtime_diagnostics", None),
                 goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
         node.get_logger().warn(f"Plan failed for {label}. status={status}")
         # Flush any deferred async CUDA errors before the next planning call
         try:
-            import torch
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         except Exception:
@@ -2249,11 +2272,13 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if callable(_record_motion):
         _record_motion(
             stage="PLAN", label=label, motion_type=motion_type,
-            planner="curobo.v2.plan_pose", result="SUCCESS",
+            planner=_planner_name, result="SUCCESS",
             status=str(getattr(res, 'status', 'SUCCESS')),
-            planning_ms=round(_planning_ms, 1),
+            planning_ms=round(_planning_ms, 1), replay_inputs=_replay_inputs,
+                runtime_diagnostics=getattr(res, "runtime_diagnostics", None),
             goal_xyz_m=list(goal_xyz) if goal_xyz is not None else None)
 
+    _postprocess_t0 = time.perf_counter()
     states = interpolated_positions(res)
     curobo_dt = get_curobo_dt(res)
 
@@ -2485,6 +2510,14 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     base_vel = 0.08        # slightly gentler than 0.1
     vel = min(base_vel * scale, 0.25)   # hard cap for safety
 
+    # Staging leg only (the straight entry appended below keeps its own
+    # duration); cuRobo's plan ends at rest there, so the junction stays smooth.
+    _want = speed_fraction_count(node, len(states), curobo_dt, dt, motion_type)
+    if _want:
+        if len(cart_path) == len(states):
+            cart_path = subsample_states(cart_path, _want)  # same indices
+        states = subsample_states(states, _want)
+
     # 2b) Optional continuation leg, appended into THIS trajectory.
     #
     # build_trajectory() zeroes only the first and last waypoint, so anything
@@ -2496,6 +2529,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     # joint space. It runs after the overshoot trim above (so the trim still
     # keys off this leg's own goal_xyz) and before the clamp check below (so
     # clearance is verified across the whole merged path).
+    _entry_t0 = time.perf_counter()
     if extend_fn is not None:
         try:
             # Per-sample joint step at the tail of this leg, so the extension
@@ -2514,9 +2548,15 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
                 f"[{label}] continuation leg unavailable; rejecting rather than "
                 "publishing a staging move that stops short of the target")
             return False
+        # Outer-path FK was already computed and trimmed above. Its joint
+        # states are unchanged; only the appended entry needs another FK pass.
+        if len(cart_path) == len(states):
+            cart_path = list(cart_path) + forward_kinematics_batch(node, _extra)
+        else:
+            cart_path = forward_kinematics_batch(node, list(states) + list(_extra))
         states = list(states) + list(_extra)
-        cart_path = forward_kinematics_batch(node, states)
 
+    _validation_t0 = time.perf_counter()
     node._planned_cartesian_path = cart_path
     node._planned_label = label
 
@@ -2563,6 +2603,7 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     # 1d) Visualize planned path in RViz (blue line) — reuse pre-computed points
     publish_planned_path(node, states, label, cartesian_points=cart_path)
 
+    _trajectory_t0 = time.perf_counter()
     # 4) Build trajectory — constant speed, except FINAL's tail below.
     # FINAL runs at dt=max_dt (12.5Hz) and hands off into GRASP/REVERSE, which
     # run at a much higher rate (REVERSE's own tail is already eased — see
@@ -2599,18 +2640,32 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         # goal. 7.5 rad/s^2 remains well inside what a UR10e will follow.
         max_acc=planner.max_joint_acceleration,
         ramp_points=getattr(planner, "ramp_points", 15),
-        enforce_limits=getattr(planner, "retime_trajectories", False),
+        enforce_limits=(motion_type == "final"
+                        or getattr(planner, "retime_trajectories", False)),
     )
     _retime = getattr(build_trajectory, "last_retime", None)
     if _retime:
         node.get_logger().warn(f"[RETIME] {label}: {_retime}")
+
+    if before_publish is not None:
+        if not before_publish():
+            return False
+        # The plan starts where the arm was at planning time; refuse if it
+        # moved during the wait.
+        _now = node.current_joint_positions
+        if (_now is None or len(_now) != len(states[0])
+                or max(abs(float(a) - float(b)) for a, b in zip(_now, states[0])) > 0.01):
+            node.get_logger().warn(f"[{label}] arm moved while awaiting confirm; rejecting")
+            return False
 
     if node.stop_requested:
         node.get_logger().warn(f"Stop before sending {label} trajectory.")
         node.stop_requested = False
         return False
 
+    _publish_t0 = time.perf_counter()
     node.trajectory_pub.publish(traj)
+    _published_t = time.perf_counter()
 
     # Planning is finished and the arm is now executing, so the GPU is free.
     # Stream vision through the approach travel; reacquire then reads a
@@ -2627,9 +2682,20 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
     if callable(_record_motion):
         _record_motion(
             stage="EXECUTE", label=label, motion_type=motion_type,
-            planner="curobo.v2.plan_pose", result="PUBLISHED",
+            planner=_planner_name, result="PUBLISHED",
             trajectory_samples=len(states), dt_s=round(float(dt), 5),
-            trajectory_duration_s=round(float(dt) * max(len(states) - 1, 0), 3),
+            trajectory_duration_s=round(traj.points[-1].time_from_start.sec
+                + traj.points[-1].time_from_start.nanosec / 1e9, 3),
+            preparation_timing_s={
+                "lock_wait": round(_locks_ready - _plan_t0, 4),
+                "planner": round(_planning_ms / 1000 - (_locks_ready - _plan_t0), 4),
+                "path_processing": round(_entry_t0 - _postprocess_t0, 4),
+                "entry_ik_and_fk": round(_validation_t0 - _entry_t0, 4),
+                "validation_and_preview": round(_trajectory_t0 - _validation_t0, 4),
+                "trajectory_build": round(_publish_t0 - _trajectory_t0, 4),
+                "publish": round(_published_t - _publish_t0, 4),
+                "total_to_publish": round(_published_t - _plan_t0, 4),
+            },
             path_length_m=(round(float(_path_len_diag), 4)
                            if _path_len_diag is not None else None),
             straight_distance_m=(round(float(_straight_diag), 4)
@@ -2860,16 +2926,11 @@ def execute_partial_reverse(node, clearance_m: float = 0.35,
     if _target_s > 0.0 and len(partial) > 2:
         _want = max(8, int(round(_target_s / max(dt, 1e-4))))
         if _want < len(partial):
-            _src = len(partial) - 1
-            _idx = [round(i * _src / (_want - 1)) for i in range(_want)]
-            _seen = set()
-            _keep = [i for i in _idx if not (i in _seen or _seen.add(i))]
-            if _keep[-1] != _src:
-                _keep.append(_src)
+            _keep = subsample_states(partial, _want)
             node.get_logger().info(
                 f"[REVERSE] resampled {len(partial)} -> {len(_keep)} states "
                 f"({len(partial) * dt:.2f}s -> {len(_keep) * dt:.2f}s at dt={dt * 1000:.0f}ms)")
-            partial = [partial[i] for i in _keep]
+            partial = _keep
 
     # Shape the final section into a real ease-out. Duplicate endpoint samples do
     # not decelerate: central differences merely become zero after the first
@@ -2992,6 +3053,30 @@ def reacquire_goal_pose(node, seed_xyz, candidate_seeds=None, timeout=5.5, radiu
                     node.stop_requested = True
 
 
+def _splice_onto_measured(states, measured, tol=0.01, min_left=4):
+    """Restart a planned joint path at the arm's measured joints.
+
+    Returns (states, None), or (None, reason). Drops the states the arm has
+    already passed; refuses when no planned state is within `tol` rad (a
+    jump) or fewer than `min_left` states remain.
+    """
+    measured = [float(v) for v in measured]
+    gaps = [max(abs(a - b) for a, b in zip(measured, s)) for s in states]
+    k = min(range(len(gaps)), key=gaps.__getitem__)
+    if gaps[k] > tol:
+        return None, "ARM_MOVED_DURING_BUILD"  # Arm left the planned line.
+    if len(states) - k < min_left:
+        return None, "FINAL_NEARLY_DONE"
+    return [measured] + [list(s) for s in states[k + 1:]], None
+
+
+def _join_at(prefix, tail):
+    """prefix up to the state nearest tail[0], then tail: the path actually flown."""
+    gaps = [max(abs(a - b) for a, b in zip(tail[0], s)) for s in prefix]
+    k = min(range(len(gaps)), key=gaps.__getitem__)
+    return [list(s) for s in prefix[:k]] + [list(s) for s in tail]
+
+
 def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     """Retarget the FINAL move already in flight. Returns True if published.
 
@@ -3003,24 +3088,30 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     [min_delta, max_delta], so the new straight line stays close to the one the
     corridor preflight already cleared.
     """
+    def reject(reason):
+        reasons = report.setdefault('retarget_rejections', {})
+        reasons[reason] = reasons.get(reason, 0) + 1
+        report['last_reject'] = reason
+        return False
+
     planner = node.cfg.planner
     tcp = getattr(node, "_final_live_wait_xyz", None)
     quat = getattr(node, "_final_live_quat", None)
     if tcp is None or quat is None:
-        return False
+        return reject("TARGET_NOT_LIVE")
     js = node.current_joint_positions
     if js is None:
-        return False
+        return reject("NO_JOINT_STATE")
     cur = node.get_end_effector_pose()
     if not cur or len(cur) < 7:
-        return False
+        return reject("NO_TCP_POSE")
 
     corrected = level_target([float(tcp[i]) + float(delta[i]) for i in range(3)],
                              getattr(node, "_level_final_z", None))
     ok, why = goal_is_in_robot_workspace(node, corrected)
     if not ok:
         node.get_logger().warn(f"[FINAL_INFLIGHT] retarget outside workspace: {why}")
-        return False
+        return reject("OUTSIDE_WORKSPACE")
 
     # Remaining distance decides how long the new leg should take, so the
     # correction does not change the approach speed near the fruit.
@@ -3028,15 +3119,21 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     _dt = float(min(max(planner.base_dt / max(
         planner.speed_scale * planner.speed_final, 1e-6),
         planner.min_dt), planner.max_dt))
-    _dur = max(0.25, _remaining / max(0.024, 1e-6))   # ~2.4cm/s, the FINAL rate
+    # Speed of the FINAL in flight (set by _direct_ik_move). The old constant
+    # 2.4cm/s would have slowed a ~9cm/s FINAL to a crawl on retarget.
+    _speed = float(getattr(node, "_final_leg_speed_mps", None) or 0.024)
+    _dur = max(0.25, _remaining / max(_speed, 1e-3))
 
     states = straight_cartesian_entry_states(
         node, list(js), list(cur[:3]), list(cur[3:7]),
-        [*corrected, *quat], _dt, label="FINAL_RETARGET", duration_s=_dur)
+        [*corrected, *quat], _dt, label="FINAL_RETARGET", duration_s=_dur,
+        stop_evt=stop_evt)
+    if stop_evt is not None and stop_evt.is_set():
+        return reject("FINAL_ENDED_OR_STOPPED")
     if not states:
         node.get_logger().warn(
             "[FINAL_INFLIGHT] retarget IK failed; keeping the original path")
-        return False
+        return reject("IK_FAILED")
 
     # Same clearance gate the original FINAL had to pass.
     _clamp_mm, _cut, _dest = _log_forearm_flange_clearance(
@@ -3046,38 +3143,48 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
         node.get_logger().warn(
             f"[FINAL_INFLIGHT] retarget clearance {_clamp_mm:.1f}mm < {_thr:.0f}mm; "
             "keeping the original path")
-        return False
+        return reject("CLAMP_CLEARANCE")
 
-    traj = build_trajectory(
-        node.joint_order, states, vel=min(0.05 * 0.5, 0.15), dt=_dt,
-        stop_flag=lambda: node.stop_requested,
-        max_vel=planner.max_joint_velocity * 0.5,
-        max_acc=planner.max_joint_acceleration * 0.3,
-        ramp_points=getattr(planner, "ramp_points", 15),
-        enforce_limits=getattr(planner, "retime_trajectories", False), include_acc=False)
-    log_retime(node, "_apply_final_inflight_correction")
-    # Everything above (IK, clearance, trajectory build) takes long enough that
-    # the FINAL can finish or fail while it runs. Publishing after that point
+    # The planned leg starts at `js`, where the arm was when the build began.
+    # The build takes 0.4-0.8s while FINAL keeps moving (~6deg/s), so requiring
+    # the arm to still be at states[0] rejected every attempt (2026-10-08:
+    # applied=0, ARM_MOVED_DURING_BUILD). Instead, publish from the arm's
+    # measured joints onward: drop the planned states it has already passed.
+    # The no-jump guard (0.01 rad) still holds, now against the nearest
+    # planned state rather than the first one.
+    with node._planning_lock:
+        if not _curobo_path_constraints_valid(node, states, "FINAL_RETARGET"):
+            return reject("PATH_CONSTRAINTS")
+    # Everything above (IK, clearance, validation) takes long enough that the
+    # FINAL can finish or fail while it runs. Publishing after that point
     # sends the arm somewhere nobody is waiting on -- observed 2026-09-14
     # 11:52:55, a retarget published in the same second as the HOME command
     # that followed the failed grasp. Last check before committing motion.
     with node._final_command_lock:
-        if (node.stop_requested or not traj.points or stop_evt is None or stop_evt.is_set()
+        if (node.stop_requested or stop_evt is None or stop_evt.is_set()
                 or node.motion_phase != "FINAL"):
-            return False
+            return reject("FINAL_ENDED_OR_STOPPED")
         measured = node.current_joint_positions
-        if measured is None or max(abs(a-b) for a,b in zip(measured, states[0])) > 0.01:
-            return False  # The arm moved too far while this proposal was planned.
-        with node._planning_lock:
-            if not _curobo_path_constraints_valid(node, states, "FINAL_RETARGET"):
-                return False
-        measured = node.current_joint_positions
-        if (node.stop_requested or stop_evt.is_set() or measured is None
-                or len(measured) != len(states[0])
-                or max(abs(a-b) for a,b in zip(measured, states[0])) > 0.01):
-            return False
+        if measured is None or len(measured) != len(states[0]):
+            return reject("NO_JOINT_STATE")
+        states, _why = _splice_onto_measured(states, measured)
+        if states is None:
+            return reject(_why)
+        traj = build_trajectory(
+            node.joint_order, states, vel=min(0.05 * 0.5, 0.15), dt=_dt,
+            stop_flag=lambda: node.stop_requested,
+            max_vel=planner.max_joint_velocity * 0.5,
+            max_acc=planner.max_joint_acceleration * float(getattr(planner, "direct_ik_acceleration_scale", 0.3)),
+            ramp_points=getattr(planner, "ramp_points", 15),
+            enforce_limits=getattr(planner, "retime_trajectories", False), include_acc=False)
+        log_retime(node, "_apply_final_inflight_correction")
+        if node.stop_requested or not traj.points:
+            return reject("FINAL_ENDED_OR_STOPPED")
         # Update the wait target before publishing, under completion ownership.
         tcp[0], tcp[1], tcp[2] = corrected
+        # Partial reverse replays the stored path; it must be the one flown.
+        _prev = getattr(node, "_final_retarget_states", None)
+        node._final_retarget_states = _join_at(_prev, states) if _prev else states
         node._final_retarget_generation += 1
         node._final_retarget_xyz = list(corrected)
         node.trajectory_pub.publish(traj)
@@ -3101,7 +3208,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     This is the measurement nobody has: the camera has never been on during the
     FINAL leg, so it is unknown whether the date stays detectable as the
     off-axis camera converges on it and the fingers enter frame. `report`
-    accumulates the answer; nothing here commands motion or alters the target.
+    accumulates the answer; when enabled, bounded retarget attempts may update
+    the active trajectory and target.
     """
     planner = node.cfg.planner
     min_d = float(getattr(planner, "final_inflight_min_delta_m", 0.002))
@@ -3109,7 +3217,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     t0 = time.time()
     seen_seq = int(getattr(node, "all_fruits_seq", 0) or 0)
     while not stop_evt.is_set():
-        time.sleep(0.05)
+        if stop_evt.wait(0.05):
+            break
         seq = int(getattr(node, "all_fruits_seq", 0) or 0)
         if seq == seen_seq:
             continue
@@ -3146,7 +3255,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         report["latest_d"] = best_d
         report["latest_t"] = time.time() - t0
 
-        if not bool(getattr(planner, "final_inflight_apply", False)):
+        if (getattr(node, "_demo_xy_alignment_active", False)
+                or not bool(getattr(planner, "final_inflight_apply", False))):
             continue
         # Bounded: a capped number of retargets, spaced out, and the running
         # total held under max_d so repeated small nudges cannot walk the goal
@@ -3154,16 +3264,34 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         if report["applied"] >= int(getattr(
                 planner, "final_inflight_max_updates", 2)):
             continue
+        if report.get("attempts", 0) >= int(getattr(
+                planner, "final_inflight_max_attempts", 2)):
+            continue
+        if (time.monotonic() - report.get("last_attempt_end", float('-inf'))
+                < float(getattr(planner, "final_inflight_min_interval_s", 0.25))):
+            continue
+        if getattr(node, "_final_live_wait_xyz", None) is None:
+            continue
         if (time.time() - report["last_apply_t"]
                 < float(getattr(planner, "final_inflight_min_interval_s", 0.25))):
             continue
         delta = [best[i] - target_xyz[i] for i in range(3)]
         if getattr(node, "_level_final_z", None) is not None:
             delta[2] = 0.0
+        if math.dist([0.0, 0.0, 0.0], delta) < min_d:
+            report['below_min_projected'] = report.get('below_min_projected', 0) + 1
+            continue
         if math.dist([0.0, 0.0, 0.0], delta) + report["applied_total"] > max_d:
             report["above_max"] += 1
             continue
-        if _apply_final_inflight_correction(node, delta, report, stop_evt):
+        if stop_evt.is_set():
+            break
+        report['attempts'] = report.get('attempts', 0) + 1
+        _attempt_t0 = time.perf_counter()
+        applied = _apply_final_inflight_correction(node, delta, report, stop_evt)
+        report['planning_s'] = report.get('planning_s', 0.0) + time.perf_counter() - _attempt_t0
+        report['last_attempt_end'] = time.monotonic()
+        if applied:
             report["last_apply_t"] = time.time()
             report["applied_total"] += math.dist([0.0, 0.0, 0.0], delta)
             # Corrections are measured against the goal we are now driving to.
@@ -3451,7 +3579,7 @@ def subscribe_to_goal_pose(node):
             img_norm = getattr(node, 'fruit_image_norm', None)
             if img_norm is not None:
                 cx_norm, cy_norm = img_norm
-                is_low = cy_norm > 0.60
+                is_low = cy_norm > float(getattr(node.cfg.planner, "low_image_cy_thresh", 0.60))
                 _very_low_thresh = getattr(node.cfg.planner, "very_low_center_cy_thresh", 0.90)
                 is_very_low_center = (is_low and cy_norm >= _very_low_thresh) or is_bunch_lower_boundary(node)
                 lateral_type = image_lateral_side(
@@ -3516,6 +3644,38 @@ def subscribe_to_goal_pose(node):
     # field and can also change the camera view during depth stabilization.
 
 
+def _stable_visible_fruits(node, snapshots=3, need=2, tol=0.02, timeout=1.0):
+    """Visible fruits from the newest /vision/all_fruit_poses frame that also
+    appear (within tol) in at least `need` of the last `snapshots` frames.
+
+    One frame used to be enough to queue a goal, so a single bad depth reading
+    became a target: 2026-10-12 goal #2 sat 12cm behind its neighbours on bare
+    strands. Same rule as the single-goal path (2 readings < 2cm). If no new
+    frames arrive (e.g. called from a callback that blocks the subscription),
+    falls back to the single latest frame, i.e. the old behaviour."""
+    frames, last_seq, t0 = [], None, time.time()
+    while len(frames) < snapshots and time.time() - t0 < timeout:
+        seq = getattr(node, 'all_fruits_seq', 0)
+        if seq != last_seq:
+            last_seq = seq
+            frames.append([
+                [float(v) for v in p[:3]]
+                for p in list(getattr(node, 'all_fruit_poses', []) or [])
+                if len(p) >= 3 and all(v is not None for v in p[:3])])
+        else:
+            time.sleep(0.02)
+    if len(frames) < 2:
+        return frames[-1] if frames else []
+    stable = [
+        p for p in frames[-1]
+        if sum(any(math.dist(p, q) < tol for q in f) for f in frames) >= need]
+    if len(stable) < len(frames[-1]):
+        node.get_logger().info(
+            f"[MULTI_STABLE] kept {len(stable)}/{len(frames[-1])} fruits seen in "
+            f">={need} of {len(frames)} frames (<{tol*100:.0f}cm)")
+    return stable
+
+
 def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
     """Queue top-scored visible fruits, with /external_goal_pose collection as fallback.
 
@@ -3575,7 +3735,7 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
     cur = node.get_end_effector_pose()
     current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
 
-    visible = list(getattr(node, 'all_fruit_poses', []) or [])
+    visible = _stable_visible_fruits(node)
     if visible:
         queued_xyz = []
         for xyz in visible:
@@ -4233,7 +4393,7 @@ def plan_and_execute(node):
         is_very_low_center = False
         if _img_norm_height is not None:
             _, _cy_norm = _img_norm_height
-            is_low = _cy_norm > 0.60
+            is_low = _cy_norm > float(getattr(node.cfg.planner, "low_image_cy_thresh", 0.60))
             _very_low_thresh = getattr(node.cfg.planner, "very_low_center_cy_thresh", 0.90)
             is_very_low_center = (is_low and _cy_norm >= _very_low_thresh) or is_bunch_lower_boundary(node)
             _height_source = f"img cy={_cy_norm:.2f}"
@@ -5015,7 +5175,7 @@ def plan_and_execute(node):
                 list(_tip_anchored_final_grasp)
                 if _tip_anchored_final_grasp is not None
                 else [_pf_gx, _pf_gy, z + _pf_z])
-            _pf_grasp, _, _, _, _ = _apply_mode_final_adjustment(
+            _pf_grasp, _, _, _pf_mode_z_extra, _ = _apply_mode_final_adjustment(
                 _pf_grasp, orientation)
             _pf_closure_offset = active_closure_offset(node)
             _pf_tcp, _ = closure_center_corrected_tcp(
@@ -5024,7 +5184,8 @@ def plan_and_execute(node):
             # Predict the level FINAL using the candidate APPROACH height.
             # Execution later substitutes the measured settled height.
             if is_low and bool(getattr(node.cfg.planner, 'low_center_level_insertion_enabled', False)):
-                _pf_final = level_target(_pf_final, approach[2])
+                _pf_final = level_target(
+                    _pf_final, approach[2] + _pf_mode_z_extra)
             from .neighbor_diagnostics import collect_candidate
             try:
                 _neighbor_reload = collect_candidate(node, _active_corridor, approach, _pf_final, [x,y,z])
@@ -5366,21 +5527,65 @@ def plan_and_execute(node):
                 f"side={is_side_approach} | goal=[{x:.3f},{y:.3f},{z:.3f}] | "
                 f"Waiting for confirm (GUI 'confirm'/'cancel' or keyboard ENTER/k)")
 
-            # Wait for confirmation via event (set by keyboard thread or GUI command)
+        # Wait for confirmation via event (set by keyboard thread or GUI command).
+        # Idempotent: a deferred confirm is asked at most once per goal.
+        _confirm_state = {"done": False, "ok": False, "wait_s": 0.0}
+
+        def _await_confirm():
+            if _confirm_state["done"]:
+                return _confirm_state["ok"]
+            _wait_t0 = time.time()
             node.plan_confirmed = None
             node.plan_confirm_event.clear()
             node.plan_waiting = True
             node.plan_confirm_event.wait()  # blocks until set
             node.plan_waiting = False
             markers_mod.clear_plan_preview(node)
-            if not node.plan_confirmed:
+            _confirm_state.update(done=True, ok=bool(node.plan_confirmed),
+                                  wait_s=time.time() - _wait_t0)
+            if not _confirm_state["ok"]:
                 node.get_logger().info("Plan cancelled by user.")
+            return _confirm_state["ok"]
+
+        # Plan the staged approach BEFORE asking, then publish on confirm, so the
+        # ~1.5s of planning overlaps the human wait. Only from HOME: every
+        # pre-confirm failure path calls move_to_home_position, which is then a
+        # no-op, so nothing moves without a confirm.
+        _defer_confirm = False
+        if node.cfg.planner.debug_plan_preview:
+            _home_js = _valid_joint_positions()
+            _defer_confirm = (
+                bool(getattr(node.cfg.planner, "preview_plan_before_confirm", True))
+                and not skip_approach and not is_side_approach
+                and bool(getattr(node.cfg.planner, "approach_alignment_enabled", True))
+                and _home_js is not None
+                # 0.05 rad = the tolerance HOME arrival itself accepts.
+                and max(abs(a - b) for a, b in zip(
+                    _home_js, nearest_joint_config(_home_js, node.home_joints))) < 0.05)
+            if not _defer_confirm:
+                _home_dev = (
+                    max(abs(a - b) for a, b in zip(
+                        _home_js, nearest_joint_config(_home_js, node.home_joints)))
+                    if _home_js is not None else float("nan"))
+                node.get_logger().info(
+                    f"[PREVIEW] confirm before planning: home_dev={math.degrees(_home_dev):.2f}deg "
+                    f"(defer needs <{math.degrees(0.05):.1f}) skip_approach={skip_approach} "
+                    f"side={is_side_approach}")
+            if not _defer_confirm and not _await_confirm():
                 unlock_target(node)
                 continue
 
         node._goal_stall_count = 0  # reset stall counter for each new goal
 
         _t_approach = time.time()
+        _approach_wait_s = 0.0
+        _approach_settle_s = 0.0
+        _candidate_preflight_s = 0.0
+        _entry_preflight_s = 0.0
+        _gripper_open_s = 0.0
+        _staged_endpoint_wait_s = 0.0
+        _post_open_endpoint_wait_s = 0.0
+        _approach_clock = time.perf_counter()
         if not skip_approach:
             node.reacquire_result = ""  # reset at start of each attempt
             node.motion_phase = "APPROACH"
@@ -5393,8 +5598,10 @@ def plan_and_execute(node):
                     _vision_resume()
                     unlock_target(node)
                     continue
+                _candidate_clock = time.perf_counter()
                 _preflight_candidate = _select_safe_approach_candidate(
                     node, approach, _preflight_start, goal_xyz=[x, y, z])
+                _candidate_preflight_s = time.perf_counter() - _candidate_clock
                 if _preflight_candidate is None:
                     move_to_home_position(node)
                     if _check_stop(): break
@@ -5440,6 +5647,7 @@ def plan_and_execute(node):
                     # preselected branch) so a corridor rejected here would have
                     # been rejected there too, just after a wasted 10s+ round trip.
                     if _preflight_candidate is None:
+                        _entry_preflight_clock = time.perf_counter()
                         try:
                             _align_seed_js = _valid_joint_positions()
                             if _align_seed_js is not None:
@@ -5487,6 +5695,8 @@ def plan_and_execute(node):
                         except Exception as _exc:
                             node.get_logger().debug(
                                 f"[APPROACH_ALIGNMENT] entry-leg preflight skipped: {_exc}")
+                        finally:
+                            _entry_preflight_s = time.perf_counter() - _entry_preflight_clock
 
                     node.get_logger().info(
                         "[APPROACH_ALIGNMENT] "
@@ -5563,8 +5773,15 @@ def plan_and_execute(node):
                             motion_type="alignment",
                             goal_xyz=_alignment_pose[:3],
                             store_trajectory=False,
-                            extend_fn=_entry_leg)
+                            extend_fn=_entry_leg,
+                            before_publish=_await_confirm if _defer_confirm else None)
+                    if (not _alignment_ok and _confirm_state["done"]
+                            and not _confirm_state["ok"]):
+                        unlock_target(node)
+                        continue
                     if not _alignment_ok:
+                        if _defer_confirm:
+                            markers_mod.clear_plan_preview(node)
                         node.get_logger().error(
                             "[APPROACH_STAGED] staged approach failed (staging plan or "
                             "straight Cartesian entry); rejecting goal instead of "
@@ -5574,9 +5791,18 @@ def plan_and_execute(node):
                         _vision_resume()
                         unlock_target(node)
                         continue
+                    # The staged path is published: overlap opening with arm travel.
+                    if not gripper_opened:
+                        _open_clock = time.perf_counter()
+                        gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
+                        _gripper_open_s += time.perf_counter() - _open_clock
+                        gripper_opened = True
                     # One continuous motion now ends at the approach pose, so wait
                     # for that (not the staging pose) before FINAL takes over.
+                    _wait_clock = time.perf_counter()
                     _approach_ok = wait_until_xyz(node, approach[:3], tol=0.008)
+                    _staged_endpoint_wait_s = time.perf_counter() - _wait_clock
+                    _approach_wait_s += _staged_endpoint_wait_s
                     if _check_stop(): break
                     if not _approach_ok:
                         node.get_logger().error(
@@ -5587,6 +5813,12 @@ def plan_and_execute(node):
                         unlock_target(node)
                         continue
                     _alignment_cartesian_done = True
+
+            # Deferred confirm but the staged path did not publish: ask before
+            # any other approach motion (no-op if already confirmed).
+            if _defer_confirm and not _await_confirm():
+                unlock_target(node)
+                continue
 
             _ap_dist = math.sqrt(sum((cur_pose[i] - approach[i])**2 for i in range(3))) if cur_pose else 999.0
             _skip_approach_wait = False
@@ -5725,11 +5957,16 @@ def plan_and_execute(node):
                 _skip_approach_wait = True
             # Open gripper during approach motion (arm is already moving)
             if not gripper_opened:
+                _open_clock = time.perf_counter()
                 gripper_mod.control_gripper(node, "OPEN", fruit_radius=fruit_radius)
+                _gripper_open_s = time.perf_counter() - _open_clock
                 gripper_opened = True
             if not _skip_approach_wait:
+                _wait_clock = time.perf_counter()
                 _approach_reached = wait_until_xyz(
                     node, approach[:3], tol=0.008)
+                _post_open_endpoint_wait_s = time.perf_counter() - _wait_clock
+                _approach_wait_s += _post_open_endpoint_wait_s
                 if _check_stop(): break
                 if not _approach_reached:
                     # Distinguish: arm never moved vs arm moved but stalled near target.
@@ -5769,8 +6006,10 @@ def plan_and_execute(node):
                 # slightly before the controller consumes the trajectory's
                 # zero-velocity endpoint. Publishing a one-point blend/hold here
                 # preempts that deceleration and creates a visible end jerk.
+                _settle_clock = time.perf_counter()
                 time.sleep(float(getattr(
                     node.cfg.planner, "approach_endpoint_settle_s", 0.25)))
+                _approach_settle_s += time.perf_counter() - _settle_clock
 
             # Wait for joint state to be available after approach
             _post_approach_joints = _valid_joint_positions()
@@ -5783,11 +6022,35 @@ def plan_and_execute(node):
                 torch.tensor([_post_approach_joints], dtype=torch.float32, device=device),
                 joint_names=node.joint_order,
             )
-        _timing["approach"] = time.time() - _t_approach
+        # A deferred confirm waits inside the approach; don't count the human.
+        # (A non-deferred one waited before _t_approach started.)
+        _human_wait_s = _confirm_state["wait_s"] if _defer_confirm else 0.0
+        _timing["approach"] = time.time() - _t_approach - _human_wait_s
+        _approach_elapsed = time.perf_counter() - _approach_clock - _human_wait_s
+        _record_approach = getattr(node, "_record_motion_plan_event", None)
+        if callable(_record_approach):
+            _record_approach(
+                stage="TIMING", label="APPROACH_PHASE", motion_type="approach",
+                result="SKIPPED" if skip_approach else "COMPLETE",
+                phase_elapsed_s=round(_approach_elapsed, 4),
+                endpoint_wait_s=round(_approach_wait_s, 4),
+                staged_endpoint_wait_s=round(_staged_endpoint_wait_s, 4),
+                post_open_endpoint_wait_s=round(_post_open_endpoint_wait_s, 4),
+                candidate_preflight_s=round(_candidate_preflight_s, 4),
+                entry_preflight_s=round(_entry_preflight_s, 4),
+                gripper_open_s=round(_gripper_open_s, 4),
+                endpoint_settle_s=round(_approach_settle_s, 4),
+                other_phase_work_s=round(
+                    _approach_elapsed - _approach_wait_s - _approach_settle_s, 4))
         if _log_phase_timings:
             node.get_logger().info(
                 f"[TIMING] approach={_timing['approach']:.2f}s "
-                f"skipped={skip_approach} gripper_opened={gripper_opened}")
+                f"skipped={skip_approach} gripper_opened={gripper_opened} "
+                f"candidate_preflight={_candidate_preflight_s:.3f}s "
+                f"entry_preflight={_entry_preflight_s:.3f}s "
+                f"gripper_open={_gripper_open_s:.3f}s "
+                f"staged_wait={_staged_endpoint_wait_s:.3f}s "
+                f"post_open_wait={_post_open_endpoint_wait_s:.3f}s")
 
         # Lock the orientation that the robot physically reached at APPROACH.
         # FINAL must be a translation-only insertion; asking it to correct even
@@ -6149,14 +6412,15 @@ def plan_and_execute(node):
                 node.get_logger().warn('[LEVEL_INSERTION] No measured APPROACH height; stopping attempt')
                 node.stop_requested = True
                 break
-            _level_z = float(_level_pose[2])
+            _level_approach_z = float(_level_pose[2])
+            _level_z = _level_approach_z + _mode_z_extra
             _nominal_final_z = final_target[2]
             final_target = level_target(final_target, _level_z)
             _baseline_final_target = level_target(_baseline_final_target, _level_z)
             _baseline_tcp_xyz = level_target(_baseline_tcp_xyz, _level_z)
             tcp_xyz = level_target(tcp_xyz, _level_z)
             node.get_logger().info(
-                f'[LEVEL_INSERTION] APPROACH TCP Z={_level_z:.4f}m; '
+                f'[LEVEL_INSERTION] APPROACH TCP Z={_level_approach_z:.4f}m; '
                 f'FINAL Z {_nominal_final_z:.4f}->{_level_z:.4f}m; X/Y and orientation unchanged')
         node._level_final_z = _level_z
         _depth_reacquired_trace = next((dict(t) for t in reversed(list(getattr(node, '_depth_traces', [])))
@@ -6214,43 +6478,81 @@ def plan_and_execute(node):
         if _demo_on:
             node._demo_attempt_goal_xyz = [float(x), float(y), float(z)]
             node._demo_planned_final_pose = list(final_target)
-        # Outcome mode observes APPROACH and then runs the cycle untouched, so it
-        # takes the ordinary FINAL path below; only the jog flow replaces it.
-        if _demo_on and bool(getattr(
-                node.cfg.planner, "demo_capture_jog_enabled", False)):
-            # Observe before insertion. The operator performs the entire remaining
-            # APPROACH-to-grasp movement; never execute the nominal FINAL afterward.
-            node.motion_phase = "DEMO_APPROACH"
+        _demo_capture_prepared = not _demo_on
+        _demo_xy_mode = _demo_on and bool(getattr(
+            node.cfg.planner, "demo_capture_jog_enabled", False))
+        node._demo_xy_alignment_active = False
+        if _demo_on:
             _vision_resume()
-            _demo_t = time.time()
-            try:
-                _demo_saved = demo_capture.capture_correction(node)
-            except Exception as exc:
-                _demo_saved = None
-                node.get_logger().warn(f"[DEMO] capture failed: {exc}")
-            if not _demo_saved or node.stop_requested:
-                node._auto_harvest_abort = True
-                node.stop_requested = True
-                node.get_logger().warn("[DEMO] attempt stopped without closing")
-                break
-            # Continue from the demonstrated endpoint, retaining the sampled jog
-            # joint path for the existing reverse routine instead of bridging
-            # straight from the corrected grasp back to the old approach path.
-            node.stored_trajectory_states.extend(node._demo_jog_joint_path)
-            final_target = list(node.get_end_effector_pose())
-            node._final_retarget_xyz = None
-            _timing["final"] = time.time() - _demo_t
-            if not _vision_pause():
-                break
-        else:
-            if _demo_on:
-                # Vision is needed for a fresh APPROACH crop; the FINAL leg below
-                # wants it running anyway, so there is nothing to pause back.
-                _vision_resume()
+            if _demo_xy_mode:
+                node.motion_phase = "DEMO_XY_ALIGN"
+
+                def _move_demo_xy(target_pose):
+                    return _direct_ik_move(
+                        node, target_pose, label="APPROACH_XY",
+                        motion_type="approach", store_trajectory=True,
+                        num_steps=10, require_cartesian=True,
+                        endpoint_tolerance=0.0025)
+
+                try:
+                    node._demo_pending_record = demo_capture.capture_correction(
+                        node, _move_demo_xy)
+                except Exception as exc:
+                    node._demo_pending_record = None
+                    node.get_logger().warn(f"[DEMO_XY] capture failed: {exc}")
+                if not node._demo_pending_record or node.stop_requested:
+                    node._auto_harvest_abort = True
+                    node.stop_requested = True
+                    node.get_logger().warn(
+                        "[DEMO_XY] alignment was not captured; stopping before FINAL")
+                    break
+
+                # Copy exactly the commanded tool-plane translation onto every
+                # FINAL fallback. This preserves the original insertion depth and
+                # keeps fallback paths from silently dropping the demonstration.
+                _xy_base = list(getattr(
+                    node, "_demo_xy_offset_base_m", [0.0, 0.0, 0.0]))
+
+                def _xy_shift(values):
+                    shifted = list(values)
+                    for _axis in range(3):
+                        shifted[_axis] = float(shifted[_axis]) + _xy_base[_axis]
+                    return shifted
+
+                final_target = _xy_shift(final_target)
+                _baseline_final_target = _xy_shift(_baseline_final_target)
+                tcp_xyz = _xy_shift(tcp_xyz)
+                _baseline_tcp_xyz = _xy_shift(_baseline_tcp_xyz)
+                desired_grasp_xyz = _xy_shift(desired_grasp_xyz)
+                _depth_pre_level_xyz = _xy_shift(_depth_pre_level_xyz)
+                x, y, z = _xy_shift([x, y, z])
+                gx, gy, gz = _xy_shift([gx, gy, gz])
+                if _level_z is not None:
+                    _level_z = float(_level_z) + _xy_base[2]
+                    node._level_final_z = _level_z
+                node._demo_xy_corrected_goal_xyz = [float(x), float(y), float(z)]
+                node._demo_xy_corrected_final_pose = list(final_target)
+                node._demo_xy_alignment_active = True
+                node.get_logger().info(
+                    "[DEMO_XY] FINAL shifted in the locked approach plane: "
+                    f"base=[{_xy_base[0]*1000:+.1f},{_xy_base[1]*1000:+.1f},"
+                    f"{_xy_base[2]*1000:+.1f}]mm")
+            else:
                 node._demo_pending_record = demo_capture.capture_observation(node)
                 if not node._demo_pending_record:
+                    node._auto_harvest_abort = True
+                    node.stop_requested = True
                     node.get_logger().warn(
-                        "[DEMO] nothing observed at APPROACH; continuing unrecorded")
+                        "[DEMO] observation was not captured; stopping before FINAL")
+                    break
+            _demo_capture_prepared = True
+
+        if _demo_on and not _demo_capture_prepared:
+            node._auto_harvest_abort = True
+            node.stop_requested = True
+            node.get_logger().warn("[DEMO] capture was not prepared; stopping before FINAL")
+            break
+        else:
             node.motion_phase = "FINAL"
             # Vision was historically kept "paused" through the FINAL move, on the
             # grounds that cuRobo needs the GPU. It does not: by this point planning
@@ -6307,7 +6609,9 @@ def plan_and_execute(node):
                 with node._final_command_lock:
                     _inflight_stop.set()
                 if _inflight_thread is not None:
+                    _join_t0 = time.perf_counter()
                     _inflight_thread.join(timeout=0.5)
+                    _inflight_report['thread_join_s'] = time.perf_counter() - _join_t0
                     # Freeze the last crop BEFORE re-pausing vision. This is the
                     # model input for a ready-to-close judgement: the date between
                     # the fingertips at the moment the arm has finished closing in
@@ -6328,9 +6632,11 @@ def plan_and_execute(node):
                     except Exception:
                         node._grasp_crop_at_close = None
                     # Restore the pause the rest of the sequence expects.
+                    _pause_t0 = time.perf_counter()
                     node.set_vision_mode("paused")
                     if not node.wait_for_vision_paused(timeout=2.0):
                         node.stop_requested = True
+                    _inflight_report["vision_pause_s"] = time.perf_counter() - _pause_t0
                     node._last_inflight_report = dict(_inflight_report)
                     _r = _inflight_report
                     _latest = (
@@ -6345,10 +6651,21 @@ def plan_and_execute(node):
                         f"below_min={_r['below_min']} above_max={_r['above_max']} "
                         f"usable={_r['usable']}{_latest} "
                         f"applied={_r['applied']} "
+                        f"retarget_rejections={_r.get('retarget_rejections', {})} "
+                        f"attempts={_r.get('attempts', 0)} "
+                        f"projected_below_min={_r.get('below_min_projected', 0)} "
+                        f"planning={_r.get('planning_s', 0.0):.3f}s "
+                        f"join={_r.get('thread_join_s', 0.0):.3f}s "
+                        f"vision_pause={_r.get('vision_pause_s', 0.0):.3f}s "
                         f"applied_total={_r['applied_total']*1000:.1f}mm "
                         f"apply={bool(getattr(node.cfg.planner, 'final_inflight_apply', False))}"
                         + (f" last_reject={_r['last_reject']}"
                            if _r["last_reject"] else ""))
+            # A stop during FINAL is not an IK failure. Without this the fallbacks
+            # below excluded the corridor, re-queued the goal and commanded HOME
+            # after an e-stop (2026-10-08 10:52:36).
+            if not final_ok and _check_stop():
+                break
             # A FINAL that solved, planned and flew, but finished off-target, is not
             # evidence against the corridor -- this one had CORRIDOR_PREFLIGHT=PASS,
             # IK pos_err=0.0000 and PATH_LATERAL max_deviation=0.1mm. Excluding it
@@ -6526,7 +6843,7 @@ def plan_and_execute(node):
         # so the vision overlay can verify the physical red fingertips around the
         # selected date. This stage never changes the target or commands motion.
         _verify_s = max(0.0, float(getattr(
-            node.cfg.planner, "final_visual_verification_s", 0.7)))
+            node.cfg.planner, "final_visual_verification_s", 0.0)))
         if _verify_s > 0.0:
             node.latest_fingertip_verification = None
             node.latest_fingertip_verification_time = 0.0
@@ -6985,8 +7302,21 @@ def plan_and_execute(node):
         # ignored while another DROP-OFF plan started behind the same planning lock.
         _preplan_wait_s = float(getattr(
             node.cfg.planner, "dropoff_preplan_wait_s", 15.0))
+        _preplan_wait_t0 = time.perf_counter()
         _preplan_thread.join(timeout=_preplan_wait_s)
-        if _preplan_thread.is_alive():
+        _timing["dropoff_preplan_wait"] = time.perf_counter() - _preplan_wait_t0
+        _preplan_still_running = _preplan_thread.is_alive()
+        if _log_phase_timings:
+            node.get_logger().info(
+                f"[TIMING] dropoff_preplan_wait={_timing['dropoff_preplan_wait']:.3f}s "
+                f"complete={not _preplan_still_running}")
+        _record_preplan_wait = getattr(node, "_record_motion_plan_event", None)
+        if callable(_record_preplan_wait):
+            _record_preplan_wait(
+                stage="TIMING", label="DROPOFF_PREPLAN_WAIT", motion_type="dropoff",
+                result="TIMEOUT" if _preplan_still_running else "COMPLETE",
+                elapsed_s=round(_timing["dropoff_preplan_wait"], 4))
+        if _preplan_still_running:
             node.get_logger().error(
                 f"[PREPLAN] Dropoff planning still running after "
                 f"{_preplan_wait_s:.1f}s; aborting automatic dropoff")
@@ -7025,6 +7355,68 @@ def plan_and_execute(node):
 
         _home_thread = _threading.Thread(target=_bg_preplan_home, daemon=True)
         _home_thread.start()
+
+        def _direct_next_ok(next_goal, start_joints, start_quat):
+            """Can the arm reach next_goal's approach from start_joints without
+            going HOME first? Plans and discards: the real approach the main loop
+            plans afterwards goes to a different pose (corridor selection,
+            tool-axis aiming and the staging offset all still to be applied), so
+            this uses the cheap reachability config rather than the polished one
+            -- PLAN_CFG_SCAN_PREFLIGHT drops the finetune smoothing pass, which is
+            pure waste for a yes/no answer."""
+            nx, ny, nz = next_goal[:3]
+            if nz < LOW_Z_THRESH:
+                next_depth = _planner_value(
+                    node.cfg.planner, "low_center_approach_depth_offset",
+                    "low_center_approach_y_offset", 0.07)
+                nax, nay = add_axis_offsets(nx, ny, depth=next_depth)
+                naz = nz + getattr(
+                    node.cfg.planner, "low_center_approach_z_offset", -0.07)
+            else:
+                nax, nay = add_axis_offsets(nx, ny, depth=0.12)
+                naz = nz
+            next_start = JointState.from_position(
+                torch.tensor([list(start_joints)], dtype=torch.float32, device=device),
+                joint_names=node.joint_order,
+            )
+            next_orient = minimize_rotation_orientation(start_quat, next_goal[3:])
+            # Hold the YOLO lock as every other cuRobo call on this shared GPU does.
+            lock = getattr(node, '_planning_lock', None)
+            _yolo_t = getattr(node, 'yolo_thread', None)
+            _yolo_l = getattr(_yolo_t, 'inference_lock', None)
+            if _yolo_l: _yolo_l.acquire()
+            if lock: lock.acquire()
+            try:
+                test_res = node.motion_gen.plan_pose(
+                    next_start, Pose.from_list([nax, nay, naz, *next_orient]),
+                    PLAN_CFG_SCAN_PREFLIGHT)
+            finally:
+                if lock: lock.release()
+                if _yolo_l: _yolo_l.release()
+            return bool(test_res.success)
+
+        # Answer the "go straight to the next goal?" question during DROP-OFF as
+        # well: its start (the drop-off endpoint) and the next goal are both known
+        # now. It used to run after the gripper opened, with the arm standing
+        # still at the drop-off pose (~1s per goal after the first). If it isn't
+        # ready, or the next goal changed, the inline test below runs as before.
+        _next_goal_peek = node.goal_poses.peek(0) if node.goal_poses else None
+        _direct_test_result = [None]
+
+        def _bg_test_direct_next():
+            try:
+                _start_pose = pose_from_joints(node, _home_plan_start)
+                if _start_pose is not None:
+                    _direct_test_result[0] = _direct_next_ok(
+                        _next_goal_peek, _home_plan_start, _start_pose[3:])
+            except Exception as _e:
+                node.get_logger().warn(f"[PREPLAN] direct-next test failed: {_e}")
+
+        _direct_thread = None
+        if _next_goal_peek is not None:
+            _direct_thread = _threading.Thread(
+                target=_bg_test_direct_next, daemon=True)
+            _direct_thread.start()
 
         if _dropoff_preplan_result[0] is not None:
             _pre_traj, _pre_states = _dropoff_preplan_result[0]
@@ -7082,69 +7474,34 @@ def plan_and_execute(node):
             # Peek at next goal (don't pop it yet)
             next_goal = node.goal_poses.peek(0)
             if next_goal is not None:
-                nx, ny, nz = next_goal[:3]
-                next_quat = next_goal[3:]
-                next_is_low = nz < LOW_Z_THRESH
+                _direct_ok = None
+                _direct_src = "inline"
+                if (_direct_thread is not None
+                        and list(next_goal[:3]) == list(_next_goal_peek[:3])):
+                    _direct_thread.join(timeout=float(getattr(
+                        node.cfg.planner, "dropoff_preplan_wait_s", 15.0)))
+                    if not _direct_thread.is_alive():
+                        _direct_ok = _direct_test_result[0]
+                        _direct_src = "preplanned"
+                if _direct_ok is None:
+                    # Background answer missing: test from where the arm is now.
+                    cur_joints = _valid_joint_positions()
+                    if cur_joints is not None:
+                        cur_pose = node.get_end_effector_pose()
+                        _direct_ok = _direct_next_ok(
+                            next_goal, cur_joints,
+                            cur_pose[3:] if cur_pose else [1.0, 0.0, 0.0, 0.0])
 
-                next_standoff = 0.12
-                if next_is_low:
-                    next_depth = _planner_value(
-                        node.cfg.planner, "low_center_approach_depth_offset",
-                        "low_center_approach_y_offset", 0.07)
-                    next_z_offset = getattr(
-                        node.cfg.planner, "low_center_approach_z_offset", -0.07)
-                    nax, nay = add_axis_offsets(nx, ny, depth=next_depth)
-                    naz = nz + next_z_offset
+                if _direct_ok:
+                    node.get_logger().info(
+                        f"Direct path to next goal approach is COLLISION-FREE — "
+                        f"skipping HOME ({_direct_src})")
+                    # Don't go home, the main loop will handle approach planning
                 else:
-                    nax, nay = add_axis_offsets(nx, ny, depth=next_standoff)
-                    naz = nz
-
-                # Try planning from current (dropoff) position to next approach
-                cur_joints = _valid_joint_positions()
-                if cur_joints is not None:
-                    next_start = JointState.from_position(
-                        torch.tensor([cur_joints], dtype=torch.float32, device=device),
-                        joint_names=node.joint_order,
-                    )
-                    cur_pose = node.get_end_effector_pose()
-                    cur_quat = cur_pose[3:] if cur_pose else [1.0, 0.0, 0.0, 0.0]
-                    next_orient = minimize_rotation_orientation(cur_quat, next_quat)
-                    next_approach = [nax, nay, naz, *next_orient]
-
-                    # Test plan (don't execute yet, just check feasibility).
-                    # The resulting trajectory is ALWAYS discarded: this asks only
-                    # "could the arm get near the next goal without going HOME
-                    # first", and the real approach the main loop plans afterwards
-                    # goes to a different pose (corridor selection, tool-axis
-                    # aiming and the staging offset all still to be applied). So
-                    # use the cheap reachability config rather than the polished
-                    # one -- PLAN_CFG_SCAN_PREFLIGHT drops the finetune smoothing
-                    # pass, which is the expensive part and is pure waste for a
-                    # yes/no answer. Hold the YOLO lock for it as every other
-                    # cuRobo call on this shared GPU does.
-                    plan_cfg = PLAN_CFG_SCAN_PREFLIGHT
-                    lock = getattr(node, '_planning_lock', None)
-                    _yolo_t = getattr(node, 'yolo_thread', None)
-                    _yolo_l = getattr(_yolo_t, 'inference_lock', None)
-                    if _yolo_l: _yolo_l.acquire()
-                    if lock: lock.acquire()
-                    try:
-                        test_res = node.motion_gen.plan_pose(
-                            next_start, Pose.from_list(next_approach), plan_cfg)
-                    finally:
-                        if lock: lock.release()
-                        if _yolo_l: _yolo_l.release()
-
-                    if test_res.success:
+                    if _direct_ok is not None:
                         node.get_logger().info(
-                            f"Direct path to next goal approach is COLLISION-FREE — skipping HOME")
-                        # Don't go home, the main loop will handle approach planning
-                    else:
-                        node.get_logger().info(
-                            f"Direct path to next goal BLOCKED — going HOME first")
-                        node.motion_phase = "HOME"
-                        _return_home()
-                else:
+                            f"Direct path to next goal BLOCKED — going HOME first "
+                            f"({_direct_src})")
                     node.motion_phase = "HOME"
                     _return_home()
             else:

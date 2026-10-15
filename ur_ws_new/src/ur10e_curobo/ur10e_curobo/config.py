@@ -64,17 +64,18 @@ _NEW_LAB_JOINTS = {
 }
 
 _OLD_LAB_JOINTS = {
-    # Re-taught on the lab rig 2026-09-16 from measured /joint_states.
-    # Previous HOME:
-    #   [-1.3516314665423792, -0.6408413213542481, 1.5598562399493616,
-    #    -4.552072664300436, -1.8974092642413538, 1.0977357625961304]
+    # Re-taught on the lab rig 2026-10-08 15:01 from measured /joint_states
+    # (GUI "update HOME/DROPOFF from current joints").
+    # Previous (2026-10-08 morning):
+    #   home    [-1.331119, -0.659095, 1.488289, 1.976323, -1.801668, -1.078378]
+    #   dropoff [-1.363727, -0.881735, 1.516923, 3.491156, -1.685185, -0.820399]
     "home": [
-        -1.352599, -0.582120, 1.307726,
-        2.136123, -1.784902, -1.059150,
+        -1.329780, -0.265898, 1.407595,
+        1.968820, -1.816049, -1.007524,
     ],
     "dropoff": [
-        -1.90818959871401, -1.079150215988495, 2.008786980305807,
-        -3.1874824963011683, -1.4845169226275843, 0.9511620998382568,
+        -1.338753, -0.476581, 1.640008,
+        2.738127, -1.743506, -0.835453,
     ],
     "predropoff": [
         -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
@@ -434,8 +435,24 @@ class Planner:
     # [min_dt, max_dt] = [10ms, 80ms]. HOME was running at 36.4ms; 0.35 gives
     # 11.4ms, close to the floor the staged approach already runs at safely.
     # 0.40 would sit exactly on min_dt if more is wanted.
-    speed_home: float = 0.35        # effective scale=1.75 with global=5 -> dt 11.4ms
-    speed_dropoff: float = 0.35     # was 0.18 (dt 22.2ms) -> dt 11.4ms
+    speed_home: float = 0.40        # reaches 10ms floor for base_dt-based paths
+    speed_dropoff: float = 0.40     # same timing floor; cuRobo paths may already saturate
+    # Never engages on the current drop-off (stays 1.000x even with 2.0 rad/s /
+    # 3.0 rad/s^2 caps, tried 2026-10-08): the path already sits at the min_dt
+    # floor and above those limits. Drop-off time is set by its distance.
+    dropoff_time_scale: float = 1.20  # bounded post-plan time compression, drop-off only
+    # Share of cuRobo's hardware-optimal timing the drop-off replays at (it plans
+    # at the URDF limits: base/shoulder 2.09 rad/s, 12 rad/s^2). The min_dt floor
+    # alone gives 0.4. 0.6 -> ~2.81s to ~1.9s; peak accel ~0.36x of 12 rad/s^2.
+    # The fruit is in the hand here: lower this if it slips. 0 = old behaviour.
+    dropoff_speed_fraction: float = 0.6
+    # Same replay-speed fraction for the empty-hand return HOME and the cuRobo
+    # staging leg of the approach (HOME -> alignment, not the last 8cm entry).
+    # 0.6 -> 0.8 on 2026-10-11 (empty hand; same change as approach). ~0.3s.
+    home_speed_fraction: float = 0.8
+    # 0.6 -> 0.8 on 2026-10-11: empty hand, ends 8cm short of the standoff.
+    # Staging leg ~0.89s -> ~0.67s. Back to 0.6 if the approach looks jerky.
+    approach_speed_fraction: float = 0.8
     speed_predropoff: float = 0.35 # was 0.2 (dt 20ms) -> dt 11.4ms; also drives REVERSE
     # Only FINAL is genuinely near the fruit and needs to be slow. Everything
     # before it is gross motion well outside the fruit corridor.
@@ -450,17 +467,16 @@ class Planner:
     # held by approach_entry_duration_s below, via sample density.
     speed_alignment: float = 4.0  # staged approach (dt 10ms, HOME rate)
     speed_approach: float = 2.0   # standalone approach path (dt 20ms)
-    speed_final: float = 0.06     # precise, deliberately slow near the fruit
-    # Wall-clock duration held for the straight near-fruit entry leg regardless
-    # of how fast the staging leg runs. Previously this leg was 41 samples at
-    # 50ms = ~2.05s; keeping it close to that preserves the careful entry while
-    # the approach to it got faster.
-    # 1.5 -> 0.9. This leg is the last 80mm of the APPROACH and ends at the
-    # standoff, ~7cm short of the fruit -- not at it. It was held slow when that
-    # standoff measurement was the last word on where the date was. The FINAL is
-    # now closed-loop and retargets in flight, so the careful part has moved
-    # downstream and this leg does not need to carry it.
-    approach_entry_duration_s: float = 0.9
+    # 0.5 -> 1.0 on 2026-10-08: dt 80ms -> 40ms, ~15cm insertion 3.17s -> ~1.6s.
+    # The slow leg bought in-flight retarget frames, but every logged
+    # [FINAL_INFLIGHT] report had applied=0. Back to 0.5 if contact gets rough.
+    speed_final: float = 1.0      # requests 40ms at speed_scale=0.5; derivative limits still apply
+    # Requested duration of the straight APPROACH entry to the standoff.
+    # Shorter entry request; no forced whole-path retiming for APPROACH.
+    # 0.75 -> 0.5 on 2026-10-08: 8cm entry at ~16cm/s instead of ~11cm/s.
+    approach_entry_duration_s: float = 0.5
+    # Plan the staged approach while the preview waits for confirm (from HOME only).
+    preview_plan_before_confirm: bool = True
 
     # Final base-frame guard for vision goals. A stable but physically impossible
     # background-depth estimate must never enter the motion queue.
@@ -474,6 +490,9 @@ class Planner:
     # === SMOOTHNESS PARAMETERS ===
     # Lower values = smoother but slower transitions
     max_joint_velocity: float = 1.5      # rad/s max velocity per joint
+    # NOTE: the 7.5 described below is not in effect; the value is 1.5. Tried
+    # 3.0 live on 2026-10-08: drop-off/home unchanged (DROPOFF_SPEED stayed
+    # 1.000x), so max_joint_velocity is the binding limit there, not this.
     # 1.5 -> 7.5 on 2026-09-16. The UR10e declares has_acceleration_limits:
     # false, so this was never a robot constraint -- it is our own ceiling, and
     # every call site scales DOWN from it: x0.5 for reverse/dropoff/home gave
@@ -503,14 +522,16 @@ class Planner:
     # === TRAJECTORY LIMITS ===
     # These control how fast trajectories can actually execute
     min_dt: float = 0.010                # minimum timestep — keep ≥0.010 to avoid UR joint velocity limit faults
-    # FINAL's per-step time is pinned here, not by speed_final: 0.5*0.06 gives a
-    # raw request of 667ms, clamped straight down to this ceiling. Nothing else
-    # comes close -- home/dropoff/predropoff go through the min_dt floor
-    # instead (see speed_home's comment), and APPROACH/REVERSE use different dt
-    # mechanisms entirely -- so this is in practice a FINAL-only knob. Raised
-    # 0.08 -> 0.12 (2026-09-17): the close-in was pushing the date on contact.
+    # Upper timestep bound for deliberately slow motions. FINAL now requests
+    # 80ms at the default speed scale instead of saturating this 120ms ceiling.
     max_dt: float = 0.12                 # allow slow approach/final trajectories
-    approach_endpoint_settle_s: float = 0.25  # let zero-velocity endpoint finish; avoid hold preemption
+    # x max_joint_acceleration for direct-IK moves (FINAL, its in-flight retarget,
+    # small corrections). 0.3 -> 0.6 on 2026-10-08: with the bunch lowered the
+    # FINAL joint kink between IK waypoints hit 0.45 rad/s^2 and retimed the
+    # insertion 40 -> 54ms/sample (+0.8s). 0.9 rad/s^2 removes the retime.
+    direct_ik_acceleration_scale: float = 0.6
+    # 0.25 -> 0.15 on 2026-10-11. Back to 0.25 if FINAL starts with a jerk.
+    approach_endpoint_settle_s: float = 0.15  # let zero-velocity endpoint finish; avoid hold preemption
     max_traj_velocity: float = 0.8       # max velocity sent to UR controller (was hardcoded to 0.25)
     approach_max_joint_step_deg: float = 12.0  # reject APPROACH plans with abrupt per-waypoint joint jumps
     approach_max_path_ratio: float = 2.5       # reject roundabout approach paths
@@ -570,7 +591,9 @@ class Planner:
     direct_final_cart_waypoints: int = 2        # intermediate Cartesian IK waypoints for FINAL only
     approach_alignment_enabled: bool = True     # stage outside fruit before entering approach standoff
     approach_alignment_extra_m: float = 0.08    # extra distance behind the existing approach pose
-    direct_approach_cart_waypoints: int = 3     # enforce straight alignment -> approach motion
+    # 3 -> 2 on 2026-10-08: each serial IK solve is ~0.1s (entry leg was 0.42-0.48s
+    # for 8cm). FINAL holds 0.1mm lateral deviation over 15cm with 2.
+    direct_approach_cart_waypoints: int = 2     # enforce straight alignment -> approach motion
     direct_final_joint_fallback_max_delta_deg: float = 25.0  # allow FINAL joint fallback only for small endpoint moves
     strict_final_cartesian_only: bool = True  # never replace straight FINAL insertion with a joint/planner curve
     very_low_ik_return_seeds: int = 8           # IK branches scored before moving to a very-low goal
@@ -603,6 +626,10 @@ class Planner:
     very_low_preflight_pitch_step_deg: float = 10.0
     very_low_preflight_pitch_steps: int = 3
     very_low_clearance_window_mm: float = 8.0   # choose path cost only among near-safest IK branches
+    # Image cy above this = LOW (pitched approach), else MID/HIGH. Was 0.60.
+    # 0.0 on 2026-10-08: bunch lowered to ~arm level; from the new HOME a
+    # MID/HIGH (level) approach planned 142cm for a 21cm move and was rejected.
+    low_image_cy_thresh: float = 0.0
     very_low_center_cy_thresh: float = 0.88     # image cy; force center-home handling for very low fruit
     side_approach_enabled: bool = False         # enable LEFT/RIGHT side-home and side-low approach routing
     low_side_home_min_goal_z_m: float = 0.55    # below this, skip fixed side-low HOME; use target-local very-low approach
@@ -638,6 +665,8 @@ class Planner:
     very_low_center_approach_z_offset: float = 0.001  # legacy; center approach is derived from insertion angle
 
 
+    # Note: levels at APPROACH Z + z_extra, ~14.5mm below the mode closure
+    # target (tool pitched ~12deg up). Episodes log level_final_z to compare.
     low_center_level_insertion_enabled: bool = True  # supervised level FINAL experiment
     low_center_insertion_pitch_deg: float = 12.0     # approach from below, then insert upward
     very_low_center_approach_pitch_deg: float = 0.0  # legacy; orientation follows the insertion vector
@@ -878,8 +907,9 @@ class Planner:
     final_inflight_min_delta_m: float = 0.002
     final_inflight_max_delta_m: float = 0.025
     final_inflight_max_updates: int = 2      # cap retargets per FINAL move
+    final_inflight_max_attempts: int = 2     # includes rejected planning attempts
     final_inflight_min_interval_s: float = 0.25
-    final_visual_verification_s: float = 0.4    # observation-only camera window at FINAL before close
+    final_visual_verification_s: float = 0.0    # optional observation-only pause; disabled for harvesting
     phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves
     phase5_center_max_correction_mm: float = 3.0 # clamp each logged image-axis suggestion
@@ -924,7 +954,11 @@ class Planner:
     # first motion of a new cycle ramps up instead of jumping straight to speed.
     # See plan_and_send().
     alignment_ease_head_points: int = 8
-    grasp_post_close_settle_s: float = 0.50      # visible hold after fingers finish closing
+    # 0.50 -> 0.30 on 2026-10-08: the close-trim passes already wait after the
+    # last step, so the fingers have stopped travelling by now.
+    # 0.30 -> 0.15 on 2026-10-11: trim passes already wait 0.45s after the
+    # last step. Back to 0.30 if empty closes start reading as CONTACT.
+    grasp_post_close_settle_s: float = 0.15      # visible hold after fingers finish closing
     grasp_pair_capture_timeout_s: float = 0.25   # bound each logging-only camera-frame wait
     skip_redundant_visual_grasp_after_temporal: bool = True  # reuse fresh after-reverse frame path
     post_reverse_verification_enabled: bool = False  # no camera/force pause; dispatch pre-planned dropoff immediately
@@ -947,7 +981,9 @@ class Planner:
     pre_dropoff_y_offset: float = 0.25  # legacy alias for pre_dropoff_depth_offset
 
     # === REACQUIRE ===
-    reacquire_after_approach: bool = True   # re-detect fruit position after reaching approach standoff
+    # True -> False on 2026-10-08: fell back to SEED in every cycle that day
+    # (~0.75s each). The FINAL in-flight monitor still corrects the target.
+    reacquire_after_approach: bool = False  # re-detect fruit position after reaching approach standoff
     # 1.5s, not 1.0s. Reacquire was ~1.1s of a 22.3s harvest cycle, so latency
     # here is not the constraint -- and both field runs timed out at 0.9s with
     # the date already measured well inside tolerance.
@@ -1017,21 +1053,29 @@ class Planner:
     demo_capture_enabled: bool = False
     # Two capture modes, both observing the same APPROACH pose:
     #
-    #   False (default) -- outcome. The cycle runs to the grasp untouched and the
-    #     gripper's verdict is appended; the operator grades good/edge/fail later
-    #     with demo_label.py. Seconds per sample, so a session yields a hundred.
+    #   False (default) -- click-confirmed outcome. Hold at APPROACH only long
+    #     enough for the operator to click the intended date, then run the grasp
+    #     automatically. The operator grades good/edge/fail in RViz; automatic
+    #     gripper verdicts are excluded from policy data. No pendant jog or Close
+    #     press is required.
     #     Trains a "will this approach work" predictor; carries no endpoint.
     #
-    #   True -- correction. Holds at APPROACH for a pendant jog to the pose that
-    #     would actually grasp, giving a demonstrated endpoint and a residual.
-    #     ~40s of operator work per sample, which capped 2026-10-04 at 11.
+    #   True -- approach XY correction. Holds at APPROACH for guarded 5mm RViz
+    #     tool-X/tool-Y moves. Tool Z is locked; the accumulated planar offset is
+    #     copied onto FINAL before the normal automatic insertion.
     #
     # Outcome is the default because the 11 correction demos showed aim error does
     # not separate success from failure (grabbed 2.7-28.5mm, missed 5.9-35.1mm),
     # so the endpoint is not where the remaining failures live.
     demo_capture_jog_enabled: bool = False
+    demo_xy_step_m: float = 0.005
+    demo_xy_limit_m: float = 0.020
+    # Optional preferred image third for automatic target selection while demo
+    # capture is enabled. "default" preserves normal ranking.
+    demo_target_region: str = "default"
     demo_capture_dir: str = "~/harvest_logs/demos"
-    demo_capture_timeout_s: float = 0.0  # Wait for Close; positive values set a timeout.
+    # Wait for the required target click and XY confirmation. Zero is unlimited.
+    demo_capture_timeout_s: float = 0.0
     demo_capture_sample_hz: float = 10.0
     grasp_episode_recording: bool = True
     grasp_episode_dir: str = "~/harvest_logs/episodes"
@@ -1057,19 +1101,25 @@ class Gripper:
     auto_envelop_axis_from_vertical_deg: float = 45.0
     auto_envelop_min_axis_confidence: float = 0.30
     normal_depth_extra_m: float = 0.0
-    normal_z_extra_m: float = 0.0
-    envelop_depth_extra_m: float = 0.0  # learned from demonstrations
-    envelop_z_extra_m: float = 0.0
+    normal_z_extra_m: float = 0.012  # consistent FINAL correction in base/world Z
+    envelop_depth_extra_m: float = 0.0
+    envelop_z_extra_m: float = 0.012  # same vertical correction in AUTO/ENVELOP
     adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
     stop_closing_on_force: bool = False  # always command the full closed posture for now
     closing_steps: int = 10
-    step_delay_s: float = 0.05
+    # 0.05 -> 0.04 on 2026-10-11 (close 0.5s -> 0.4s). Back to 0.05 if dates get pushed.
+    step_delay_s: float = 0.04
     close_feedback_trim_enabled: bool = True
-    close_feedback_trim_iterations: int = 4
+    # 4 -> 2 passes and 0.25 -> 0.15s settle on 2026-10-08: the trim never
+    # reached its 1deg tolerance (every close logged +4-9deg; a held date
+    # blocks it), so it always ran 5 x 0.25s = 1.25s. Now 3 x 0.15 = 0.45s.
+    # The contact check reads finger position after this: re-measure empty
+    # closes (left remaining must stay well under 0.085) after changing it.
+    close_feedback_trim_iterations: int = 2
     close_feedback_trim_tolerance_rad: float = 0.0175  # about 1 degree
     close_feedback_trim_max_correction_rad: float = 0.1745  # 10 degrees
-    close_feedback_trim_settle_s: float = 0.25
+    close_feedback_trim_settle_s: float = 0.15
     holding_force_enabled: bool = True
     # Squeeze applied to the three primary closing motors (M4/M7/M12) after the
     # position close finishes -- this is what actually holds the date, since the
@@ -1108,10 +1158,18 @@ class Gripper:
     # once the hold force change (5 N -> 7 N) is running, which should widen the
     # current separation and make a real current threshold worth setting.
     nontactile_contact_validation: bool = True
+    # 2026-10-08, operator ground truth (16 held dates, 3 empty closes):
+    # only the LEFT finger's remaining travel separates them -- held 0.11-0.18,
+    # empty 0.04-0.06. Right current overlapped completely (held 5-35 mA, empty
+    # 6-9 mA) and its 20 mA bar called 6 real grabs EMPTY_CLOSE; right
+    # remaining missed by 0.01. So: left finger only, position only (current
+    # bar 0). Re-measure empty closes if the closed-pose calibration changes.
+    # Re-measured 15:53 after the shorter close-trim: empty left remaining
+    # -0.01..0.00 (3/3), held 0.13; left current 41-56 mA even when empty.
     nontactile_current_delta_a: List[float] = field(
-        default_factory=lambda: [0.020, 0.020, 0.020])
+        default_factory=lambda: [0.020, 0.020, 0.0])
     nontactile_remaining_fraction: List[float] = field(
-        default_factory=lambda: [0.08, 0.50, 0.10])
+        default_factory=lambda: [0.08, 0.50, 0.085])
     # Fingers that physically bear load, by index into the 3-finger arrays:
     #   0 = RIGHT  (motors M1-M4,  tracked M4)
     #   1 = CENTER (motors M5-M8,  tracked M7)
@@ -1125,8 +1183,8 @@ class Gripper:
     #   - nontactile_min_contact_fingers=2 "of 3" was really "2 of 2", so one
     #     marginal outer finger gave contacts=1/3 -> EMPTY_CLOSE -> NO_GRAB
     # Set back to [0, 1, 2] if a full-length centre fingertip is refitted.
-    active_fingers: List[int] = field(default_factory=lambda: [0, 2])
-    nontactile_min_contact_fingers: int = 2
+    active_fingers: List[int] = field(default_factory=lambda: [2])  # was [0, 2]; see 2026-10-08 note above
+    nontactile_min_contact_fingers: int = 1
     nontactile_feedback_max_age_s: float = 0.30
 
 @dataclass
@@ -1161,6 +1219,8 @@ class LidarScan:
     semicircle_joint_bridge_step_deg: float = 10.0    # insert only as needed when a coarse arc step causes an IK-branch jump
     semicircle_radius_candidates_m: List[float] = field(
         default_factory=lambda: [0.22, 0.35])
+    scan_section_plan_budget_s: float = 5.0          # checked between calls; manual scan sections
+    discovery_plan_budget_s: float = 5.0             # per viewpoint; checked between planner calls
     semicircle_min_points: int = 3
     semicircle_preflight_direction: str = "reverse"   # reverse is usually smoother for the base-frame front arc
     semicircle_preflight_fallback_opposite: bool = True

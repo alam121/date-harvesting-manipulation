@@ -87,6 +87,8 @@ def record_episode(node, outcome: str, end: str) -> Optional[str]:
         "motion_phase": str(getattr(node, "motion_phase", "") or ""),
         "grasp_mode": str(getattr(node, "active_goal_grasp_mode", "") or ""),
         "fruit_radius": _jsonable(getattr(node, "latest_fruit_radius", None)),
+        # None = level insertion off or not a low-centre goal (A/B on hit rate).
+        "level_final_z": _jsonable(getattr(node, "_level_final_z", None)),
         # --- arm ---
         "joint_positions": _jsonable(getattr(node, "current_joint_positions", None)),
         "ee_pose": _jsonable(_safe(node.get_end_effector_pose)),

@@ -31,8 +31,7 @@ def test_keys_cover_the_three_grades_and_skip():
 
 def test_grades_are_written_and_skip_leaves_the_record_alone(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        _session(tmp, {f"2026{i}": {"auto_outcome": {"outcome": "NO_GRAB", "end": "X"}}
-                       for i in range(3)})
+        _session(tmp, {f"2026{i}": {} for i in range(3)})
         keys = iter(["g", "s", "f"])
         monkeypatch.setattr(demo_label, "show", lambda d: None)
         monkeypatch.setattr("builtins.input", lambda *_: next(keys))
@@ -59,6 +58,27 @@ def test_regrade_offers_everything(monkeypatch):
         assert _labels(tmp) == {"a": "fail", "b": "fail"}
 
 
+def test_grade_updates_the_policy_manifest(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _session(tmp, {"a": {}})
+        sequence = os.path.join(tmp, "a", "sequence")
+        os.makedirs(sequence)
+        manifest = os.path.join(sequence, "sequence.json")
+        with open(manifest, "w") as handle:
+            json.dump({"quality": {"data_ready": True}}, handle)
+        monkeypatch.setattr(demo_label, "show", lambda d: None)
+        monkeypatch.setattr("builtins.input", lambda *_: "g")
+        assert demo_label.grade(tmp, regrade=False) == 1
+        with open(manifest) as handle:
+            saved = json.load(handle)
+        assert saved["label_source"] == "operator"
+        assert saved["operator_label"] == "good"
+        assert saved["quality"]["training_ready"] is True
+        with open(os.path.join(tmp, "a", "sample.json")) as handle:
+            sample = json.load(handle)
+        assert sample["sequence_quality"] == saved["quality"]
+
+
 def test_quit_stops_without_touching_the_rest(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _session(tmp, {"a": {}, "b": {}})
@@ -69,5 +89,16 @@ def test_quit_stops_without_touching_the_rest(monkeypatch):
         assert _labels(tmp) == {"a": "good", "b": None}
 
 
-def test_describe_survives_a_record_with_no_outcome_yet():
-    assert "no gripper verdict" in demo_label.describe({})
+def test_describe_uses_policy_context_only():
+    text = demo_label.describe({"auto_outcome": {"outcome": "GRABBED"}})
+    assert "GRABBED" not in text
+
+
+def test_stats_ignore_legacy_detector_fields(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        _session(tmp, {"a": {"operator_label": "good",
+                             "auto_outcome": {"outcome": "NO_GRAB"}}})
+        assert demo_label.stats(tmp) == 1
+        output = capsys.readouterr().out
+        assert "good" in output
+        assert "NO_GRAB" not in output

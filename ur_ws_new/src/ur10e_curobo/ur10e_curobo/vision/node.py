@@ -20,8 +20,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from rclpy.duration import Duration as rclpyDuration
 from rclpy.time import Time as rclpyTime
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
-from std_msgs.msg import Float32, Float32MultiArray, String as StdString
-from sensor_msgs.msg import PointCloud2, Image as ROSImage, CameraInfo
+from std_msgs.msg import Bool, Float32, Float32MultiArray, String as StdString
+from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, Image as ROSImage
 from cv_bridge import CvBridge
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
@@ -29,6 +29,7 @@ import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 from .config import (
     CAMERA_PROFILE, CAM_FRAME, ZEDMINI_CAM_FRAME, Z_MAX,
     BEST_REUSE_THRESH, SWITCH_THRESHOLD, TARGET_LOCK_RADIUS,
+    DEMO_REGION_WEIGHT,
     TRUNK_DEPTH_OFFSET,
     LIDAR_TOPIC, LIDAR_Z_MIN, LIDAR_Z_MAX, T_CAM_LIDAR,
     ZEDMINI_SERIAL, ZEDMINI_DEPTH_FPS, ZEDMINI_RGBD_FPS,
@@ -65,7 +66,7 @@ DEBUG_DEPTH_SAMPLING = True
 # field operation. Enable temporarily when benchmarking perception performance.
 DEBUG_PERFORMANCE = False
 from .scoring import (
-    compute_fruit_score, compute_collision_free_direction,
+    compute_fruit_score, compute_demo_region_score, compute_collision_free_direction,
     estimate_fruit_radius,
 )
 from .contact_points import estimate_three_finger_contacts
@@ -100,6 +101,8 @@ class VisionNode:
         self.prev_direction_base: Optional[np.ndarray] = None
         self.direction_history = deque(maxlen=5)
         self.best_history = deque(maxlen=5)
+        self._demo_region_enabled = False
+        self._demo_target_region = "default"
 
         # Heatmap throttling — only recompute every N frames
         self._heatmap_frame_count = 0
@@ -327,9 +330,108 @@ class VisionNode:
         # frames when rendering cannot keep up.
         self.image_pub = self.node.create_publisher(
             ROSImage, "/vision/display", fast_qos)
-        from sensor_msgs.msg import CompressedImage
         self.demo_full_pub = self.node.create_publisher(
             CompressedImage, "/vision/demo_full/compressed", 1)
+        # Raw imitation frames have their own capture-rate path. They must not
+        # inherit the annotated display's YOLO/viz cadence, and JPEG encoding
+        # must never hold up camera acquisition or perception.
+        self.imitation_full_pub = self.node.create_publisher(
+            CompressedImage, "/vision/imitation_full/compressed", fast_qos)
+        _imitation_queue: queue.Queue = queue.Queue(maxsize=1)
+        _imitation_stop = Event()
+        _imitation_state_lock = Lock()
+        _imitation_recording_active = False
+        _imitation_recording_epoch = 0
+        _imitation_last_enqueue_t = 0.0
+        try:
+            _imitation_fps = float(os.getenv("UR10E_IMITATION_FPS", "10.0"))
+            if not math.isfinite(_imitation_fps) or _imitation_fps <= 0.0:
+                raise ValueError("FPS must be finite and greater than zero")
+        except ValueError as exc:
+            _imitation_fps = 10.0
+            self.node.get_logger().warn(
+                f"Invalid UR10E_IMITATION_FPS; using 10 Hz: {exc}")
+        _imitation_min_interval = 1.0 / _imitation_fps
+
+        def _imitation_is_current(epoch):
+            with _imitation_state_lock:
+                return (not _imitation_stop.is_set()
+                        and _imitation_recording_active
+                        and epoch == _imitation_recording_epoch)
+
+        def _enqueue_imitation_frame(frame, stamp, *, frame_is_owned=False):
+            """Offer one raw acquisition without blocking its producer.
+
+            ``stamp`` is passed alongside the pixels instead of being read by
+            the encoder thread later; the global current-image stamp may have
+            advanced by several grabs before JPEG encoding completes.
+            """
+            nonlocal _imitation_last_enqueue_t
+            with _imitation_state_lock:
+                if not _imitation_recording_active:
+                    return
+                epoch = _imitation_recording_epoch
+            now = time()
+            if (now - _imitation_last_enqueue_t < _imitation_min_interval
+                    or _imitation_queue.full()):
+                return
+            # ZED's image Mat is reused on the next grab. Take ownership only
+            # after all cheap inactive/cadence/queue checks. The Mini capture
+            # path already made an owned packet copy and can share that array.
+            image = frame if frame_is_owned else frame[:, :, :3].copy()
+            try:
+                _imitation_queue.put_nowait((image, stamp, epoch))
+                # Keep cadence phase: resetting to `now` loses a whole camera
+                # frame whenever a nominal 100 ms boundary is missed slightly.
+                _imitation_last_enqueue_t = (
+                    _imitation_last_enqueue_t + _imitation_min_interval
+                    if now - _imitation_last_enqueue_t < 2 * _imitation_min_interval
+                    else now)
+            except queue.Full:
+                pass
+
+        def _imitation_worker():
+            while not _imitation_stop.is_set():
+                try:
+                    item = _imitation_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                frame, stamp, epoch = item
+                if not _imitation_is_current(epoch):
+                    continue
+                try:
+                    image = frame[:, :, :3]
+                    height, width = image.shape[:2]
+                    if width > 960:
+                        image = cv2.resize(
+                            image,
+                            (960, round(height * 960 / width)),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    ok, jpeg = cv2.imencode(
+                        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if not ok or not _imitation_is_current(epoch):
+                        continue
+                    msg = CompressedImage()
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = self.cam_frame
+                    msg.format = "jpeg"
+                    msg.data = jpeg.tobytes()
+                    # Keep the state stable across the non-blocking publish so
+                    # a recording-stop callback cannot interleave here.
+                    with _imitation_state_lock:
+                        if (_imitation_recording_active
+                                and epoch == _imitation_recording_epoch):
+                            self.imitation_full_pub.publish(msg)
+                except Exception as exc:
+                    now = time()
+                    if now - getattr(self, "_last_imitation_error_t", 0.0) >= 5.0:
+                        self._last_imitation_error_t = now
+                        self.node.get_logger().warn(
+                            f"Imitation image encode/publish failed: {exc}")
+
         self.demo_targets_pub = self.node.create_publisher(StdString, "/vision/demo_targets", 10)
         self.depth_trace_pub = self.node.create_publisher(StdString, "/vision/depth_trace", 10)
         self.nearby_dates_pub = self.node.create_publisher(StdString, "/vision/nearby_dates", 1)
@@ -367,6 +469,17 @@ class VisionNode:
         self.node.create_timer(0.02, publish_timer_cb)
 
         # Subscribers
+        def _recording_active_cb(msg):
+            nonlocal _imitation_recording_active, _imitation_recording_epoch
+            active = bool(msg.data)
+            with _imitation_state_lock:
+                if active != _imitation_recording_active:
+                    _imitation_recording_epoch += 1
+                    _imitation_recording_active = active
+
+        self.node.create_subscription(
+            Bool, "/demo/recording_active", _recording_active_cb, 10)
+
         def grasp_attempt_cb(msg):
             self.tracker.increment_fruit_attempt([msg.point.x, msg.point.y, msg.point.z])
 
@@ -548,15 +661,44 @@ class VisionNode:
                     f"YOLO settings applied live: confidence={confidence:.2f}, "
                     f"max_detections={max_detections}")
                 self._publish_camera_status()
+            elif cmd.startswith("demo_region "):
+                parts = cmd.split()
+                region = parts[1].lower() if len(parts) > 1 else ""
+                if region not in ("default", "left", "center", "right"):
+                    self.node.get_logger().warn(
+                        "Demo target region ignored: expected default/left/center/right, "
+                        f"got '{region}'")
+                    return
+                enabled = any(
+                    token.lower() in ("enabled=1", "enabled=true", "enabled=yes", "enabled=on")
+                    for token in parts[2:])
+                self._demo_target_region = region
+                self._demo_region_enabled = enabled and region != "default"
+                self.best_target_prev = None
+                self.node.get_logger().info(
+                    f"[DEMO] target region={region}, "
+                    f"priority={'ON' if self._demo_region_enabled else 'OFF'}")
             elif cmd.startswith("nurec "):
                 mode = cmd.split()[1].lower()
                 if self._nurec is None:
                     self.node.get_logger().warn("[NUREC] unavailable: requires ZED X Mini RGBD mode and valid calibration")
+                elif mode == "record":
+                    try:
+                        self._nurec.start_bag()
+                    except Exception as exc:
+                        self.node.get_logger().error(f"[NUREC] bag start failed: {exc}")
+                    self._publish_camera_status()
+                elif mode == "stop" or (mode == "off" and self._nurec.recording()):
+                    # A bag without the stream records nothing; stop both.
+                    self._nurec.stop_bag()
+                    self._publish_camera_status()
                 elif mode in ("on", "off"):
                     self._nurec.enabled = mode == "on"
                     self.node.get_logger().info(f"[NUREC] {mode.upper()}")
+                    self._publish_camera_status()
                 else:
-                    self.node.get_logger().warn("[NUREC] use 'nurec on' or 'nurec off'")
+                    self.node.get_logger().warn(
+                        "[NUREC] use 'nurec on|off' or 'nurec record|stop'")
             elif cmd.startswith("raw_stream "):
                 parts = cmd.split()
                 mode = parts[1].lower() if len(parts) > 1 else ""
@@ -1152,10 +1294,14 @@ class VisionNode:
                                 _cap_pc = _cap_cloud.get_data()[:, :, :3].copy()
                             else:
                                 _cap_pc = None
+                        _cap_rgb = _cap_image.get_data().copy()
+                        _cap_stamp = self._ros_time_from_wall(_cap_t).to_msg()
+                        _enqueue_imitation_frame(
+                            _cap_rgb, _cap_stamp, frame_is_owned=True)
                         _packet = (
                             _cap_t,
                             _cap_fps,
-                            _cap_image.get_data().copy(),
+                            _cap_rgb,
                             _cap_pc,
                         )
                         try:
@@ -1207,7 +1353,13 @@ class VisionNode:
                     if grab_status != sl.ERROR_CODE.SUCCESS:
                         self.exit_signal = True
                         break
-                    t_now = time()
+                    # Carry the sensor's acquisition time with the raw frame.
+                    # Reading the global current-image stamp later in the JPEG
+                    # worker would associate it with a newer camera grab.
+                    t_now = (
+                        zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+                        / 1e9
+                    )
                 self._latest_zed_one_ts = t_now
                 # Stamp this frame with when it was CAPTURED, not when the loop
                 # got round to it. _lookup_tf_at_image() exists precisely so a
@@ -1222,11 +1374,8 @@ class VisionNode:
                 # above). At 0.3 m/s tool speed every 10ms of stamp error is
                 # ~3mm of position error.
                 #
-                # Residual: the sensor->grab-return latency inside the SDK is
-                # still counted as zero. zed.get_timestamp(TIME_REFERENCE.IMAGE)
-                # would remove that too, but it has to be read on the capture
-                # thread and carried in the packet; t_now removes the large,
-                # variable term, which is the one that matters.
+                # Both camera paths read TIME_REFERENCE.IMAGE on the thread
+                # that owns grab(), then carry it with the pixels.
                 self._latest_image_stamp = self._ros_time_from_wall(t_now)
                 if not use_zedx_mini_only:
                     _grab_times.append(t_now)
@@ -1265,6 +1414,8 @@ class VisionNode:
                 # extra full-HD BGRA copy on every camera frame.
                 if not use_zedx_mini_only:
                     image_left_ocv = image_left.get_data()
+                    _enqueue_imitation_frame(
+                        image_left_ocv, self._latest_image_stamp.to_msg())
                 if not getattr(self, "_printed_zed_buffer_shape", False):
                     print("buffer", image_left_ocv.shape, "zed", image_left_ocv.shape)
                     self._printed_zed_buffer_shape = True
@@ -1828,6 +1979,16 @@ class VisionNode:
             if _capture_thread is not None:
                 _capture_thread.join(timeout=2.0)
 
+        imitation_thread = Thread(
+            target=_imitation_worker,
+            name="imitation_jpeg_publisher",
+            daemon=True,
+        )
+        imitation_thread.start()
+        self.node.get_logger().info(
+            f"Imitation camera stream armed at {_imitation_fps:.1f} FPS; "
+            "publishes only while /demo/recording_active is true.")
+
         perception_thread = Thread(target=perception_loop, daemon=True)
         perception_thread.start()
 
@@ -1836,9 +1997,17 @@ class VisionNode:
             self.executor.spin()
         finally:
             self.exit_signal = True
+            _imitation_stop.set()
+            try:
+                _imitation_queue.put_nowait(None)
+            except queue.Full:
+                # The worker will finish or discard its one queued frame, see
+                # the stop flag, and exit without another publish.
+                pass
             if bool(getattr(self.args, "raw_yolo_view", False)):
                 cv2.destroyAllWindows()
             perception_thread.join(timeout=3.0)
+            imitation_thread.join(timeout=3.0)
             if self._nurec is not None:
                 self._nurec.close()
             if self.yolo_thread is not None:
@@ -2142,6 +2311,11 @@ class VisionNode:
             return
         model_path = str(getattr(self.args, "weights", ""))
         model_name = Path(model_path).name if model_path else "-"
+        nurec = getattr(self, "_nurec", None)
+        nurec_text = (
+            "unavailable" if nurec is None else
+            f"RECORDING -> {nurec.bag_path}" if nurec.recording() else
+            "ON (stream only)" if nurec.enabled else "OFF")
         status = (
             f"Camera: {self._camera_type}\n"
             f"Resolution: {self._camera_resolution}  FPS: {self._camera_fps}\n"
@@ -2153,7 +2327,8 @@ class VisionNode:
             f"Model: {model_name}\n"
             f"YOLO confidence: {float(self.args.conf_thres):.2f}\n"
             f"Maximum detections: {int(self.args.max_det)}\n"
-            f"Path: {model_path}"
+            f"Path: {model_path}\n"
+            f"NuRec: {nurec_text}"
         )
         msg = StdString()
         msg.data = status
@@ -3276,6 +3451,10 @@ class VisionNode:
 
         for i, t in enumerate(targets):
             score_result = compute_fruit_score(t, prev_pt_base)
+            if self._demo_region_enabled:
+                region_score = compute_demo_region_score(t, self._demo_target_region)
+                score_result["components"]["demo_region"] = region_score
+                score_result["total_score"] += DEMO_REGION_WEIGHT * region_score
             t["score"] = score_result["total_score"]
             t["score_components"] = score_result["components"]
 

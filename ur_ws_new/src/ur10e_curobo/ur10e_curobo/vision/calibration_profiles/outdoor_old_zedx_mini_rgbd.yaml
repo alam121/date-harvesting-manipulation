@@ -4,20 +4,6 @@ environment: outdoor
 mode: zedx_mini
 description: Initial old-robot outdoor seed copied from the preserved old/lab mount
   calibration; replace by running hand-eye calibration on the outdoor robot.
-# PROVENANCE (recorded 2026-09-10): calibrated_at below reads 1970 because this
-# unit has no battery-backed RTC and the calibration ran on an offline boot, so
-# the system clock was still at the epoch. The geometry is unaffected -- hand-eye
-# only uses TF within a single session, and the clock was stable (wrong, but not
-# jumping) throughout. This 26-sample run was reviewed and ACCEPTED on
-# 2026-09-10 over the previous 20-sample one: mean error 2.57mm -> 2.14mm and
-# translation max 3.05mm -> 2.15mm, at the cost of rotation p95 0.249deg ->
-# 0.339deg. The values here match ur_macro.xacro's
-# hand_eye_zed_mini_left_camera_frame_old_outdoor_* properties -- keep them in
-# step, cuRobo rebuilds its URDF from this profile at startup.
-# A second, later run (epoch 03:24:20; rotation max 0.749deg, translation max
-# 4.12mm) was REJECTED as worse and never promoted here.
-# The clock is fixed as of 2026-09-10 (fake-hwclock + chrony), so future
-# calibrations will carry real timestamps.
 parent_frame: tool0
 rgb_frame: zed_mini_left_camera_frame
 depth_frame: zed_mini_left_camera_frame
@@ -25,46 +11,46 @@ hand_eye:
   parent_frame: tool0
   child_frame: zed_mini_left_camera_frame
   translation:
-    x: -0.11513821641701083
-    y: -0.07536464379905945
-    z: 0.08071274369440969
+    x: -0.02378384203859212
+    y: -0.11774704196540936
+    z: 0.07309316017110636
   quaternion:
-    x: -0.08728168983509135
-    y: 0.03437504560341898
-    z: -0.3864360049992242
-    w: 0.9175333655511028
+    x: -0.052689055227700364
+    y: 0.005080465860359652
+    z: 0.0013438278077836764
+    w: 0.9985971392171505
   rpy:
-    roll: -0.1878396923541878
-    pitch: -0.004377086468623004
-    yaw: -0.7968291434084649
+    roll: -0.10541733281053517
+    pitch: 0.01028846889247581
+    yaw: 0.002148630687514551
   matrix:
-  - - 0.698971140560005
-    - 0.7031352323372723
-    - 0.13053807762586345
-    - -0.11513821641701083
-  - - -0.7151364806109711
-    - 0.6860982413195411
-    - 0.1336002146614549
-    - -0.07536464379905945
-  - - 0.004377072491952857
-    - -0.18673523584006038
-    - 0.9824005257185875
-    - 0.08071274369440969
+  - - 0.9999447659869295
+    - -0.0032192551015043404
+    - 0.010005067312929428
+    - -0.02378384203859212
+  - - 0.0021485153163085966
+    - 0.9944441151720707
+    - 0.10524393417947137
+    - -0.11774704196540936
+  - - -0.010288287383252763
+    - -0.10521662509427276
+    - 0.9943961046517081
+    - 0.07309316017110636
   - - 0.0
     - 0.0
     - 0.0
     - 1.0
   method: DANIILIDIS
-  mean_error_m: 0.002138245697167895
-  num_samples: 26
+  mean_error_m: 0.0011357187781009742
+  num_samples: 20
   stationary_board_validation:
-    translation_median_m: 0.001092162079010469
-    translation_p95_m: 0.0018505759175931728
-    translation_max_m: 0.0021469044542147928
-    rotation_median_deg: 0.10619168769170256
-    rotation_p95_deg: 0.3387958274296352
-    rotation_max_deg: 0.43421736404081107
+    translation_median_m: 0.0005181331302180621
+    translation_p95_m: 0.0009858074003046325
+    translation_max_m: 0.002059516932467221
+    rotation_median_deg: 0.09296470937159526
+    rotation_p95_deg: 0.1255618905155248
+    rotation_max_deg: 0.15980217858803344
     rejected_samples: 0
     converged: true
-  calibrated_at: '1970-01-01 03:09:10'
+  calibrated_at: '2026-10-14 15:56:19'
 profile_path: /home/datepalm2/manipulatorsdatepalm/ur_ws_new/src/ur10e_curobo/ur10e_curobo/vision/calibration_profiles/outdoor_old_zedx_mini_rgbd.yaml

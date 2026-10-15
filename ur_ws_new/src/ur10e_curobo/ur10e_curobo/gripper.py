@@ -5,6 +5,7 @@ from .delto_gripper_controller import DeltoGripperController
 from ur_msgs.srv import SetIO
 from sensor_msgs.msg import JointState
 import os
+import time
 from .gripper_profiles import (
     finger_joint_indices_for_profile,
     make_closed_position,
@@ -246,6 +247,10 @@ def control_gripper(node, action: str, fruit_radius: float = None):
     """
 
     act = action.upper()
+    recorder = getattr(node, '_demo_sequence', None)
+    if recorder is not None and act == 'CLOSE':
+        recorder.command('gripper.close_request', 1.0, time.time_ns(),
+                         source_stamp_ns=node.get_clock().now().nanoseconds)
     if getattr(node.gripper_controller, "disabled", False):
         if act == "OPEN":
             node.gripper_controller.open_gripper()
@@ -368,12 +373,13 @@ def on_grasp_outcome(node, outcome: str, end: str):
         record_episode(node, outcome, end)
     except Exception as _exc:
         node.get_logger().warn(f"[EPISODE] not recorded: {_exc}")
-    # Same best-effort rule: close out the demo record this cycle opened, if any.
+    # Same best-effort rule: close out the policy record this cycle opened, if any.
+    # The detector result above is deliberately not passed into policy data.
     try:
-        from .demo_capture import attach_outcome
-        attach_outcome(node, outcome, end)
+        from .demo_capture import complete_capture
+        complete_capture(node)
     except Exception as _exc:
-        node.get_logger().warn(f"[DEMO] outcome not attached: {_exc}")
+        node.get_logger().warn(f"[DEMO] recording not finalized: {_exc}")
     if hasattr(node, "visualizer"):
         node.visualizer.update_outcome(outcome)
 

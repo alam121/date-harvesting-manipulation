@@ -2,9 +2,7 @@
 
 The point of outcome capture is that grading is cheap: the harvest cycle runs at
 full speed and writes a record per attempt, then a session's worth is graded here
-in a couple of minutes. The gripper's own verdict is only binary and it is wrong
-often enough to matter -- it reported GRABBED on attempts that had barely caught
-the fruit -- so the operator's grade is the label that gets trained on.
+in a couple of minutes. Only the operator's grade is recorded and trained on.
 
     good  the fruit was taken cleanly
     edge  it worked, but only just: one finger, a graze, nearly dropped
@@ -17,7 +15,7 @@ Usage:
     python3 -m ur10e_curobo.demo_label --dir PATH
 
 Writes operator_label back into each sample.json. Shows full_before_marked.jpg
-if a viewer is available; grading from the gripper line alone still works.
+if a viewer is available.
 """
 
 import argparse
@@ -26,6 +24,8 @@ import os
 import subprocess
 import sys
 from collections import Counter
+
+from .demo_sequence import update_training_readiness
 
 KEYS = {"g": "good", "e": "edge", "f": "fail", "s": None}
 VALID = ("good", "edge", "fail")
@@ -48,13 +48,10 @@ def load(path):
 
 
 def describe(sample):
-    auto = sample.get("auto_outcome") or {}
-    verdict = (f"{auto.get('outcome')}/{auto.get('end')}"
-               if auto.get("outcome") else "no gripper verdict")
     trace = (sample.get("before") or {}).get("depth_trace") or {}
     vision = trace.get("accepted_goal_vision") or {}
     radius = vision.get("estimated_radius_m")
-    return (f"{verdict}  mode={trace.get('mode', '?')}"
+    return (f"mode={trace.get('mode', '?')}"
             f"  range={sample.get('range_m', '?')}m"
             + (f"  r={radius * 1000:.0f}mm" if radius else ""))
 
@@ -74,7 +71,7 @@ def show(directory):
 
 
 def stats(root):
-    counts, autos = Counter(), Counter()
+    counts = Counter()
     total = 0
     for _, path in records(root):
         sample = load(path)
@@ -82,13 +79,10 @@ def stats(root):
             continue
         total += 1
         counts[sample.get("operator_label") or "ungraded"] += 1
-        auto = sample.get("auto_outcome") or {}
-        autos[auto.get("outcome") or "none"] += 1
     print(f"{total} record(s) in {root}")
     for label in VALID + ("ungraded",):
         if counts[label]:
             print(f"  {label:9} {counts[label]:4}")
-    print("  gripper verdict: " + ", ".join(f"{k}={v}" for k, v in autos.most_common()))
     return total
 
 
@@ -129,6 +123,7 @@ def grade(root, regrade):
         try:
             with open(path, "w") as handle:
                 json.dump(sample, handle, indent=1, default=str)
+            update_training_readiness(directory, sample["operator_label"])
             done += 1
         except Exception as exc:
             print(f"          NOT saved: {exc}")

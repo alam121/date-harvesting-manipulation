@@ -593,19 +593,34 @@ class DeltoGripperController:
     # --------------------------------------------------------
     # OPENING
     # --------------------------------------------------------
+    def is_at_open_position(self):
+        """Only fresh measured feedback can suppress an opening command."""
+        measured = getattr(self, 'actual_joint_position', None)
+        age = time.time() - getattr(self, 'actual_joint_stamp', 0.0)
+        return bool(measured is not None and len(measured) == len(self.open_position)
+                    and 0.0 <= age <= 0.30
+                    and all(math.isfinite(a) and abs(a - b) <= math.radians(1.0)
+                            for a, b in zip(measured, self.open_position)))
+
     def open_gripper(self):
         self._set_holding_force(False)
         self.set_state('OPENING')
         self.current_step = 0
         self.current_open_alpha = 0.0
-        self.move_to_position(self.open_position)
+        already_open = self.is_at_open_position()
+        if not already_open:
+            self.move_to_position(self.open_position)
+        else:
+            self.current_position = self.open_position.copy()
+            self.node.get_logger().info('[GRIPPER_OPEN] already open (fresh feedback); skipping motion')
         self.close_start_position = self.open_position.copy()
 
         # The command is non-blocking, but 150ms is sufficient for release and
         # baseline capture while avoiding a fixed 300ms delay in every cycle.
-        time.sleep(float(getattr(
-            self.node.cfg.gripper, "open_settle_s", 0.15)))
-        self.hold_position(self.open_position)
+        if not already_open:
+            time.sleep(float(getattr(
+                self.node.cfg.gripper, "open_settle_s", 0.15)))
+            self.hold_position(self.open_position)
 
         # Capture baseline force when gripper is fully open
         self.baseline_force = self.force_data.copy()

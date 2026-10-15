@@ -2,8 +2,11 @@
 import copy
 import math
 import queue
+import signal
+import subprocess
 import threading
 import time
+from pathlib import Path
 
 import cv2
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -43,7 +46,8 @@ class NuRecCapture:
         self._stop = threading.Event()
         qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                          reliability=ReliabilityPolicy.RELIABLE)
-        self.infos, self.publishers = [], []
+        self.infos, self.publishers, self.topics = [], [], []
+        self._bag, self.bag_path = None, None
         right_frame = left_frame.replace('left', 'right') if 'left' in left_frame else left_frame + '_right'
         for side, cam, frame, b in (
                 ('left', calibration.left_cam, left_frame, 0.),
@@ -52,6 +56,7 @@ class NuRecCapture:
             info.header.frame_id = frame
             self.infos.append(info)
             root = '/vision/nurec/' + side
+            self.topics += [root + '/image_rect/compressed', root + '/camera_info']
             self.publishers.append((
                 node.create_publisher(CompressedImage, root + '/image_rect/compressed', qos),
                 node.create_publisher(CameraInfo, root + '/camera_info', qos)))
@@ -119,7 +124,47 @@ class NuRecCapture:
                 except Exception as exc:
                     self.node.get_logger().warn(f'[NUREC] pair dropped: {exc}')
 
+    def recording(self):
+        return self._bag is not None and self._bag.poll() is None
+
+    def start_bag(self, directory='~/nurec_data/bags'):
+        """Record the NuRec stereo pair to a local bag on this machine (no network
+        needed, e.g. outdoors). Same topics as isaac/nurec/record_stereo.sh, plus
+        TF and the URDF so replay_bag_joints.py can recover the arm pose. Default
+        sqlite3 storage: the mcap plugin is not installed on the Jetson, and
+        extract_frames.py reads either."""
+        if self.recording():
+            return self.bag_path
+        path = Path(directory).expanduser() / time.strftime('nurec_%Y%m%d_%H%M%S')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(f'{path}.log', 'w') as log:
+            # Same process group: a Ctrl+C on the launcher also stops the bag.
+            self._bag = subprocess.Popen(
+                ['ros2', 'bag', 'record', '-o', str(path), *self.topics,
+                 '/tf', '/tf_static', '/robot_description'],
+                stdout=log, stderr=subprocess.STDOUT)
+        self.bag_path = str(path)
+        self.enabled = True
+        self.node.get_logger().info(f'[NUREC] recording bag -> {path}')
+        return self.bag_path
+
+    def stop_bag(self):
+        """SIGINT lets rosbag2 finish metadata.yaml; reaped off-thread."""
+        proc, self._bag = self._bag, None
+        self.enabled = False
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            threading.Thread(target=proc.wait, daemon=True).start()
+            self.node.get_logger().info(f'[NUREC] bag stopped: {self.bag_path}')
+        return proc is not None
+
     def close(self):
+        if self.recording():
+            self._bag.send_signal(signal.SIGINT)
+            try:
+                self._bag.wait(timeout=10.)
+            except subprocess.TimeoutExpired:
+                self._bag.kill()
         self.enabled = False
         self._stop.set()
         self._worker.join(timeout=2.)

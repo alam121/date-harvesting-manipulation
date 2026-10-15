@@ -169,11 +169,45 @@ def plan_diagnostics(result) -> dict:
     return diagnostics()
 
 
+def scene_replay_snapshot(world):
+    """Detached primitive geometry; explicitly flag unsupported scene types."""
+    result = {}
+    for kind, dimensions in (("cuboid", "dims"), ("sphere", "radius")):
+        result[kind] = {}
+        for obstacle in getattr(world, kind, None) or []:
+            value = getattr(obstacle, dimensions)
+            result[kind][obstacle.name] = {
+                "pose": [float(x) for x in obstacle.pose],
+                dimensions: ([float(x) for x in value] if dimensions == "dims" else float(value)),
+            }
+    unsupported = [kind for kind in ("mesh", "capsule", "cylinder", "voxel")
+                   if getattr(world, kind, None)]
+    return {"world_config": result, "complete": not unsupported,
+            "unsupported_types": unsupported}
+
+
+def gpu_activity_snapshot():
+    """Jetson load is system-wide, in tenths of a percent; no CUDA sync."""
+    root = Path('/sys/devices/platform/bus@0/17000000.gpu')
+    result = {"monotonic_s": time.monotonic()}
+    for name, path, divisor in (
+            ('load_percent', root / 'load', 10.),
+            ('frequency_hz', root / 'devfreq/17000000.gpu/cur_freq', 1.)):
+        try:
+            result[name] = float(path.read_text().strip()) / divisor
+        except (OSError, ValueError):
+            result[name] = None
+    return result
+
+
 class PlannerV2:
     def __init__(self, robot_config, world_config, interpolation_dt=.02,
                  num_trajopt_seeds=4, num_ik_seeds=32, use_cuda_graph=True):
         self.interpolation_dt = interpolation_dt
         self.world_model = Scene.create(copy.deepcopy(world_config))
+        self._replay_world = scene_replay_snapshot(self.world_model)
+        self._world_revision = 0
+        self._world_updated_at = time.monotonic()
         self.config = MotionPlannerCfg.create(
             robot=copy.deepcopy(robot_config), scene_model=self.world_model,
             interpolation_dt=interpolation_dt,
@@ -203,15 +237,31 @@ class PlannerV2:
         """
         options = options or PlanOptions()
         graph_index = options.enable_graph_attempt()
+        world = copy.deepcopy(self._replay_world)
+        revision = self._world_revision
+        world_age = time.monotonic() - self._world_updated_at
+        gpu_before = gpu_activity_snapshot()
+        cpu_t0 = time.process_time()
         t0 = time.perf_counter()
         result = call(goal_arg, start, max_attempts=options.max_attempts,
                       enable_graph_attempt=graph_index)
-        return PlanResult(
+        wall_time = time.perf_counter() - t0
+        cpu_time = time.process_time() - cpu_t0
+        wrapped = PlanResult(
             result, self.interpolation_dt,
-            wall_time=time.perf_counter() - t0,
+            wall_time=wall_time,
             graph_attempt=options.graph_attempt,
             graph_attempt_index=graph_index,
             graph_seeding_available=self._graph_planner_available())
+        wrapped.runtime_diagnostics = {
+            "scene": world, "world_revision": revision,
+            "world_changed_during_plan": revision != self._world_revision,
+            "world_age_s": world_age, "planner_call_s": wall_time,
+            "process_cpu_s": cpu_time,
+            "gpu_before": gpu_before, "gpu_after": gpu_activity_snapshot(),
+            "gpu_scope": "system-wide endpoint samples, not per-process utilization",
+        }
+        return wrapped
 
     def plan_pose(self, start, goal, options=None):
         return self._run_plan(
@@ -248,6 +298,9 @@ class PlannerV2:
     def update_world(self, world):
         self.planner.update_world(world)
         self.world_model = world
+        self._replay_world = scene_replay_snapshot(world)
+        self._world_revision += 1
+        self._world_updated_at = time.monotonic()
 
     def reset(self, reset_seed=True):
         if reset_seed:
