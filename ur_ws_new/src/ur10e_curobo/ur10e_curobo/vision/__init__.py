@@ -14,7 +14,17 @@ def __getattr__(name):
 def main():
     """Entry point for ros2 run ur10e_curobo vision."""
     import argparse
+    import os
+    import sys
     from .node import VisionNode
+
+    # Same GIL fix as main.py. Every small PyTorch step around the 10ms
+    # TensorRT call took 10-20ms regardless of its size (2 masks: 23ms), and
+    # halving the camera's GPU load barely changed that -- the YOLO thread was
+    # queuing for the GIL behind capture, geometry, display and ROS threads.
+    _gil = float(os.environ.get("UR10E_GIL_SWITCH_INTERVAL", "0.0001"))
+    if _gil > 0:
+        sys.setswitchinterval(_gil)
 
     parser = argparse.ArgumentParser(description="Date fruit vision detection node")
     parser.add_argument(

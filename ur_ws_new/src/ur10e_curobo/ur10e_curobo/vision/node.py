@@ -1303,6 +1303,7 @@ class VisionNode:
                             _cap_fps,
                             _cap_rgb,
                             _cap_pc,
+                            time(),  # packet ready: grab + image/depth retrieval done
                         )
                         try:
                             _capture_queue.put_nowait(_packet)
@@ -1333,6 +1334,11 @@ class VisionNode:
                 )
                 _capture_thread.start()
 
+            # Per-stage wall times of the frame now in YOLO (_lat) and of the
+            # one being published (_lat_done); published as latency_ms.
+            _lat = None
+            _lat_done = None
+            _lat_yolo = None
             while not self.exit_signal:
                 fresh_detections = False
                 # ZED X Mini neural depth is the other major GPU workload. In
@@ -1344,8 +1350,9 @@ class VisionNode:
                 _captured_pc_np = None
                 if use_zedx_mini_only:
                     try:
-                        t_now, loop_fps, image_left_ocv, _captured_pc_np = (
+                        t_now, loop_fps, image_left_ocv, _captured_pc_np, _cap_ready = (
                             _capture_queue.get(timeout=1.0))
+                        _lat_got = time()
                     except queue.Empty:
                         continue
                 else:
@@ -1478,7 +1485,15 @@ class VisionNode:
                                     _capture_depth_request.set()
                                 elif self.yolo_thread.set_image(image_left_ocv, capture_time=t_now):
                                     # Retain exactly the RGB-D packet used by inference.
+                                    # Depth for the next one is requested only after
+                                    # this result is used. Overlapping the two was
+                                    # tried (2026-10-27) and raised total age
+                                    # 345 -> 530ms for 3.9 -> 4.5 obs/s: YOLO, not
+                                    # depth, is the bottleneck, so the early depth
+                                    # frame just waited ~180ms for it.
                                     _inference_packet = (t_now, image_left_ocv, _captured_pc_np)
+                                    _lat = {"ready": _cap_ready, "got": _lat_got,
+                                            "submit": time()}
                         else:
                             self.yolo_thread.set_image(image_left_ocv, capture_time=t_now)
                 _t1 = time()
@@ -1509,9 +1524,18 @@ class VisionNode:
                             or timing.get("capture_time") != _inference_packet[0]):
                         self.yolo_thread.dets_ready.clear()
                         _inference_packet = None
+                        _lat = None
                         _capture_depth_request.set()
                         continue
                     t_now, image_left_ocv, _captured_pc_np = _inference_packet
+                    _lat_done = dict(_lat, infer=time()) if _lat else None
+                    _lat = None
+                    _lat_yolo = {k: timing.get(k) for k in (
+                        "capture_to_start_ms", "color_ms",
+                        "predict_wall_ms", "decode_mask_ms",
+                        "preprocess_ms", "inference_ms", "postprocess_ms",
+                        "post_filter_ms", "post_masks_ms", "post_tail_ms",
+                        "mask_rows")}
                     _inference_packet = None
                     _capture_depth_request.set()
                     self._latest_image_stamp = self._ros_time_from_wall(t_now)
@@ -1773,7 +1797,15 @@ class VisionNode:
                 self.all_fruit_quality_pub.publish(_aq_msg)
                 self._fruit_observation_seq += 1
                 _obs_msg = StdString()
+                _lat_ms = None
+                if _lat_done is not None:
+                    _lat_ms = {k: round((v - t_now) * 1000.0, 1)
+                               for k, v in _lat_done.items()}
+                    _lat_ms["publish"] = round((time() - t_now) * 1000.0, 1)
+                    _lat_ms.update({k: round(float(v), 1) for k, v in
+                                    (_lat_yolo or {}).items() if v is not None})
                 _obs_msg.data = json.dumps({
+                    "latency_ms": _lat_ms,
                     "frame_id": "base_link",
                     "stamp_ns": int(self._latest_image_stamp.nanoseconds),
                     "sequence": self._fruit_observation_seq,

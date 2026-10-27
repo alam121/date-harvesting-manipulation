@@ -53,12 +53,20 @@ class DirectTensorRTSegmenter:
             wanted = torch.tensor(
                 self.class_ids, device=rows.device, dtype=rows[:, 5].dtype)
             rows = rows[(rows[:, 5:6] == wanted).any(1)]
+        n_rows = int(rows.shape[0])   # boolean indexing above already synced
+        t2a = perf_counter()
 
         masks = None
+        t2b = t2a
         if rows.shape[0]:
             masks = ops.process_mask(
                 prototypes[0], rows[:, 6:], rows[:, :4],
                 tensor.shape[2:], upsample=True)
+            # Diagnostic sync so mask building is timed on its own; the amax
+            # below would wait for it anyway.
+            if masks.is_cuda:
+                torch.cuda.synchronize()
+            t2b = perf_counter()
             keep = masks.amax((-2, -1)) > 0
             if not bool(torch.all(keep)):
                 rows, masks = rows[keep], masks[keep]
@@ -78,5 +86,11 @@ class DirectTensorRTSegmenter:
             "preprocess": (t1 - t0) * 1000.0,
             "inference": (t2 - t1) * 1000.0,
             "postprocess": (t3 - t2) * 1000.0,
+            # postprocess split: row filtering (first sync), mask building,
+            # and the keep/rescale tail; rows = detections given a mask.
+            "post_filter": (t2a - t2) * 1000.0,
+            "post_masks": (t2b - t2a) * 1000.0,
+            "post_tail": (t3 - t2b) * 1000.0,
+            "rows": n_rows,
         }
         return result
