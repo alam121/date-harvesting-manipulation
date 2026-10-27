@@ -64,18 +64,23 @@ _NEW_LAB_JOINTS = {
 }
 
 _OLD_LAB_JOINTS = {
-    # Re-taught on the lab rig 2026-10-08 15:01 from measured /joint_states
-    # (GUI "update HOME/DROPOFF from current joints").
-    # Previous (2026-10-08 morning):
+    # Re-taught on the lab rig 2026-10-26 14:32 from current joints, after the
+    # gripper/camera mount was re-aligned to the URDF's 0,0,0.
+    # Previous (2026-10-26 morning, before the re-align):
+    #   home    [-2.457372, -1.364862, 2.220335, 3.878384, -1.600102, 0.966558]
+    # Previous (2026-10-08 15:01):
+    #   home    [-1.329780, -0.265898, 1.407595, 1.968820, -1.816049, -1.007524]
+    #   dropoff [-1.338753, -0.476581, 1.640008, 2.738127, -1.743506, -0.835453]
+    # Before that (2026-10-08 morning):
     #   home    [-1.331119, -0.659095, 1.488289, 1.976323, -1.801668, -1.078378]
     #   dropoff [-1.363727, -0.881735, 1.516923, 3.491156, -1.685185, -0.820399]
     "home": [
-        -1.329780, -0.265898, 1.407595,
-        1.968820, -1.816049, -1.007524,
+        -1.336765, -0.415018, 1.656290,
+        1.882112, -1.944410, 1.230161,
     ],
     "dropoff": [
-        -1.338753, -0.476581, 1.640008,
-        2.738127, -1.743506, -0.835453,
+        -1.344882, -0.608352, 1.848471,
+        2.614793, -1.882953, 1.388141,
     ],
     "predropoff": [
         -1.5009062925921839, -1.7099877796568812, 2.0609028975116175,
@@ -1107,6 +1112,10 @@ class Gripper:
     adaptive_aperture_enabled: bool = False  # keep fully open during approach
     min_fingers_for_stop: int = 2
     stop_closing_on_force: bool = False  # always command the full closed posture for now
+    # Stop closing when the 12 motors together draw more than this. The UR
+    # control-box 24V IO supply gives 2A; a stall past it sagged the supply to
+    # 7.9V and faulted the robot (2026-10-26). 0 disables.
+    close_current_limit_a: float = 1.5
     closing_steps: int = 10
     # 0.05 -> 0.04 on 2026-10-11 (close 0.5s -> 0.4s). Back to 0.05 if dates get pushed.
     step_delay_s: float = 0.04

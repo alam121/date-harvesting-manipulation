@@ -142,8 +142,32 @@ class UR10eCuroboMoveIt(Node):
         self._state_mgr.initialize()
 
         # ========= PHASE 3: MotionExecutor =========
-        self._motion_mgr = MotionExecutor(self, self._config_mgr, self._state_mgr)
-        self._motion_mgr.initialize()
+        # cuRobo's warmup (CUDA graph capture) is the one GPU-heavy step main
+        # runs before it can arbitrate the GPU with vision: the /vision/mode
+        # handshake needs the executor spinning, which starts later. Restarting
+        # main while vision kept running made the capture run under live YOLO
+        # inference, and it died with "CUDA error: unspecified launch failure"
+        # (twice on 2026-10-26, both with vision up). A full launch never hit it
+        # because main warms up before vision starts. So: if vision is up,
+        # pause it for the warmup -- fire-and-forget, no ack is possible yet.
+        _warmup_mode_pub = self.create_publisher(String, "/vision/mode", 10)
+        _deadline = time.time() + 2.0
+        while (_warmup_mode_pub.get_subscription_count() == 0
+               and time.time() < _deadline):
+            time.sleep(0.05)
+        _vision_up = _warmup_mode_pub.get_subscription_count() > 0
+        if _vision_up:
+            _warmup_mode_pub.publish(String(data="paused"))
+            time.sleep(0.5)  # let an in-flight inference finish
+            self.get_logger().info(
+                "[STARTUP] vision paused for cuRobo warmup")
+        try:
+            self._motion_mgr = MotionExecutor(self, self._config_mgr, self._state_mgr)
+            self._motion_mgr.initialize()
+        finally:
+            if _vision_up:
+                _warmup_mode_pub.publish(String(data="full"))
+            self.destroy_publisher(_warmup_mode_pub)
         planner = self.cfg.planner
         self._append_harvest_log({
             "event": "MOTION_CONFIG",

@@ -104,7 +104,9 @@ MAX_FRUIT_ATTEMPTS = 3        # max grasp attempts before blacklisting
 
 # Temporal stabilization (reduce flickering)
 MIN_FRAMES_TO_SHOW = 2        # Fruit must appear in N consecutive frames before showing
-MAX_FRAMES_TO_KEEP = 2        # Keep fruit for N frames after last seen (persistence)
+# 2 -> 6 (2026-10-26): in wind a swinging date is missed for a few frames (blur,
+# leaf occlusion) and at 2 it was dropped and had to be re-confirmed.
+MAX_FRAMES_TO_KEEP = 6        # Keep fruit for N frames after last seen (persistence)
 
 # Target lock state
 TARGET_LOCK_RADIUS = 0.06     # 6cm - match locked target within this radius

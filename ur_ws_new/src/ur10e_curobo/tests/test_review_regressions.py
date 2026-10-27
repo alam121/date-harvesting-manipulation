@@ -587,6 +587,83 @@ class NoLocalTorchImportTest(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class GripperCurrentLimitTests(unittest.TestCase):
+    def test_trips_on_first_fresh_sample_over_limit(self):
+        import time as _time
+        fn = load('delto_gripper_controller.py', 'close_current_exceeded',
+                  dict(time=_time), owner='DeltoGripperController')
+        cfg = types.SimpleNamespace(close_current_limit_a=1.5,
+                                    nontactile_feedback_max_age_s=0.3)
+        g = types.SimpleNamespace(
+            node=types.SimpleNamespace(cfg=types.SimpleNamespace(gripper=cfg)),
+            _over_current_count=0, _current_sample_stamp=None,
+            close_peak_current_a=0.0)
+
+        def sample(amps_each):
+            g.actual_joint_effort = [amps_each] * 12
+            g.actual_joint_stamp = _time.time()
+            _time.sleep(0.001)          # distinct stamp per sample
+            return fn(g)
+
+        self.assertFalse(sample(0.05))  # 0.6A total: under limit
+        self.assertTrue(sample(0.20))   # 2.4A: first over-limit sample trips
+        self.assertTrue(fn(g))          # same sample re-read: still tripped
+        self.assertAlmostEqual(g.close_peak_current_a, 2.4)
+        g.actual_joint_stamp -= 1.0     # stale feedback never trips
+        g._over_current_count = 5
+        self.assertFalse(fn(g))
+
+
+class HandEyeRefinementTests(unittest.TestCase):
+    def test_reprojection_refinement_recovers_known_transform(self):
+        import cv2
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+        env = dict(np=np, cv2=cv2, Rotation=Rotation, least_squares=least_squares)
+        path = 'vision/hand_eye_calibration.py'
+        to_T = load(path, '_to_T', env)
+        solve = load(path, 'solve_board_pose', env)
+        refine = load(path, 'refine_hand_eye_reprojection', env)
+
+        rng = np.random.default_rng(0)
+        K = np.array([[1000., 0, 960], [0, 1000., 540], [0, 0, 1]])
+        dist = np.zeros(5)
+        gx, gy = np.meshgrid(np.arange(8) * .04, np.arange(13) * .04)
+        obj = np.stack([gx.ravel() - .14, gy.ravel() - .24, 0 * gx.ravel()], 1)
+        Y = to_T(np.eye(3), [.6, -.4, 0.])
+        X = to_T(Rotation.from_euler('xyz', [2, -3, 90], degrees=True).as_matrix(),
+                 [.03, -.07, .05])
+        G_list, C_list, objs, imgs = [], [], [], []
+        for _ in range(15):
+            pos = Y[:3, 3] + [rng.uniform(-.25, .25), rng.uniform(-.25, .25),
+                              .5 + rng.uniform(-.05, .1)]
+            z = (Y[:3, 3] - pos) / np.linalg.norm(Y[:3, 3] - pos)
+            x = np.cross([0, 1, 0], z); x /= np.linalg.norm(x)
+            R = np.column_stack([x, np.cross(z, x), z]) @ Rotation.from_rotvec(
+                [0, 0, rng.uniform(-1, 1)]).as_matrix()
+            C = to_T(R, pos)                      # base -> camera
+            T_ct = np.linalg.inv(C) @ Y
+            rvec, _ = cv2.Rodrigues(T_ct[:3, :3])
+            px, _ = cv2.projectPoints(obj, rvec, T_ct[:3, 3], K, dist)
+            px = px.reshape(-1, 2) + rng.normal(0, .3, (len(obj), 2))
+            r, t, _ = solve(obj, px, K, dist)
+            G_list.append(C @ np.linalg.inv(X))
+            C_list.append(to_T(cv2.Rodrigues(r)[0], t))
+            objs.append(obj); imgs.append(px)
+
+        X0 = X.copy()
+        X0[:3, 3] += [.003, -.002, .002]
+        X0[:3, :3] = X0[:3, :3] @ Rotation.from_rotvec([.008, 0, .005]).as_matrix()
+        X_hat, stats = refine(X0, G_list, C_list, objs, imgs, K, dist)
+
+        self.assertTrue(stats['success'])
+        self.assertLess(stats['after_px'], stats['before_px'])
+        self.assertLess(stats['after_px'], .6)
+        self.assertLess(np.linalg.norm(X_hat[:3, 3] - X[:3, 3]), .001)
+        self.assertLess(np.degrees(Rotation.from_matrix(
+            X[:3, :3].T @ X_hat[:3, :3]).magnitude()), .1)
+
+
 if __name__=='__main__': unittest.main()
 
 class IncrementalDiscoveryTests(unittest.TestCase):

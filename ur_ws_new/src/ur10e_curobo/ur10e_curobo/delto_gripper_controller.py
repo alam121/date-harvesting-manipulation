@@ -374,10 +374,72 @@ class DeltoGripperController:
 
         return self.all_channels_contacted()
 
+    def close_current_exceeded(self):
+        """True once total motor current tops the limit on any fresh sample.
+
+        A single sample, not a debounce: the stall current is spiky, and on
+        2026-10-26 a 1.84A peak against a 1.5A limit never produced two in a
+        row, so the supply sagged with the check never firing.
+        """
+        limit = float(getattr(self.node.cfg.gripper, "close_current_limit_a", 0.0))
+        if limit <= 0.0 or self.actual_joint_effort is None:
+            return False
+        max_age = float(getattr(
+            self.node.cfg.gripper, 'nontactile_feedback_max_age_s', 0.30))
+        if time.time() - self.actual_joint_stamp > max_age:
+            return False
+        if self.actual_joint_stamp == self._current_sample_stamp:
+            return self._over_current_count >= 1  # same sample, already counted
+        self._current_sample_stamp = self.actual_joint_stamp
+        # ponytail: sum of motor phase currents overestimates the supply draw,
+        # so this trips early rather than late; measure supply current if the
+        # limit ever cuts real grasps short.
+        total = sum(abs(e) for e in self.actual_joint_effort)
+        self.close_peak_current_a = max(self.close_peak_current_a, total)
+        self._over_current_count = self._over_current_count + 1 if total > limit else 0
+        return self._over_current_count >= 1
+
     # --------------------------------------------------------
     # CLOSING MOTION
     # --------------------------------------------------------
+    def _hold_at_measured(self, where):
+        # Hold where the fingers ARE. Just not advancing would leave the last
+        # command past the obstacle, and the motors would keep pushing into it.
+        hold = list(self.actual_joint_position)
+        self.current_position = hold
+        msg = Float32MultiArray()
+        msg.data = hold
+        self.publisher.publish(msg)
+        self.close_current_limited = True
+        self.node.get_logger().warn(
+            f"[GRIPPER_CURRENT_LIMIT] {self.close_peak_current_a:.2f}A > "
+            f"{self.node.cfg.gripper.close_current_limit_a:.2f}A during {where}; "
+            "holding measured position")
+
+    def _watch_close_current(self, duration_s):
+        """Sleep duration_s, holding the measured pose if current tops the limit.
+
+        The steps go out in ~0.4s, before the fingers have moved; the stall
+        current arrives during the trim and settle that follow, which is when
+        the 24V IO sagged (2026-10-26). Returns True once the limit has tripped.
+        """
+        end = time.time() + max(0.0, duration_s)
+        while time.time() < end:
+            if not self.close_current_limited and self.close_current_exceeded():
+                self._hold_at_measured("post-close")
+            time.sleep(min(0.02, max(0.0, end - time.time())))
+        return self.close_current_limited
+
     def step_close(self):
+        if self.close_current_exceeded():
+            self._hold_at_measured(f"step {self.current_step}/{self.steps}")
+            self.closure_stopped_early = True
+            self.closure_step_stopped = self.current_step
+            self.closure_deltas = [
+                abs(self.force_data[i] - self.baseline_force[i]) for i in range(3)]
+            self.current_step = 0
+            self.set_state('IDLE')
+            return False
         force_reached = self.is_force_threshold_reached()
         if self.current_step >= self.steps or force_reached:
             stopped_early = force_reached and self.current_step < self.steps
@@ -445,6 +507,10 @@ class DeltoGripperController:
     def run_closure_loop(self):
         self.set_state('CLOSING')
         self.first_contact_index = None
+        self._over_current_count = 0
+        self._current_sample_stamp = None
+        self.close_peak_current_a = 0.0
+        self.close_current_limited = False
         # Clear need_rearm flag and reset ignore window when starting to close
         self.need_rearm = False
         self.ignore_contacts_until = 0.0  # Clear debounce window to allow immediate force detection
@@ -491,8 +557,12 @@ class DeltoGripperController:
         # near-open positions and near-zero current.  Use the configured
         # post-close hold here, before classifying, and do not repeat it in the
         # harvesting sequence.
-        time.sleep(max(0.0, float(getattr(
-            self.node.cfg.planner, 'grasp_post_close_settle_s', 0.50))))
+        self._watch_close_current(float(getattr(
+            self.node.cfg.planner, 'grasp_post_close_settle_s', 0.50)))
+        self.node.get_logger().info(
+            f"[GRIPPER_CURRENT] peak={self.close_peak_current_a:.2f}A "
+            f"limit={float(getattr(self.node.cfg.gripper, 'close_current_limit_a', 0.0)):.2f}A "
+            f"limited={self.close_current_limited}")
 
         # Classify from the completed position-controlled close before enabling
         # firmware holding. Otherwise the holding-current rise can be mistaken
@@ -557,7 +627,10 @@ class DeltoGripperController:
         final_error = None
 
         for _ in range(iterations):
-            time.sleep(settle_s)
+            # A blocked finger reads as "error", and trimming would push it
+            # further; once current trips, stop trimming entirely.
+            if self._watch_close_current(settle_s):
+                return
             if (self.actual_joint_position is None
                     or time.time() - self.actual_joint_stamp > 0.30):
                 return
@@ -574,7 +647,8 @@ class DeltoGripperController:
             ]
             self.publish_position(compensated)
 
-        time.sleep(settle_s)
+        if self._watch_close_current(settle_s):
+            return
         if (self.actual_joint_position is not None
                 and time.time() - self.actual_joint_stamp <= 0.30):
             final_error = [

@@ -147,8 +147,11 @@ def generate_launch_description():
 
     declared_arguments.append(
         DeclareLaunchArgument(
-            "delto_port", 
-            default_value="10000", 
+            "delto_port",
+            # 502 (Modbus TCP) is the only port this gripper listens on; 10000
+            # is refused. ur_control.launch.py passes 502 explicitly, so only
+            # standalone starts (calibration dialog) hit this default.
+            default_value="502",
             description="Port for gripper"
         )
     )

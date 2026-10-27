@@ -30,5 +30,11 @@ class FruitObservation:
             raise ValueError("Invalid fruit quality")
         return cls(stamp, sequence, poses, qualities)
 
-    def fresh(self, now_ns, max_age_s=0.5):
+    # 0.5 -> 0.8 (2026-10-26). Measured during FINAL, observations already
+    # arrive 0.26-0.46s old (depth handoff + inference), and main reads them a
+    # little later still while busy with IK -- so at 0.5 the in-flight monitor
+    # and reacquire discarded most of them (frames=5 matched=0). Positions are
+    # in base_link at the photo's arm pose, so age only matters if the fruit
+    # itself moves (wind).
+    def fresh(self, now_ns, max_age_s=0.8):
         return 0 <= now_ns - self.stamp_ns <= max_age_s * 1e9

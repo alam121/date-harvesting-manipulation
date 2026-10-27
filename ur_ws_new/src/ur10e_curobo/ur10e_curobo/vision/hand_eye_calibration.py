@@ -28,6 +28,7 @@ import pyzed.sl as sl
 import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 try:
@@ -93,6 +94,9 @@ CHESSBOARD_INNER_X = 7
 CHESSBOARD_INNER_Y = 10
 CHESSBOARD_SQUARE_SIZE = 0.02975  # measured mean: 29.7–29.8 mm
 MAX_REPROJECTION_RMSE_PX = 0.60
+# Frames pooled per capture, all taken AFTER the settle window passes.
+CAPTURE_FRAMES = 10
+CAPTURE_MIN_FRAMES = 5
 STATIONARY_TRANSLATION_FLOOR_M = 0.005
 STATIONARY_ROTATION_FLOOR_DEG = 1.5
 ROBOT_SETTLE_WINDOW_S = 0.60
@@ -236,6 +240,94 @@ def rotation_matrix_to_rvec(R):
     """Convert 3x3 rotation matrix to Rodrigues vector."""
     rvec, _ = cv2.Rodrigues(R)
     return rvec.flatten()
+
+
+def _to_T(R, t):
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
+    return T
+
+
+def solve_board_pose(obj_points, image_points, camera_matrix, dist_coeffs):
+    """Planar board pose: IPPE (exact for z=0 targets) then LM refinement.
+
+    Returns (rvec, tvec, rmse_px), or None if PnP fails.
+    """
+    obj = np.asarray(obj_points, dtype=np.float64).reshape(-1, 3)
+    img = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+    ok, rvec, tvec = cv2.solvePnP(
+        obj, img, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_IPPE)
+    if not ok:
+        return None
+    rvec, tvec = cv2.solvePnPRefineLM(
+        obj, img, camera_matrix, dist_coeffs, rvec, tvec)
+    projected, _ = cv2.projectPoints(obj, rvec, tvec, camera_matrix, dist_coeffs)
+    rmse = float(np.sqrt(np.mean(np.sum(
+        (img - projected.reshape(-1, 2)) ** 2, axis=1))))
+    return rvec, tvec, rmse
+
+
+def refine_hand_eye_reprojection(T_cam2gripper, base_gripper_list,
+                                 cam_target_list, obj_list, img_list,
+                                 camera_matrix, dist_coeffs):
+    """Jointly refine camera->tool0 (X) and base->board (Y) on corner pixels.
+
+    The closed-form solvers fit per-sample PnP poses; this fits the pixels
+    those poses came from, through base->tool0->camera->board, with a Huber
+    loss so a few bad corners cannot dominate. Returns (X_refined, stats).
+    """
+    boards = [G @ T_cam2gripper @ C
+              for G, C in zip(base_gripper_list, cam_target_list)]
+    Y0 = _to_T(
+        Rotation.from_matrix(np.array([B[:3, :3] for B in boards])).mean()
+        .as_matrix(),
+        np.median([B[:3, 3] for B in boards], axis=0))
+    gripper_base = [np.linalg.inv(G) for G in base_gripper_list]
+    objs = [np.asarray(o, dtype=np.float64).reshape(-1, 3) for o in obj_list]
+    imgs = [np.asarray(i, dtype=np.float64).reshape(-1, 2) for i in img_list]
+
+    def pack(X, Y):
+        return np.concatenate([
+            Rotation.from_matrix(X[:3, :3]).as_rotvec(), X[:3, 3],
+            Rotation.from_matrix(Y[:3, :3]).as_rotvec(), Y[:3, 3]])
+
+    def unpack(p):
+        return (_to_T(Rotation.from_rotvec(p[0:3]).as_matrix(), p[3:6]),
+                _to_T(Rotation.from_rotvec(p[6:9]).as_matrix(), p[9:12]))
+
+    def residuals(p):
+        X, Y = unpack(p)
+        X_inv = np.linalg.inv(X)
+        out = []
+        for G_inv, obj, img in zip(gripper_base, objs, imgs):
+            T_ct = X_inv @ G_inv @ Y
+            rvec, _ = cv2.Rodrigues(T_ct[:3, :3])
+            proj, _ = cv2.projectPoints(
+                obj, rvec, T_ct[:3, 3], camera_matrix, dist_coeffs)
+            out.append((proj.reshape(-1, 2) - img).ravel())
+        return np.concatenate(out)
+
+    def pixel_stats(r):
+        point_sq = np.sum(r.reshape(-1, 2) ** 2, axis=1)
+        per_sample, start = [], 0
+        for img in imgs:
+            per_sample.append(float(np.sqrt(np.mean(
+                point_sq[start:start + len(img)]))))
+            start += len(img)
+        return float(np.sqrt(np.mean(point_sq))), np.asarray(per_sample)
+
+    p0 = pack(T_cam2gripper, Y0)
+    before_px, before_samples = pixel_stats(residuals(p0))
+    sol = least_squares(residuals, p0, loss="huber", f_scale=1.0,
+                        x_scale="jac")
+    X, _ = unpack(sol.x)
+    after_px, after_samples = pixel_stats(residuals(sol.x))
+    return X, {
+        "before_px": before_px, "before_per_sample": before_samples,
+        "after_px": after_px, "after_per_sample": after_samples,
+        "success": bool(sol.success),
+    }
 
 
 def main():
@@ -444,6 +536,60 @@ def main():
             0.001,
         )
 
+    def retrieve_frame():
+        if use_zedx_mini:
+            zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+        else:
+            zed.retrieve_image(image_mat)  # CameraOne: no VIEW arg
+        return image_mat.get_data()[:, :, :3].copy()  # drop alpha (BGRA→BGR)
+
+    def detect_board(gray, display=None):
+        """Return (found, status_text, obj_points, image_points)."""
+        if args.target == "charuco":
+            marker_corners, marker_ids, _ = marker_detector.detectMarkers(gray)
+            best = None
+            for layout_name, candidate_board, candidate_detector in charuco_detectors:
+                corners, ids, _, _ = candidate_detector.detectBoard(
+                    gray, markerCorners=marker_corners, markerIds=marker_ids)
+                count = 0 if ids is None else len(ids)
+                if best is None or count > best[0]:
+                    best = (count, layout_name, candidate_board, corners, ids)
+            corner_count, layout_name, active_board, corners, ids = best
+            marker_count = 0 if marker_ids is None else len(marker_ids)
+            found = corner_count >= MIN_CHARUCO_CORNERS
+            if display is not None:
+                if marker_ids is not None and len(marker_ids) > 0:
+                    cv2.aruco.drawDetectedMarkers(
+                        display, marker_corners, marker_ids)
+                if ids is not None and corner_count > 0:
+                    cv2.aruco.drawDetectedCornersCharuco(display, corners, ids)
+            status_text = (
+                f"ChArUco FOUND: {marker_count} markers, "
+                f"{corner_count} corners ({layout_name}) - press 'c'"
+                if found
+                else f"Markers: {marker_count} | ChArUco corners: "
+                     f"{corner_count}/{MIN_CHARUCO_CORNERS} ({layout_name})"
+            )
+            if not found:
+                return False, status_text, None, None
+            obj_points, image_points = active_board.matchImagePoints(corners, ids)
+            return True, status_text, obj_points, image_points
+
+        found, corners = cv2.findChessboardCorners(
+            gray,
+            (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
+            cv2.CALIB_CB_ADAPTIVE_THRESH
+            + cv2.CALIB_CB_NORMALIZE_IMAGE
+            + cv2.CALIB_CB_FAST_CHECK,
+        )
+        if not found:
+            return False, "No chessboard detected", None, None
+        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+        if display is not None:
+            cv2.drawChessboardCorners(
+                display, (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y), corners, True)
+        return True, "Chessboard FOUND - press 'c'", objp, corners
+
     # ── Storage for calibration data ──────────────────────────────────
     R_gripper2base_list = []   # rotation:    gripper -> base
     t_gripper2base_list = []   # translation: gripper -> base
@@ -451,6 +597,8 @@ def main():
     t_target2cam_list = []     # translation: chessboard -> camera
     reprojection_rmse_list = []
     sample_id_list = []
+    obj_points_list = []       # pooled board points per sample (refinement)
+    image_points_list = []
 
     sample_count = 0
 
@@ -572,74 +720,10 @@ def main():
         if zed.grab() != sl.ERROR_CODE.SUCCESS:
             continue
 
-        if use_zedx_mini:
-            zed.retrieve_image(image_mat, sl.VIEW.LEFT)
-        else:
-            zed.retrieve_image(image_mat)  # CameraOne: no VIEW arg
-        frame = image_mat.get_data()[:, :, :3].copy()  # drop alpha channel (BGRA→BGR)
+        frame = retrieve_frame()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         display = frame.copy()
-        if args.target == "charuco":
-            marker_corners, marker_ids, _ = marker_detector.detectMarkers(gray)
-            best_detection = None
-            for layout_name, candidate_board, candidate_detector in charuco_detectors:
-                candidate_corners, candidate_ids, _, _ = candidate_detector.detectBoard(
-                    gray,
-                    markerCorners=marker_corners,
-                    markerIds=marker_ids,
-                )
-                candidate_count = (
-                    0 if candidate_ids is None else len(candidate_ids)
-                )
-                if best_detection is None or candidate_count > best_detection[0]:
-                    best_detection = (
-                        candidate_count,
-                        layout_name,
-                        candidate_board,
-                        candidate_corners,
-                        candidate_ids,
-                    )
-            corner_count, layout_name, active_board, charuco_corners, charuco_ids = (
-                best_detection
-            )
-            marker_count = 0 if marker_ids is None else len(marker_ids)
-            found = corner_count >= MIN_CHARUCO_CORNERS
-            if marker_ids is not None and len(marker_ids) > 0:
-                cv2.aruco.drawDetectedMarkers(
-                    display, marker_corners, marker_ids)
-            if charuco_ids is not None and corner_count > 0:
-                cv2.aruco.drawDetectedCornersCharuco(
-                    display, charuco_corners, charuco_ids)
-            status_text = (
-                f"ChArUco FOUND: {marker_count} markers, "
-                f"{corner_count} corners ({layout_name}) - press 'c'"
-                if found
-                else f"Markers: {marker_count} | ChArUco corners: "
-                     f"{corner_count}/{MIN_CHARUCO_CORNERS} ({layout_name})"
-            )
-        else:
-            found, chessboard_corners = cv2.findChessboardCorners(
-                gray,
-                (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
-                cv2.CALIB_CB_ADAPTIVE_THRESH
-                + cv2.CALIB_CB_NORMALIZE_IMAGE
-                + cv2.CALIB_CB_FAST_CHECK,
-            )
-            if found:
-                chessboard_corners = cv2.cornerSubPix(
-                    gray, chessboard_corners, (11, 11), (-1, -1), criteria)
-                cv2.drawChessboardCorners(
-                    display,
-                    (CHESSBOARD_INNER_X, CHESSBOARD_INNER_Y),
-                    chessboard_corners,
-                    found,
-                )
-            status_text = (
-                "Chessboard FOUND - press 'c'"
-                if found
-                else "No chessboard detected"
-            )
+        found, status_text, _, _ = detect_board(gray, display)
 
         cv2.putText(
             display,
@@ -701,23 +785,34 @@ def main():
                     f"capturing again.")
                 continue
 
-            if args.target == "charuco":
-                obj_points, image_points = active_board.matchImagePoints(
-                    charuco_corners, charuco_ids)
-            else:
-                obj_points, image_points = objp, chessboard_corners
-            ret, rvec, tvec = cv2.solvePnP(
+            # The on-screen frame predates the settle window, so pool fresh
+            # frames taken after it: the pose is provably static and corner
+            # noise averages down across the pooled points.
+            obj_frames, img_frames = [], []
+            for _ in range(CAPTURE_FRAMES * 3):
+                if len(obj_frames) >= CAPTURE_FRAMES:
+                    break
+                if zed.grab() != sl.ERROR_CODE.SUCCESS:
+                    continue
+                ok, _, obj_f, img_f = detect_board(
+                    cv2.cvtColor(retrieve_frame(), cv2.COLOR_BGR2GRAY))
+                if ok:
+                    obj_frames.append(np.asarray(obj_f, np.float64).reshape(-1, 3))
+                    img_frames.append(np.asarray(img_f, np.float64).reshape(-1, 2))
+            if len(obj_frames) < CAPTURE_MIN_FRAMES:
+                node.get_logger().warn(
+                    f"Sample rejected: board seen in only {len(obj_frames)}/"
+                    f"{CAPTURE_FRAMES} post-settle frames (need "
+                    f"{CAPTURE_MIN_FRAMES}).")
+                continue
+            obj_points = np.vstack(obj_frames)
+            image_points = np.vstack(img_frames)
+            board_pose = solve_board_pose(
                 obj_points, image_points, camera_matrix, dist_coeffs)
-            if not ret:
+            if board_pose is None:
                 node.get_logger().warn("solvePnP failed — skipping.")
                 continue
-
-            projected_points, _ = cv2.projectPoints(
-                obj_points, rvec, tvec, camera_matrix, dist_coeffs)
-            observed = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
-            projected = projected_points.reshape(-1, 2)
-            reprojection_rmse = float(np.sqrt(np.mean(np.sum(
-                (observed - projected) ** 2, axis=1))))
+            rvec, tvec, reprojection_rmse = board_pose
             if (not np.isfinite(reprojection_rmse)
                     or reprojection_rmse > MAX_REPROJECTION_RMSE_PX):
                 node.get_logger().warn(
@@ -736,11 +831,14 @@ def main():
             t_target2cam_list.append(tvec.reshape(3, 1))
             reprojection_rmse_list.append(reprojection_rmse)
             sample_id_list.append(sample_count + 1)
+            obj_points_list.append(obj_points)
+            image_points_list.append(image_points)
 
             sample_count += 1
             node.get_logger().info(
                 f"Sample {sample_count} captured "
-                f"(reprojection={reprojection_rmse:.3f}px, settled="
+                f"(reprojection={reprojection_rmse:.3f}px over "
+                f"{len(obj_frames)} frames, settled="
                 f"{settle_translation * 1000.0:.2f}mm/"
                 f"{settle_rotation_deg:.2f}deg over "
                 f"{ROBOT_SETTLE_WINDOW_S:.1f}s).")
@@ -926,7 +1024,8 @@ def main():
         for values in (
                 R_gripper2base_list, t_gripper2base_list,
                 R_target2cam_list, t_target2cam_list,
-                reprojection_rmse_list, sample_id_list):
+                reprojection_rmse_list, sample_id_list,
+                obj_points_list, image_points_list):
             values[:] = [
                 value for index, value in enumerate(values)
                 if index not in rejected]
@@ -940,6 +1039,36 @@ def main():
             print("  Re-solve failed after filtering; calibration aborted.")
             shutdown_ros()
             return
+
+    print("\n" + "=" * 60)
+    print("REPROJECTION REFINEMENT (pixel error)")
+    print("=" * 60)
+    T_refined, reproj = refine_hand_eye_reprojection(
+        best_T,
+        [_to_T(R, t) for R, t in zip(R_gripper2base_list, t_gripper2base_list)],
+        [_to_T(R, t) for R, t in zip(R_target2cam_list, t_target2cam_list)],
+        obj_points_list, image_points_list, camera_matrix, dist_coeffs)
+    for label, px, per_sample in (
+            (best_method_name, reproj["before_px"], reproj["before_per_sample"]),
+            ("refined", reproj["after_px"], reproj["after_per_sample"])):
+        print(
+            f"  {label:<12s} RMSE {px:.3f}px | per-sample median "
+            f"{np.median(per_sample):.3f}px, worst {np.max(per_sample):.3f}px "
+            f"(sample {sample_id_list[int(np.argmax(per_sample))]})")
+    if reproj["success"] and reproj["after_px"] < reproj["before_px"]:
+        shift_mm = np.linalg.norm(T_refined[:3, 3] - best_T[:3, 3]) * 1000.0
+        shift_deg = np.degrees(Rotation.from_matrix(
+            best_T[:3, :3].T @ T_refined[:3, :3]).magnitude())
+        print(f"  ACCEPTED — moved {shift_mm:.2f}mm / {shift_deg:.3f}deg "
+              f"from {best_method_name}")
+        best_T = T_refined
+        best_method_name = f"{best_method_name}+REPROJ"
+        best_error = compute_consistency_error(best_T)
+        reprojection_rmse_px = reproj["after_px"]
+    else:
+        print(f"  KEPT {best_method_name} — refinement did not lower the "
+              f"pixel error")
+        reprojection_rmse_px = reproj["before_px"]
 
     final_translation_errors, final_rotation_errors_deg = (
         stationary_board_errors(best_T))
@@ -1023,6 +1152,7 @@ def main():
             "matrix": T_cam2gripper.tolist(),
             "method": best_method_name,
             "num_samples": sample_count,
+            "reprojection_rmse_px": float(reprojection_rmse_px),
             "stationary_board_validation": {
                 "translation_median_m": float(np.median(final_translation_errors)),
                 "translation_p95_m": float(np.percentile(final_translation_errors, 95)),
@@ -1075,6 +1205,7 @@ def main():
         "method": best_method_name,
         "mean_error_m": float(best_error),
         "num_samples": sample_count,
+        "reprojection_rmse_px": float(reprojection_rmse_px),
         "stationary_board_validation": {
             "translation_median_m": float(np.median(final_translation_errors)),
             "translation_p95_m": float(np.percentile(final_translation_errors, 95)),
@@ -1087,7 +1218,8 @@ def main():
         },
         "calibrated_at": timestamp,
     }
-    print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm)")
+    print(f"\nBest method: {best_method_name}  (mean error: {best_error*1000:.2f} mm, "
+          f"reprojection: {reprojection_rmse_px:.3f} px)")
     print("=" * 60)
 
     # ── Ask user to confirm URDF update ───────────────────────────────

@@ -112,7 +112,11 @@ def default_environment_calibrations():
         for environment in ("lab", "outdoor")
     }
     # The measured second-unit postures (LAB_NORMAL_*) apply to "lab", and
-    # "outdoor" keeps the computed NEW_GRIPPER-derived default.
+    # "outdoor" keeps the computed NEW_GRIPPER-derived default. A swap to
+    # "outdoor" was tried 2026-10-26 and reverted the same day: on the lab rig
+    # the computed default drove the fingers ~25deg past their stop and the
+    # stall sagged the UR 24V IO (7.9-9.4V faults); the measured posture had
+    # left ~6deg and never faulted.
     calibrations["lab"]["normal_open"] = (
         LAB_NORMAL_OPEN_POSITION.copy())
     calibrations["lab"]["normal_closed"] = (

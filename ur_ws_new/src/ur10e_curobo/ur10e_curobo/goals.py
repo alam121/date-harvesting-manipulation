@@ -3243,6 +3243,11 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
             report["no_candidate"] += 1
             continue
         report["matched"] += 1
+        # Last quality-passed sighting, before the correction gates: the close
+        # accuracy snapshot falls back to it when the final frame has the date
+        # hidden between the fingers.
+        report["last_match"] = best
+        report["last_match_wall"] = time.time()
         if best_d < min_d:
             report["below_min"] += 1
             continue
@@ -6572,6 +6577,7 @@ def plan_and_execute(node):
             }
             _inflight_stop = threading.Event()
             node._final_inflight_stop = _inflight_stop
+            node._close_geometry = None  # never record a previous grasp's geometry
             _inflight_thread = None
             _final_inplace_retried = False
             if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
@@ -6631,6 +6637,13 @@ def plan_and_execute(node):
                                 node, "_latest_grasp_crop_t", 0.0)), 3)
                     except Exception:
                         node._grasp_crop_at_close = None
+                    # Same instant, while vision is still streaming: where the
+                    # date is relative to the fingers, not just the arm's error.
+                    from .grasp_episode_recorder import snapshot_close_geometry
+                    snapshot_close_geometry(
+                        node, [float(x), float(y), float(z)],
+                        getattr(node, "_final_retarget_xyz", None) or final_target[:3],
+                        inflight_report=_inflight_report)
                     # Restore the pause the rest of the sequence expects.
                     _pause_t0 = time.perf_counter()
                     node.set_vision_mode("paused")
