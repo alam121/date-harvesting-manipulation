@@ -192,6 +192,10 @@ tcp_pose_broadcaster:
     pose_name: $(var tf_prefix)tcp_pose
     tf:
       child_frame_id: $(var tf_prefix)tool0_controller
+      # Default 0 = every 500 Hz control cycle. tool0_controller is only drawn
+      # in RViz, but 455 msg/s on /tf starved the vision node's Python TF
+      # listener (~200ms behind under load -> lookups at the image stamp fail).
+      publish_rate: 20.0
 
 tool_contact_controller:
   ros__parameters:

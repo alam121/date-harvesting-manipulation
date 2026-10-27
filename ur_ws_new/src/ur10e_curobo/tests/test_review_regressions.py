@@ -771,3 +771,34 @@ class SectionScanTests(unittest.TestCase):
         e = self.run_scan(plan_seconds=6)
         self.assertEqual(len([x for x in e if isinstance(x, tuple) and x[0] == 'plan']), 1)
         self.assertIn('reason=PLAN_BUDGET', e[-1])
+
+
+class ImageStampTfLookupTests(unittest.TestCase):
+    def test_waits_briefly_for_tf_at_the_image_stamp(self):
+        from tf2_ros import ExtrapolationException
+        tree = ast.parse((ROOT / 'vision/node.py').read_text())
+        owner = next(n.name for n in tree.body if isinstance(n, ast.ClassDef)
+                     and any(isinstance(f, ast.FunctionDef) and f.name == '_lookup_tf_at_image' for f in n.body))
+        import time as _time
+        env = dict(time=_time.time, sleep=_time.sleep, ExtrapolationException=ExtrapolationException,
+                   _tf_stamped_to_Rt=lambda t: t, rclpyTime=lambda: 'latest',
+                   rclpyDuration=lambda **kw: None)
+        fn = load('vision/node.py', '_lookup_tf_at_image', env, owner)
+
+        class Buf:
+            def __init__(self, misses):
+                self.misses, self.calls = misses, []
+            def lookup_transform(self, target, source, stamp, timeout=None):
+                self.calls.append(stamp)
+                if stamp != 'latest' and len(self.calls) <= self.misses:
+                    raise ExtrapolationException('future')
+                return stamp
+
+        self_ = types.SimpleNamespace(_latest_image_stamp='image', cam_frame='cam',
+                                      node=types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(warn=lambda m: None)))
+        self_.tf_buffer = Buf(misses=3)          # listener catches up after ~3ms
+        self.assertEqual(fn(self_, 'base_link'), 'image')
+        self_.tf_buffer = Buf(misses=10**6)      # never arrives: old fallback
+        t0 = _time.time()
+        self.assertEqual(fn(self_, 'base_link'), 'latest')
+        self.assertLess(_time.time() - t0, 0.1)

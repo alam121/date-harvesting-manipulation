@@ -23,7 +23,7 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Vector3Stamped
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String as StdString
 from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, Image as ROSImage
 from cv_bridge import CvBridge
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, ExtrapolationException, TransformListener
 import tf2_geometry_msgs  # noqa: F401 - Required for transform registration
 
 from .config import (
@@ -1248,7 +1248,14 @@ class VisionNode:
             if use_zedx_mini_only:
                 def _capture_zedx_mini():
                     _cap_image = sl.Mat()
-                    _cap_cloud = sl.Mat()
+                    # Two clouds used in turn instead of an 18ms copy of each.
+                    # Safe because the loop asks for the next depth frame only
+                    # after YOLO used this one, and finishes this frame's
+                    # geometry before asking again: at most one new cloud is
+                    # written while one is in use. Cached heatmaps/contacts
+                    # hold copies, never views.
+                    _cap_clouds = (sl.Mat(), sl.Mat())
+                    _cap_cloud_i = 0
                     _nurec_left, _nurec_right = sl.Mat(), sl.Mat()
                     _cap_times = deque(maxlen=30)
                     _cap_runtime = sl.RuntimeParameters()
@@ -1262,6 +1269,7 @@ class VisionNode:
                             if zed.grab(_cap_runtime) != sl.ERROR_CODE.SUCCESS:
                                 self.exit_signal = True
                                 break
+                            _cap_split = {"grab": time()}
                             # IMAGE is the acquisition timestamp, not grab completion.
                             _cap_t = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds() / 1e9
                             _cap_times.append(_cap_t)
@@ -1287,23 +1295,29 @@ class VisionNode:
                                         self.node.get_logger().warn("[NUREC] stereo retrieve failed; pair dropped")
                                 except Exception as exc:
                                     self.node.get_logger().warn(f"[NUREC] capture skipped: {exc}")
+                            _cap_split["image"] = time()
                             if _want_depth:
+                                _cap_cloud = _cap_clouds[_cap_cloud_i]
+                                _cap_cloud_i ^= 1
                                 zed.retrieve_measure(
                                     _cap_cloud, sl.MEASURE.XYZ, sl.MEM.CPU,
                                     sl.Resolution(disp_w, disp_h))
-                                _cap_pc = _cap_cloud.get_data()[:, :, :3].copy()
+                                _cap_split["depth"] = time()
+                                _cap_pc = _cap_cloud.get_data(deep_copy=False)[:, :, :3]
                             else:
                                 _cap_pc = None
                         _cap_rgb = _cap_image.get_data().copy()
                         _cap_stamp = self._ros_time_from_wall(_cap_t).to_msg()
                         _enqueue_imitation_frame(
                             _cap_rgb, _cap_stamp, frame_is_owned=True)
+                        # ready: grab + image/depth retrieval and copies done
+                        _cap_split["ready"] = time()
                         _packet = (
                             _cap_t,
                             _cap_fps,
                             _cap_rgb,
                             _cap_pc,
-                            time(),  # packet ready: grab + image/depth retrieval done
+                            _cap_split,
                         )
                         try:
                             _capture_queue.put_nowait(_packet)
@@ -1350,7 +1364,7 @@ class VisionNode:
                 _captured_pc_np = None
                 if use_zedx_mini_only:
                     try:
-                        t_now, loop_fps, image_left_ocv, _captured_pc_np, _cap_ready = (
+                        t_now, loop_fps, image_left_ocv, _captured_pc_np, _cap_split = (
                             _capture_queue.get(timeout=1.0))
                         _lat_got = time()
                     except queue.Empty:
@@ -1492,8 +1506,8 @@ class VisionNode:
                                     # depth, is the bottleneck, so the early depth
                                     # frame just waited ~180ms for it.
                                     _inference_packet = (t_now, image_left_ocv, _captured_pc_np)
-                                    _lat = {"ready": _cap_ready, "got": _lat_got,
-                                            "submit": time()}
+                                    _lat = dict(_cap_split, got=_lat_got,
+                                                submit=time())
                         else:
                             self.yolo_thread.set_image(image_left_ocv, capture_time=t_now)
                 _t1 = time()
@@ -1801,6 +1815,12 @@ class VisionNode:
                 if _lat_done is not None:
                     _lat_ms = {k: round((v - t_now) * 1000.0, 1)
                                for k, v in _lat_done.items()}
+                    # geometry split: TF lookup, per-date extraction, tracking,
+                    # trunk/voxel publish, best-target processing.
+                    _lat_ms.update({k: round((v - t_now) * 1000.0, 1) for k, v in (
+                        ("g_tf", _depth_t0), ("g_objects", _t3), ("g_track", _tp1),
+                        ("g_trunk", _tp2), ("g_best", _tp4))})
+                    _lat_ms["g_n"] = len(_extracted_targets)
                     _lat_ms["publish"] = round((time() - t_now) * 1000.0, 1)
                     _lat_ms.update({k: round(float(v), 1) for k, v in
                                     (_lat_yolo or {}).items() if v is not None})
@@ -2311,10 +2331,20 @@ class VisionNode:
         stamp = self._latest_image_stamp
         if stamp is None:
             raise RuntimeError("No image timestamp available for localization")
+        # Poll instead of tf2's timeout: that sleeps a fixed 20ms on the first
+        # miss. The listener thread occasionally trails by a few ms under GIL
+        # load; re-checking every 1ms gets the pose AT the image stamp almost
+        # as soon as it lands, instead of falling back to an older one.
+        deadline = time() + 0.03
         try:
-            return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
-                target_frame, self.cam_frame, stamp,
-                timeout=rclpyDuration(seconds=0.01)))
+            while True:
+                try:
+                    return _tf_stamped_to_Rt(self.tf_buffer.lookup_transform(
+                        target_frame, self.cam_frame, stamp))
+                except ExtrapolationException:
+                    if time() >= deadline:
+                        raise
+                    sleep(0.001)
         except Exception as exc:
             # The image stamp is taken right after grab() returns and /tf
             # arrives about every 1.5ms, so the stamp is routinely a hair NEWER

@@ -56,6 +56,12 @@ def main():
             return
         received = (node.get_clock().now().nanoseconds - int(data["stamp_ns"])) / 1e6
         row = {name: lat[b] - (lat[a] if a else 0.0) for name, a, b in STAGES}
+        # Split grab+depth: transfer + depth compute, image, depth retrieve, copies.
+        if "depth" in lat:
+            row["  .grab"] = lat["grab"]
+            row["  .img"] = lat["image"] - lat["grab"]
+            row["  .xyz"] = lat["depth"] - lat["image"]
+            row["  .copy"] = lat["ready"] - lat["depth"]
         # Split "yolo" with the worker's own timings.
         if "predict_wall_ms" in lat:
             row["y.wait"] = lat["capture_to_start_ms"] - lat["submit"]
@@ -73,6 +79,14 @@ def main():
                 row["#masked"] = lat["mask_rows"]
             row["y.pickup"] = (row["yolo"] - row["y.wait"] - row["y.predict"]
                                - row["y.masks"])
+        if "g_tf" in lat:
+            row["  .tf"] = lat["g_tf"] - lat["infer"]
+            row["  .dates"] = lat["g_objects"] - lat["g_tf"]
+            row["  .track"] = lat["g_track"] - lat["g_objects"]
+            row["  .trunk"] = lat["g_trunk"] - lat["g_track"]
+            row["  .best"] = lat["g_best"] - lat["g_trunk"]
+            row["  .pub"] = lat["publish"] - lat["g_best"]
+            row["#dates"] = lat["g_n"]
         row["transport"] = received - lat["publish"]
         row["TOTAL"] = received
         rows.setdefault(phase["name"], []).append(row)
@@ -87,8 +101,15 @@ def main():
         print("No observations with latency_ms -- is vision running the new code?")
         return
     names = [s[0] for s in STAGES] + ["transport", "TOTAL"]
+    if any("  .grab" in r for rs in rows.values() for r in rs):
+        names[1:1] = ["  .grab", "  .img", "  .xyz", "  .copy"]
+    if any("  .tf" in r for rs in rows.values() for r in rs):
+        at = names.index("geometry") + 1
+        names[at:at] = ["  .tf", "  .dates", "  .track", "  .trunk", "  .best",
+                        "  .pub", "#dates"]
     if any("y.wait" in r for rs in rows.values() for r in rs):
-        names[4:4] = ["y.wait", "y.predict", "  .pre", "  .trt", "  .post",
+        at = names.index("geometry")
+        names[at:at] = ["y.wait", "y.predict", "  .pre", "  .trt", "  .post",
                       "   ..filter", "   ..masks", "   ..tail", "#masked",
                       "y.masks", "y.pickup"]
     print(f"{'phase':<10}{'n':>5}  " + "".join(f"{n:>13}" for n in names))

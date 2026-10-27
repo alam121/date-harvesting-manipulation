@@ -333,7 +333,11 @@ def launch_setup(context, *args, **kwargs):
         package="robot_state_publisher",
         executable="robot_state_publisher",
         output="both",
-        parameters=[robot_description],
+        # Default 20 Hz left the arm TF up to 50ms+ behind each camera photo:
+        # vision's lookup at the image stamp failed, slept 20ms in tf2, and fell
+        # back to a stale pose (~15mm camera error at 0.3 m/s). 100 Hz keeps a
+        # sample around every image without doubling /tf traffic like 500 Hz.
+        parameters=[robot_description, {"publish_frequency": 100.0}],
     )
 
     rviz_node = Node(
