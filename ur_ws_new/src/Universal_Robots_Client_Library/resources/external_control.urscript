@@ -1,6 +1,12 @@
 # HEADER_BEGIN
 
 {{BEGIN_REPLACE}}
+# Datepalm: the Delto gripper needs 24V dual-pin tool power (its closing
+# stall tops the 12V/single-pin budget). The outdoor PolyScope X pendant
+# offers no 24V setting and power-on restores its 12V installation, so
+# set it every time External Control starts. Harmless where already 24V.
+set_tool_voltage(24)
+set_tool_output_mode(1)
 
 steptime = get_steptime()
 
