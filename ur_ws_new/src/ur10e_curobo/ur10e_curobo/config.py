@@ -1122,7 +1122,10 @@ class Gripper:
     # it. A 3.32A stall sagged the outdoor 24V IO to 15V (2026-10-28) because
     # all steps went out before the fingers moved. Lower if [GRIPPER_CURRENT]
     # peaks still top the limit; raise if closes get slow or weak. 0 disables.
-    close_max_lead_rad: float = 0.26
+    # 0.26 -> 0.45 on 2026-11-02: at 0.26 empty closes peaked at only 0.04A
+    # but M7 stopped 19-29deg short of the closed pose (friction needs more
+    # gap than that), and the stalled finger read as contact.
+    close_max_lead_rad: float = 0.45
     # 10 x 0.04s -> 20 x 0.03s on 2026-10-29 (close 0.4s -> 0.6s), eased so
     # the fingers slow down as they meet the date: dates were slipping out.
     closing_steps: int = 20
