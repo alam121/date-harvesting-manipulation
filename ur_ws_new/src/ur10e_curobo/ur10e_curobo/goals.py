@@ -3255,7 +3255,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
             except Exception:
                 pass
         usable = []
-        for cand in observation.poses:
+        _feats = getattr(observation, "features", ()) or ()
+        for _ci, cand in enumerate(observation.poses):
             if len(cand) < 3:
                 usable.append(False)
                 continue
@@ -3263,13 +3264,17 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
             usable.append(ok)
             if entry is not None:
                 try:
-                    # [x, y, z, dist_mm, vis_ratio, z_std_mm, conf, ok]
+                    # [x, y, z, dist_mm, vis_ratio, z_std_mm, conf, ok,
+                    #  diameter_mm, L, a, b, overlap_iou] -- the image evidence
+                    # the track saw, to tune its overlap/appearance thresholds.
                     q = (_reacquire_candidate_quality(node, cand, observation)
                          or [float("nan")] * 5)
+                    f = _feats[_ci] if _ci < len(_feats) else [float("nan")] * 5
                     entry["c"].append([
                         round(cand[0], 4), round(cand[1], 4), round(cand[2], 4),
                         round(math.dist(cand[:3], target_xyz[:3]) * 1000.0, 1),
-                        round(q[0], 2), round(q[1] * 1000.0, 1), round(q[2], 2), ok])
+                        round(q[0], 2), round(q[1] * 1000.0, 1), round(q[2], 2), ok]
+                        + [round(float(v), 2) for v in f])
                 except Exception:
                     pass
             if not ok:
