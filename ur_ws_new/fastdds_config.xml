@@ -25,6 +25,14 @@
                     <transport_id>udp_transport</transport_id>
                 </userTransports>
                 <useBuiltinTransports>false</useBuiltinTransports>
+                <builtin>
+                    <!-- Setting this replaces the default multicast peer, so keep it
+                         for local discovery and add the remote workstation. -->
+                    <initialPeersList>
+                        <locator><udpv4><address>239.255.0.1</address></udpv4></locator>
+                        <locator><udpv4><address>10.76.154.75</address></udpv4></locator>
+                    </initialPeersList>
+                </builtin>
             </rtps>
         </participant>
     </profiles>
