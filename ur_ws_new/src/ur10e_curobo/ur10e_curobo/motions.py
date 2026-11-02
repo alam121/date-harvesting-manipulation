@@ -102,13 +102,22 @@ def _plan_cartesian_states_from_joints(node, start_joints, pose, label: str, pla
     lock = getattr(node, '_planning_lock', None)
     yolo = getattr(node, 'yolo_thread', None)
     yolo_lock = getattr(yolo, 'inference_lock', None)
+    # Where a slow preflight's time goes: waiting on YOLO, waiting on another
+    # planner user (e.g. the drop-off preplan), or cuRobo itself. A discovery
+    # scan once spent 8.7s in one candidate (2026-11-02).
+    _t0 = time.perf_counter()
+    timing = node._last_cartesian_plan_timing = {}
     if yolo_lock:
         yolo_lock.acquire()
     try:
+        timing["yolo_wait_s"] = round(time.perf_counter() - _t0, 3)
         if lock:
             lock.acquire()
         try:
+            _t1 = time.perf_counter()
+            timing["lock_wait_s"] = round(_t1 - _t0 - timing["yolo_wait_s"], 3)
             res = node.motion_gen.plan_pose(start, goal, plan_cfg or PLAN_CFG_DEFAULT)
+            timing["plan_s"] = round(time.perf_counter() - _t1, 3)
         except Exception as e:
             msg = str(e)
             if "CUDA error" in msg or "illegal memory access" in msg:

@@ -342,7 +342,8 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
     stalled = False
     reached = False
     STALL_TIMEOUT = 2.0
-    _deadline = time.monotonic() + timeout
+    _wait_t0 = time.monotonic()
+    _deadline = _wait_t0 + timeout
     _min_dist_seen = float('inf')
     _prog_was_off = False
 
@@ -394,6 +395,23 @@ def wait_until_xyz(node, target_xyz, tol: float = 0.005, timeout: float = 10.0,
                 node.get_logger().warn("Stop requested during wait; holding.")
                 publish_stop_trajectory(node)
                 node._stop_was_requested = True
+                break
+
+            # Stopped on purpose because a goal was found (e.g. scan
+            # discovery): that ends this motion -- it is not a stall. Wait
+            # only for the arm to settle, instead of the 2s stall timeout
+            # (2026-11-02: found 14:48:46, released 14:48:49 as a "failure").
+            if getattr(node, "_goal_stop_t", 0.0) > _wait_t0:
+                _settle_end = time.monotonic() + 1.5
+                while time.monotonic() < _settle_end:
+                    _v = getattr(node, 'current_joint_velocities', None)
+                    if (_v is not None and len(_v)
+                            and max(abs(float(x)) for x in _v) <= 0.01):
+                        break
+                    time.sleep(0.02)
+                node.get_logger().info(
+                    f"Motion stopped: goal found; settled "
+                    f"{time.monotonic() - node._goal_stop_t:.2f}s after the stop")
                 break
 
             # Robot program off — wait silently

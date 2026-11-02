@@ -116,6 +116,22 @@ class WaitTests(unittest.TestCase):
     def test_stale_feedback_does_not_succeed(self):
         self.node._state_mgr=types.SimpleNamespace(_joint_state_received_at=0)
         self.assertFalse(self.fn(self.node,[0,0,0],timeout=.3))
+    def test_stop_for_found_goal_ends_after_settling_not_stall(self):
+        # Arm stopped 3.8 cm short because a goal was found mid-scan.
+        self.node.get_end_effector_pose=lambda:[.038,0,0,1,0,0,0]
+        self.node.current_joint_velocities=[.2]*6
+        def tick():
+            if self.clock.t>1.2 and not hasattr(self.node,'_goal_stop_t'):
+                self.node._goal_stop_t=self.clock.t          # goal callback stops the arm
+            if self.clock.t>1.5:
+                self.node.current_joint_velocities=[0]*6     # settled
+        self.clock.callback=tick
+        self.assertFalse(self.fn(self.node,[0,0,0],timeout=10))
+        self.assertLess(self.clock.t,1.7)                    # not the 2 s stall timeout
+        self.assertEqual(getattr(self.node,'_goal_stall_count',0),0)
+    def test_goal_stop_before_this_wait_is_ignored(self):
+        self.node._goal_stop_t=0.5                           # from an earlier motion
+        self.assertTrue(self.fn(self.node,[0,0,0],timeout=.5))
 
 
 class TrackerTests(unittest.TestCase):

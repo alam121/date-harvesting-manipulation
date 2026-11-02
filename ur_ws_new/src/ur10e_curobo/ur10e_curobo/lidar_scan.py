@@ -1117,7 +1117,11 @@ def _execute_scan_joint(node, joints, label, speed_factor):
 def _run_discovery_scan(node, goal_available):
     """Plan and execute one checked viewpoint at a time, from measured joints."""
     cfg = node.cfg.lidar_scan
+    _t_rows = time.monotonic()
     rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
+    node.get_logger().info(
+        f"[LIDAR_DISCOVERY_TIMING] rows={time.monotonic() - _t_rows:.2f}s "
+        f"({sum(len(r) for r in rows)} poses)")
     budget = max(0.1, float(getattr(cfg, "discovery_plan_budget_s", 5.0)))
     deadline = time.monotonic() + budget
     moved = False
@@ -1135,10 +1139,22 @@ def _run_discovery_scan(node, goal_available):
             if node.current_joint_positions is None:
                 return False
             attempts += 1
+            _t_cand = time.monotonic()
             candidate, reason = _cartesian_scan_candidate(
                 node, list(node.current_joint_positions), pose,
                 f"SCAN_DISCOVERY_{attempts}", require_horizontal=moved,
                 log_rejection=False, plan_cfg=PlanOptions(max_attempts=1))
+            # The budget is only checked between candidates, so one slow call
+            # can overrun it; log where each candidate's time went.
+            _pt = getattr(node, "_last_cartesian_plan_timing", None) or {}
+            _total = time.monotonic() - _t_cand
+            node.get_logger().info(
+                f"[LIDAR_DISCOVERY_TIMING] candidate={attempts} total={_total:.2f}s "
+                f"yolo_wait={_pt.get('yolo_wait_s', float('nan')):.2f}s "
+                f"lock_wait={_pt.get('lock_wait_s', float('nan')):.2f}s "
+                f"plan={_pt.get('plan_s', float('nan')):.2f}s "
+                f"checks={_total - sum(_pt.get(k, 0.0) for k in ('yolo_wait_s', 'lock_wait_s', 'plan_s')):.2f}s "
+                f"result={'OK' if candidate is not None else reason}")
             # Detection/stop can arrive while the non-interruptible planner runs.
             if goal_available():
                 return True

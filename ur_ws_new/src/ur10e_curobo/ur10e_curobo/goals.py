@@ -3697,6 +3697,9 @@ def subscribe_to_goal_pose(node):
                     pass
 
             publish_stop_trajectory(node)
+            # Lets a motion waiting in wait_until_xyz end as "stopped: goal
+            # found" once settled, instead of waiting out a stall timeout.
+            node._goal_stop_t = time.monotonic()
 
             node.goal_seed_xy = [new_xyz[0], new_xyz[1]]
             node.best_goal_xyz = new_xyz
