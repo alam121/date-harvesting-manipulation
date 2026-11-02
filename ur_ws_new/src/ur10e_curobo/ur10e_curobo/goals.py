@@ -3847,7 +3847,7 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
     each goal must be stable (2 readings <2cm) and distinct from accepted goals.
     Goals are queued in node.goal_poses for sequential execution.
     """
-    DISTINCT_DIST = 0.05  # 5cm apart to count as a separate goal
+    DISTINCT_DIST = 0.03  # same-date distance; matches vision EXCLUSION_RADIUS_M
 
     # Wait until robot stops before subscribing
     if is_robot_moving(node):

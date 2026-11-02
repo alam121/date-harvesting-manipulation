@@ -75,8 +75,8 @@ GRIPPER_FORCE_TOPIC = "/gripper/force"
 TRAJECTORY_TOPIC = "/scaled_joint_trajectory_controller/joint_trajectory"
 GRIPPER_JOINT_STATE_TOPIC = "/gripper/joint_states"
 DELTO_JOINT_NAMES = [f"F{finger}M{motor}" for finger in (1, 2, 3) for motor in (1, 2, 3, 4)]
-# As the real vision node: the best-target choice skips dates within 8 cm of an excluded position.
-EXCLUDE_RADIUS_M = 0.08
+# As the real vision node: the best-target choice skips dates within 3 cm of an excluded position.
+EXCLUDE_RADIUS_M = 0.03
 
 LATEST_ONLY_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,

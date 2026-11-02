@@ -59,6 +59,11 @@ from .zed_utils import (
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
 from .tracking import FruitTracker, appearance_features
 
+# An excluded position stands for ONE date: skip detections within this
+# radius only (same-date distance used by main). Was 8 cm, which also
+# skipped reachable neighbours of a date auto-harvest gave up on.
+EXCLUSION_RADIUS_M = 0.03
+
 # Per-date depth diagnostics, throttled to ~2 Hz while resolving range-dependent
 # foreground/background selection. Disable after field validation.
 DEBUG_DEPTH_SAMPLING = True
@@ -3629,7 +3634,7 @@ class VisionNode:
                 prev_pt = self.best_target_prev.get("pt_base")
                 if prev_pt is not None:
                     prev_pos = [prev_pt.point.x, prev_pt.point.y, prev_pt.point.z]
-                    if any(math.dist(prev_pos, ep) < 0.08 for ep in self.excluded_positions):
+                    if any(math.dist(prev_pos, ep) < EXCLUSION_RADIUS_M for ep in self.excluded_positions):
                         self.best_target_prev = None
 
         prev_pt_base = None
@@ -3658,7 +3663,7 @@ class VisionNode:
                 if pt is not None:
                     t_pos = [pt.point.x, pt.point.y, pt.point.z]
                     dists = [math.dist(t_pos, ep) for ep in self.excluded_positions]
-                    if any(d < 0.08 for d in dists):
+                    if any(d < EXCLUSION_RADIUS_M for d in dists):
                         t["excluded"] = True
                         continue
 
