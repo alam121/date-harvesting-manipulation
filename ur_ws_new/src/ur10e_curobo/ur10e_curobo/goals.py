@@ -3226,12 +3226,42 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
         report["frames"] += 1
         best, best_d = None, float("inf")
         observation = getattr(node, "_fruit_observation", None)
+        # Per-frame timeline for the episode: how the target's detection,
+        # confidence and position evolve through FINAL -- measures sway and
+        # where/why the date drops out (outdoors 2026-10-28, 12 of 19 closes
+        # had no detection of it). Logging only; capped to bound episode size.
+        timeline = report.setdefault("timeline", [])
+        entry = None
+        if len(timeline) < 80:
+            entry = {"t": round(time.time() - t0, 3),
+                     "tgt": [round(v, 4) for v in target_xyz[:3]]}
+            timeline.append(entry)
         if observation is None or not observation.fresh(node.get_clock().now().nanoseconds):
+            if entry is not None:
+                entry["stale"] = True
             continue
+        if entry is not None:
+            entry["c"] = []
+            try:
+                entry["age"] = round((node.get_clock().now().nanoseconds
+                                      - observation.stamp_ns) / 1e9, 3)
+            except Exception:
+                pass
         for cand in observation.poses:
             if len(cand) < 3:
                 continue
             ok, why = _reacquire_quality_ok(node, cand, observation)
+            if entry is not None:
+                try:
+                    # [x, y, z, dist_mm, vis_ratio, z_std_mm, conf, ok]
+                    q = (_reacquire_candidate_quality(node, cand, observation)
+                         or [float("nan")] * 5)
+                    entry["c"].append([
+                        round(cand[0], 4), round(cand[1], 4), round(cand[2], 4),
+                        round(math.dist(cand[:3], target_xyz[:3]) * 1000.0, 1),
+                        round(q[0], 2), round(q[1] * 1000.0, 1), round(q[2], 2), ok])
+                except Exception:
+                    pass
             if not ok:
                 report["rejected"] += 1
                 report["last_reject"] = why
@@ -3239,6 +3269,8 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
             d = math.dist(cand[:3], target_xyz[:3])
             if d < best_d:
                 best, best_d = list(cand[:3]), d
+        if entry is not None:
+            entry["c"] = sorted(entry["c"], key=lambda c: c[3])[:3]
         if best is None:
             report["no_candidate"] += 1
             continue

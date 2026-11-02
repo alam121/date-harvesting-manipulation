@@ -668,6 +668,46 @@ class AfterReverseSnapshotTests(unittest.TestCase):
             self.assertEqual(ep["after_reverse"]["gripper_joint_position"], [0.1] * 12)
 
 
+class FinalInflightTimelineTests(unittest.TestCase):
+    def test_timeline_records_nearest_candidates_with_quality(self):
+        import time as _time
+        env = dict(time=_time, math=math)
+        for name in ("_reacquire_candidate_quality", "_reacquire_quality_ok",
+                     "_final_inflight_monitor"):
+            fn = load('goals.py', name, env)
+        planner = types.SimpleNamespace(
+            final_inflight_min_delta_m=0.002, final_inflight_max_delta_m=0.025,
+            final_inflight_apply=False)
+        now_ns = lambda: int(_time.time() * 1e9)
+        obs = types.SimpleNamespace(
+            stamp_ns=now_ns(), fresh=lambda ns: True,
+            poses=((0.0, 0.0, 0.0), (0.010, 0.0, 0.0), (0.200, 0.0, 0.0),
+                   (0.050, 0.0, 0.0)),
+            qualities=((0.9, 0.002, 0.8, 1, 0.1), (0.9, 0.002, 0.10, 1, 0.1),
+                       (0.9, 0.002, 0.8, 1, 0.1), (0.9, 0.002, 0.8, 1, 0.1)))
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(planner=planner), all_fruits_seq=0,
+            _fruit_observation=obs,
+            get_clock=lambda: types.SimpleNamespace(
+                now=lambda: types.SimpleNamespace(nanoseconds=now_ns())))
+        stop = threading.Event()
+        report = dict(frames=0, rejected=0, no_candidate=0, matched=0,
+                      below_min=0, above_max=0, usable=0, applied=0,
+                      applied_total=0.0, last_apply_t=0.0)
+        t = threading.Thread(target=fn, args=(node, [0.0, 0.0, 0.0], stop, report))
+        t.start()
+        node.all_fruits_seq = 1         # one new frame
+        _time.sleep(0.2)
+        stop.set()
+        t.join(1.0)
+        self.assertEqual(len(report["timeline"]), 1)
+        cands = report["timeline"][0]["c"]
+        self.assertEqual([c[3] for c in cands], [0.0, 10.0, 50.0])  # nearest 3
+        self.assertEqual([c[7] for c in cands], [True, False, True])  # conf 0.10 fails
+        self.assertEqual(cands[1][6], 0.1)
+        self.assertGreaterEqual(report["timeline"][0]["age"], 0.0)
+
+
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):
         import cv2
