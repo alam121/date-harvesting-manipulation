@@ -645,8 +645,7 @@ class AfterReverseSnapshotTests(unittest.TestCase):
             cfg=types.SimpleNamespace(planner=types.SimpleNamespace(
                 grasp_episode_recording=True)),
             get_logger=lambda: logger,
-            _latest_grasp_crop=np.zeros((8, 8, 3), np.uint8),
-            _latest_grasp_crop_t=_time.time(),
+            capture_grasp_pair_frame=lambda *a, **k: np.zeros((8, 8, 3), np.uint8),
             gripper_controller=types.SimpleNamespace(
                 actual_joint_position=[0.1] * 12, actual_joint_effort=[0.02] * 12),
             _last_episode=("/old/episode", _time.time() - 60.0))  # previous cycle

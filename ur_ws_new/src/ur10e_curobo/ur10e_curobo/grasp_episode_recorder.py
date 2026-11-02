@@ -131,28 +131,30 @@ def snapshot_after_reverse(node, t_close: float) -> None:
     """Add the after-reverse camera crop and gripper state to this attempt's
     episode, without delaying the cycle.
 
-    The crop and gripper state are copied now; a thread waits for the episode
-    (the outcome classifier usually decides ~1.9s after close, often after
-    this) and writes them into it as after_reverse.jpg / "after_reverse".
-    Retention is judged from crop_close.jpg vs after_reverse.jpg.
+    Gripper state is copied now. A thread grabs a fresh raw camera frame --
+    not /vision/grasp_crop, which is only published while a date is detected
+    and so stops before the fingers close (2026-11-02: every "after-reverse"
+    crop was the pre-close frame, 3.2-3.5s old) -- then waits for the
+    episode (the outcome classifier usually decides ~1.9s after close, often
+    after this) and writes both in as after_reverse.jpg / "after_reverse".
     """
     planner = getattr(getattr(node, "cfg", None), "planner", None)
     if not bool(getattr(planner, "grasp_episode_recording", False)):
         return
     gc = getattr(node, "gripper_controller", None)
-    img = getattr(node, "_latest_grasp_crop", None)
     snap = {
         "wall_time": time.time(),
-        "crop_age_s": _safe(lambda: round(
-            time.time() - float(node._latest_grasp_crop_t), 3)),
         "gripper_joint_position": _jsonable(
             getattr(gc, "actual_joint_position", None) if gc else None),
         "gripper_joint_effort": _jsonable(
             getattr(gc, "actual_joint_effort", None) if gc else None),
     }
-    img = img.copy() if img is not None else None
 
     def _write():
+        img = _safe(lambda: node.capture_grasp_pair_frame(
+            f"{t_close:.3f}", "after_reverse", timeout=1.0))
+        # Arm is already heading to drop-off by then; how far is in the delay.
+        snap["image_delay_s"] = round(time.time() - snap["wall_time"], 3)
         # ponytail: pairs by time -- the first episode recorded after this
         # close. Cycles are >10s apart; tag episodes with an attempt id if
         # that ever stops holding.
