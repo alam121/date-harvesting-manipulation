@@ -1045,7 +1045,7 @@
          A profile without them (a seed, e.g. zed_one_rgb_zedx_mini_depth)
          falls through to this value, so it must stay current. Kept in step by
          hand_eye_calibration.py; see URDF_FILES there. -->
-    <origin rpy="-0.103508 0.003320 -1.264110" xyz="-0.120561 -0.012048 0.073652"/><!-- hand-eye calibrated (DANIILIDIS+REPROJ, 1.20mm error, 20 samples, updated 2026-10-26 11:33:30) -->
+    <origin rpy="-0.108042 0.011765 0.002337" xyz="-0.025010 -0.117943 0.072092"/><!-- hand-eye calibrated (DANIILIDIS+REPROJ, 1.29mm error, 20 samples, updated 2026-10-28 16:30:27) -->
     <!-- hand-eye calibrated (DANIILIDIS, 2.89mm consistency error, 34 samples, 2026-07-28) -->
   </joint>
 
