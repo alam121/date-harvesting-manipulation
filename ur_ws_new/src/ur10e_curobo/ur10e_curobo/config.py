@@ -914,6 +914,11 @@ class Planner:
     final_inflight_max_updates: int = 2      # cap retargets per FINAL move
     final_inflight_max_attempts: int = 2     # includes rejected planning attempts
     final_inflight_min_interval_s: float = 0.25
+    # Pick "the date" in each FINAL frame from a track of it (fruit_track:
+    # predicted position + velocity + uncertainty, size/colour/overlap
+    # evidence) rather than the detection nearest the target. Ambiguous frames
+    # give no correction instead of switching to a neighbour. False = nearest.
+    final_track_association: bool = True
     final_visual_verification_s: float = 0.0    # optional observation-only pause; disabled for harvesting
     phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves

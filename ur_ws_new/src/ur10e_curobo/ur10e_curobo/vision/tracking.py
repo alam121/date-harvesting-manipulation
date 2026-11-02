@@ -5,6 +5,9 @@ import threading
 from time import time
 from typing import Dict, List, Any
 
+import cv2
+import numpy as np
+
 # Nearest-neighbour association in base_link. 15mm was tight against real
 # measurement jitter -- an arm moving at 0.3 m/s with 28ms of TF lag is already
 # ~8mm, before depth noise -- and every miss created a duplicate registry entry.
@@ -224,3 +227,47 @@ class FruitTracker:
             del self.detection_history[fid]
 
         return stabilized
+
+
+def _box_iou(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def appearance_features(target: Dict[str, Any], image, others) -> List[float]:
+    """[diameter_mm, L, a, b, overlap_iou] for one detection.
+
+    Image evidence for main's selected-fruit track, so it can tell the date it
+    is picking from a neighbour at similar 3-D position: physical size (mask
+    area scaled by depth -- range-invariant), mean CIELAB colour inside the
+    mask, and the largest box IoU with any other detection (high = the masks
+    may mix two dates). Unknown values are NaN; never raises.
+    """
+    out = [float("nan")] * 4 + [0.0]
+    try:
+        bb = [float(v) for v in target["bb"]]
+        zc, fx = float(target.get("Zc", 0.0)), float(target.get("fx", 0.0))
+        area = float(target.get("mask_area_px", 0))
+        if zc > 0 and fx > 0 and area > 0:
+            out[0] = 2.0 * math.sqrt(area / math.pi) * zc / fx * 1000.0
+        out[4] = max((_box_iou(bb, [float(v) for v in o["bb"]])
+                      for o in others if o is not target and o.get("bb") is not None),
+                     default=0.0)
+        mask = target.get("mask_resized")
+        x1, y1, x2, y2 = (int(v) for v in bb)
+        if image is not None and mask is not None and x2 > x1 and y2 > y1:
+            roi = image[y1:y2, x1:x2, :3]
+            if roi.shape[:2] == mask.shape[:2]:
+                sel = mask > 0
+                if np.count_nonzero(sel) >= 20:
+                    lab = cv2.cvtColor(np.ascontiguousarray(roi), cv2.COLOR_BGR2LAB)
+                    # OpenCV 8-bit Lab: L*255/100, a+128, b+128 -> CIELAB
+                    mean = lab[sel].reshape(-1, 3).mean(axis=0)
+                    out[1:4] = [float(mean[0]) * 100.0 / 255.0,
+                                float(mean[1]) - 128.0, float(mean[2]) - 128.0]
+    except Exception:
+        pass
+    return out

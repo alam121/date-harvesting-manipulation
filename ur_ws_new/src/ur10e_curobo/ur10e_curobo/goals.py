@@ -108,6 +108,7 @@ from .motions import blend_motion, preplan_js, execute_preplan, plan_execute_js,
 from .utils import compute_visibility_approach
 from .fk import forward_kinematics, forward_kinematics_batch, pose_from_joints
 from .grasp_learner import GraspRecord
+from .fruit_track import SelectedFruitTrack
 from . import gripper as gripper_mod
 from . import markers as markers_mod
 
@@ -3216,6 +3217,12 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     max_d = float(getattr(planner, "final_inflight_max_delta_m", 0.025))
     t0 = time.time()
     seen_seq = int(getattr(node, "all_fruits_seq", 0) or 0)
+    # "Which detection is the date" comes from a track of it (predicted
+    # position + velocity + uncertainty, image evidence) instead of the
+    # detection nearest the target; ambiguous frames give no candidate.
+    use_track = bool(getattr(planner, "final_track_association", True))
+    track = None
+    node._selected_fruit_track = None
     while not stop_evt.is_set():
         if stop_evt.wait(0.05):
             break
@@ -3247,10 +3254,13 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
                                       - observation.stamp_ns) / 1e9, 3)
             except Exception:
                 pass
+        usable = []
         for cand in observation.poses:
             if len(cand) < 3:
+                usable.append(False)
                 continue
             ok, why = _reacquire_quality_ok(node, cand, observation)
+            usable.append(ok)
             if entry is not None:
                 try:
                     # [x, y, z, dist_mm, vis_ratio, z_std_mm, conf, ok]
@@ -3271,6 +3281,40 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
                 best, best_d = list(cand[:3]), d
         if entry is not None:
             entry["c"] = sorted(entry["c"], key=lambda c: c[3])[:3]
+        if use_track:
+            try:
+                stamp_s = observation.stamp_ns / 1e9
+                if track is None:
+                    track = SelectedFruitTrack(target_xyz[:3], stamp_s)
+                    node._selected_fruit_track = track
+                idx, status = track.step(
+                    stamp_s, observation.poses,
+                    [q[1] for q in observation.qualities],
+                    getattr(observation, "features", ()) or None, usable)
+                best = list(observation.poses[idx][:3]) if idx is not None else None
+                best_d = (math.dist(best, target_xyz[:3]) if best is not None
+                          else float("inf"))
+                s = track.state()
+                report["track"] = dict(s, counts=dict(track.counts))
+                if entry is not None:
+                    # [x, y, z, vx, vy, vz, pos_std_mm, vel_std_mm_s, conf, status]
+                    entry["trk"] = (
+                        [round(v, 4) for v in s["position"]]
+                        + [round(v, 4) for v in s["velocity"]]
+                        + [round(s["pos_std_m"] * 1000.0, 1),
+                           round(s["vel_std_mps"] * 1000.0, 1),
+                           round(s["confidence"], 2), status])
+                if idx is None:
+                    report["track_" + status] = report.get("track_" + status, 0) + 1
+            except Exception as exc:
+                # Never lose the in-flight check over the track: fall back to
+                # nearest-to-target for the rest of this move.
+                use_track = False
+                report["track_error"] = str(exc)
+                try:
+                    node.get_logger().warn(f"[FINAL_TRACK] disabled for this move: {exc}")
+                except Exception:
+                    pass
         if best is None:
             report["no_candidate"] += 1
             continue

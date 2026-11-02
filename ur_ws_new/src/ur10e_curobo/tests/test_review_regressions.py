@@ -708,6 +708,52 @@ class FinalInflightTimelineTests(unittest.TestCase):
         self.assertGreaterEqual(report["timeline"][0]["age"], 0.0)
 
 
+class FinalTrackAssociationTests(unittest.TestCase):
+    def test_hidden_date_does_not_switch_to_neighbour(self):
+        import time as _time
+        from ur10e_curobo.fruit_track import SelectedFruitTrack
+        env = dict(time=_time, math=math, SelectedFruitTrack=SelectedFruitTrack)
+        for name in ("_reacquire_candidate_quality", "_reacquire_quality_ok",
+                     "_final_inflight_monitor"):
+            fn = load('goals.py', name, env)
+        planner = types.SimpleNamespace(
+            final_inflight_min_delta_m=0.002, final_inflight_max_delta_m=0.025,
+            final_inflight_apply=False)
+        now_ns = lambda: int(_time.time() * 1e9)
+        good = (0.9, 0.003, 0.8, 1, 0.1)
+        date_f, other_f = (22, 50, 20, 40, 0), (22, 80, 0, 10, 0)
+
+        def obs(poses, feats):
+            return types.SimpleNamespace(
+                stamp_ns=now_ns(), fresh=lambda ns: True, poses=poses,
+                qualities=(good,) * len(poses), features=feats)
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(planner=planner), all_fruits_seq=0,
+            _fruit_observation=obs(((0.001, 0, 0), (0, 0.022, 0)), (date_f, other_f)),
+            get_clock=lambda: types.SimpleNamespace(
+                now=lambda: types.SimpleNamespace(nanoseconds=now_ns())))
+        stop = threading.Event()
+        report = dict(frames=0, rejected=0, no_candidate=0, matched=0,
+                      below_min=0, above_max=0, usable=0, applied=0,
+                      applied_total=0.0, last_apply_t=0.0)
+        t = threading.Thread(target=fn, args=(node, [0.0, 0.0, 0.0], stop, report))
+        t.start()
+        node.all_fruits_seq = 1                      # date + neighbour
+        _time.sleep(0.15)
+        # Date hidden: only the neighbour, 22 mm away -- inside the 25 mm
+        # correction bound, so nearest-to-target would have retargeted to it.
+        node._fruit_observation = obs(((0, 0.022, 0),), (other_f,))
+        node.all_fruits_seq = 2
+        _time.sleep(0.15)
+        stop.set()
+        t.join(1.0)
+        self.assertNotIn("track_error", report)
+        self.assertEqual(report["matched"], 1)       # the date, frame 1
+        self.assertEqual(report.get("track_missed"), 1)
+        self.assertEqual(report["usable"], 0)        # never offered as a correction
+        self.assertEqual(report["timeline"][1]["trk"][-1], "missed")
+
+
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):
         import cv2

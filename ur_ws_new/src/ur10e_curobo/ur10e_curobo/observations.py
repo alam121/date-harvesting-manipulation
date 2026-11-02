@@ -11,6 +11,9 @@ class FruitObservation:
     sequence: int
     poses: tuple
     qualities: tuple
+    # Optional per pose: (diameter_mm, L, a, b, overlap_iou); NaN = unknown.
+    # Empty when vision does not publish them or they are malformed.
+    features: tuple = ()
 
     @classmethod
     def decode(cls, payload):
@@ -28,7 +31,13 @@ class FruitObservation:
             raise ValueError("Invalid fruit positions")
         if any(len(q) != 5 or not all(math.isfinite(v) for v in q) for q in qualities):
             raise ValueError("Invalid fruit quality")
-        return cls(stamp, sequence, poses, qualities)
+        try:
+            features = tuple(tuple(float(v) for v in f) for f in data.get("features") or ())
+            if len(features) != len(poses) or any(len(f) != 5 for f in features):
+                features = ()
+        except (TypeError, ValueError):
+            features = ()
+        return cls(stamp, sequence, poses, qualities, features)
 
     # 0.5 -> 0.8 (2026-10-26). Measured during FINAL, observations already
     # arrive 0.26-0.46s old (depth handoff + inference), and main reads them a

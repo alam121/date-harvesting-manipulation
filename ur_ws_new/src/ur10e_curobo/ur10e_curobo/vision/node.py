@@ -57,7 +57,7 @@ from .zed_utils import (
     apply_zed_stereo_settings,
 )
 apply_zed_camera_settings = apply_zed_one_settings  # used by older call sites below
-from .tracking import FruitTracker
+from .tracking import FruitTracker, appearance_features
 
 # Per-date depth diagnostics, throttled to ~2 Hz while resolving range-dependent
 # foreground/background selection. Disable after field validation.
@@ -1766,11 +1766,17 @@ class VisionNode:
                 # for "the date is not fully visible", which is the failure mode
                 # at close range as the off-axis camera converges on the fruit.
                 _qual_flat = []
+                # Per fruit, same order: [diameter_mm, L, a, b, overlap_iou]
+                # (see appearance_features) -- image evidence that lets main's
+                # selected-fruit track avoid switching to a neighbouring date.
+                _feat_list = []
                 for _t in _targets_by_score:
                     _pb = _t.get("pt_base")
                     if _pb is None or _pb.header.stamp != self._image_stamp_msg():
                         continue
                     _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
+                    _feat_list.append([round(v, 2) for v in appearance_features(
+                        _t, image_left_ocv, _targets_by_score)])
                     _bb = _t.get("bb")
                     _iw = float(_t.get("img_width", 0) or 0)
                     _ih = float(_t.get("img_height", 0) or 0)
@@ -1831,6 +1837,7 @@ class VisionNode:
                     "sequence": self._fruit_observation_seq,
                     "poses": [_all_flat[i:i+3] for i in range(0, len(_all_flat), 3)],
                     "qualities": [_qual_flat[i:i+5] for i in range(0, len(_qual_flat), 5)],
+                    "features": _feat_list,
                 })
                 self.fruit_observation_pub.publish(_obs_msg)
 
