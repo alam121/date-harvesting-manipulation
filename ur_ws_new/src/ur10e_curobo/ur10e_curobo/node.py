@@ -70,6 +70,24 @@ def _curobo_version_label() -> str:
     return f"cuRobo: {major} ({version})"
 
 
+def record_goal_failure(fail_counts, excluded, xyz, max_failures, radius_m=0.03):
+    """Count a failed attempt on the date at xyz; exclude it at max_failures.
+
+    fail_counts: [[xyz, n], ...] for this batch; dates within radius_m are the
+    same date. Appends xyz to `excluded` the first time it reaches the limit
+    and returns its failure count then; otherwise returns 0.
+    """
+    rec = next((r for r in fail_counts if math.dist(r[0], xyz) < radius_m), None)
+    if rec is None:
+        rec = [list(xyz), 0]
+        fail_counts.append(rec)
+    rec[1] += 1
+    if rec[1] >= max_failures and all(math.dist(e, xyz) >= radius_m for e in excluded):
+        excluded.append(list(xyz))
+        return rec[1]
+    return 0
+
+
 class UR10eCuroboMoveIt(Node):
     # Speed multiplier for "Execute Queue" goal moves, relative to the active
     # velocity scale. <1.0 makes these waypoint moves slower than normal motions.
@@ -2640,6 +2658,13 @@ class UR10eCuroboMoveIt(Node):
             time.sleep(0.05)
         return len(self.goal_poses) > 0
 
+    def _publish_auto_exclusions(self):
+        """Tell vision which dates auto-harvest gave up on (skips within 8 cm)."""
+        msg = Float32MultiArray()
+        for p in getattr(self, "_auto_excluded_goals", None) or []:
+            msg.data.extend([float(p[0]), float(p[1]), float(p[2])])
+        self.exclude_pub.publish(msg)
+
     def _run_auto_harvest(self, requested_goals: int):
         """Discover and harvest one stationary-reacquired goal at a time."""
         from . import lidar_scan as lidar_scan_mod
@@ -2662,6 +2687,17 @@ class UR10eCuroboMoveIt(Node):
         self.get_logger().info(
             f"[AUTO_HARVEST] START requested={target_count} "
             "mode=DISCOVER_SCAN_REACQUIRE_EXECUTE")
+        # A date that keeps failing is excluded for the rest of the batch (vision
+        # then picks the next-best), and the batch stops after too many rounds
+        # without a harvest. 2026-11-02: a VERY LOW date whose every corridor
+        # failed IK was re-selected 12 times in 24 s until an emergency stop.
+        self._auto_excluded_goals = []
+        self._publish_auto_exclusions()
+        _fail_counts = []   # [[xyz, failures], ...]
+        _idle_rounds = 0
+        _gave_up = False
+        _max_idle = int(getattr(self.cfg.planner, "auto_harvest_max_idle_rounds", 5))
+        _max_fail = int(getattr(self.cfg.planner, "auto_harvest_max_goal_failures", 2))
 
         try:
             while (
@@ -2670,6 +2706,13 @@ class UR10eCuroboMoveIt(Node):
                 and not getattr(self, 'stop_requested', False)
                 and not getattr(self, '_auto_harvest_abort', False)
             ):
+                if _idle_rounds >= _max_idle:
+                    self.get_logger().warn(
+                        f"[AUTO_HARVEST] {_idle_rounds} rounds in a row without a "
+                        f"harvest (excluded {len(self._auto_excluded_goals)} date(s)); "
+                        "stopping batch")
+                    _gave_up = True
+                    break
                 search_round += 1
                 self.goal_poses.clear()
                 getattr(self, "_reachability_goal_metadata", {}).clear()
@@ -2699,6 +2742,7 @@ class UR10eCuroboMoveIt(Node):
                         self.get_logger().warn(
                             f"[AUTO_HARVEST] No goal found in LiDAR search "
                             f"round={search_round}; retrying")
+                        _idle_rounds += 1
                         continue
 
                     discovered = self.goal_poses.peek(0)
@@ -2723,10 +2767,12 @@ class UR10eCuroboMoveIt(Node):
                         self.get_logger().warn(
                             "[AUTO_HARVEST] Goal disappeared during stationary "
                             "reacquisition; resuming search")
+                        _idle_rounds += 1
                         continue
 
                 self._destroy_auto_goal_subscription()
                 if not self.goal_poses:
+                    _idle_rounds += 1
                     continue
 
                 # Queue several targets from this one detection pass when
@@ -2777,6 +2823,7 @@ class UR10eCuroboMoveIt(Node):
                     f"{completed + 1}-{completed + _queued}/{target_count}")
                 # Never reuse the result of a previous execution attempt.
                 self._last_completed_harvest_cycles = 0
+                _attempted = self.goal_poses.peek(0)
                 self._prep_and_execute()
                 # plan_and_execute increments this once per COMPLETED cycle, so a
                 # batch can finish several; count them all rather than assuming 1.
@@ -2784,12 +2831,26 @@ class UR10eCuroboMoveIt(Node):
                     self, "_last_completed_harvest_cycles", 0))
                 if finished_now > 0:
                     completed += finished_now
+                    _idle_rounds = 0
                     self.get_logger().info(
                         f"[AUTO_HARVEST] PROGRESS completed={completed}/{target_count}"
                         + (f" (+{finished_now} this batch)" if finished_now > 1 else ""))
                 else:
+                    _idle_rounds += 1
                     self.get_logger().warn(
                         "[AUTO_HARVEST] Goal did not complete; returning to discovery")
+                    # ponytail: blames the first queued goal when a whole batch
+                    # completes nothing; per-goal results if batching gets used.
+                    if _attempted is not None and not getattr(self, '_auto_harvest_abort', False):
+                        _xyz = [float(v) for v in _attempted[:3]]
+                        _n = record_goal_failure(
+                            _fail_counts, self._auto_excluded_goals, _xyz, _max_fail)
+                        if _n:
+                            self._publish_auto_exclusions()
+                            self.get_logger().warn(
+                                f"[AUTO_HARVEST] excluding date at "
+                                f"[{_xyz[0]:.3f},{_xyz[1]:.3f},{_xyz[2]:.3f}] "
+                                f"after {_n} failed attempts")
 
                 if getattr(self, '_auto_harvest_abort', False):
                     self.get_logger().warn(
@@ -2805,6 +2866,8 @@ class UR10eCuroboMoveIt(Node):
             self._destroy_auto_goal_subscription()
             self.cfg.planner.debug_plan_preview = original_preview
             self._auto_harvest_active = False
+            self._auto_excluded_goals = []
+            self._publish_auto_exclusions()
             if completed >= target_count:
                 self.get_logger().info(
                     f"[AUTO_HARVEST] DONE completed={completed}/{target_count} "
@@ -2813,6 +2876,10 @@ class UR10eCuroboMoveIt(Node):
                 self.get_logger().warn(
                     f"[AUTO_HARVEST] STOPPED completed={completed}/{target_count} "
                     "reason=USER_STOP")
+            elif _gave_up:
+                self.get_logger().warn(
+                    f"[AUTO_HARVEST] GAVE UP completed={completed}/{target_count} "
+                    "reason=NO_REACHABLE_GOAL")
             else:
                 self.get_logger().warn(
                     f"[AUTO_HARVEST] ABORTED completed={completed}/{target_count} "

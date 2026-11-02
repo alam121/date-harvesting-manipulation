@@ -3892,7 +3892,9 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
             msg.data.extend([float(pos[0]), float(pos[1]), float(pos[2])])
         node.exclude_pub.publish(msg)
 
-    _publish_exclusions([])  # clear any previous exclusions
+    # Keep auto-harvest's persistent exclusions (dates it gave up on).
+    _base_excl = list(getattr(node, "_auto_excluded_goals", None) or [])
+    _publish_exclusions(_base_excl)  # clear this call's previous exclusions
 
     cur = node.get_end_effector_pose()
     current_orientation = cur[3:] if cur else [1.0, 0.0, 0.0, 0.0]
@@ -3963,7 +3965,7 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
         state["finished"] = True
         _destroy_sub()
         _cancel_timeout()
-        _publish_exclusions([])  # clear exclusions so vision returns to normal
+        _publish_exclusions(_base_excl)  # back to normal (persistent ones stay)
         n = len(state["accepted_goals"])
         node.get_logger().info(f"Subscribe multi: collected {n}/{max_goals} goals in {time.time() - state['start_time']:.1f}s")
         if n > 0:
@@ -4037,7 +4039,7 @@ def subscribe_multi_goals(node, max_goals=3, timeout=10.0):
             publish_goal_marker(node, xyz)
 
             # Tell vision to exclude this position so it picks next-best
-            _publish_exclusions(state["accepted_goals"])
+            _publish_exclusions(_base_excl + state["accepted_goals"])
 
             goal_type = "LOW" if xyz[2] < LOW_Z_THRESH else "MID/HIGH"
             n = len(state["accepted_goals"])

@@ -862,6 +862,20 @@ class FinalFrameCaptureTests(unittest.TestCase):
             self.assertEqual(int(cv2.imread(os.path.join(d, "f.jpg")).max()), 0)  # frame 111, not 222
 
 
+class AutoHarvestGoalFailureTests(unittest.TestCase):
+    def test_repeatedly_failing_date_is_excluded_once(self):
+        fn = load('node.py', 'record_goal_failure', dict(math=math))
+        counts, excluded = [], []
+        date = [0.546, -1.233, -0.336]          # the VERY LOW date of 2026-11-02
+        self.assertEqual(fn(counts, excluded, date, 2), 0)          # one retry allowed
+        self.assertEqual(fn(counts, excluded, [0.548, -1.232, -0.335], 2), 2)  # same date
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(fn(counts, excluded, date, 2), 0)          # not re-added
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(fn(counts, excluded, [0.40, -1.20, 0.0], 2), 0)  # other date
+        self.assertEqual(len(counts), 2)
+
+
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):
         import cv2
