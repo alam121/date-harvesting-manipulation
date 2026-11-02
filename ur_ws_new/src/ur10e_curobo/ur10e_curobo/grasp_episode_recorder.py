@@ -127,6 +127,64 @@ def snapshot_close_geometry(node, fruit_seed_xyz, commanded_tcp_xyz,
         return None
 
 
+def snapshot_after_reverse(node, t_close: float) -> None:
+    """Add the after-reverse camera crop and gripper state to this attempt's
+    episode, without delaying the cycle.
+
+    The crop and gripper state are copied now; a thread waits for the episode
+    (the outcome classifier usually decides ~1.9s after close, often after
+    this) and writes them into it as after_reverse.jpg / "after_reverse".
+    Retention is judged from crop_close.jpg vs after_reverse.jpg.
+    """
+    planner = getattr(getattr(node, "cfg", None), "planner", None)
+    if not bool(getattr(planner, "grasp_episode_recording", False)):
+        return
+    gc = getattr(node, "gripper_controller", None)
+    img = getattr(node, "_latest_grasp_crop", None)
+    snap = {
+        "wall_time": time.time(),
+        "crop_age_s": _safe(lambda: round(
+            time.time() - float(node._latest_grasp_crop_t), 3)),
+        "gripper_joint_position": _jsonable(
+            getattr(gc, "actual_joint_position", None) if gc else None),
+        "gripper_joint_effort": _jsonable(
+            getattr(gc, "actual_joint_effort", None) if gc else None),
+    }
+    img = img.copy() if img is not None else None
+
+    def _write():
+        # ponytail: pairs by time -- the first episode recorded after this
+        # close. Cycles are >10s apart; tag episodes with an attempt id if
+        # that ever stops holding.
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            last = getattr(node, "_last_episode", None)
+            if last is not None and last[1] >= t_close:
+                break
+            time.sleep(0.1)
+        else:
+            node.get_logger().warn("[EPISODE] after-reverse snapshot: no episode")
+            return
+        path = last[0]
+        try:
+            if img is not None:
+                import cv2
+                cv2.imwrite(os.path.join(path, "after_reverse.jpg"), img,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                snap["image"] = "after_reverse.jpg"
+            fn = os.path.join(path, "episode.json")
+            with open(fn) as fh:
+                episode = json.load(fh)
+            episode["after_reverse"] = snap
+            with open(fn, "w") as fh:
+                json.dump(episode, fh, indent=2, sort_keys=True)
+        except Exception as exc:
+            node.get_logger().warn(f"[EPISODE] after-reverse not saved: {exc}")
+
+    import threading
+    threading.Thread(target=_write, daemon=True).start()
+
+
 def _jsonable(value: Any) -> Any:
     """numpy and ROS types are not JSON-serialisable; flatten what we can."""
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -215,6 +273,13 @@ def record_episode(node, outcome: str, end: str) -> Optional[str]:
             getattr(node, "latest_fingertip_verification", "") or ""),
         "all_fruit_poses": _jsonable(getattr(node, "all_fruit_poses", None)),
         "all_fruit_quality": _jsonable(getattr(node, "all_fruit_quality", None)),
+        "close_peak_current_a": _jsonable(
+            getattr(gc, "close_peak_current_a", None) if gc else None),
+        "close_current_limited": _jsonable(
+            getattr(gc, "close_current_limited", None) if gc else None),
+        # Set by label_episodes.py from what the operator saw; authoritative
+        # over "outcome", which only reflects the gripper's force signal.
+        "human_label": None,
     }
 
     # The crop is the one that matters for a learned grasp-state model: it

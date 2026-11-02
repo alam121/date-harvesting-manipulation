@@ -1116,9 +1116,17 @@ class Gripper:
     # control-box 24V IO supply gives 2A; a stall past it sagged the supply to
     # 7.9V and faulted the robot (2026-10-26). 0 disables.
     close_current_limit_a: float = 1.5
-    closing_steps: int = 10
-    # 0.05 -> 0.04 on 2026-10-11 (close 0.5s -> 0.4s). Back to 0.05 if dates get pushed.
-    step_delay_s: float = 0.04
+    # Never command a joint more than this far past its measured position
+    # while closing. The DG-3F-M is position controlled, so current follows
+    # that gap; capping it caps the stall current before any sample can see
+    # it. A 3.32A stall sagged the outdoor 24V IO to 15V (2026-10-28) because
+    # all steps went out before the fingers moved. Lower if [GRIPPER_CURRENT]
+    # peaks still top the limit; raise if closes get slow or weak. 0 disables.
+    close_max_lead_rad: float = 0.26
+    # 10 x 0.04s -> 20 x 0.03s on 2026-10-29 (close 0.4s -> 0.6s), eased so
+    # the fingers slow down as they meet the date: dates were slipping out.
+    closing_steps: int = 20
+    step_delay_s: float = 0.03
     close_feedback_trim_enabled: bool = True
     # 4 -> 2 passes and 0.25 -> 0.15s settle on 2026-10-08: the trim never
     # reached its 1deg tolerance (every close logged +4-9deg; a held date

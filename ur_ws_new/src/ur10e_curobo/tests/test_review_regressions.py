@@ -613,6 +613,61 @@ class GripperCurrentLimitTests(unittest.TestCase):
         g._over_current_count = 5
         self.assertFalse(fn(g))
 
+    def test_close_command_never_leads_measured_by_more_than_limit(self):
+        import time as _time
+        fn = load('delto_gripper_controller.py', '_lead_limited',
+                  dict(time=_time), owner='DeltoGripperController')
+        cfg = types.SimpleNamespace(close_max_lead_rad=0.25)
+        g = types.SimpleNamespace(
+            node=types.SimpleNamespace(cfg=types.SimpleNamespace(gripper=cfg)),
+            actual_joint_position=[0.0, 1.0, 0.5],
+            actual_joint_stamp=_time.time())
+        # Far target clamped both ways; a near one passes through.
+        self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [0.25, 0.75, 0.6])
+        g.actual_joint_stamp -= 1.0     # stale feedback: stop advancing
+        self.assertIsNone(fn(g, [2.0, 0.0, 0.6]))
+        g.actual_joint_position = None  # no feedback yet: same
+        self.assertIsNone(fn(g, [2.0, 0.0, 0.6]))
+        g.actual_joint_position = [0.0, 1.0, 0.5]
+        cfg.close_max_lead_rad = 0.0    # 0 disables
+        g.actual_joint_stamp = _time.time()
+        self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [2.0, 0.0, 0.6])
+
+
+class AfterReverseSnapshotTests(unittest.TestCase):
+    def test_snapshot_lands_in_episode_recorded_after_it(self):
+        import os
+        import tempfile
+        import time as _time
+        from ur10e_curobo.grasp_episode_recorder import snapshot_after_reverse
+        logger = types.SimpleNamespace(warn=lambda *a, **k: None)
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(planner=types.SimpleNamespace(
+                grasp_episode_recording=True)),
+            get_logger=lambda: logger,
+            _latest_grasp_crop=np.zeros((8, 8, 3), np.uint8),
+            _latest_grasp_crop_t=_time.time(),
+            gripper_controller=types.SimpleNamespace(
+                actual_joint_position=[0.1] * 12, actual_joint_effort=[0.02] * 12),
+            _last_episode=("/old/episode", _time.time() - 60.0))  # previous cycle
+        with tempfile.TemporaryDirectory() as path:
+            with open(os.path.join(path, "episode.json"), "w") as fh:
+                json.dump({"outcome": "GRABBED"}, fh)
+            t_close = _time.time()
+            snapshot_after_reverse(node, t_close)
+            _time.sleep(0.3)                    # outcome decided after the reverse
+            node._last_episode = (path, _time.time())
+            for _ in range(30):
+                if os.path.isfile(os.path.join(path, "after_reverse.jpg")):
+                    break
+                _time.sleep(0.1)
+            _time.sleep(0.1)
+            with open(os.path.join(path, "episode.json")) as fh:
+                ep = json.load(fh)
+            self.assertEqual(ep["outcome"], "GRABBED")
+            self.assertEqual(ep["after_reverse"]["image"], "after_reverse.jpg")
+            self.assertEqual(ep["after_reverse"]["gripper_joint_position"], [0.1] * 12)
+
 
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):

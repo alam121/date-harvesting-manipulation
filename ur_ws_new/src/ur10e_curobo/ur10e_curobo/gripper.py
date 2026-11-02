@@ -370,7 +370,9 @@ def on_grasp_outcome(node, outcome: str, end: str):
     # the grasp sequence.
     try:
         from .grasp_episode_recorder import record_episode
-        record_episode(node, outcome, end)
+        path = record_episode(node, outcome, end)
+        if path:
+            node._last_episode = (path, time.time())
     except Exception as _exc:
         node.get_logger().warn(f"[EPISODE] not recorded: {_exc}")
     # Same best-effort rule: close out the policy record this cycle opened, if any.

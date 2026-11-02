@@ -416,17 +416,53 @@ class DeltoGripperController:
             f"{self.node.cfg.gripper.close_current_limit_a:.2f}A during {where}; "
             "holding measured position")
 
+    def _lead_limited(self, target):
+        """target with each joint kept within close_max_lead_rad of measured.
+
+        None while feedback is missing or stale: without knowing where the
+        fingers are the lead can't be bounded, so the caller stops advancing.
+        """
+        lead = float(getattr(self.node.cfg.gripper, "close_max_lead_rad", 0.0))
+        if lead <= 0.0:
+            return list(target)
+        if (self.actual_joint_position is None
+                or time.time() - self.actual_joint_stamp > 0.30):
+            return None
+        return [min(a + lead, max(a - lead, t))
+                for t, a in zip(target, self.actual_joint_position)]
+
+    def _publish_close(self, target):
+        """Publish a closing target, lead-limited; _watch keeps advancing it."""
+        self._close_target = list(target)
+        sent = self._lead_limited(target)
+        if sent is None:
+            self.node.get_logger().warn(
+                "[GRIPPER_CLOSE] feedback stale; holding last close command",
+                throttle_duration_sec=1.0)
+            return
+        self._close_sent = sent
+        self.publish_position(sent)
+
     def _watch_close_current(self, duration_s):
         """Sleep duration_s, holding the measured pose if current tops the limit.
 
         The steps go out in ~0.4s, before the fingers have moved; the stall
         current arrives during the trim and settle that follow, which is when
-        the 24V IO sagged (2026-10-26). Returns True once the limit has tripped.
+        the 24V IO sagged (2026-10-26). Meanwhile the lead-limited command is
+        walked toward the target as the fingers follow. Returns True once the
+        limit has tripped.
         """
         end = time.time() + max(0.0, duration_s)
         while time.time() < end:
             if not self.close_current_limited and self.close_current_exceeded():
                 self._hold_at_measured("post-close")
+            if not self.close_current_limited and self._close_target is not None:
+                sent = self._lead_limited(self._close_target)
+                if sent is not None and (
+                        self._close_sent is None or
+                        max(abs(s - p) for s, p in zip(sent, self._close_sent)) > 0.01):
+                    self._close_sent = sent
+                    self.publish_position(sent)
             time.sleep(min(0.02, max(0.0, end - time.time())))
         return self.close_current_limited
 
@@ -457,7 +493,10 @@ class DeltoGripperController:
             self.set_state('IDLE')
             return False
 
+        # Smoothstep: gentle start, and slowest at the end where the fingers
+        # meet the date, so it is not knocked out of the grasp.
         alpha = (self.current_step + 1) / self.steps
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
         # --------------------------------------------------------
         # SUCTION MODE: center-first closing (Version A behavior)
@@ -497,9 +536,7 @@ class DeltoGripperController:
                         alpha * self.closed_position[j_idx]
                     )
 
-        msg = Float32MultiArray()
-        msg.data = self.current_position
-        self.publisher.publish(msg)
+        self._publish_close(self.current_position)
 
         self.current_step += 1
         return True
@@ -511,6 +548,8 @@ class DeltoGripperController:
         self._current_sample_stamp = None
         self.close_peak_current_a = 0.0
         self.close_current_limited = False
+        self._close_target = None
+        self._close_sent = None
         # Clear need_rearm flag and reset ignore window when starting to close
         self.need_rearm = False
         self.ignore_contacts_until = 0.0  # Clear debounce window to allow immediate force detection
@@ -588,7 +627,13 @@ class DeltoGripperController:
         # Keep the calibrated shape joints fixed while the primary closing
         # joint of each finger applies the configured firmware grasp force.
         # This stays active through reverse/pull and is released by OPEN.
-        self._set_holding_force(True)
+        # Not after a current trip: the firmware hold would drive the motors
+        # back into the stall the trip just stopped.
+        if self.close_current_limited:
+            self.node.get_logger().warn(
+                "[GRIPPER_HOLD] skipped: current limit tripped during close")
+        else:
+            self._set_holding_force(True)
 
         # Compute early contact step: first step where any finger delta > 0.5N
         self.closure_first_contact_step = len(self.closure_force_profile)  # default: no early contact
@@ -645,7 +690,7 @@ class DeltoGripperController:
                 desired[i] + max(-max_correction, min(max_correction, errors[i]))
                 for i in range(len(desired))
             ]
-            self.publish_position(compensated)
+            self._publish_close(compensated)
 
         if self._watch_close_current(settle_s):
             return

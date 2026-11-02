@@ -7211,6 +7211,13 @@ def plan_and_execute(node):
                     f"[VISUAL_GRASP] UNCERTAIN | verifier failed: {_e} "
                     "(logging only)")
         _timing["reverse"] = time.time() - _t_reverse
+        # Retention evidence for the episode: image + gripper state after the
+        # reverse. Copies now, writes in the background -- no added pause.
+        try:
+            from .grasp_episode_recorder import snapshot_after_reverse
+            snapshot_after_reverse(node, _t_grasp)
+        except Exception as _e:
+            node.get_logger().warn(f"[EPISODE] after-reverse snapshot failed: {_e}")
         if _log_phase_timings:
             node.get_logger().info(
                 f"[TIMING] reverse={_timing['reverse']:.2f}s "
