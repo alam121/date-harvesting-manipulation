@@ -754,6 +754,98 @@ class FinalTrackAssociationTests(unittest.TestCase):
         self.assertEqual(report["timeline"][1]["trk"][-1], "missed")
 
 
+class FinalFrameCaptureTests(unittest.TestCase):
+    def test_main_requests_exact_frames_for_misses_and_hits(self):
+        import time as _time
+        from ur10e_curobo.fruit_track import SelectedFruitTrack
+        env = dict(time=_time, math=math, SelectedFruitTrack=SelectedFruitTrack)
+        for name in ("_reacquire_candidate_quality", "_reacquire_quality_ok",
+                     "_final_frame_capture", "_final_inflight_monitor"):
+            fn = load('goals.py', name, env)
+        planner = types.SimpleNamespace(
+            final_inflight_min_delta_m=0.002, final_inflight_max_delta_m=0.025,
+            final_inflight_apply=False, final_frame_capture=True,
+            final_frame_dir="/tmp/ff", final_frame_max_misses=2,
+            final_frame_max_hits=1, final_frame_min_spacing_s=0.0)
+        now_ns = lambda: int(_time.time() * 1e9)
+        good = (0.9, 0.003, 0.8, 1, 0.1)
+        sent = []
+
+        def obs(poses, stamp):
+            return types.SimpleNamespace(
+                stamp_ns=stamp, fresh=lambda ns: True, poses=poses,
+                qualities=(good,) * len(poses), features=(), ids=(7,) * len(poses))
+        node = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(planner=planner), all_fruits_seq=0,
+            current_joint_positions=[0.0] * 6,
+            _request_camera_raw_stream=sent.append,
+            get_clock=lambda: types.SimpleNamespace(
+                now=lambda: types.SimpleNamespace(nanoseconds=now_ns())))
+        stop = threading.Event()
+        report = dict(frames=0, rejected=0, no_candidate=0, matched=0,
+                      below_min=0, above_max=0, usable=0, applied=0,
+                      applied_total=0.0, last_apply_t=0.0)
+        t = threading.Thread(target=fn, args=(node, [0.0, 0.0, 0.0], stop, report))
+        stamps = []
+        # hit, hit (over the cap), miss, miss, miss (over the cap)
+        frames = [((0.001, 0, 0),), ((0.001, 0, 0),), (), (), ()]
+        node._fruit_observation = obs(frames[0], now_ns())
+        t.start()
+        for seq, poses in enumerate(frames, 1):
+            stamps.append(now_ns())
+            node._fruit_observation = obs(poses, stamps[-1])
+            node.all_fruits_seq = seq
+            _time.sleep(0.12)
+        stop.set()
+        t.join(1.0)
+        self.assertTrue(sent[0].startswith("final_frames arm"))
+        self.assertEqual(sent[-1], "final_frames off")
+        saves = [json.loads(s.split(" ", 2)[2]) for s in sent
+                 if s.startswith("final_frames save ")]
+        self.assertEqual([s["kind"] for s in saves], ["hit", "miss", "miss"])
+        # each save names the exact frame that produced that observation
+        self.assertEqual([s["stamp_ns"] for s in saves],
+                         [stamps[0], stamps[2], stamps[3]])
+        self.assertEqual(saves[1]["target_id"], 7)          # remembered from the hit
+        self.assertIn("position", saves[1]["track"])        # predicted, for the label
+        self.assertEqual(len(saves[1]["track"]["cov_pos_m2"]), 3)
+        self.assertEqual(len(report["frame_capture"]["saved"]), 3)
+
+    def test_vision_saves_buffered_frame_with_projected_prediction(self):
+        import os
+        import tempfile
+        from collections import deque
+        import cv2
+        env = dict(np=np, json=json, os=os, cv2=cv2, Thread=threading.Thread)
+        buf = load('vision/node.py', '_buffer_final_frame', env, owner='VisionNode')
+        save = load('vision/node.py', '_save_final_frame', env, owner='VisionNode')
+        logger = types.SimpleNamespace(warn=lambda *a, **k: None)
+        vn = types.SimpleNamespace(
+            _final_frames=deque(maxlen=6),
+            _cached_tf_base=(np.eye(3), np.zeros(3)),   # camera == base
+            node=types.SimpleNamespace(get_logger=lambda: logger))
+        img = np.zeros((100, 200, 4), np.uint8)
+        raw = [types.SimpleNamespace(bounding_box_2d=[[10, 10], [20, 10], [20, 30], [10, 30]],
+                                     probability=0.05)]
+        k = {"fx": 100.0, "fy": 100.0, "cx": 50.0, "cy": 25.0}
+        buf(vn, 111, img, k, [2.0, 2.0], raw, [])
+        buf(vn, 222, img + 1, k, [2.0, 2.0], [], [])
+        with tempfile.TemporaryDirectory() as d:
+            save(vn, json.dumps({"stamp_ns": 111, "dir": d, "name": "f",
+                                 "track": {"position": [0.1, 0.05, 1.0],
+                                           "pos_std_m": 0.01}}))
+            for _ in range(30):
+                if os.path.isfile(os.path.join(d, "f.json")):
+                    break
+                threading.Event().wait(0.05)
+            meta = json.load(open(os.path.join(d, "f.json")))
+            self.assertEqual(meta["stamp_ns"], 111)
+            self.assertEqual(meta["predicted_px"], [120.0, 60.0])  # (100*.1+50)*2, (100*.05+25)*2
+            self.assertEqual(meta["predicted_sigma_px"], 2.0)
+            self.assertEqual(meta["raw_detections_xyxy_conf"], [[20.0, 20.0, 40.0, 60.0, 0.05]])
+            self.assertEqual(int(cv2.imread(os.path.join(d, "f.jpg")).max()), 0)  # frame 111, not 222
+
+
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):
         import cv2

@@ -919,6 +919,17 @@ class Planner:
     # evidence) rather than the detection nearest the target. Ambiguous frames
     # give no correction instead of switching to a neighbour. False = nearest.
     final_track_association: bool = True
+    # Detector training data: during FINAL, ask vision to save the exact
+    # frames whose observation missed the tracked date (and a couple that
+    # found it, for comparison) with the track's prediction, detections and
+    # camera pose. Async; vision buffers frames only while this is armed.
+    # Lab 2026-11-02: the date went undetected for most of FINAL in 3 of 4
+    # cycles against trunk/strand backgrounds.
+    final_frame_capture: bool = True
+    final_frame_dir: str = "~/harvest_logs/final_frames"
+    final_frame_max_misses: int = 3
+    final_frame_max_hits: int = 2
+    final_frame_min_spacing_s: float = 0.3
     final_visual_verification_s: float = 0.0    # optional observation-only pause; disabled for harvesting
     phase5_center_logging_enabled: bool = True  # estimate residual centering only; never command motion
     phase5_center_px_per_mm: float = 4.0        # provisional image scale; validate from controlled moves

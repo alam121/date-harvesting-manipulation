@@ -199,6 +199,12 @@ class VisionNode:
         self._refresh_reason = "camera refresh"
         self._raw_stream_enabled = bool(int(os.getenv("UR10E_RAW_IMAGE_STREAM", "0")))
         self._raw_stream_until = 0.0
+        # FINAL frame capture (detector training data). While main has it
+        # armed, the exact frames that produced each fruit observation are
+        # kept, keyed by acquisition stamp, so a save request labels the very
+        # image that missed -- not a later snapshot of a different scene.
+        self._final_frames_until = 0.0
+        self._final_frames = deque(maxlen=6)
         self._nurec = None
 
         # Components
@@ -699,6 +705,20 @@ class VisionNode:
                 else:
                     self.node.get_logger().warn(
                         "[NUREC] use 'nurec on|off' or 'nurec record|stop'")
+            elif cmd.startswith("final_frames "):
+                parts = cmd.split(" ", 2)
+                mode = parts[1] if len(parts) > 1 else ""
+                if mode == "arm":
+                    try:
+                        dur = float(parts[2].split("=", 1)[1]) if len(parts) > 2 else 8.0
+                    except (IndexError, ValueError):
+                        dur = 8.0
+                    self._final_frames_until = time() + max(0.0, min(dur, 30.0))
+                elif mode == "off":
+                    self._final_frames_until = 0.0
+                    self._final_frames.clear()
+                elif mode == "save" and len(parts) > 2:
+                    self._save_final_frame(parts[2])
             elif cmd.startswith("raw_stream "):
                 parts = cmd.split()
                 mode = parts[1].lower() if len(parts) > 1 else ""
@@ -1770,11 +1790,13 @@ class VisionNode:
                 # (see appearance_features) -- image evidence that lets main's
                 # selected-fruit track avoid switching to a neighbouring date.
                 _feat_list = []
+                _id_list = []
                 for _t in _targets_by_score:
                     _pb = _t.get("pt_base")
                     if _pb is None or _pb.header.stamp != self._image_stamp_msg():
                         continue
                     _all_flat.extend([_pb.point.x, _pb.point.y, _pb.point.z])
+                    _id_list.append(int(_t.get("fruit_id", -1) if _t.get("fruit_id") is not None else -1))
                     _feat_list.append([round(v, 2) for v in appearance_features(
                         _t, image_left_ocv, _targets_by_score)])
                     _bb = _t.get("bb")
@@ -1838,8 +1860,13 @@ class VisionNode:
                     "poses": [_all_flat[i:i+3] for i in range(0, len(_all_flat), 3)],
                     "qualities": [_qual_flat[i:i+5] for i in range(0, len(_qual_flat), 5)],
                     "features": _feat_list,
+                    "ids": _id_list,
                 })
                 self.fruit_observation_pub.publish(_obs_msg)
+                if time() < self._final_frames_until:
+                    self._buffer_final_frame(
+                        int(self._latest_image_stamp.nanoseconds), image_left_ocv,
+                        intrinsics, image_scale, current_dets, _targets_by_score)
 
                 # Single detection, highest confidence -- not the largest mask.
                 # Pollination's own scoring sweep (_score_pose_here) already
@@ -2539,6 +2566,104 @@ class VisionNode:
             return True
         except Exception:
             return False
+
+    def _buffer_final_frame(self, stamp_ns, image, intrinsics, image_scale,
+                            raw_dets, targets):
+        """Keep the frame behind one fruit observation, with what produced it.
+
+        Only while main has FINAL capture armed: a full-frame copy is a few ms,
+        so it is never paid outside FINAL. Coordinates are image pixels.
+        """
+        try:
+            sx, sy = float(image_scale[0]), float(image_scale[1])
+            raw = []
+            for o in raw_dets or []:
+                bb = np.asarray(o.bounding_box_2d, dtype=float)
+                raw.append([round(float(bb[:, 0].min()) * sx, 1),
+                            round(float(bb[:, 1].min()) * sy, 1),
+                            round(float(bb[:, 0].max()) * sx, 1),
+                            round(float(bb[:, 1].max()) * sy, 1),
+                            round(float(getattr(o, "probability", 0.0)), 3)])
+            tgt = []
+            for t in targets or []:
+                pb = t.get("pt_base")
+                tgt.append({
+                    "fruit_id": t.get("fruit_id"),
+                    "bb": [int(v) for v in t["bb"]] if t.get("bb") is not None else None,
+                    "confidence": round(float(t.get("confidence", 0.0)), 3),
+                    "vis_ratio": round(float(t.get("vis_ratio", 0.0)), 3),
+                    "z_std_m": round(float(t.get("z_std", 0.0)), 4),
+                    "base_xyz": ([round(pb.point.x, 4), round(pb.point.y, 4),
+                                  round(pb.point.z, 4)] if pb is not None else None),
+                })
+            tf = self._cached_tf_base
+            self._final_frames.append({
+                "stamp_ns": int(stamp_ns),
+                "image": image.copy(),
+                "cam_to_base": ((np.asarray(tf[0]).copy(), np.asarray(tf[1]).copy())
+                                if tf is not None else None),
+                "intrinsics": {k: float(v) for k, v in intrinsics.items()},
+                "image_scale": [sx, sy],
+                "raw_detections_xyxy_conf": raw,
+                "targets": tgt,
+            })
+        except Exception as exc:
+            self.node.get_logger().warn(f"[FINAL_FRAMES] buffer failed: {exc}",
+                                        throttle_duration_sec=5.0)
+
+    def _save_final_frame(self, payload):
+        """Write the buffered frame named by payload["stamp_ns"], plus metadata.
+
+        Lookup happens here, in order with arm/off; encoding and disk writes
+        go to a thread so the camera callback never waits on them.
+        """
+        try:
+            req = json.loads(payload)
+            stamp = int(req["stamp_ns"])
+            frame = next((f for f in self._final_frames if f["stamp_ns"] == stamp), None)
+            if frame is None:
+                self.node.get_logger().warn(
+                    f"[FINAL_FRAMES] frame {stamp} no longer buffered; not saved")
+                return
+        except Exception as exc:
+            self.node.get_logger().warn(f"[FINAL_FRAMES] bad save request: {exc}")
+            return
+
+        def _write():
+            try:
+                meta = dict(req)
+                meta.update({k: v for k, v in frame.items() if k not in ("image", "cam_to_base")})
+                img = frame["image"]
+                meta["image_shape"] = list(img.shape)
+                # Where the track predicts the date in THIS image, and how big
+                # its 1-sigma is there, from this frame's own camera pose.
+                pred = (req.get("track") or {}).get("position")
+                if pred is not None and frame["cam_to_base"] is not None:
+                    R, t = frame["cam_to_base"]
+                    pc = R.T @ (np.asarray(pred, dtype=float) - t)
+                    meta["camera_to_base_R"] = R.tolist()
+                    meta["camera_to_base_t"] = t.tolist()
+                    if pc[2] > 0.01:
+                        k, (sx, sy) = frame["intrinsics"], frame["image_scale"]
+                        meta["predicted_px"] = [
+                            round((k["fx"] * pc[0] / pc[2] + k["cx"]) * sx, 1),
+                            round((k["fy"] * pc[1] / pc[2] + k["cy"]) * sy, 1)]
+                        pos_std = float((req.get("track") or {}).get("pos_std_m", 0.0))
+                        meta["predicted_sigma_px"] = round(
+                            k["fx"] * sx * pos_std / pc[2], 1)
+                        meta["predicted_range_m"] = round(float(pc[2]), 4)
+                out_dir = os.path.expanduser(str(req.get("dir", "~/harvest_logs/final_frames")))
+                os.makedirs(out_dir, exist_ok=True)
+                name = str(req.get("name", stamp))
+                bgr = img[:, :, :3] if img.ndim == 3 and img.shape[2] == 4 else img
+                cv2.imwrite(os.path.join(out_dir, name + ".jpg"),
+                            np.ascontiguousarray(bgr), [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                with open(os.path.join(out_dir, name + ".json"), "w") as fh:
+                    json.dump(meta, fh, indent=1)
+            except Exception as exc:
+                self.node.get_logger().warn(f"[FINAL_FRAMES] save failed: {exc}")
+
+        Thread(target=_write, daemon=True).start()
 
     def _process_objects(
         self,

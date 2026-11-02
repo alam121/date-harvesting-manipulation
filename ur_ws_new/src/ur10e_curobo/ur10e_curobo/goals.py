@@ -3198,6 +3198,52 @@ def _apply_final_inflight_correction(node, delta, report, stop_evt=None):
     return True
 
 
+def _final_frame_capture(node, report, cap, observation, idx, status, prior,
+                         t, target_xyz):
+    """Ask vision to save the exact frame behind this observation, if wanted.
+
+    Misses (the track found no match: missed/ambiguous) and a few hits are
+    kept per FINAL, spaced out, for detector training. `prior` is the track's
+    prediction at the frame's stamp, before this frame's update -- where the
+    date should be in the image. Fire-and-forget; never raises.
+    """
+    try:
+        import json
+        kind = "miss" if idx is None else "hit"
+        planner = node.cfg.planner
+        limit = (int(getattr(planner, "final_frame_max_misses", 3)) if kind == "miss"
+                 else int(getattr(planner, "final_frame_max_hits", 2)))
+        spacing = float(getattr(planner, "final_frame_min_spacing_s", 0.3))
+        if (len(cap[kind]) >= limit or t - cap["last"][kind] < spacing):
+            return
+        cap["last"][kind] = t
+        ids = getattr(observation, "ids", ()) or ()
+        if idx is not None and idx < len(ids):
+            cap["target_id"] = ids[idx]
+        name = f"{t:05.2f}s_{kind}_{status}"
+        req = {
+            "stamp_ns": int(observation.stamp_ns),
+            "dir": cap["dir"],
+            "name": name,
+            "attempt_id": cap["attempt_id"],
+            "kind": kind,
+            "track_status": status,
+            "final_t_s": round(t, 3),
+            # vision's fruit id of the tracked date when last matched
+            "target_id": cap.get("target_id"),
+            "track": prior,
+            "arm_target_xyz": [round(float(v), 4) for v in target_xyz[:3]],
+            # at request time (~0.3s after the photo); the frame's own camera
+            # pose is added by vision as camera_to_base_R/t
+            "joint_positions": list(getattr(node, "current_joint_positions", None) or []),
+        }
+        node._request_camera_raw_stream("final_frames save " + json.dumps(req))
+        cap[kind].append(name)
+        report["frame_capture"]["saved"].append(name)
+    except Exception:
+        pass
+
+
 def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     """Watch vision during the FINAL move. Observation-only.
 
@@ -3223,6 +3269,20 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
     use_track = bool(getattr(planner, "final_track_association", True))
     track = None
     node._selected_fruit_track = None
+    cap = None
+    if (use_track and bool(getattr(planner, "final_frame_capture", False))
+            and hasattr(node, "_request_camera_raw_stream")):
+        try:
+            import os
+            _aid = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+            cap = {"attempt_id": _aid, "miss": [], "hit": [],
+                   "last": {"miss": float("-inf"), "hit": float("-inf")},
+                   "dir": os.path.join(os.path.expanduser(str(getattr(
+                       planner, "final_frame_dir", "~/harvest_logs/final_frames"))), _aid)}
+            report["frame_capture"] = {"attempt_id": _aid, "dir": cap["dir"], "saved": []}
+            node._request_camera_raw_stream("final_frames arm duration=10")
+        except Exception:
+            cap = None
     while not stop_evt.is_set():
         if stop_evt.wait(0.05):
             break
@@ -3292,6 +3352,10 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
                 if track is None:
                     track = SelectedFruitTrack(target_xyz[:3], stamp_s)
                     node._selected_fruit_track = track
+                prior = None
+                if cap is not None:
+                    prior = track.state(stamp_s)
+                    prior["cov_pos_m2"] = track.predict(stamp_s)[1][:3, :3].tolist()
                 idx, status = track.step(
                     stamp_s, observation.poses,
                     [q[1] for q in observation.qualities],
@@ -3311,6 +3375,9 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
                            round(s["confidence"], 2), status])
                 if idx is None:
                     report["track_" + status] = report.get("track_" + status, 0) + 1
+                if cap is not None:
+                    _final_frame_capture(node, report, cap, observation, idx, status,
+                                         prior, time.time() - t0, target_xyz)
             except Exception as exc:
                 # Never lose the in-flight check over the track: fall back to
                 # nearest-to-target for the rest of this move.
@@ -3382,6 +3449,12 @@ def _final_inflight_monitor(node, target_xyz, stop_evt, report):
             report["applied_total"] += math.dist([0.0, 0.0, 0.0], delta)
             # Corrections are measured against the goal we are now driving to.
             target_xyz = [target_xyz[i] + delta[i] for i in range(3)]
+    if cap is not None:
+        # Saves already requested were looked up before this, in topic order.
+        try:
+            node._request_camera_raw_stream("final_frames off")
+        except Exception:
+            pass
 
 
 def _reacquire_candidate_quality(node, candidate, observation=None):
