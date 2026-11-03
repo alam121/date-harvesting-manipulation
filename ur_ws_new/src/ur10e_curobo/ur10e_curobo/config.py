@@ -1147,6 +1147,11 @@ class Gripper:
     # but M7 stopped 19-29deg short of the closed pose (friction needs more
     # gap than that), and the stalled finger read as contact.
     close_max_lead_rad: float = 0.45
+    # ENVELOP drives all 12 joints into the wrap at once, so the same per-joint
+    # lead lets far more total current through: 2.70 A at 0.45 rad when the
+    # fingers pressed into a table (2026-11-03), vs 0.1-0.4 A for NORMAL.
+    # Roughly linear -> 0.15 rad ~ 0.9 A. Raise if wraps close too weakly.
+    close_max_lead_rad_envelop: float = 0.15
     # 10 x 0.04s -> 20 x 0.03s on 2026-10-29 (close 0.4s -> 0.6s), eased so
     # the fingers slow down as they meet the date: dates were slipping out.
     closing_steps: int = 20

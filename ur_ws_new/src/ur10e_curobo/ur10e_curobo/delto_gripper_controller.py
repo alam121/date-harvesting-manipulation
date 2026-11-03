@@ -470,7 +470,11 @@ class DeltoGripperController:
         None while feedback is missing or stale: without knowing where the
         fingers are the lead can't be bounded, so the caller stops advancing.
         """
-        lead = float(getattr(self.node.cfg.gripper, "close_max_lead_rad", 0.0))
+        cfg = self.node.cfg.gripper
+        lead = float(getattr(cfg, "close_max_lead_rad", 0.0))
+        if getattr(self, "active_grasp_mode", "NORMAL") == "ENVELOP":
+            # All 12 joints drive into the wrap, so their currents add up.
+            lead = float(getattr(cfg, "close_max_lead_rad_envelop", lead))
         if lead <= 0.0:
             return list(target)
         if (self.actual_joint_position is None

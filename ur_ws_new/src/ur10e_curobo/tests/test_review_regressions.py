@@ -645,6 +645,11 @@ class GripperCurrentLimitTests(unittest.TestCase):
         g.actual_joint_position = None  # no feedback yet: same
         self.assertIsNone(fn(g, [2.0, 0.0, 0.6]))
         g.actual_joint_position = [0.0, 1.0, 0.5]
+        g.active_grasp_mode = "ENVELOP"  # 12 joints: its own, smaller lead
+        cfg.close_max_lead_rad_envelop = 0.10
+        g.actual_joint_stamp = _time.time()
+        self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [0.10, 0.90, 0.6])
+        g.active_grasp_mode = "NORMAL"
         cfg.close_max_lead_rad = 0.0    # 0 disables
         g.actual_joint_stamp = _time.time()
         self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [2.0, 0.0, 0.6])
