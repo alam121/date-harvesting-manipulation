@@ -897,6 +897,16 @@ class LabelFinalFramesTests(unittest.TestCase):
         self.assertEqual(seg[1].split()[0], "2")        # trunk as a rectangle
         self.assertEqual(len(seg[1].split()), 9)
 
+    def test_hints_are_uncovered_weak_detections(self):
+        from ur10e_curobo.label_final_frames import hints
+        boxes = [[1, 10.0, 10.0, 60.0, 60.0]]
+        raw = [[110, 110, 150, 150, 0.12],   # covered by the box (crop at 100,100)
+               [200, 200, 240, 250, 0.08],   # uncovered -> hint
+               [300, 300, 340, 340, 0.02],   # too weak
+               [395, 395, 520, 520, 0.10]]   # clipped to 5 px -> too small
+        self.assertEqual(hints(raw, 100, 100, boxes, size=300),
+                         [[100.0, 100.0, 140.0, 150.0, 0.08]])
+
     def test_review_reloads_saved_boxes(self):
         import os, tempfile
         from ur10e_curobo.label_final_frames import label_lines, load_box_labels

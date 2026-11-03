@@ -8,6 +8,8 @@ teaches the model "not a date". Mark trunk/bunch too when they are in the
 crop: the engine has those classes as well.
 
 Mouse:  left-drag      draw a box of the current class
+        left-click     on a thin grey hint (a weaker YOLO detection no box
+                       covers yet): turn it into a date box
         right-click    delete the box under the cursor
 Keys:   SPACE / ENTER  save and next
         n              save, recording that the target date is NOT visible
@@ -82,6 +84,29 @@ def label_lines(boxes, size=CROP, ellipse_points=16):
     return seg, det
 
 
+def hints(raw, x0, y0, boxes, size=CROP, min_conf=0.05):
+    """Weaker YOLO detections in the crop that no box covers: [x1,y1,x2,y2,conf].
+
+    Shown as one-click suggestions -- dark dates the labeller tends to skip
+    are often among them (and so is the fingertip stain: leave that).
+    """
+    out = []
+    for x1, y1, x2, y2, conf in raw or []:
+        if conf < min_conf:
+            continue
+        b = [max(0.0, x1 - x0), max(0.0, y1 - y0),
+             min(float(size), x2 - x0), min(float(size), y2 - y0)]
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if b[2] - b[0] < 8 or b[3] - b[1] < 8:
+            continue
+        covered = max((max(0.0, min(b[2], c[3]) - max(b[0], c[1]))
+                       * max(0.0, min(b[3], c[4]) - max(b[1], c[2])) / area
+                       for c in boxes), default=0.0)
+        if covered < 0.3:
+            out.append(b + [conf])
+    return out
+
+
 def load_box_labels(path, size=CROP):
     """Boxes back from a labels_box file: [cls, x1, y1, x2, y2] in crop px."""
     boxes = []
@@ -106,8 +131,13 @@ def _frames(root, since, kind):
             yield attempt, name, img, meta_path
 
 
-def _draw(crop, boxes, pred, sigma, cls, title):
+def _draw(crop, boxes, pred, sigma, cls, title, suggestions=()):
     view = cv2.resize(crop, None, fx=SCALE, fy=SCALE)
+    for x1, y1, x2, y2, conf in suggestions:
+        cv2.rectangle(view, (int(x1 * SCALE), int(y1 * SCALE)),
+                      (int(x2 * SCALE), int(y2 * SCALE)), (170, 170, 170), 1)
+        cv2.putText(view, f"{conf:.2f}", (int(x1 * SCALE), int(y2 * SCALE) + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (170, 170, 170), 1)
     for c, x1, y1, x2, y2 in boxes:
         cv2.rectangle(view, (int(x1 * SCALE), int(y1 * SCALE)),
                       (int(x2 * SCALE), int(y2 * SCALE)), COLORS[c], 2)
@@ -157,7 +187,7 @@ def main(argv=None):
 
     win = "label_final_frames"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-    state = {"boxes": [], "added": [], "drag": None, "cls": 1}
+    state = {"boxes": [], "added": [], "drag": None, "cls": 1, "hints": []}
 
     def on_mouse(event, x, y, flags, _):
         x, y = x / SCALE, y / SCALE
@@ -172,6 +202,14 @@ def main(argv=None):
             if box[3] - box[1] >= 4 and box[4] - box[2] >= 4:
                 state["boxes"].append(box)
                 state["added"].append(box)
+            else:   # a click: accept the hint under it, if any
+                hit = [h for h in state["hints"] if h[0] <= x2 <= h[2] and h[1] <= y2 <= h[3]]
+                if hit:
+                    h = min(hit, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+                    state["hints"].remove(h)
+                    box = [1, *h[:4]]
+                    state["boxes"].append(box)
+                    state["added"].append(box)
         elif event == cv2.EVENT_RBUTTONDOWN:
             hits = [b for b in state["boxes"] if b[1] <= x <= b[3] and b[2] <= y <= b[4]]
             if hits:
@@ -201,13 +239,14 @@ def main(argv=None):
                             size=size, min_conf=args.prefill)
         crop = img[y0:y0 + size, x0:x0 + size].copy()
         pred_c = [pred[0] - x0, pred[1] - y0] if pred else None
-        state.update(boxes=boxes, added=[], drag=None)
+        state.update(boxes=boxes, added=[], drag=None,
+                     hints=hints(meta.get("raw_detections_xyxy_conf"), x0, y0, boxes, size=size))
         title = f"[{i}/{len(todo)}] {attempt}/{name}"
         key = None
         while True:
             boxes = state["boxes"] + ([[state["cls"], *state["drag"]]] if state["drag"] else [])
             cv2.imshow(win, _draw(crop, boxes, pred_c, meta.get("predicted_sigma_px"),
-                                  state["cls"], title))
+                                  state["cls"], title, state["hints"]))
             k = cv2.waitKey(30) & 0xFF
             if k in (ord(" "), 13, ord("n"), ord("s"), ord("q")):
                 key = chr(k) if k != 13 else " "
