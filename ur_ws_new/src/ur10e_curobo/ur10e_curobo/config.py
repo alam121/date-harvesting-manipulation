@@ -1125,7 +1125,11 @@ class Gripper:
     use_suction: bool = False
     grasp_mode: str = "AUTO"             # AUTO chooses NORMAL/ENVELOP per accepted goal
     auto_envelop_axis_from_vertical_deg: float = 45.0
-    auto_envelop_min_axis_confidence: float = 0.30
+    # 0.30 -> 0.15 on 2026-11-03: a date lying at 87deg from vertical read
+    # conf 0.15-0.18 (outline only ~1.2x longer than wide: strands/foreshortening)
+    # and never got ENVELOP. Noisy angles are still held back by the stability
+    # gate (5 readings within 8deg). Keep vision/visualization.py ENVELOP_MIN_CONF equal.
+    auto_envelop_min_axis_confidence: float = 0.15
     normal_depth_extra_m: float = 0.0
     normal_z_extra_m: float = 0.012  # consistent FINAL correction in base/world Z
     envelop_depth_extra_m: float = 0.0

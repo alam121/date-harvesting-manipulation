@@ -318,7 +318,7 @@ class VisionVisualizer:
     # Mirrors config.gripper auto_envelop_axis_from_vertical_deg /
     # auto_envelop_min_axis_confidence (main decides; this is the operator's view).
     ENVELOP_TILT_DEG = 45.0
-    ENVELOP_MIN_CONF = 0.30
+    ENVELOP_MIN_CONF = 0.15
 
     def _draw_axis_info(self, image, target, cx, cy, x1, y1, x2, y2) -> None:
         """Selected date's long axis, its tilt from TRUE vertical and confidence.
