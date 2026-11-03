@@ -650,6 +650,27 @@ class GripperCurrentLimitTests(unittest.TestCase):
         self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [2.0, 0.0, 0.6])
 
 
+class AxisWorldTiltTests(unittest.TestCase):
+    def test_tilt_is_measured_from_gravity_not_the_image(self):
+        fn = load('vision/node.py', '_axis_world_tilt_deg', dict(math=math, np=np),
+                  owner='VisionNode')
+        # Upright camera looking along base +x: optical x -> -base y,
+        # optical y (down) -> -base z, optical z -> +base x.
+        R = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])
+        vn = types.SimpleNamespace(_cached_tf_base=(R, np.zeros(3)))
+        self.assertAlmostEqual(fn(vn, 90.0), 0.0, places=6)    # hanging date
+        self.assertAlmostEqual(fn(vn, 0.0), 90.0, places=6)    # lying sideways
+        self.assertAlmostEqual(fn(vn, 45.0), 45.0, places=6)
+        # Same hanging date, camera rolled 40 deg about its view axis: the image
+        # shows it at 90-40 = 50 deg, yet it is still vertical in the world.
+        a = math.radians(40.0)
+        roll = np.array([[math.cos(a), -math.sin(a), 0.], [math.sin(a), math.cos(a), 0.], [0., 0., 1.]])
+        vn._cached_tf_base = (R @ roll, np.zeros(3))
+        self.assertAlmostEqual(fn(vn, 50.0), 0.0, places=6)
+        vn._cached_tf_base = None
+        self.assertIsNone(fn(vn, 90.0))
+
+
 class HoldCurrentGuardTests(unittest.TestCase):
     def _gripper(self, limit=1.15):
         import time as _time

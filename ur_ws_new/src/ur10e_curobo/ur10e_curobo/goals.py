@@ -4478,6 +4478,19 @@ def plan_and_execute(node):
                 node, "fruit_major_axis_confidence", 0.0))
             _axis_stable = bool(getattr(
                 node, "fruit_major_axis_stable", False))
+            _samples = int(getattr(node, "fruit_major_axis_samples", 0) or 0)
+            _spread = float(getattr(node, "fruit_major_axis_spread_deg", float("inf")))
+            _axis_ref = "image"
+            # Prefer the tilt from TRUE vertical: the image angle is relative to
+            # the camera, which is rolled at many approach poses.
+            _world_tilt = getattr(node, "fruit_axis_world_tilt", None)
+            if _world_tilt is not None and math.isfinite(float(_world_tilt)):
+                _axis_from_vertical = math.degrees(float(_world_tilt))
+                _axis_stable = bool(getattr(node, "fruit_axis_world_tilt_stable", False))
+                _samples = int(getattr(node, "fruit_axis_world_tilt_samples", 0) or 0)
+                _spread = float(getattr(
+                    node, "fruit_axis_world_tilt_spread_deg", float("inf")))
+                _axis_ref = "world"
             _axis_threshold = float(getattr(
                 node.cfg.gripper,
                 "auto_envelop_axis_from_vertical_deg", 45.0))
@@ -4493,10 +4506,9 @@ def plan_and_execute(node):
             # Info level + recorded in the episode: outdoors (2026-11-02) all 17
             # decisions were NORMAL although some dates looked tilted, and the
             # debug-only line left no way to tell which gate blocked ENVELOP.
-            _samples = int(getattr(node, "fruit_major_axis_samples", 0) or 0)
-            _spread = float(getattr(node, "fruit_major_axis_spread_deg", float("inf")))
             node._grasp_mode_decision = {
                 "selected": _goal_grasp_mode,
+                "axis_reference": _axis_ref,
                 "axis_from_vertical_deg": round(_axis_from_vertical, 1),
                 "axis_threshold_deg": _axis_threshold,
                 "confidence": round(_axis_confidence, 3),
@@ -4515,7 +4527,7 @@ def plan_and_execute(node):
                 f"threshold={_axis_threshold:.1f}deg "
                 f"confidence={_axis_confidence:.2f}/"
                 f"{_confidence_threshold:.2f} stable={_axis_stable} "
-                f"samples={_samples} spread={_spread:.1f}deg "
+                f"samples={_samples} spread={_spread:.1f}deg ref={_axis_ref} "
                 f"blocked_by={','.join(_blocked) or 'none'} frozen=THIS_GOAL")
         else:
             _goal_grasp_mode = (

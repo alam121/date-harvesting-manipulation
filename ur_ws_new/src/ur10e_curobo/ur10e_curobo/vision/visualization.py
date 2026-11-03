@@ -299,6 +299,8 @@ class VisionVisualizer:
 
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
+        if is_best:
+            self._draw_axis_info(image, target, cx, cy, x1, y1, x2, y2)
 
         if self.clean_harvest_overlay:
             marker_size = self._radius(12 if is_best else 8)
@@ -312,6 +314,36 @@ class VisionVisualizer:
         # Detailed diagnostic overlay retained for non-harvesting consumers.
         self._draw_detailed_target_annotations(
             image, target, cx, cy, x1, y1, x2, y2, is_best, idx)
+
+    # Mirrors config.gripper auto_envelop_axis_from_vertical_deg /
+    # auto_envelop_min_axis_confidence (main decides; this is the operator's view).
+    ENVELOP_TILT_DEG = 45.0
+    ENVELOP_MIN_CONF = 0.30
+
+    def _draw_axis_info(self, image, target, cx, cy, x1, y1, x2, y2) -> None:
+        """Selected date's long axis, its tilt from TRUE vertical and confidence.
+
+        Magenta when this frame passes AUTO's ENVELOP tilt + confidence gates
+        (main also requires several stable frames), grey otherwise.
+        """
+        angle = target.get("ellipse_angle")
+        conf = float(target.get("ellipse_confidence") or 0.0)
+        tilt = target.get("axis_world_tilt_deg")
+        if angle is None:
+            return
+        passes = (tilt is not None and tilt >= self.ENVELOP_TILT_DEG
+                  and conf >= self.ENVELOP_MIN_CONF)
+        color = (255, 0, 255, 255) if passes else (180, 180, 180, 255)
+        half = 0.5 * max(x2 - x1, y2 - y1)
+        th = math.radians(float(angle))
+        dx, dy = half * math.cos(th), half * math.sin(th)
+        cv2.line(image, (int(cx - dx), int(cy - dy)), (int(cx + dx), int(cy + dy)),
+                 color, self._thick(2), cv2.LINE_AA)
+        label = (f"tilt {tilt:.0f}deg conf {conf:.2f}" if tilt is not None
+                 else f"tilt ? conf {conf:.2f}") + ("  ENVELOP" if passes else "")
+        cv2.putText(image, label, (x1, y2 + int(self._len(18))),
+                    cv2.FONT_HERSHEY_SIMPLEX, self._font(0.55), color,
+                    self._thick(2), cv2.LINE_AA)
 
     def _draw_target_mask_overlay(
         self, image, target, is_best, x1, y1, x2, y2, mask_resized,

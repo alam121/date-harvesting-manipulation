@@ -3361,6 +3361,7 @@ class VisionNode:
                 "long_axis_2d": long_axis_2d,
                 "ellipse_angle": t_angle,
                 "ellipse_confidence": ellipse_confidence,
+                "axis_world_tilt_deg": self._axis_world_tilt_deg(t_angle),
                 "heatmap": heatmap,
                 "best_dir2d": t_best_dir2d,
                 "best_point2d": t_best_point,
@@ -3473,6 +3474,26 @@ class VisionNode:
         target["gap_angle_cam"] = float(gap_angle)
         target["_ring_debug"]["gap_angle"] = gap_angle
         target["_ring_debug"]["detected"] = True
+
+    def _axis_world_tilt_deg(self, ellipse_angle_deg):
+        """Long axis's angle from TRUE vertical (base_link z, gravity), deg.
+
+        0 = hanging straight down, 90 = lying flat. The image angle alone is
+        relative to the camera, so a rolled camera made hanging dates look
+        tilted and tilted ones upright. The image direction is taken in the
+        camera plane (as the finger-contact angle is) and rotated by this
+        frame's camera pose; the axis component along the view ray is not
+        observable. None when unknown.
+        """
+        tf = self._cached_tf_base
+        if ellipse_angle_deg is None or tf is None:
+            return None
+        th = math.radians(float(ellipse_angle_deg))
+        d = np.asarray(tf[0], dtype=float) @ np.array([math.cos(th), math.sin(th), 0.0])
+        n = float(np.linalg.norm(d))
+        if n < 1e-6:
+            return None
+        return math.degrees(math.acos(min(1.0, abs(float(d[2])) / n)))
 
     def _fit_ellipse(self, mask_clean: np.ndarray) -> tuple:
         """Fit ellipse to mask and extract short axis."""
@@ -4343,6 +4364,12 @@ class VisionNode:
                 float(math.radians(((((ellipse_angle - 90.0) + 90.0)
                                       % 180.0) - 90.0))),
                 ellipse_confidence,
+                # [7] long axis from TRUE vertical, rad (NaN unknown) -- what
+                # AUTO grasp mode should judge; [8] which date it belongs to,
+                # so main restarts its stability window when the target changes.
+                (math.radians(t_best["axis_world_tilt_deg"])
+                 if t_best.get("axis_world_tilt_deg") is not None else float("nan")),
+                float(t_best.get("fruit_id", -1) if t_best.get("fruit_id") is not None else -1),
             ]
             self.gap_info_pub.publish(gap_msg)
 

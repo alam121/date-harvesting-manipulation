@@ -4166,6 +4166,22 @@ class UR10eCuroboMoveIt(Node):
         return self._state_mgr.fruit_major_axis_spread_deg
 
     @property
+    def fruit_axis_world_tilt(self):
+        return self._state_mgr.fruit_axis_world_tilt
+
+    @property
+    def fruit_axis_world_tilt_stable(self):
+        return self._state_mgr.fruit_axis_world_tilt_stable
+
+    @property
+    def fruit_axis_world_tilt_samples(self):
+        return self._state_mgr.fruit_axis_world_tilt_samples
+
+    @property
+    def fruit_axis_world_tilt_spread_deg(self):
+        return self._state_mgr.fruit_axis_world_tilt_spread_deg
+
+    @property
     def fruit_image_norm(self):
         return self._state_mgr.fruit_image_norm
 

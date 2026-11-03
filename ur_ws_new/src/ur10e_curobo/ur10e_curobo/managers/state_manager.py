@@ -82,6 +82,14 @@ class StateManager:
         self.fruit_major_axis_samples: int = 0
         self.fruit_major_axis_spread_deg: float = float("inf")
         self._fruit_major_axis_history: List[float] = []
+        # Gravity-referenced tilt of the selected date's long axis (rad, 0 =
+        # hanging), its stability, and which date the readings belong to.
+        self.fruit_axis_world_tilt: Optional[float] = None
+        self.fruit_axis_world_tilt_stable: bool = False
+        self.fruit_axis_world_tilt_samples: int = 0
+        self.fruit_axis_world_tilt_spread_deg: float = float("inf")
+        self._fruit_axis_world_tilt_history: List[float] = []
+        self._fruit_axis_target_id: Optional[int] = None
 
         # Normalised image-space bounding-box centre of best fruit [cx_norm, cy_norm]
         # cx_norm: 0=left, 1=right  |  cy_norm: 0=top, 1=bottom
@@ -405,6 +413,36 @@ class StateManager:
             self.fruit_contact_roll_stable = False
             self.fruit_contact_roll_samples = 0
             self.fruit_contact_roll_spread_deg = float("inf")
+        if len(msg.data) >= 9:
+            # New target date: its axis readings must not be judged together
+            # with the previous date's, or stability never builds (or lies).
+            _tid = int(msg.data[8])
+            if _tid != self._fruit_axis_target_id:
+                self._fruit_axis_target_id = _tid
+                self._fruit_major_axis_history.clear()
+                self._fruit_axis_world_tilt_history.clear()
+            _wt = float(msg.data[7])
+            _n = max(2, int(getattr(
+                self._config.cfg.planner, "approach_date_axis_stable_frames", 5)))
+            _max = math.radians(float(getattr(
+                self._config.cfg.planner, "approach_date_axis_max_spread_deg", 8.0)))
+            _h = self._fruit_axis_world_tilt_history
+            if math.isfinite(_wt):
+                _h.append(_wt)
+                del _h[:-max(_n + 3, 8)]
+            if _h:
+                _recent = _h[-_n:]
+                _spread = max(_recent) - min(_recent) if len(_recent) > 1 else float("inf")
+                self.fruit_axis_world_tilt = sum(_recent) / len(_recent)
+                self.fruit_axis_world_tilt_samples = len(_recent)
+                self.fruit_axis_world_tilt_spread_deg = math.degrees(_spread)
+                self.fruit_axis_world_tilt_stable = (
+                    len(_recent) >= _n and _spread <= _max)
+            else:
+                self.fruit_axis_world_tilt = None
+                self.fruit_axis_world_tilt_stable = False
+                self.fruit_axis_world_tilt_samples = 0
+                self.fruit_axis_world_tilt_spread_deg = float("inf")
         if len(msg.data) >= 7:
             self.fruit_major_axis_confidence = float(msg.data[6])
             raw_axis = float(msg.data[5])
