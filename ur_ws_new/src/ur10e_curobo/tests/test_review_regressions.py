@@ -897,6 +897,20 @@ class LabelFinalFramesTests(unittest.TestCase):
         self.assertEqual(seg[1].split()[0], "2")        # trunk as a rectangle
         self.assertEqual(len(seg[1].split()), 9)
 
+    def test_review_reloads_saved_boxes(self):
+        import os, tempfile
+        from ur10e_curobo.label_final_frames import label_lines, load_box_labels
+        boxes = [[1, 20.0, 20.0, 80.0, 100.0], [2, 0.0, 0.0, 64.0, 400.0]]
+        _, det = label_lines(boxes, size=400)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.txt")
+            open(p, "w").write("\n".join(det) + "\n")
+            back = load_box_labels(p, 400)
+        for a, b in zip(back, boxes):
+            self.assertEqual(a[0], b[0])
+            for u, v in zip(a[1:], b[1:]):
+                self.assertAlmostEqual(u, v, places=3)
+
 
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):

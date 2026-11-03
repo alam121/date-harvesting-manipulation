@@ -25,6 +25,7 @@ Writes ~/harvest_logs/final_frames_dataset/:
 
 Usage:
     python3 -m ur10e_curobo.label_final_frames [--since 20261102_1556]
+            [--review]   # reopen labelled frames with their boxes to fix them
             [--kind miss|hit|all] [--crop 400] [--prefill 0.25]
 """
 import argparse
@@ -81,6 +82,19 @@ def label_lines(boxes, size=CROP, ellipse_points=16):
     return seg, det
 
 
+def load_box_labels(path, size=CROP):
+    """Boxes back from a labels_box file: [cls, x1, y1, x2, y2] in crop px."""
+    boxes = []
+    if os.path.isfile(path):
+        with open(path) as fh:
+            for line in fh:
+                v = line.split()
+                if len(v) == 5:
+                    c, cx, cy, w, h = int(v[0]), *(float(x) * size for x in v[1:])
+                    boxes.append([c, cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0])
+    return boxes
+
+
 def _frames(root, since, kind):
     for meta_path in sorted(glob.glob(os.path.join(root, "*", "*.json"))):
         attempt = os.path.basename(os.path.dirname(meta_path))
@@ -118,6 +132,8 @@ def main(argv=None):
     ap.add_argument("--kind", default="all", choices=("miss", "hit", "all"))
     ap.add_argument("--crop", type=int, default=CROP,
                     help="crop size in px; smaller = fewer dates to label per frame")
+    ap.add_argument("--review", action="store_true",
+                    help="reopen already-labelled frames with their boxes, to fix them")
     ap.add_argument("--prefill", type=float, default=0.25,
                     help="pre-fill YOLO date boxes at or above this confidence")
     args = ap.parse_args(argv)
@@ -125,11 +141,15 @@ def main(argv=None):
     for sub in ("images", "labels", "labels_box"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
     index_path = os.path.join(out, "index.jsonl")
-    done = set()
+    records = {}   # source -> latest record
     if os.path.isfile(index_path):
         with open(index_path) as fh:
-            done = {json.loads(line)["source"] for line in fh if line.strip()}
-    todo = [f for f in _frames(root, args.since, args.kind) if f[2] not in done]
+            for line in fh:
+                if line.strip():
+                    r = json.loads(line)
+                    records[r["source"]] = r
+    todo = [f for f in _frames(root, args.since, args.kind)
+            if (f[2] in records) == args.review]
     if not todo:
         print(f"Nothing to label in {root}.")
         return
@@ -166,13 +186,22 @@ def main(argv=None):
             continue
         h, w = img.shape[:2]
         pred = meta.get("predicted_px")
-        size = min(args.crop, w, h)
-        x0, y0 = crop_window(pred, w, h, size)
+        stem = f"{attempt}_{name}"
+        rec = records.get(img_path) if args.review else None
+        if rec is not None:
+            # Same crop as first labelled, with its boxes, to add/fix.
+            old = cv2.imread(os.path.join(out, "images", rec["image"]))
+            size = old.shape[0] if old is not None else min(args.crop, w, h)
+            x0, y0 = rec["crop_xy"]
+            boxes = load_box_labels(os.path.join(out, "labels_box", stem + ".txt"), size)
+        else:
+            size = min(args.crop, w, h)
+            x0, y0 = crop_window(pred, w, h, size)
+            boxes = prefill(meta.get("raw_detections_xyxy_conf"), x0, y0,
+                            size=size, min_conf=args.prefill)
         crop = img[y0:y0 + size, x0:x0 + size].copy()
         pred_c = [pred[0] - x0, pred[1] - y0] if pred else None
-        state.update(boxes=prefill(meta.get("raw_detections_xyxy_conf"), x0, y0,
-                                   size=size, min_conf=args.prefill),
-                     added=[], drag=None)
+        state.update(boxes=boxes, added=[], drag=None)
         title = f"[{i}/{len(todo)}] {attempt}/{name}"
         key = None
         while True:
@@ -193,7 +222,6 @@ def main(argv=None):
             break
         if key == "s":
             continue
-        stem = f"{attempt}_{name}"
         cv2.imwrite(os.path.join(out, "images", stem + ".jpg"), crop,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         seg, det = label_lines(state["boxes"], size=size)
@@ -204,16 +232,17 @@ def main(argv=None):
         covers = bool(pred_c) and any(
             b[0] == 1 and b[1] <= pred_c[0] <= b[3] and b[2] <= pred_c[1] <= b[4]
             for b in state["boxes"])
-        with open(index_path, "a") as fh:
-            fh.write(json.dumps({
-                "source": img_path, "image": stem + ".jpg", "crop_xy": [x0, y0],
-                "kind": meta.get("kind"), "track_status": meta.get("track_status"),
-                "predicted_px_in_crop": pred_c,
-                "target_visible": key != "n",
-                "date_box_at_prediction": covers,
-                "n_boxes": {NAMES[c]: sum(1 for b in state["boxes"] if b[0] == c)
-                            for c in NAMES},
-            }) + "\n")
+        records[img_path] = {
+            "source": img_path, "image": stem + ".jpg", "crop_xy": [x0, y0],
+            "kind": meta.get("kind"), "track_status": meta.get("track_status"),
+            "predicted_px_in_crop": pred_c,
+            "target_visible": key != "n",
+            "date_box_at_prediction": covers,
+            "n_boxes": {NAMES[c]: sum(1 for b in state["boxes"] if b[0] == c)
+                        for c in NAMES},
+        }
+        with open(index_path, "w") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in records.values())
         saved += 1
     cv2.destroyAllWindows()
     print(f"{saved} frame(s) labelled -> {out}")
