@@ -876,6 +876,28 @@ class AutoHarvestGoalFailureTests(unittest.TestCase):
         self.assertEqual(len(counts), 2)
 
 
+class LabelFinalFramesTests(unittest.TestCase):
+    def test_crop_prefill_and_label_geometry(self):
+        from ur10e_curobo.label_final_frames import crop_window, prefill, label_lines
+        self.assertEqual(crop_window([1000, 800], 1920, 1080), (680, 440))
+        self.assertEqual(crop_window([10, 1070], 1920, 1080), (0, 440))   # kept inside
+        self.assertEqual(crop_window(None, 1920, 1080), (640, 220))       # no prediction
+        boxes = prefill([[700, 460, 760, 540, 0.6],     # inside -> kept
+                         [0, 0, 50, 50, 0.9],           # outside the crop -> dropped
+                         [700, 460, 760, 540, 0.1]],    # below threshold -> dropped
+                        680, 440)
+        self.assertEqual(boxes, [[1, 20.0, 20.0, 80.0, 100.0]])
+        seg, det = label_lines(boxes + [[2, 0.0, 0.0, 64.0, 640.0]])
+        self.assertEqual(det[0], "1 0.078125 0.093750 0.093750 0.125000")
+        pts = [float(v) for v in seg[0].split()[1:]]
+        self.assertEqual(len(pts), 32)                  # 16-point ellipse for a date
+        xs, ys = pts[0::2], pts[1::2]
+        self.assertAlmostEqual(min(xs), 20 / 640, places=4)
+        self.assertAlmostEqual(max(ys), 100 / 640, places=4)
+        self.assertEqual(seg[1].split()[0], "2")        # trunk as a rectangle
+        self.assertEqual(len(seg[1].split()), 9)
+
+
 class HandEyeRefinementTests(unittest.TestCase):
     def test_reprojection_refinement_recovers_known_transform(self):
         import cv2
