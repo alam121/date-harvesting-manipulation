@@ -4470,6 +4470,15 @@ def plan_and_execute(node):
                 and getattr(node, "_corridor_retry_grasp_mode", None)):
             _goal_grasp_mode = node._corridor_retry_grasp_mode
         elif _configured_grasp_mode == "AUTO":
+            # The tilt history resets per target, and execution can start
+            # ~0.5s after the goal is accepted (2026-11-03: 75deg, conf 0.21,
+            # samples=1 -> NORMAL). Give it a moment to build before deciding.
+            _wait_end = time.time() + float(getattr(
+                node.cfg.gripper, "auto_envelop_stable_wait_s", 1.0))
+            while (getattr(node, "fruit_axis_world_tilt", None) is not None
+                   and not getattr(node, "fruit_axis_world_tilt_stable", False)
+                   and time.time() < _wait_end):
+                time.sleep(0.05)
             _axis_deg_raw = math.degrees(float(getattr(
                 node, "fruit_major_axis_angle", 0.0)))
             _axis_from_vertical = abs(

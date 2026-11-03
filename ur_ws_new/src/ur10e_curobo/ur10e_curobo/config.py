@@ -1130,6 +1130,8 @@ class Gripper:
     # and never got ENVELOP. Noisy angles are still held back by the stability
     # gate (5 readings within 8deg). Keep vision/visualization.py ENVELOP_MIN_CONF equal.
     auto_envelop_min_axis_confidence: float = 0.15
+    # Max wait for 5 steady tilt readings before AUTO decides (per goal).
+    auto_envelop_stable_wait_s: float = 1.0
     normal_depth_extra_m: float = 0.0
     normal_z_extra_m: float = 0.012  # consistent FINAL correction in base/world Z
     envelop_depth_extra_m: float = 0.0
