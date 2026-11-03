@@ -4473,6 +4473,9 @@ def plan_and_execute(node):
             # The tilt history resets per target, and execution can start
             # ~0.5s after the goal is accepted (2026-11-03: 75deg, conf 0.21,
             # samples=1 -> NORMAL). Give it a moment to build before deciding.
+            # Lock first: unlocked, the "best" date flips between neighbours,
+            # each flip resets the history, and the tilt may be another date's.
+            lock_target(node, goal[:3])
             _wait_end = time.time() + float(getattr(
                 node.cfg.gripper, "auto_envelop_stable_wait_s", 1.0))
             while (getattr(node, "fruit_axis_world_tilt", None) is not None
