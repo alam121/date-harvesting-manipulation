@@ -1188,3 +1188,16 @@ class ImageStampTfLookupTests(unittest.TestCase):
         t0 = _time.time()
         self.assertEqual(fn(self_, 'base_link'), 'latest')
         self.assertLess(_time.time() - t0, 0.1)
+
+
+class WiderCorridorSkipTests(unittest.TestCase):
+    def test_wrong_side_flip_drops_wider_same_side_only(self):
+        import re
+        fn = load('goals.py', '_wider_same_side_corridors', dict(re=re))
+        labels = ['FROM_RIGHT_45', 'FROM_RIGHT_30', 'FROM_RIGHT_20', 'FROM_RIGHT_10',
+                  'STRAIGHT', 'FROM_LEFT_10', 'FROM_LEFT_45']
+        flip = 'APPROACH_BRANCH_SWITCH(j1=165deg>75deg)'
+        self.assertEqual(fn('FROM_RIGHT_20', flip, labels), {'FROM_RIGHT_45', 'FROM_RIGHT_30'})
+        self.assertEqual(fn('FROM_RIGHT_20', 'APPROACH_BRANCH_SWITCH(j1=90deg>75deg)', labels), set())
+        self.assertEqual(fn('FROM_RIGHT_20', 'FINAL_WAYPOINT_1', labels), set())
+        self.assertEqual(fn('STRAIGHT', flip, labels), set())

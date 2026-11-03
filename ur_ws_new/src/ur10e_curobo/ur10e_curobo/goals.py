@@ -1498,6 +1498,26 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     return True
 
 
+def _wider_same_side_corridors(label, reason, labels, min_flip_deg=150.0):
+    """Corridors a wrong-side preflight reject also rules out.
+
+    A >=150deg APPROACH flip means the arm is on the wrong side for this
+    heading; wider headings on the same side turn it further, so preflighting
+    them is ~0.13s of IK each for a known reject (2026-11-03: RIGHT_30, 20, 45
+    all flipped 165-180deg before RIGHT_10 passed).
+    """
+    m = re.match(r"FROM_(LEFT|RIGHT)_([\d.]+)$", str(label))
+    flip = re.search(r"APPROACH_BRANCH_SWITCH\(j\d+=(\d+)deg", str(reason))
+    if not m or not flip or float(flip.group(1)) < min_flip_deg:
+        return set()
+    out = set()
+    for other in labels:
+        o = re.match(r"FROM_(LEFT|RIGHT)_([\d.]+)$", str(other))
+        if o and o.group(1) == m.group(1) and float(o.group(2)) > float(m.group(2)):
+            out.add(other)
+    return out
+
+
 def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
                                     waypoint_count=2):
     """Validate APPROACH and fixed-orientation straight FINAL before motion.
@@ -5590,6 +5610,9 @@ def plan_and_execute(node):
                     node._corridor_retry_keep_lock = True
                     continue
                 node._corridor_exclusions.add(_active_corridor)
+                node._corridor_exclusions |= _wider_same_side_corridors(
+                    _active_corridor, _pf_reason,
+                    getattr(node, "_neighbor_candidate_labels", []))
                 _tip_failure_limit = max(1, int(getattr(
                     node.cfg.planner,
                     "tool_axis_tip_fallback_after_corridors", 2)))
