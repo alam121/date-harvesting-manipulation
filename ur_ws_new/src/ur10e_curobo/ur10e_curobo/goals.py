@@ -4502,6 +4502,8 @@ def plan_and_execute(node):
                 _samples = int(getattr(node, "fruit_axis_world_tilt_samples", 0) or 0)
                 _spread = float(getattr(
                     node, "fruit_axis_world_tilt_spread_deg", float("inf")))
+                _axis_confidence = float(getattr(
+                    node, "fruit_axis_world_confidence", _axis_confidence))
                 _axis_ref = "world"
             _axis_threshold = float(getattr(
                 node.cfg.gripper,

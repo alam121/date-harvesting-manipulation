@@ -4182,6 +4182,10 @@ class UR10eCuroboMoveIt(Node):
         return self._state_mgr.fruit_axis_world_tilt_spread_deg
 
     @property
+    def fruit_axis_world_confidence(self):
+        return self._state_mgr.fruit_axis_world_confidence
+
+    @property
     def fruit_image_norm(self):
         return self._state_mgr.fruit_image_norm
 
