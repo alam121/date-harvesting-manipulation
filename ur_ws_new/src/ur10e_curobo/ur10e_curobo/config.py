@@ -1170,6 +1170,13 @@ class Gripper:
     # risks crushing the fruit, so step up rather than jumping to the ceiling.
     holding_force_command: int = 70  # DG-3F-M units: 0.1 N (70 = 7 N)
     holding_force_settle_s: float = 0.15
+    # Release the force-hold (hold position instead) when the 12 motors draw
+    # more than this, sustained, while holding. Outdoors 2026-11-02 holds at
+    # 1.22-1.25 A (all empty closes) tripped C289A9 tool-connector current and
+    # stopped the program; <=1.12 A never did (a held date: 1.04 A). Narrow
+    # margin from 16 cycles -- revisit with more data. 0 disables.
+    holding_current_limit_a: float = 1.15
+    holding_current_limit_hold_s: float = 0.2
     holding_release_settle_s: float = 0.05
     opening_steps: int = 6
     opening_step_delay_s: float = 0.06

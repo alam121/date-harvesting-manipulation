@@ -650,6 +650,58 @@ class GripperCurrentLimitTests(unittest.TestCase):
         self.assertEqual(fn(g, [2.0, 0.0, 0.6]), [2.0, 0.0, 0.6])
 
 
+class HoldCurrentGuardTests(unittest.TestCase):
+    def _gripper(self, limit=1.15):
+        import time as _time
+        fn = load('delto_gripper_controller.py', '_watch_hold_current',
+                  dict(time=_time, Int16MultiArray=lambda: types.SimpleNamespace(data=None)),
+                  owner='DeltoGripperController')
+        sent, logs = [], []
+        g = types.SimpleNamespace(
+            node=types.SimpleNamespace(
+                running=True,
+                cfg=types.SimpleNamespace(gripper=types.SimpleNamespace(
+                    holding_current_limit_a=limit, holding_current_limit_hold_s=0.1)),
+                get_logger=lambda: types.SimpleNamespace(warn=logs.append)),
+            holding_control_publisher=types.SimpleNamespace(publish=lambda m: sent.append(m.data)),
+            published=[], _hold_seq=1, hold_peak_current_a=0.0, hold_current_limited=False,
+            actual_joint_position=[0.5] * 12, current_position=None,
+            actual_joint_effort=[0.0] * 12, actual_joint_stamp=_time.time())
+        g.publish_position = g.published.append
+        return fn, g, sent, logs
+
+    def _feed(self, g, amps, seconds):
+        import time as _time
+        end = _time.time() + seconds
+        while _time.time() < end:
+            g.actual_joint_effort = [amps / 12.0] * 12
+            g.actual_joint_stamp = _time.time()
+            _time.sleep(0.05)
+
+    def test_empty_close_hold_is_released_to_position_hold(self):
+        fn, g, sent, logs = self._gripper()
+        t = threading.Thread(target=fn, args=(g, 1, [1, 70, 0, 0])); t.start()
+        self._feed(g, 1.24, 0.4)                     # the outdoor trip level
+        t.join(1.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(sent, [[0, 1, 70, 0, 0]])   # force-hold released
+        self.assertEqual(g.published, [[0.5] * 12])  # held at the measured pose
+        self.assertTrue(g.hold_current_limited)
+        self.assertGreater(g.hold_peak_current_a, 1.2)
+
+    def test_held_date_level_and_brief_spike_keep_the_hold(self):
+        fn, g, sent, logs = self._gripper()
+        t = threading.Thread(target=fn, args=(g, 1, [1, 70, 0, 0])); t.start()
+        self._feed(g, 1.04, 0.3)                     # the held date's level
+        self._feed(g, 1.30, 0.05)                    # one-sample spike
+        self._feed(g, 1.04, 0.2)
+        g._hold_seq = 2                              # hold released by OPEN
+        t.join(1.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(sent, [])
+        self.assertFalse(g.hold_current_limited)
+
+
 class AfterReverseSnapshotTests(unittest.TestCase):
     def test_snapshot_lands_in_episode_recorded_after_it(self):
         import os

@@ -148,6 +148,12 @@ def snapshot_after_reverse(node, t_close: float) -> None:
             getattr(gc, "actual_joint_position", None) if gc else None),
         "gripper_joint_effort": _jsonable(
             getattr(gc, "actual_joint_effort", None) if gc else None),
+        # Force-hold current so far; limited=True means the hold-current guard
+        # released it -- in the outdoor data, an empty-close signal.
+        "hold_peak_current_a": _jsonable(
+            getattr(gc, "hold_peak_current_a", None) if gc else None),
+        "hold_current_limited": _jsonable(
+            getattr(gc, "hold_current_limited", None) if gc else None),
     }
 
     def _write():

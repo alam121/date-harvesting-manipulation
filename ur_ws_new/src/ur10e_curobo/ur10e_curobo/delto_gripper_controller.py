@@ -2,6 +2,7 @@
 import time
 import math
 import os
+import threading
 from std_msgs.msg import Float32MultiArray, Int16MultiArray
 from sensor_msgs.msg import JointState
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -168,7 +169,13 @@ class DeltoGripperController:
         msg = Int16MultiArray()
         msg.data = [1 if active else 0, mode, force, *hold_mask]
         self.holding_control_publisher.publish(msg)
+        # Any change of hold state ends the previous hold's current watch.
+        self._hold_seq = getattr(self, "_hold_seq", 0) + 1
         if active:
+            self.hold_peak_current_a = 0.0
+            self.hold_current_limited = False
+            threading.Thread(target=self._watch_hold_current,
+                             args=(self._hold_seq, msg.data[1:]), daemon=True).start()
             self.node.get_logger().info(
                 "[GRIPPER_HOLD] requested=ON "
                 f"mode={mode} force={force * 0.1:.1f}N "
@@ -178,6 +185,47 @@ class DeltoGripperController:
         else:
             time.sleep(max(0.0, float(getattr(
                 self.node.cfg.gripper, "holding_release_settle_s", 0.05))))
+
+    def _watch_hold_current(self, seq, hold_params):
+        """Keep the tool-connector current in budget while the force-hold is on.
+
+        On an empty close the firmware hold squeezes the fingers into each
+        other: outdoors (2026-11-02) every hold that reached 1.22-1.25 A total
+        tripped C289A9 "limit current at tool connector" ~1.3 s later and
+        stopped the robot program; holds at <=1.12 A (incl. a held date at
+        1.04 A) never did. Sustained current over the limit switches to a
+        position hold at the measured finger pose. Runs until the hold changes.
+        """
+        cfg = self.node.cfg.gripper
+        limit = float(getattr(cfg, "holding_current_limit_a", 0.0))
+        if limit <= 0.0:
+            return
+        sustain = float(getattr(cfg, "holding_current_limit_hold_s", 0.2))
+        over_since, last_stamp = None, None
+        while getattr(self, "_hold_seq", 0) == seq and getattr(self.node, "running", True):
+            eff, stamp = self.actual_joint_effort, self.actual_joint_stamp
+            if eff is not None and stamp != last_stamp and time.time() - stamp < 0.3:
+                last_stamp = stamp
+                total = sum(abs(e) for e in eff)
+                self.hold_peak_current_a = max(self.hold_peak_current_a, total)
+                if total <= limit:
+                    over_since = None
+                elif over_since is None:
+                    over_since = time.time()
+                elif time.time() - over_since >= sustain:
+                    msg = Int16MultiArray()
+                    msg.data = [0, *hold_params]          # release the force-hold
+                    self.holding_control_publisher.publish(msg)
+                    if self.actual_joint_position is not None:
+                        self.current_position = list(self.actual_joint_position)
+                        self.publish_position(self.current_position)
+                    self.hold_current_limited = True
+                    self.node.get_logger().warn(
+                        f"[GRIPPER_HOLD_LIMIT] {total:.2f}A > {limit:.2f}A for "
+                        f"{sustain:.2f}s; force-hold released, holding measured pose "
+                        "(likely an empty close)")
+                    return
+            time.sleep(0.02)
 
     def active_joint_degrees(self, position):
         indices = [idx for joints in self.finger_joint_indices.values() for idx in joints]
