@@ -4464,6 +4464,8 @@ def plan_and_execute(node):
         # date's stable image major axis: 0deg is vertical, +/-90deg horizontal.
         _configured_grasp_mode = str(getattr(
             node.cfg.gripper, "grasp_mode", "NORMAL")).strip().upper()
+        if not _same_corridor_goal:
+            node._grasp_mode_decision = None
         if (_same_corridor_goal
                 and getattr(node, "_corridor_retry_grasp_mode", None)):
             _goal_grasp_mode = node._corridor_retry_grasp_mode
@@ -4488,13 +4490,33 @@ def plan_and_execute(node):
                     and _axis_confidence >= _confidence_threshold
                     and _axis_from_vertical >= _axis_threshold)
                 else "NORMAL")
-            node.get_logger().debug(
+            # Info level + recorded in the episode: outdoors (2026-11-02) all 17
+            # decisions were NORMAL although some dates looked tilted, and the
+            # debug-only line left no way to tell which gate blocked ENVELOP.
+            _samples = int(getattr(node, "fruit_major_axis_samples", 0) or 0)
+            _spread = float(getattr(node, "fruit_major_axis_spread_deg", float("inf")))
+            node._grasp_mode_decision = {
+                "selected": _goal_grasp_mode,
+                "axis_from_vertical_deg": round(_axis_from_vertical, 1),
+                "axis_threshold_deg": _axis_threshold,
+                "confidence": round(_axis_confidence, 3),
+                "confidence_threshold": _confidence_threshold,
+                "stable": _axis_stable,
+                "samples": _samples,
+                "spread_deg": round(_spread, 1) if math.isfinite(_spread) else None,
+            }
+            _blocked = [name for name, ok in (
+                ("tilt", _axis_from_vertical >= _axis_threshold),
+                ("confidence", _axis_confidence >= _confidence_threshold),
+                ("stable", _axis_stable)) if not ok]
+            node.get_logger().info(
                 f"[GRASP_MODE_AUTO] selected={_goal_grasp_mode} "
                 f"axis_from_vertical={_axis_from_vertical:.1f}deg "
                 f"threshold={_axis_threshold:.1f}deg "
                 f"confidence={_axis_confidence:.2f}/"
                 f"{_confidence_threshold:.2f} stable={_axis_stable} "
-                "frozen=THIS_GOAL")
+                f"samples={_samples} spread={_spread:.1f}deg "
+                f"blocked_by={','.join(_blocked) or 'none'} frozen=THIS_GOAL")
         else:
             _goal_grasp_mode = (
                 _configured_grasp_mode

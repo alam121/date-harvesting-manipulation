@@ -256,6 +256,9 @@ def record_episode(node, outcome: str, end: str) -> Optional[str]:
         "reacquire_result": str(getattr(node, "reacquire_result", "") or ""),
         "motion_phase": str(getattr(node, "motion_phase", "") or ""),
         "grasp_mode": str(getattr(node, "active_goal_grasp_mode", "") or ""),
+        # AUTO's inputs at selection: tilt, confidence, stability (samples,
+        # spread) -- which gate kept a tilted date out of ENVELOP.
+        "grasp_mode_decision": _jsonable(getattr(node, "_grasp_mode_decision", None)),
         "fruit_radius": _jsonable(getattr(node, "latest_fruit_radius", None)),
         # None = level insertion off or not a low-centre goal (A/B on hit rate).
         "level_final_z": _jsonable(getattr(node, "_level_final_z", None)),
