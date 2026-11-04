@@ -346,6 +346,8 @@ class DeltoGripperController:
             cfg, 'nontactile_current_delta_a', [0.220, 0.120, 0.220]))
         remaining_thresholds = list(getattr(
             cfg, 'nontactile_remaining_fraction', [0.75, 0.55, 0.75]))
+        current_only_thresholds = list(getattr(
+            cfg, 'nontactile_current_only_a', [math.inf] * 3))
         contacts, current_deltas, remaining, tracking_joints = [], [], [], []
         for finger in range(3):
             finger_indices = list(range(finger * 4, finger * 4 + 4))
@@ -377,8 +379,9 @@ class DeltoGripperController:
             current_deltas.append(current_delta)
             remaining.append(remaining_fraction)
             contacts.append(
-                current_delta >= float(current_thresholds[finger])
-                and remaining_fraction >= float(remaining_thresholds[finger]))
+                (current_delta >= float(current_thresholds[finger])
+                 and remaining_fraction >= float(remaining_thresholds[finger]))
+                or current_delta >= float(current_only_thresholds[finger]))
 
         # Only load-bearing fingers can register contact. Counting a finger
         # whose tip cannot reach the fruit silently raises the bar: "2 of 3"

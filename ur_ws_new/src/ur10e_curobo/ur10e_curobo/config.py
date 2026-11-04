@@ -1,6 +1,7 @@
 # ur10e_curobo/config.py
 from dataclasses import dataclass, field
 from typing import List
+import math
 import os
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from .planner_options import PlanOptions
@@ -1229,6 +1230,11 @@ class Gripper:
         default_factory=lambda: [0.020, 0.020, 0.0])
     nontactile_remaining_fraction: List[float] = field(
         default_factory=lambda: [0.08, 0.50, 0.085])
+    # 2026-11-04, judged after the fingers stop: empty left remaining 0.05-0.07
+    # and current 58-63 mA (5/5); held remaining 0.09-0.18, current 77-98 mA
+    # (4/4). One held date stopped at 0.09, so current alone also counts.
+    nontactile_current_only_a: List[float] = field(
+        default_factory=lambda: [math.inf, math.inf, 0.070])
     # Fingers that physically bear load, by index into the 3-finger arrays:
     #   0 = RIGHT  (motors M1-M4,  tracked M4)
     #   1 = CENTER (motors M5-M8,  tracked M7)
