@@ -1498,6 +1498,54 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     return True
 
 
+def _empty_close_retry(node, seed_xyz, final_target, clearance_m):
+    """Once per grasp, when the close found nothing: open, back out along the
+    FINAL leg to the approach standoff, look for the date near where it was,
+    and go back in to where it is now. Returns True if the arm moved.
+
+    Only the reliable post-close signal triggers it: before closing, a date
+    hidden in the jaws and a date that moved look the same (2026-11-04).
+    """
+    ev = getattr(node.gripper_controller, "contact_evidence", None) or {}
+    if not ev.get("valid") or ev.get("reason") != "EMPTY_CLOSE":
+        return False
+    stored = list(getattr(node, "stored_trajectory_states", None) or [])
+    n0 = int(getattr(node, "_stored_len_before_final", len(stored)))
+    final_leg = stored[n0:]
+    if len(final_leg) < 2:
+        return False
+    log = node.get_logger()
+    log.warn("[EMPTY_CLOSE_RETRY] closed on nothing; backing out to look again")
+    node.control_gripper("OPEN")
+    # Back out along the exact FINAL leg, then forget it: a later pull-back
+    # must never replay it forwards into the bunch.
+    if not execute_partial_reverse(node, clearance_m, prepared_states=list(reversed(final_leg)),
+                                   original_state_count=len(final_leg)):
+        node.stored_trajectory_states = stored[:n0]
+        return True
+    node.stored_trajectory_states = stored[:n0]
+    radius = float(getattr(node.cfg.planner, "empty_close_retry_radius_m", 0.06))
+    found = reacquire_goal_pose(
+        node, list(seed_xyz), timeout=float(getattr(
+            node.cfg.planner, "empty_close_retry_timeout_s", 1.0)),
+        radius=radius, depth_settle_s=0.10, restore_mode="paused", planner_busy=True)
+    if not found:
+        log.warn("[EMPTY_CLOSE_RETRY] date not found from the standoff; giving up")
+        return True
+    shift = [float(found[i]) - float(seed_xyz[i]) for i in range(3)]
+    target = [float(final_target[i]) + shift[i] for i in range(3)] + list(final_target[3:])
+    log.info(f"[EMPTY_CLOSE_RETRY] date found {math.dist(found, seed_xyz) * 1000:.0f}mm "
+             f"from where it was; re-entering")
+    if _direct_ik_move(node, target, label="FINAL_RETRY_EMPTY",
+                       motion_type="final", store_trajectory=True):
+        node.control_gripper("CLOSE")
+        ev = getattr(node.gripper_controller, "contact_evidence", None) or {}
+        log.info(f"[EMPTY_CLOSE_RETRY] second close: {ev.get('reason', 'UNKNOWN')}")
+    else:
+        log.warn("[EMPTY_CLOSE_RETRY] could not reach the new position")
+    return True
+
+
 def _blind_close(inflight_report, close_geometry, min_nearest_mm, min_frames=5):
     """True when closing would be blind: the in-flight monitor never matched
     the date and the nearest date seen at close is far from the target.
@@ -6825,6 +6873,10 @@ def plan_and_execute(node):
             node._close_geometry = None  # never record a previous grasp's geometry
             _inflight_thread = None
             _final_inplace_retried = False
+            # Where the FINAL leg starts in the stored path, so an empty-close
+            # retry can back out along it and drop it before re-entering.
+            node._stored_len_before_final = len(
+                getattr(node, "stored_trajectory_states", None) or [])
             if bool(getattr(node.cfg.planner, "final_inflight_observe", False)):
                 # _direct_ik_move publishes its trajectory ~25 lines BEFORE it
                 # assigns node._final_live_wait_xyz, and this thread starts before
@@ -7217,6 +7269,13 @@ def plan_and_execute(node):
             break
         # Notify vision system about grasp attempt for fruit tracking
         notify_grasp_attempt(node, [x, y, z])
+        if (bool(getattr(node.cfg.planner, "empty_close_retry", True))
+                and _empty_close_retry(node, [x, y, z], final_target, _reverse_clearance)):
+            # The arm moved: rebuild the pull-back from the new stored path.
+            _prepared_reverse, _reverse_state_count = _prepare_partial_reverse_states(
+                node, _reverse_clearance)
+        if _check_stop():
+            break
 
         # Evaluate grasp using force profile (when did contact start during closure)
         gc = node.gripper_controller

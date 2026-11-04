@@ -1213,3 +1213,25 @@ class BlindCloseTests(unittest.TestCase):
         self.assertFalse(fn({"frames": 14, "matched": 1}, {"nearest_date_mm": 114.0}, 40.0))
         self.assertFalse(fn({"frames": 3, "matched": 0}, {"nearest_date_mm": 114.0}, 40.0))
         self.assertFalse(fn(None, None, 40.0))
+
+
+class EmptyCloseRetryTests(unittest.TestCase):
+    def test_only_an_empty_close_moves_the_arm(self):
+        moved = []
+        env = dict(math=math, execute_partial_reverse=lambda *a, **k: moved.append('rev') or True,
+                   reacquire_goal_pose=lambda *a, **k: None,
+                   _direct_ik_move=lambda *a, **k: moved.append('ik') or True)
+        fn = load('goals.py', '_empty_close_retry', env)
+        def node(reason, stored, n0):
+            gc = types.SimpleNamespace(contact_evidence={"valid": True, "reason": reason})
+            return types.SimpleNamespace(
+                gripper_controller=gc, stored_trajectory_states=stored, _stored_len_before_final=n0,
+                get_logger=logger, control_gripper=lambda a: moved.append(a),
+                cfg=types.SimpleNamespace(planner=types.SimpleNamespace()))
+        self.assertFalse(fn(node("CONTACT", [[0]] * 5, 2), [0, 0, 0], [0] * 7, 0.2))
+        self.assertFalse(fn(node("EMPTY_CLOSE", [[0]] * 2, 2), [0, 0, 0], [0] * 7, 0.2))
+        self.assertEqual(moved, [])
+        n = node("EMPTY_CLOSE", [[1], [2], [3], [4]], 2)
+        self.assertTrue(fn(n, [0, 0, 0], [0] * 7, 0.2))
+        self.assertEqual(n.stored_trajectory_states, [[1], [2]])   # FINAL leg dropped
+        self.assertEqual(moved, ['OPEN', 'rev'])                   # not found -> no re-entry

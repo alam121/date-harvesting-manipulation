@@ -822,6 +822,11 @@ class Planner:
     # by the fingers) because a neighbour 52/77mm away was visible. Neighbours
     # 5-11cm away are normal in a bunch, so only skip when none is near.
     blind_close_min_nearest_mm: float = 150.0
+    # After an EMPTY_CLOSE: open, back out along FINAL, re-detect the date within
+    # this radius of where it was, re-enter and close once more (goals._empty_close_retry).
+    empty_close_retry: bool = True
+    empty_close_retry_radius_m: float = 0.06
+    empty_close_retry_timeout_s: float = 1.0
     # Disabled 2026-09-16 after measuring the tip-anchored FINAL geometry at
     # ~1.39 m range: the detected tip sat 21.3 mm from the date centre (fruit
     # radius 8.0 mm, so the anchor is already outside the fruit), and
