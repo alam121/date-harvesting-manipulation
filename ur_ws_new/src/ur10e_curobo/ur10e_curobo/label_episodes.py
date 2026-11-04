@@ -15,14 +15,14 @@ Usage:
     python3 -m ur10e_curobo.label_episodes --all            # relabel everything
     python3 -m ur10e_curobo.label_episodes --stats          # outcome vs label
 
-Opens crop_close.jpg (before closing) and after_reverse.jpg if a viewer is
-available. Writes human_label into each episode.json.
+Shows the episode's images (crop, crop_close, after_reverse) side by side in
+one window; press the label key in that window. Writes human_label into each
+episode.json.
 """
 
 import argparse
 import json
 import os
-import subprocess
 from collections import Counter
 
 KEYS = {"h": "held", "s": "slipped", "m": "missed", "u": "unclear", "k": None}
@@ -53,19 +53,30 @@ def describe(ep):
             + ("" if after.get("image") else "  (no after-reverse image)"))
 
 
-def show(directory):
-    """Open the before/after images. Labelling works without them."""
-    for name in ("crop_close.jpg", "after_reverse.jpg"):
-        image = os.path.join(directory, name)
-        if not os.path.isfile(image):
+def show(directory, title):
+    """One enlarged side-by-side window of the episode's images; returns the
+    key pressed in it, or None when there is no display (fall back to input)."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    tiles = []
+    for name in ("crop.jpg", "crop_close.jpg", "after_reverse.jpg"):
+        image = cv2.imread(os.path.join(directory, name))
+        if image is None:
             continue
-        for viewer in ("eog", "feh", "xdg-open"):
-            try:
-                subprocess.Popen([viewer, image],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                break
-            except FileNotFoundError:
-                continue
+        image = cv2.resize(image, (int(image.shape[1] * 520 / image.shape[0]), 520))
+        cv2.putText(image, name[:-4], (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        tiles.append(image)
+    if not tiles:
+        return None
+    try:
+        cv2.imshow("label_episodes", np.hstack(tiles))
+        cv2.setWindowTitle("label_episodes", f"{title}   [h]eld [s]lipped [m]issed [u]nclear s[k]ip [q]uit")
+        return chr(cv2.waitKey(0) & 0xFF).lower()
+    except cv2.error:
+        return None
 
 
 def stats(root, since):
@@ -96,18 +107,22 @@ def label(root, since, relabel):
         print(f"          {describe(ep)}")
         if ep.get("human_label"):
             print(f"          currently: {ep['human_label']}")
-        show(directory)
+        key = show(directory, os.path.basename(directory))
         while True:
-            try:
-                key = input("          label> ").strip().lower()[:1]
-            except (EOFError, KeyboardInterrupt):
-                key = "q"
+            if key in KEYS or key == "q":
+                print(f"          label> {key}")
+            else:
+                try:
+                    key = input("          label> ").strip().lower()[:1]
+                except (EOFError, KeyboardInterrupt):
+                    key = "q"
             if key == "q":
                 print(f"{done} labelled.")
                 return
             if key in KEYS:
                 break
             print("          h / s / m / u / k / q")
+            key = None
         if KEYS[key] is None:
             continue
         ep["human_label"] = KEYS[key]
