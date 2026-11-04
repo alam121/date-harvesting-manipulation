@@ -7372,33 +7372,11 @@ def plan_and_execute(node):
                 prediction = "PROPER" if (stopped_early or first_contact < gc.steps - 2) else "NO_CONTACT"
             node.get_logger().info(f"Re-grip result: {prediction}, first_contact={first_contact}/{gc.steps}")
 
-        # Depth correction: nudge gripper forward (gripper closed) to bring contact
-        # ratio closer to ideal 0.40. Only applied when grip is accepted (no regrip
-        # needed) but fruit is shallower than ideal (ratio > 0.40).
-        # Gripper stays closed — this deepens the cup around the fruit without releasing.
-        contact_ratio_now = first_contact / max(gc.steps, 1)
-        _depth_correction = -(contact_ratio_now - 0.40) * 0.04  # same formula as REGRIP
-        _depth_correction = max(-0.020, min(0.0, _depth_correction))  # forward only, ≤20mm
-        if abs(_depth_correction) > 0.003:  # only move if correction > 3mm
-            _cur_for_depth = node.get_end_effector_pose()
-            if _cur_for_depth:
-                _depth_x, _depth_y = add_axis_offsets(
-                    _cur_for_depth[0],
-                    _cur_for_depth[1],
-                    depth=_depth_correction,
-                )
-                _depth_target = [
-                    _depth_x,
-                    _depth_y,
-                    _cur_for_depth[2],
-                    *_cur_for_depth[3:]
-                ]
-                node.get_logger().info(
-                    f"[DEPTH] contact_ratio={contact_ratio_now:.0%} → nudging "
-                    f"{_depth_correction*1000:+.1f}mm forward to deepen grip"
-                )
-                _direct_ik_move(node, _depth_target, label="DEPTH_CORRECT",
-                                motion_type="final", store_trajectory=True)
+        # The closed-gripper DEPTH_CORRECT forward nudge was removed 2026-11-04:
+        # it keyed off the tactile first-contact step, and with no tactile
+        # sensors that reads 20/20 exactly when feedback is lost. At 14:12:50 the
+        # Delto Modbus link dropped mid-close and it tried to push the closed
+        # gripper 20mm into the bunch (stopped only by "IK too far").
         _timing["grasp"] = time.time() - _t_grasp
         if _log_phase_timings:
             node.get_logger().info(
