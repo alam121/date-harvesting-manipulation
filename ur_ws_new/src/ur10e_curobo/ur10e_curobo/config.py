@@ -818,6 +818,9 @@ class Planner:
     # On again 2026-11-04 to profile the ~1.2s between GRASP_MODE and
     # APPROACH_ALIGNMENT (ik_preflight_ms / lock_wait_ms per corridor).
     log_corridor_candidates: bool = True
+    # 2026-11-04: sample the planning thread GRASP_MODE -> approach publish and
+    # log the hottest source lines as [PLAN_PROFILE]. Off once profiled.
+    profile_planning: bool = True
     # Skip the close when FINAL never matched the date and the nearest visible
     # date is at least this far from the target (see goals._blind_close).
     # Was 40: 2026-11-04 11:26 it skipped two dates sitting in the jaws (hidden

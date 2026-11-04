@@ -9,6 +9,47 @@ from curobo.types import Pose
 from curobo.types import JointState
 
 
+class _PlanSampler:
+    """Wall-clock stack sampler for the planning thread (profile_planning).
+
+    py-spy cannot attach here (ptrace_scope=1, no sudo), so sample our own
+    thread every period_s and count, per ur10e_curobo source line, how many
+    samples had that line on the stack; its share of samples x wall time
+    ~= inclusive time.
+    """
+
+    def __init__(self, node, period_s=0.005):
+        import sys
+        from collections import Counter
+        self._node, self._period, self._tid = node, period_s, threading.get_ident()
+        self._counts, self._n, self._stop = Counter(), 0, threading.Event()
+        self._frames = sys._current_frames
+        self._t0 = time.perf_counter()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop.wait(self._period):
+            f = self._frames().get(self._tid)
+            seen = set()
+            while f is not None:
+                c = f.f_code
+                if "ur10e_curobo" in c.co_filename:
+                    seen.add(f"{c.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno} {c.co_name}")
+                f = f.f_back
+            self._counts.update(seen)
+            self._n += 1
+
+    def stop(self, top=15):
+        self._stop.set()
+        wall = time.perf_counter() - self._t0
+        # Share of samples x wall time: sampling runs slower than period_s
+        # under GIL contention, so count * period would under-report.
+        rows = " | ".join(f"{k} {v / max(self._n, 1) * wall:.2f}s"
+                          for k, v in self._counts.most_common(top))
+        self._node.get_logger().info(
+            f"[PLAN_PROFILE] wall={wall:.2f}s samples={self._n} {rows}")
+
+
 def try_cuda_recovery(node) -> bool:
     """Attempt to recover from a CUDA fault by resetting the device state.
     Returns True if CUDA is usable again, False if still broken."""
@@ -2857,6 +2898,9 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         node.set_vision_mode("reacquire_fast")
         node.get_logger().info(
             "[APPROACH_VISION] streaming during travel (GPU free; planning done)")
+    if label.startswith("APPROACH") and getattr(node, "_plan_sampler", None) is not None:
+        node._plan_sampler.stop()
+        node._plan_sampler = None
 
     if callable(_record_motion):
         _record_motion(
@@ -4735,6 +4779,10 @@ def plan_and_execute(node):
             node.get_logger().info(
                 f"[GRASP_MODE] selected={_goal_grasp_mode} "
                 f"style={_grasp_style} source={_configured_grasp_mode}")
+            if bool(getattr(node.cfg.planner, "profile_planning", False)):
+                if getattr(node, "_plan_sampler", None) is not None:
+                    node._plan_sampler._stop.set()   # previous goal never published
+                node._plan_sampler = _PlanSampler(node)
         node.active_goal_grasp_mode = _goal_grasp_mode
         node._corridor_retry_grasp_mode = _goal_grasp_mode
         _active_corridor = None
