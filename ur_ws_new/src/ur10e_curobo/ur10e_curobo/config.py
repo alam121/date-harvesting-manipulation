@@ -818,7 +818,10 @@ class Planner:
     log_corridor_candidates: bool = False
     # Skip the close when FINAL never matched the date and the nearest visible
     # date is at least this far from the target (see goals._blind_close).
-    blind_close_min_nearest_mm: float = 40.0
+    # Was 40: 2026-11-04 11:26 it skipped two dates sitting in the jaws (hidden
+    # by the fingers) because a neighbour 52/77mm away was visible. Neighbours
+    # 5-11cm away are normal in a bunch, so only skip when none is near.
+    blind_close_min_nearest_mm: float = 150.0
     # Disabled 2026-09-16 after measuring the tip-anchored FINAL geometry at
     # ~1.39 m range: the detected tip sat 21.3 mm from the date centre (fruit
     # radius 8.0 mm, so the anchor is already outside the fruit), and

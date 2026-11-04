@@ -1502,9 +1502,10 @@ def _blind_close(inflight_report, close_geometry, min_nearest_mm, min_frames=5):
     """True when closing would be blind: the in-flight monitor never matched
     the date and the nearest date seen at close is far from the target.
 
-    Labelled 2026-11-02..04: 9 such closes, 9 missed; no held grasp had a
-    visible date >=44mm away. 'No dates in view' is NOT blind -- an ENVELOP
-    grasp that hid the date behind the fingers still held it.
+    The nearest visible date may be a neighbour while the target is hidden by
+    the fingers (2026-11-04: two dates in the jaws, neighbours 52/77mm away),
+    so the threshold only catches a bunch that moved away. 'No dates in view'
+    is NOT blind either -- an ENVELOP grasp that hid the date still held it.
     """
     r = inflight_report or {}
     near = (close_geometry or {}).get("nearest_date_mm")
