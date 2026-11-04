@@ -1201,3 +1201,15 @@ class WiderCorridorSkipTests(unittest.TestCase):
         self.assertEqual(fn('FROM_RIGHT_20', 'APPROACH_BRANCH_SWITCH(j1=90deg>75deg)', labels), set())
         self.assertEqual(fn('FROM_RIGHT_20', 'FINAL_WAYPOINT_1', labels), set())
         self.assertEqual(fn('STRAIGHT', flip, labels), set())
+
+
+class BlindCloseTests(unittest.TestCase):
+    def test_only_far_unmatched_closes_are_skipped(self):
+        fn = load('goals.py', '_blind_close', {})
+        r0 = {"frames": 13, "matched": 0}
+        self.assertTrue(fn(r0, {"nearest_date_mm": 114.0}, 40.0))   # 2026-11-04 miss
+        self.assertFalse(fn(r0, {"nearest_date_mm": 20.0}, 40.0))
+        self.assertFalse(fn(r0, {}, 40.0))                          # no dates in view (ENVELOP held)
+        self.assertFalse(fn({"frames": 14, "matched": 1}, {"nearest_date_mm": 114.0}, 40.0))
+        self.assertFalse(fn({"frames": 3, "matched": 0}, {"nearest_date_mm": 114.0}, 40.0))
+        self.assertFalse(fn(None, None, 40.0))

@@ -76,6 +76,7 @@ def snapshot_close_geometry(node, fruit_seed_xyz, commanded_tcp_xyz,
             else:
                 why = (f"latest frame {age:.2f}s old, nearest "
                        f"{math.dist(nearest, seed) * 1000:.0f}mm")
+                snap["nearest_date_mm"] = math.dist(nearest, seed) * 1000.0
         elif obs is not None:
             why = "latest frame has no dates"
         # As the fingers close around it the date is often hidden in the last

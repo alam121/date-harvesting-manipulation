@@ -815,6 +815,9 @@ class Planner:
     # from debug to info. Set back to False once the corridor question is
     # settled -- it is several lines per goal.
     log_corridor_candidates: bool = False
+    # Skip the close when FINAL never matched the date and the nearest visible
+    # date is at least this far from the target (see goals._blind_close).
+    blind_close_min_nearest_mm: float = 40.0
     # Disabled 2026-09-16 after measuring the tip-anchored FINAL geometry at
     # ~1.39 m range: the detected tip sat 21.3 mm from the date centre (fruit
     # radius 8.0 mm, so the anchor is already outside the fruit), and

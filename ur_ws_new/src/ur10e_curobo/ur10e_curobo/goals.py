@@ -1498,6 +1498,20 @@ def _direct_ik_move(node, target_pose_list, label="FINAL", motion_type="final",
     return True
 
 
+def _blind_close(inflight_report, close_geometry, min_nearest_mm, min_frames=5):
+    """True when closing would be blind: the in-flight monitor never matched
+    the date and the nearest date seen at close is far from the target.
+
+    Labelled 2026-11-02..04: 9 such closes, 9 missed; no held grasp had a
+    visible date >=44mm away. 'No dates in view' is NOT blind -- an ENVELOP
+    grasp that hid the date behind the fingers still held it.
+    """
+    r = inflight_report or {}
+    near = (close_geometry or {}).get("nearest_date_mm")
+    return (r.get("frames", 0) >= min_frames and r.get("matched", 1) == 0
+            and near is not None and near >= min_nearest_mm)
+
+
 def _wider_same_side_corridors(label, reason, labels, min_flip_deg=150.0):
     """Corridors a wrong-side preflight reject also rules out.
 
@@ -7023,6 +7037,20 @@ def plan_and_execute(node):
                 node.get_logger().info(
                     f"[TIMING] final={_timing['final']:.2f}s ok={final_ok} "
                     f"target=[{final_target[0]:.3f},{final_target[1]:.3f},{final_target[2]:.3f}]")
+
+            if _blind_close(getattr(node, "_last_inflight_report", None),
+                            getattr(node, "_close_geometry", None),
+                            float(getattr(node.cfg.planner,
+                                          "blind_close_min_nearest_mm", 40.0))):
+                node.get_logger().warn(
+                    "[BLIND_CLOSE_SKIP] FINAL never saw the date and the nearest "
+                    f"visible date is {node._close_geometry['nearest_date_mm']:.0f}mm "
+                    "away; not closing, returning HOME (counts as a failed attempt)")
+                node.motion_phase = "HOME"
+                move_to_home_position(node)
+                unlock_target(node)
+                _vision_resume()
+                continue
 
             # If stop was requested but arm is already at the final target, proceed with grasp.
             # E-stop during the wait does not mean the arm failed — check actual EE position.
