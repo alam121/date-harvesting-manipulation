@@ -1581,7 +1581,7 @@ def _wider_same_side_corridors(label, reason, labels, min_flip_deg=150.0):
     return out
 
 
-def _ik_batch(node, poses, seed_js):
+def _ik_batch(node, poses, seed_js, return_seeds=1):
     """(success, solutions) for up to ik_batch_size poses in one IK call, all
     seeded from seed_js; None when the planner has no batch solver or the
     chain is longer than its batch."""
@@ -1592,7 +1592,7 @@ def _ik_batch(node, poses, seed_js):
     try:
         return fn(torch.tensor([p[:3] for p in poses], dtype=torch.float32, device=dev),
                   torch.tensor([p[3:7] for p in poses], dtype=torch.float32, device=dev),
-                  list(seed_js))
+                  list(seed_js), return_seeds=return_seeds)
     except Exception as exc:
         node.get_logger().warn(f"[IK_BATCH] falling back to sequential: {exc}")
         return None
@@ -2015,44 +2015,94 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
         for pitch_deg in pitch_offsets
     )
 
-    for pitch_deg, wrist_deg in orientation_order:
-            pitched_quat = quat_apply_local_x_pitch(
-                list(approach_pose[3:]), pitch_deg)
+    def _orientation_pose(pitch_deg, wrist_deg):
+        pitched_quat = quat_apply_local_x_pitch(list(approach_pose[3:]), pitch_deg)
+        half = math.radians(wrist_deg) / 2.0
+        q_wrist = [math.cos(half), 0.0, 0.0, math.sin(half)]
+        return [*approach_pose[:3],
+                *quat_normalize(quat_multiply(pitched_quat, q_wrist))]
+
+    def _alignment_pose_for(pose):
+        if not _check_alignment:
+            return None
+        _toward = np.asarray(goal_xyz, dtype=float) - np.asarray(pose[:3], dtype=float)
+        _toward_norm = float(np.linalg.norm(_toward))
+        if _toward_norm <= 0.020:
+            return None
+        _align_xyz = (np.asarray(pose[:3], dtype=float)
+                      - _alignment_extra * (_toward / _toward_norm))
+        return [float(_align_xyz[0]), float(_align_xyz[1]),
+                float(_align_xyz[2]), *pose[3:]]
+
+    # Solve orientations ik_batch_size at a time (APPROACH branches, then the
+    # ALIGNMENT pose each implies), all seeded from start_js exactly like the
+    # one-at-a-time solves below. The loop still walks orientations in order
+    # and early-accepts the same one; it just reads answers already computed.
+    # 2026-11-04 the sequential sweep cost 0.65-0.84s when the first pitches
+    # lacked clearance (2 solves per orientation at ~90ms each).
+    _batch_n = (int(getattr(node.motion_gen, "ik_batch_size", 0))
+                if callable(getattr(node.motion_gen, "solve_ik_batch", None)) else 0)
+    _prefetched = {}
+
+    def _prefetch(first):
+        idx = list(range(first, min(first + _batch_n, len(orientation_order))))
+        poses = [_orientation_pose(*orientation_order[i]) for i in idx]
+        app = _ik_batch(node, poses, start_js, return_seeds=return_seeds)
+        if app is None:
+            return
+        aligns = [_alignment_pose_for(p) for p in poses]
+        _al_in = [a for a in aligns if a is not None]
+        al = _ik_batch(node, _al_in, start_js) if _al_in else None
+        j = 0
+        for n, i in enumerate(idx):
+            al_res = None
+            if aligns[n] is not None:
+                if al is not None:
+                    al_res = (al[0][j], al[1][j])
+                j += 1
+            _prefetched[i] = (list(zip(app[0][n], app[1][n])), al_res)
+
+    for _oi, (pitch_deg, wrist_deg) in enumerate(orientation_order):
             orientations_tested += 1
             orientation_candidate_start = len(candidates)
-            half = math.radians(wrist_deg) / 2.0
-            q_wrist = [math.cos(half), 0.0, 0.0, math.sin(half)]
-            quat = quat_normalize(quat_multiply(pitched_quat, q_wrist))
-            pose = [*approach_pose[:3], *quat]
-            pos_t = torch.tensor([pose[:3]], dtype=torch.float32, device=device)
-            quat_t = torch.tensor([pose[3:]], dtype=torch.float32, device=device)
+            pose = _orientation_pose(pitch_deg, wrist_deg)
+            quat = pose[3:]
+            if _batch_n and _oi not in _prefetched:
+                _prefetch(_oi)
+            _pre = _prefetched.get(_oi)
+            if _pre is not None:
+                branches = _pre[0]
+            else:
+                pos_t = torch.tensor([pose[:3]], dtype=torch.float32, device=device)
+                quat_t = torch.tensor([pose[3:]], dtype=torch.float32, device=device)
+                try:
+                    result = node.motion_gen.solve_ik(
+                        Pose(position=pos_t, quaternion=quat_t),
+                        seed_config=seed,
+                        retract_config=retract,
+                        return_seeds=return_seeds,
+                    )
+                except Exception as exc:
+                    node.get_logger().warn(
+                        f"[PREFLIGHT] pitch={pitch_deg:+.0f}deg "
+                        f"wrist={wrist_deg:+.0f}deg IK exception: {exc}")
+                    continue
 
-            try:
-                result = node.motion_gen.solve_ik(
-                    Pose(position=pos_t, quaternion=quat_t),
-                    seed_config=seed,
-                    retract_config=retract,
-                    return_seeds=return_seeds,
-                )
-            except Exception as exc:
-                node.get_logger().warn(
-                    f"[PREFLIGHT] pitch={pitch_deg:+.0f}deg "
-                    f"wrist={wrist_deg:+.0f}deg IK exception: {exc}")
-                continue
+                solutions = result.js_solution.position
+                success = result.success
+                if solutions.ndim == 3:
+                    solutions = solutions[0]
+                if success.ndim == 2:
+                    success = success[0]
+                branches = [
+                    (bool(success[b].item()), solutions[b].detach().cpu().tolist())
+                    for b in range(min(len(solutions), len(success)))]
 
-            solutions = result.js_solution.position
-            success = result.success
-            if solutions.ndim == 3:
-                solutions = solutions[0]
-            if success.ndim == 2:
-                success = success[0]
-
-            for branch_idx in range(min(len(solutions), len(success))):
-                if not bool(success[branch_idx].item()):
+            for branch_idx, (_branch_ok, _branch_js) in enumerate(branches):
+                if not _branch_ok:
                     ik_fail_count += 1
                     continue
-                goal_js = nearest_joint_config(
-                    start_js, solutions[branch_idx].detach().cpu().tolist())
+                goal_js = nearest_joint_config(start_js, _branch_js)
                 deltas = [abs(g - s) for g, s in zip(goal_js, start_js)]
                 if max(deltas) > max_delta:
                     delta_filtered_count += 1
@@ -2105,36 +2155,33 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
                 alignment_goal_js = None
                 alignment_clearance = float('inf')
                 if _check_alignment:
-                    _toward = np.asarray(goal_xyz, dtype=float) - np.asarray(pose[:3], dtype=float)
-                    _toward_norm = float(np.linalg.norm(_toward))
-                    if _toward_norm > 0.020:
-                        _align_xyz = (
-                            np.asarray(pose[:3], dtype=float)
-                            - _alignment_extra * (_toward / _toward_norm))
-                        alignment_pose = [
-                            float(_align_xyz[0]), float(_align_xyz[1]),
-                            float(_align_xyz[2]), *quat]
-                        _align_pos_t = torch.tensor(
-                            [alignment_pose[:3]], dtype=torch.float32, device=device)
-                        _align_quat_t = torch.tensor(
-                            [alignment_pose[3:]], dtype=torch.float32, device=device)
-                        try:
-                            _align_result = node.motion_gen.solve_ik(
-                                Pose(position=_align_pos_t, quaternion=_align_quat_t),
-                                seed_config=seed, retract_config=retract,
-                                return_seeds=return_seeds)
-                        except Exception:
+                    alignment_pose = _alignment_pose_for(pose)
+                    if alignment_pose is not None:
+                        if _pre is not None and _pre[1] is not None:
+                            _align_ok, _align_js = _pre[1]
+                        else:
+                            _align_pos_t = torch.tensor(
+                                [alignment_pose[:3]], dtype=torch.float32, device=device)
+                            _align_quat_t = torch.tensor(
+                                [alignment_pose[3:]], dtype=torch.float32, device=device)
+                            try:
+                                _align_result = node.motion_gen.solve_ik(
+                                    Pose(position=_align_pos_t, quaternion=_align_quat_t),
+                                    seed_config=seed, retract_config=retract,
+                                    return_seeds=return_seeds)
+                            except Exception:
+                                continue
+                            _align_solutions = _align_result.js_solution.position
+                            _align_success = _align_result.success
+                            if _align_solutions.ndim == 3:
+                                _align_solutions = _align_solutions[0]
+                            if _align_success.ndim == 2:
+                                _align_success = _align_success[0]
+                            _align_ok = bool(_align_success[0].item())
+                            _align_js = _align_solutions[0].detach().cpu().tolist()
+                        if not _align_ok:
                             continue
-                        _align_solutions = _align_result.js_solution.position
-                        _align_success = _align_result.success
-                        if _align_solutions.ndim == 3:
-                            _align_solutions = _align_solutions[0]
-                        if _align_success.ndim == 2:
-                            _align_success = _align_success[0]
-                        if not bool(_align_success[0].item()):
-                            continue
-                        alignment_goal_js = nearest_joint_config(
-                            start_js, _align_solutions[0].detach().cpu().tolist())
+                        alignment_goal_js = nearest_joint_config(start_js, _align_js)
                         _align_deltas = [
                             abs(g - s) for g, s in zip(alignment_goal_js, start_js)]
                         if max(_align_deltas) > max_delta:

@@ -299,12 +299,14 @@ class PlannerV2:
             self._goal(pose), current_state=current, seed_config=seed_config,
             return_seeds=min(return_seeds, self.num_ik_seeds))
 
-    def solve_ik_batch(self, positions, quaternions, seed_js):
+    def solve_ik_batch(self, positions, quaternions, seed_js, return_seeds=1):
         """IK for up to ik_batch_size poses at once, all seeded from seed_js.
 
         positions [N,3], quaternions [N,4] (wxyz) tensors. Returns
-        (success list[bool], solutions list[list[float]]) in input order.
+        (success list[bool], solutions list[list[float]]) in input order; with
+        return_seeds > 1 each entry is instead a list over the ranked seeds.
         """
+        k = max(1, min(int(return_seeds), self.num_ik_seeds))
         n = positions.shape[0]
         dev = positions.device
         # v2 pads the goal batch but not current_state: a short batch raises a
@@ -318,11 +320,13 @@ class PlannerV2:
         r = self.ik_batch.solve_pose(
             self._goal(Pose(position=positions, quaternion=quaternions)),
             current_state=JointState.from_position(seed, joint_names=self.planner.joint_names),
-            seed_config=seed.unsqueeze(1))
-        succ = r.success.reshape(self.ik_batch_size, -1)[:n, 0].cpu().tolist()
+            seed_config=seed.unsqueeze(1), return_seeds=k)
+        succ = r.success.reshape(self.ik_batch_size, -1)[:n, :k].cpu().tolist()
         sols = r.js_solution.position.reshape(
-            self.ik_batch_size, -1, seed.shape[-1])[:n, 0].cpu().tolist()
-        return [bool(v) for v in succ], sols
+            self.ik_batch_size, -1, seed.shape[-1])[:n, :k].cpu().tolist()
+        if return_seeds == 1:
+            return [bool(v[0]) for v in succ], [v[0] for v in sols]
+        return [[bool(x) for x in v] for v in succ], sols
 
     def check_constraints(self, state):
         # A horizon of one checks geometry/joint bounds without inventing motion
