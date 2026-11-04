@@ -95,7 +95,8 @@ def stats(root, since):
 
 def label(root, since, relabel):
     pending = [(d, p, ep) for d, p in episodes(root, since)
-               if (ep := load(p)) is not None and (relabel or not ep.get("human_label"))]
+               if os.path.isfile(os.path.join(d, "after_reverse.jpg"))  # what happened is only visible there
+               and (ep := load(p)) is not None and (relabel or not ep.get("human_label"))]
     if not pending:
         print(f"Nothing to label in {root}.")
         return
