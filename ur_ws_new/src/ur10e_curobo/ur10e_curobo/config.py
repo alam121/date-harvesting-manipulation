@@ -573,6 +573,7 @@ class Planner:
     # harvest. 2026-11-02: one unreachable date was retried 12x in 24 s.
     auto_harvest_max_goal_failures: int = 2
     auto_harvest_max_idle_rounds: int = 5
+    auto_harvest_max_empty_searches: int = 1           # stop after this many LiDAR searches in a row find no date
     goal_reachability_skip_delta_deg: float = 100.0    # postpone/skip queued goals above this nearest-IK delta
     goal_recovery_max_ik_delta_deg: float = 100.0      # do not grind staging/posture recovery above this nearest-IK delta
     shortest_ik_plan_max_delta_deg: float = 80.0       # fail fast when nearest IK branch is too far for short-goal planning

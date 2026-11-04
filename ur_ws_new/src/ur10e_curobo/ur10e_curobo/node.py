@@ -2696,6 +2696,7 @@ class UR10eCuroboMoveIt(Node):
         self._publish_auto_exclusions()
         _fail_counts = []   # [[xyz, failures], ...]
         _idle_rounds = 0
+        _empty_searches = 0   # consecutive LiDAR searches that found nothing
         _gave_up = False
         _max_idle = int(getattr(self.cfg.planner, "auto_harvest_max_idle_rounds", 5))
         _max_fail = int(getattr(self.cfg.planner, "auto_harvest_max_goal_failures", 2))
@@ -2740,11 +2741,20 @@ class UR10eCuroboMoveIt(Node):
                         break
                     if not found_during_scan:
                         self._destroy_auto_goal_subscription()
+                        _empty_searches += 1
+                        if _empty_searches >= int(getattr(
+                                self.cfg.planner, "auto_harvest_max_empty_searches", 1)):
+                            self.get_logger().warn(
+                                f"[AUTO_HARVEST] No goal found in {_empty_searches} "
+                                "LiDAR search(es); stopping batch")
+                            _gave_up = True
+                            break
                         self.get_logger().warn(
                             f"[AUTO_HARVEST] No goal found in LiDAR search "
                             f"round={search_round}; retrying")
                         _idle_rounds += 1
                         continue
+                    _empty_searches = 0
 
                     discovered = self.goal_poses.peek(0)
                     if discovered is not None:
