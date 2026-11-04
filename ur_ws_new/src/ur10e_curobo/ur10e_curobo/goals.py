@@ -4329,7 +4329,10 @@ def plan_and_execute(node):
     # Wait for a numbered drain acknowledgement; a timeout is not GPU idle.
     def _vision_pause():
         node.set_vision_mode("paused")
+        _t_pause = time.perf_counter()
         if node.wait_for_vision_paused(timeout=2.0):
+            node.get_logger().info(
+                f"[TIMING] vision_pause_ack={time.perf_counter() - _t_pause:.3f}s")
             return True
         node.get_logger().error("Vision pause was not acknowledged; stopping harvest")
         node.motion_phase = "ERROR"
