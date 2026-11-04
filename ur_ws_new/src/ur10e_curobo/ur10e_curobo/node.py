@@ -2692,6 +2692,7 @@ class UR10eCuroboMoveIt(Node):
         # without a harvest. 2026-11-02: a VERY LOW date whose every corridor
         # failed IK was re-selected 12 times in 24 s until an emergency stop.
         self._auto_excluded_goals = []
+        self._discovery_target_xyz = None
         self._publish_auto_exclusions()
         _fail_counts = []   # [[xyz, failures], ...]
         _idle_rounds = 0
@@ -2824,6 +2825,8 @@ class UR10eCuroboMoveIt(Node):
                 # Never reuse the result of a previous execution attempt.
                 self._last_completed_harvest_cycles = 0
                 _attempted = self.goal_poses.peek(0)
+                if _attempted is not None:
+                    self._discovery_target_xyz = [float(v) for v in _attempted[:3]]
                 self._prep_and_execute()
                 # plan_and_execute increments this once per COMPLETED cycle, so a
                 # batch can finish several; count them all rather than assuming 1.

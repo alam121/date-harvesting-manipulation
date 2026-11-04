@@ -1292,6 +1292,9 @@ class LidarScan:
         default_factory=lambda: [0.22, 0.35])
     scan_section_plan_budget_s: float = 5.0          # checked between calls; manual scan sections
     discovery_plan_budget_s: float = 5.0             # per viewpoint; checked between planner calls
+    discovery_standoff_m: float = 0.20               # auto-harvest search: distance from the last target date
+    discovery_arc_deg: List[float] = field(
+        default_factory=lambda: [60.0, 120.0])       # base-frame angles about that date; 90 = +Y, toward the robot
     semicircle_min_points: int = 3
     semicircle_preflight_direction: str = "reverse"   # reverse is usually smoother for the base-frame front arc
     semicircle_preflight_fallback_opposite: bool = True

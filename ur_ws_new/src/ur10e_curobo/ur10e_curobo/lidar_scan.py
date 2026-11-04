@@ -126,7 +126,8 @@ def _scan_basis_and_angles(node, center, cur, n: int, arc: float):
 
 
 def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = True,
-                            stop_check=None, center_override=None, discovery_rows=False):
+                            stop_check=None, center_override=None, discovery_rows=False,
+                            radius_override=None, angles_deg_override=None):
     """Build the arc. `center_override` puts the centre somewhere other than
     the TCP -- pollination orbits the detected flower rather than the arm.
 
@@ -158,6 +159,9 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     arc = math.radians(float(getattr(cfg, "semicircle_arc_deg", 180.0)))
     local_axis = tuple(getattr(cfg, "semicircle_local_axis", [0.0, 0.0, 1.0]))
     radial, tangent, angles, angle_mode = _scan_basis_and_angles(node, center, cur, n, arc)
+    if angles_deg_override is not None:
+        radial, tangent = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+        angles = np.radians(np.linspace(angles_deg_override[0], angles_deg_override[1], n))
     if not discovery_rows and bool(getattr(cfg, "semicircle_use_reachability", True)):
         poses = _semicircle_from_reachability(
             node, center, ref_quat, source, n, radius, arc, local_axis,
@@ -214,6 +218,8 @@ def _semicircle_scan_poses(node, *, publish_preview: bool = True, log: bool = Tr
     ]
     if radius not in radius_candidates:
         radius_candidates.append(radius)
+    if radius_override is not None:
+        radius_candidates = [max(0.02, float(radius_override))]
     radius_candidates = list(dict.fromkeys(radius_candidates))
     yaw_candidates = list(dict.fromkeys([
         max(0.0, configured_yaw_limit),
@@ -1118,7 +1124,21 @@ def _run_discovery_scan(node, goal_available):
     """Plan and execute one checked viewpoint at a time, from measured joints."""
     cfg = node.cfg.lidar_scan
     _t_rows = time.monotonic()
-    rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
+    # Orbit the last date auto-harvest went for, from the robot side, instead
+    # of the arm's current TCP: around HOME the viewpoints sat 25-60cm from the
+    # bunch (2026-11-04). With no target yet, keep the original TCP orbit.
+    target = getattr(node, "_discovery_target_xyz", None)
+    if target is not None:
+        rows = _semicircle_scan_poses(
+            node, publish_preview=False, discovery_rows=True,
+            center_override=list(target[:3]),
+            radius_override=float(getattr(cfg, "discovery_standoff_m", 0.20)),
+            angles_deg_override=tuple(getattr(cfg, "discovery_arc_deg", (60.0, 120.0))))
+        node.get_logger().info(
+            f"[LIDAR_DISCOVERY] orbiting last target [{target[0]:.3f},{target[1]:.3f},"
+            f"{target[2]:.3f}] at {getattr(cfg, 'discovery_standoff_m', 0.20):.2f}m")
+    else:
+        rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
     node.get_logger().info(
         f"[LIDAR_DISCOVERY_TIMING] rows={time.monotonic() - _t_rows:.2f}s "
         f"({sum(len(r) for r in rows)} poses)")
@@ -1186,7 +1206,21 @@ def _run_discovery_scan(node, goal_available):
 def _run_section_scan(node):
     """Validate at most two consecutive viewpoints before each section."""
     cfg = node.cfg.lidar_scan
-    rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
+    # Orbit the last date auto-harvest went for, from the robot side, instead
+    # of the arm's current TCP: around HOME the viewpoints sat 25-60cm from the
+    # bunch (2026-11-04). With no target yet, keep the original TCP orbit.
+    target = getattr(node, "_discovery_target_xyz", None)
+    if target is not None:
+        rows = _semicircle_scan_poses(
+            node, publish_preview=False, discovery_rows=True,
+            center_override=list(target[:3]),
+            radius_override=float(getattr(cfg, "discovery_standoff_m", 0.20)),
+            angles_deg_override=tuple(getattr(cfg, "discovery_arc_deg", (60.0, 120.0))))
+        node.get_logger().info(
+            f"[LIDAR_DISCOVERY] orbiting last target [{target[0]:.3f},{target[1]:.3f},"
+            f"{target[2]:.3f}] at {getattr(cfg, 'discovery_standoff_m', 0.20):.2f}m")
+    else:
+        rows = _semicircle_scan_poses(node, publish_preview=False, discovery_rows=True)
     budget = max(0.1, float(getattr(cfg, "scan_section_plan_budget_s", 5.0)))
     completed = 0
     index = 0
