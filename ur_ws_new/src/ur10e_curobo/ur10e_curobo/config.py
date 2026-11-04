@@ -815,7 +815,9 @@ class Planner:
     # per-corridor [CORRIDOR_PREFLIGHT] PASS/REJECT line (reason + branch_cost)
     # from debug to info. Set back to False once the corridor question is
     # settled -- it is several lines per goal.
-    log_corridor_candidates: bool = False
+    # On again 2026-11-04 to profile the ~1.2s between GRASP_MODE and
+    # APPROACH_ALIGNMENT (ik_preflight_ms / lock_wait_ms per corridor).
+    log_corridor_candidates: bool = True
     # Skip the close when FINAL never matched the date and the nearest visible
     # date is at least this far from the target (see goals._blind_close).
     # Was 40: 2026-11-04 11:26 it skipped two dates sitting in the jaws (hidden
@@ -1175,7 +1177,12 @@ class Gripper:
     # the fingers slow down as they meet the date: dates were slipping out.
     closing_steps: int = 20
     step_delay_s: float = 0.03
-    close_feedback_trim_enabled: bool = True
+    # Off 2026-11-04 (-0.47s per grasp): every close since the settle check went
+    # in logged the trim stuck on M7 (centre finger, not load-bearing) at
+    # +15-17deg, and the settle check already waits for the fingers to stop.
+    # The nontactile thresholds below were measured WITH the trim on --
+    # re-measure empty/held closes, or set back to True.
+    close_feedback_trim_enabled: bool = False
     # 4 -> 2 passes and 0.25 -> 0.15s settle on 2026-10-08: the trim never
     # reached its 1deg tolerance (every close logged +4-9deg; a held date
     # blocks it), so it always ran 5 x 0.25s = 1.25s. Now 3 x 0.15 = 0.45s.
@@ -1207,6 +1214,10 @@ class Gripper:
     open_settle_s: float = 0.10
     open_hold_repeats: int = 3
     open_hold_interval_s: float = 0.04
+    # Dropoff: leave for HOME this long after the OPEN starts instead of after
+    # the full ~0.6s open; the rest of the open runs in the background. Raise
+    # it if dates get carried away from the bin.
+    dropoff_release_wait_s: float = 0.30
     # Non-tactile contact validation. Re-measured 2026-09-08 on the lab hand
     # against the corrected closed posture and the signed remaining_fraction
     # (empty close now reads ~0.00 instead of 0.15-0.43, so the position signal

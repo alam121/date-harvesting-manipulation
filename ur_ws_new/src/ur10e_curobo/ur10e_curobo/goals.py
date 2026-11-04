@@ -7758,7 +7758,14 @@ def plan_and_execute(node):
             break
         # Reset 2-finger mode before dropoff open (all fingers active for release)
         node.gripper_controller.frozen_fingers = set()
-        node.control_gripper("OPEN")
+        # The full open takes ~0.6s but the date drops once the fingers part;
+        # leave for HOME after dropoff_release_wait_s and join before the next
+        # cycle can touch the gripper.
+        _release_thread = _threading.Thread(
+            target=node.control_gripper, args=("OPEN",), daemon=True)
+        _release_thread.start()
+        _release_thread.join(timeout=float(getattr(
+            node.cfg.gripper, "dropoff_release_wait_s", 0.30)))
         _timing["dropoff"] = time.time() - _t_dropoff
         if _log_phase_timings:
             node.get_logger().info(
@@ -7831,6 +7838,7 @@ def plan_and_execute(node):
         _timing["return_home"] = time.time() - _t_return_home
         if _log_phase_timings:
             node.get_logger().info(f"[TIMING] return_home={_timing['return_home']:.2f}s")
+        _release_thread.join(timeout=2.0)
         _vision_resume()
 
         # Wait for grasp feedback from RViz GUI (Y/N keys) or terminal
