@@ -36,12 +36,25 @@ class NeighborDiagnosticsTests(unittest.TestCase):
         candidate['start'][2]=.02;candidate['end'][2]=.02
         self.assertGreater(rank_corridors([0,0,0],[candidate],fruits)['rows'][0]['interference_m'],0)
 
+    def test_unmatched_target_skips_corridor_collection(self):
+        import time
+        from types import SimpleNamespace as NS
+        from unittest.mock import Mock
+        from ur10e_curobo.neighbor_diagnostics import collect_candidate
+        node=NS(_nearby_dates_snapshot=(time.monotonic(),{'stamp_ns':10**9,'fruits':[]}),
+                get_clock=lambda:NS(now=lambda:NS(nanoseconds=10**9)),
+                _neighbor_candidate_labels=['a','b'],get_logger=lambda:Mock())
+        self.assertFalse(collect_candidate(node,'a',[0,.1,0],[0,0,0],[0,0,0]))
+        self.assertFalse(hasattr(node,'_corridor_forced_label'))
+        self.assertEqual(node._last_neighbor_diagnostic['status'],'TARGET_UNMATCHED')
+
     def test_collection_reloads_ranked_candidate(self):
         import time
         from types import SimpleNamespace as NS
         from unittest.mock import Mock, patch
         from ur10e_curobo.neighbor_diagnostics import collect_candidate
-        node=NS(_nearby_dates_snapshot=(time.monotonic(),{'stamp_ns':10**9,'fruits':[]}),
+        target={'base_xyz':[0,0,0],'radius_m':.015,'fruit_id':1}
+        node=NS(_nearby_dates_snapshot=(time.monotonic(),{'stamp_ns':10**9,'fruits':[target]}),
                 get_clock=lambda:NS(now=lambda:NS(nanoseconds=10**9)),
                 _neighbor_candidate_labels=['a','b'],get_logger=lambda:Mock())
         self.assertTrue(collect_candidate(node,'a',[0,.1,0],[0,0,0],[0,0,0]))

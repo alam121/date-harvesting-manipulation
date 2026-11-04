@@ -101,6 +101,15 @@ def collect_candidate(node, label, approach, final, goal):
             node._neighbor_geometry = {'disabled': True}
             node.get_logger().warn('[NEIGHBOR_RANK] stale observations; retaining axis ranking')
             return False
+        # Target association needs only the goal and the snapshot, so decide it
+        # before collecting every corridor: on 2026-11-04 >=28 of 56 goals ended
+        # TARGET_UNMATCHED/AMBIGUOUS after a ~0.6s geometry pass per corridor.
+        early = rank_corridors(goal, [], snapshot[1]['fruits'])
+        if early['status'] != 'OK':
+            node._last_neighbor_diagnostic = early
+            node._neighbor_geometry = {'disabled': True}
+            node.get_logger().warn('[NEIGHBOR_RANK] '+early['status']+'; retaining axis ranking')
+            return False
         state = {'snapshot':copy.deepcopy(snapshot), 'candidates':{}, 'labels':list(node._neighbor_candidate_labels)}
         node._neighbor_geometry = state
     if state.get('disabled') or state.get('done'):
