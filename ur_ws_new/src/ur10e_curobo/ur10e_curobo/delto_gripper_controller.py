@@ -660,12 +660,19 @@ class DeltoGripperController:
         _t_settle = time.time()
         _settle_end = _t_settle + float(getattr(
             self.node.cfg.gripper, 'contact_settle_max_s', 1.5))
+        # Two still windows in a row, and not before min_s: an ENVELOP close
+        # (2026-11-04 11:26:31) passed one still window before the fingers had
+        # started (settle=0.10s, peak 0.06A, remaining 0.7-0.9) -> false CONTACT.
+        _min_end = _t_settle + float(getattr(
+            self.node.cfg.gripper, 'contact_settle_min_s', 0.3))
         _prev = list(self.actual_joint_position or [])
+        _still = 0
         while time.time() < _settle_end:
             self._watch_close_current(0.1)
             _cur = list(self.actual_joint_position or [])
-            if _prev and len(_cur) == len(_prev) and max(
-                    abs(a - b) for a, b in zip(_cur, _prev)) < 0.005:
+            _still = _still + 1 if (_prev and len(_cur) == len(_prev) and max(
+                abs(a - b) for a, b in zip(_cur, _prev)) < 0.005) else 0
+            if _still >= 2 and time.time() >= _min_end:
                 break
             _prev = _cur
         self.close_settle_s = time.time() - _t_settle

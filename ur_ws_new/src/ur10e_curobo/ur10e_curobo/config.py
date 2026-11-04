@@ -1258,6 +1258,7 @@ class Gripper:
     # Contact is judged only after the fingers stop (<0.005 rad per 0.1 s), at
     # most this long after the close; see run_closure_loop.
     contact_settle_max_s: float = 1.5
+    contact_settle_min_s: float = 0.3
 
 @dataclass
 class Grasp:
