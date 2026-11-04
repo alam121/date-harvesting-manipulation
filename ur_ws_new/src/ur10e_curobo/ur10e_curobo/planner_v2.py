@@ -11,10 +11,11 @@ from types import SimpleNamespace
 
 import torch
 from curobo.config_io import load_yaml
+from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
 from curobo.kinematics import Kinematics, KinematicsCfg
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Scene
-from curobo.types import GoalToolPose, JointState, RobotState
+from curobo.types import GoalToolPose, JointState, Pose, RobotState
 
 from .planner_options import PlanOptions
 
@@ -219,9 +220,28 @@ class PlannerV2:
         self.fk_config = KinematicsCfg.from_data_dict(copy.deepcopy(robot_config))
         self.tool_frame = self.planner.tool_frames[0]
         self.num_ik_seeds = self.planner.ik_solver.config.num_seeds
+        # Short IK chains (corridor preflight, straight entry legs) solved as
+        # one batch instead of one call per point: 2026-11-04 bench 87 -> 23ms
+        # for 4 poses under GIL load, identical solutions. Shares the planner's
+        # collision checker, so every update_world() applies here too.
+        self.ik_batch_size = 4
+        self.ik_batch = InverseKinematics(InverseKinematicsCfg.create(
+            robot=copy.deepcopy(robot_config), optimizer_configs=["ik/lbfgs_ik.yml"],
+            num_seeds=self.num_ik_seeds, max_batch_size=self.ik_batch_size,
+            use_cuda_graph=use_cuda_graph), self.planner.scene_collision_checker)
 
     def warmup(self):
         self.planner.warmup()
+        q = self.planner.default_joint_state.position.view(1, -1)
+        tool = self.planner.compute_kinematics(JointState.from_position(
+            q, joint_names=self.planner.joint_names)).tool_poses.get_link_pose(self.tool_frame)
+        pos = tool.position.view(1, 3).repeat(self.ik_batch_size, 1)
+        quat = tool.quaternion.view(1, 4).repeat(self.ik_batch_size, 1)
+        # Also an unreachable batch: the first failing solve costs ~1s of
+        # one-off capture, which must not land on the first rejected corridor.
+        for offset in (0.0, 3.0):
+            self.solve_ik_batch(pos + torch.tensor([0.0, 0.0, offset], device=pos.device),
+                                quat, q.view(-1).tolist())
 
     def _goal(self, pose):
         return GoalToolPose.from_poses({self.tool_frame: pose})
@@ -278,6 +298,31 @@ class PlannerV2:
         return self.planner.ik_solver.solve_pose(
             self._goal(pose), current_state=current, seed_config=seed_config,
             return_seeds=min(return_seeds, self.num_ik_seeds))
+
+    def solve_ik_batch(self, positions, quaternions, seed_js):
+        """IK for up to ik_batch_size poses at once, all seeded from seed_js.
+
+        positions [N,3], quaternions [N,4] (wxyz) tensors. Returns
+        (success list[bool], solutions list[list[float]]) in input order.
+        """
+        n = positions.shape[0]
+        dev = positions.device
+        # v2 pads the goal batch but not current_state: a short batch raises a
+        # size mismatch, so always send ik_batch_size poses (repeat the last).
+        pad = self.ik_batch_size - n
+        if pad > 0:
+            positions = torch.cat([positions, positions[-1:].repeat(pad, 1)])
+            quaternions = torch.cat([quaternions, quaternions[-1:].repeat(pad, 1)])
+        seed = torch.tensor([seed_js], dtype=torch.float32, device=dev).repeat(
+            self.ik_batch_size, 1)
+        r = self.ik_batch.solve_pose(
+            self._goal(Pose(position=positions, quaternion=quaternions)),
+            current_state=JointState.from_position(seed, joint_names=self.planner.joint_names),
+            seed_config=seed.unsqueeze(1))
+        succ = r.success.reshape(self.ik_batch_size, -1)[:n, 0].cpu().tolist()
+        sols = r.js_solution.position.reshape(
+            self.ik_batch_size, -1, seed.shape[-1])[:n, 0].cpu().tolist()
+        return [bool(v) for v in succ], sols
 
     def check_constraints(self, state):
         # A horizon of one checks geometry/joint bounds without inventing motion

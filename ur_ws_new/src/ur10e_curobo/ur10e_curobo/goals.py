@@ -1581,6 +1581,23 @@ def _wider_same_side_corridors(label, reason, labels, min_flip_deg=150.0):
     return out
 
 
+def _ik_batch(node, poses, seed_js):
+    """(success, solutions) for up to ik_batch_size poses in one IK call, all
+    seeded from seed_js; None when the planner has no batch solver or the
+    chain is longer than its batch."""
+    fn = getattr(node.motion_gen, "solve_ik_batch", None)
+    if fn is None or not 0 < len(poses) <= int(getattr(node.motion_gen, "ik_batch_size", 0)):
+        return None
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        return fn(torch.tensor([p[:3] for p in poses], dtype=torch.float32, device=dev),
+                  torch.tensor([p[3:7] for p in poses], dtype=torch.float32, device=dev),
+                  list(seed_js))
+    except Exception as exc:
+        node.get_logger().warn(f"[IK_BATCH] falling back to sequential: {exc}")
+        return None
+
+
 def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
                                     waypoint_count=2):
     """Validate APPROACH and fixed-orientation straight FINAL before motion.
@@ -1617,7 +1634,25 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
     try:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        def solve(pose, seed):
+        _wp_poses = [
+            [*[approach_pose[i] + (k / (waypoint_count + 1))
+               * (final_pose[i] - approach_pose[i]) for i in range(3)],
+             *final_pose[3:]]
+            for k in range(1, waypoint_count + 2)]
+        _batch_t0 = time.time()
+        _batch = _ik_batch(node, [list(approach_pose), *_wp_poses], start_js)
+        if _batch is not None:
+            _pf_solve_ms.append((time.time() - _batch_t0) * 1000.0)  # one batch call
+
+        def solve(pose, seed, idx=None):
+            # Batched answers are all seeded from start_js. APPROACH is seeded
+            # there anyway, so a batch miss is final; a waypoint miss falls
+            # through to the sequential solve seeded from the previous point.
+            if _batch is not None and idx is not None:
+                if _batch[0][idx]:
+                    return nearest_joint_config(seed, _batch[1][idx])
+                if idx == 0:
+                    return None
             # v2 searches its configured parallel seed set and uses the
             # current state as the posture preference. The continuity and
             # branch-switch checks below still validate the returned solution.
@@ -1676,7 +1711,7 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
             _pf_cpu_ms.append(_call_cpu_ms)
             return _out
 
-        approach_js = solve(approach_pose, start_js)
+        approach_js = solve(approach_pose, start_js, idx=0)
         if approach_js is None:
             return False, "APPROACH_IK"
         _approach_deltas = [
@@ -1700,12 +1735,13 @@ def _preflight_approach_final_chain(node, start_js, approach_pose, final_pose,
 
         previous = approach_js
         for index in range(1, waypoint_count + 2):
-            alpha = index / (waypoint_count + 1)
-            xyz = [
-                approach_pose[i] + alpha * (final_pose[i] - approach_pose[i])
-                for i in range(3)
-            ]
-            candidate = solve([*xyz, *final_pose[3:]], previous)
+            candidate = solve(_wp_poses[index - 1], previous, idx=index)
+            if (candidate is not None and _batch is not None and _batch[0][index]
+                    and max(abs(a - b) for a, b in zip(candidate, previous))
+                    > math.radians(30.0)):
+                # The batch seed was start_js, not the previous point: re-solve
+                # sequentially before calling it a branch switch.
+                candidate = solve(_wp_poses[index - 1], previous)
             if candidate is None:
                 return False, f"FINAL_WAYPOINT_{index}"
             _step_deltas = [
@@ -2225,13 +2261,25 @@ def straight_cartesian_entry_states(node, start_js, start_xyz, start_quat,
 
     wp_js = [list(start_js)]
     prev_js = list(start_js)
+    _wps = []
     for k in range(1, n_wp + 2):        # intermediate points, then the endpoint
+        a = k / (n_wp + 1)
+        _wps.append([*[start_xyz[i] + a * (target_pose_list[i] - start_xyz[i])
+                       for i in range(3)],
+                     *quat_slerp(list(start_quat), target_quat, min(a, 1.0))])
+    _batch = _ik_batch(node, _wps, start_js)
+    for k in range(1, n_wp + 2):
         if stop_evt is not None and stop_evt.is_set():
             return None
-        a = k / (n_wp + 1)
-        wp_xyz = [start_xyz[i] + a * (target_pose_list[i] - start_xyz[i])
-                  for i in range(3)]
-        wp_quat = quat_slerp(list(start_quat), target_quat, min(a, 1.0))
+        wp_xyz, wp_quat = _wps[k - 1][:3], _wps[k - 1][3:]
+        if _batch is not None and _batch[0][k - 1]:
+            # Batch is seeded from start_js; keep it only if it stays on the
+            # previous point's branch, else solve this point sequentially.
+            js = nearest_joint_config(prev_js, _batch[1][k - 1])
+            if max(abs(a2 - b2) for a2, b2 in zip(js, prev_js)) <= 0.52:
+                wp_js.append(js)
+                prev_js = js
+                continue
         try:
             r = node.motion_gen.solve_ik(
                 Pose(position=torch.tensor([wp_xyz], dtype=torch.float32, device=dev),
