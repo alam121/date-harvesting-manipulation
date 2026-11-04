@@ -2044,7 +2044,6 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = torch.tensor([start_js], dtype=torch.float32, device=device).unsqueeze(0)
     retract = torch.tensor([start_js], dtype=torch.float32, device=device)
-    start_pose = node.get_end_effector_pose()
 
     # First sweep pitch with no wrist rotation. Pitch changes the actual
     # forearm/flange separation; wrist variants are a slower fallback.
@@ -2177,13 +2176,10 @@ def _select_safe_approach_candidate(node, approach_pose, start_js, goal_xyz=None
                     )
                     for i in range(1, len(cart_path))
                 )
-                if start_pose is not None:
-                    straight = math.dist(start_pose[:3], pose[:3])
-                else:
-                    straight = math.dist(
-                        (cart_path[0].x, cart_path[0].y, cart_path[0].z),
-                        (cart_path[-1].x, cart_path[-1].y, cart_path[-1].z),
-                    )
+                # cart_path[0] is FK of start_js, i.e. the current TCP; a
+                # separate get_end_effector_pose() cost 0.12s under contention.
+                straight = math.dist(
+                    (cart_path[0].x, cart_path[0].y, cart_path[0].z), pose[:3])
                 ratio = path_len / max(straight, 0.001)
                 if straight > 0.02 and ratio > max_ratio:
                     continue
@@ -2597,12 +2593,11 @@ def plan_and_send(node, start_state, goal_pose: Pose, label: str, motion_type: s
         indices = list(range(0, len(waypoints), step))
         if indices[-1] != len(waypoints) - 1:
             indices.append(len(waypoints) - 1)
-        pts = []
-        for idx in indices:
-            p = forward_kinematics(node, waypoints[idx])
-            if p is None:
-                return None, None  # FK failed
-            pts.append(p)
+        # One batched FK call; per-waypoint calls cost 0.13-0.15s per plan
+        # (2026-11-04 [PLAN_PROFILE]).
+        pts = forward_kinematics_batch(node, [list(waypoints[i]) for i in indices])
+        if len(pts) != len(indices):
+            return None, None  # FK failed
         total = 0.0
         for i in range(1, len(pts)):
             total += math.sqrt((pts[i].x - pts[i-1].x)**2 + (pts[i].y - pts[i-1].y)**2 + (pts[i].z - pts[i-1].z)**2)
