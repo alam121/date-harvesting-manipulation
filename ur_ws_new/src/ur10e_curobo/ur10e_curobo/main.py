@@ -2,6 +2,7 @@
 import os, signal, sys, termios, atexit
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy._rclpy_pybind11 import InvalidHandle
 from ur10e_curobo.node import UR10eCuroboMoveIt
 
 # restore TTY on exit (even on crashes)
@@ -60,7 +61,13 @@ def main():
     executor.add_node(node)
     try:
         while rclpy.ok() and not exit_signal:
-            executor.spin_once(timeout_sec=0.1)
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except InvalidHandle:
+                # A worker thread destroyed a subscription (e.g. goal_pose_sub)
+                # while the executor was building its wait set; 2026-11-04 this
+                # killed main mid auto-harvest. The next spin rebuilds without it.
+                continue
 
     finally:
         node.stop_requested = True
