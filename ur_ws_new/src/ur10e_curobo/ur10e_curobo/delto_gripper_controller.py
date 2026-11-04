@@ -650,10 +650,26 @@ class DeltoGripperController:
         # harvesting sequence.
         self._watch_close_current(float(getattr(
             self.node.cfg.planner, 'grasp_post_close_settle_s', 0.50)))
+        # The lead-limited close is slower than the fixed settle: 2026-11-03
+        # every close was judged mid-travel (left remaining 0.17-1.1 vs 0.0
+        # empty / 0.13 held on 10-08), so every close read CONTACT. Judge only
+        # once the fingers have stopped.
+        _t_settle = time.time()
+        _settle_end = _t_settle + float(getattr(
+            self.node.cfg.gripper, 'contact_settle_max_s', 1.5))
+        _prev = list(self.actual_joint_position or [])
+        while time.time() < _settle_end:
+            self._watch_close_current(0.1)
+            _cur = list(self.actual_joint_position or [])
+            if _prev and len(_cur) == len(_prev) and max(
+                    abs(a - b) for a, b in zip(_cur, _prev)) < 0.005:
+                break
+            _prev = _cur
+        self.close_settle_s = time.time() - _t_settle
         self.node.get_logger().info(
             f"[GRIPPER_CURRENT] peak={self.close_peak_current_a:.2f}A "
             f"limit={float(getattr(self.node.cfg.gripper, 'close_current_limit_a', 0.0)):.2f}A "
-            f"limited={self.close_current_limited}")
+            f"limited={self.close_current_limited} settle={self.close_settle_s:.2f}s")
 
         # Classify from the completed position-controlled close before enabling
         # firmware holding. Otherwise the holding-current rise can be mistaken
@@ -661,6 +677,7 @@ class DeltoGripperController:
         if bool(getattr(
                 self.node.cfg.gripper, 'nontactile_contact_validation', True)):
             self.contact_evidence = self.evaluate_nontactile_contact()
+            self.contact_evidence['settle_s'] = round(self.close_settle_s, 3)
             evidence = self.contact_evidence
             if evidence.get('valid'):
                 currents = evidence['current_delta_a']

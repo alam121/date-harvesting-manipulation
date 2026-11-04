@@ -1245,6 +1245,9 @@ class Gripper:
     active_fingers: List[int] = field(default_factory=lambda: [2])  # was [0, 2]; see 2026-10-08 note above
     nontactile_min_contact_fingers: int = 1
     nontactile_feedback_max_age_s: float = 0.30
+    # Contact is judged only after the fingers stop (<0.005 rad per 0.1 s), at
+    # most this long after the close; see run_closure_loop.
+    contact_settle_max_s: float = 1.5
 
 @dataclass
 class Grasp:
