@@ -1177,12 +1177,11 @@ class Gripper:
     # the fingers slow down as they meet the date: dates were slipping out.
     closing_steps: int = 20
     step_delay_s: float = 0.03
-    # Off 2026-11-04 (-0.47s per grasp): every close since the settle check went
-    # in logged the trim stuck on M7 (centre finger, not load-bearing) at
-    # +15-17deg, and the settle check already waits for the fingers to stop.
-    # The nontactile thresholds below were measured WITH the trim on --
-    # re-measure empty/held closes, or set back to True.
-    close_feedback_trim_enabled: bool = False
+    # Do NOT turn off to save time. Tried 2026-11-04 15:07: without the trim the
+    # left finger (M12) stops 13% short on an EMPTY close with ~3 mA, which
+    # reads as CONTACT (4/4 empty closes). With it, empty reads 0.05-0.07 and
+    # 54-65 mA. The trim log only shows M7 (worst joint); M12 it does fix.
+    close_feedback_trim_enabled: bool = True
     # 4 -> 2 passes and 0.25 -> 0.15s settle on 2026-10-08: the trim never
     # reached its 1deg tolerance (every close logged +4-9deg; a held date
     # blocks it), so it always ran 5 x 0.25s = 1.25s. Now 3 x 0.15 = 0.45s.
